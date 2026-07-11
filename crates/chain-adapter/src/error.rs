@@ -20,6 +20,14 @@ pub enum AdapterError {
         /// Confirmations required by the per-chain finality policy.
         need: u32,
     },
+    /// A finality witness was empty or its header chain was not contiguous and
+    /// hash-linked from the including block to the head.
+    #[error("malformed finality witness")]
+    InvalidWitness,
+    /// A deposit's Merkle inclusion proof did not verify against the base
+    /// block's committed root.
+    #[error("deposit inclusion proof failed")]
+    InvalidInclusion,
     /// A `(chain, tx, event)` triple was observed and credited already.
     #[error("duplicate observation (replay protection)")]
     DuplicateObservation,

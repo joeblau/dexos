@@ -14,6 +14,7 @@ pub mod codec;
 pub mod conformance;
 pub mod deposit;
 pub mod error;
+pub mod finality;
 pub mod ids;
 pub mod policy;
 pub mod wire;
@@ -27,6 +28,10 @@ pub use deposit::{
     DOMAIN_DEPOSIT,
 };
 pub use error::AdapterError;
+pub use finality::{
+    verify_finality, BlockHeader, ChainCommit, FinalityWitness, InclusionProof,
+    MAX_INCLUSION_DEPTH, MAX_WITNESS_HEADERS,
+};
 pub use ids::{AssetId, ChainId, TxId, MAX_TXID_LEN};
 pub use policy::{DepositTracker, FinalityPolicy, DEFAULT_TRACKER_CAPACITY};
 pub use withdrawal::{

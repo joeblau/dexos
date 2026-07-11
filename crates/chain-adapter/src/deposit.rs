@@ -73,13 +73,20 @@ impl Codec for DepositEvent {
 }
 
 /// Proof that a transaction reached a given depth on its chain.
+///
+/// A trustworthy proof is only ever produced by
+/// [`verify_finality`](crate::verify_finality), which derives `confirmations`
+/// from a verified, hash-linked header chain and recomputes `block_hash` — it is
+/// never a bare, observer-asserted count. Consumers that credit funds must
+/// obtain proofs through verification, not by constructing this struct directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FinalityProof {
     /// Block/slot height that included the transaction.
     pub block_number: u64,
     /// Block/slot hash.
     pub block_hash: Hash,
-    /// Confirmations observed on top of the including block.
+    /// Confirmation depth derived from a verified header chain (the number of
+    /// contiguous headers from the including block through the head, inclusive).
     pub confirmations: u32,
 }
 

@@ -9,6 +9,12 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Opt-in, deterministic in-memory `MockEvmAdapter` for tests and simulations.
+# The production node binary depends on this crate *without* this feature, so
+# the mock is never linked into a release build.
+mock = []
+
 [dependencies]
 types = { path = "../types" }
 crypto = { path = "../crypto" }
