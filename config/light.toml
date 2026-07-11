@@ -1,0 +1,32 @@
+# Read-only light node: discovers peers/markets, verifies checkpoints, serves
+# read-only RPC. No consensus, execution, or order entry.
+[node]
+name = "light-1"
+region = "local"
+light = true
+roles = ["gateway", "observer"]
+
+[network]
+listen = "0.0.0.0:9001"
+bootstrap_peers = ["us-1.dexos.local:9000"]
+enable_quic = true
+enable_datagrams = true
+
+[consensus]
+checkpoint_interval_ms = 100
+epoch_length = 100000
+validator_set_path = "validators.toml"
+
+[storage]
+data_dir = "./data/light-1"
+snapshot_interval_sequences = 1000000
+segment_size_mb = 1024
+
+[rpc]
+listen = "0.0.0.0:8081"
+read_only = true
+
+[performance]
+pin_threads = false
+busy_poll = false
+simd = "auto"

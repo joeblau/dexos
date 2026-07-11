@@ -1,0 +1,50 @@
+[workspace]
+resolver = "2"
+members = ["crates/*", "bin/*"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.92"
+repository = "https://github.com/joeblau/dexos"
+
+# Engineering standards, mechanically enforced.
+#
+# `unsafe_code = "deny"` makes unsafe a hard error by default. The only sanctioned
+# escape hatch is a narrow, documented, per-item opt-in inside an isolated performance
+# module — e.g.
+#
+#     #[allow(unsafe_code)] // SAFETY: <invariant>, covered by <test>
+#     unsafe { ... }
+#
+# See docs and the `scripts/check-unsafe.sh` gate. The deterministic execution core
+# (types, execution, orderbook, risk, state-tree) additionally forbids floating point
+# (scripts/check-no-float.sh) and any dependency on async runtimes or I/O crates
+# (scripts/check-core-deps.sh).
+[workspace.lints.rust]
+unsafe_code = "deny"
+unused_must_use = "deny"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+# Silent integer truncation and undocumented panics are disallowed by spec; surface them.
+cast_possible_truncation = "warn"
+undocumented_unsafe_blocks = "warn"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+clap = { version = "4.5", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Thin release profile suitable for latency benchmarking later phases will tune.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "unwind"

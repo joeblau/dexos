@@ -1,0 +1,18 @@
+[package]
+name = "marketd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "marketd"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+node = { path = "../../crates/node" }
+clap.workspace = true
+anyhow.workspace = true

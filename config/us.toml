@@ -1,0 +1,31 @@
+# US region validator (three-region demo).
+[node]
+name = "us-1"
+region = "us-east"
+light = false
+roles = ["validator", "sequencer", "witness", "gateway"]
+
+[network]
+listen = "0.0.0.0:9000"
+bootstrap_peers = ["eu-1.dexos.local:9000", "tokyo-1.dexos.local:9000"]
+enable_quic = true
+enable_datagrams = true
+
+[consensus]
+checkpoint_interval_ms = 100
+epoch_length = 100000
+validator_set_path = "validators.toml"
+
+[storage]
+data_dir = "./data/us-1"
+snapshot_interval_sequences = 1000000
+segment_size_mb = 1024
+
+[rpc]
+listen = "0.0.0.0:8080"
+read_only = false
+
+[performance]
+pin_threads = true
+busy_poll = true
+simd = "auto"

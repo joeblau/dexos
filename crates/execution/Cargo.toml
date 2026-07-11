@@ -1,0 +1,16 @@
+[package]
+name = "execution"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+types = { path = "../types" }
+orderbook = { path = "../orderbook" }
+risk = { path = "../risk" }
+state-tree = { path = "../state-tree" }
+crypto = { path = "../crypto" }

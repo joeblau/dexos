@@ -1,0 +1,15 @@
+[package]
+name = "network"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+types = { path = "../types" }
+codec = { path = "../codec" }
+crypto = { path = "../crypto" }
+tokio.workspace = true

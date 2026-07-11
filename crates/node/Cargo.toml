@@ -1,0 +1,40 @@
+[package]
+name = "node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+types = { path = "../types" }
+crypto = { path = "../crypto" }
+codec = { path = "../codec" }
+state-tree = { path = "../state-tree" }
+orderbook = { path = "../orderbook" }
+risk = { path = "../risk" }
+execution = { path = "../execution" }
+oracle = { path = "../oracle" }
+markets = { path = "../markets" }
+prediction-markets = { path = "../prediction-markets" }
+decision-markets = { path = "../decision-markets" }
+custody = { path = "../custody" }
+chain-adapter = { path = "../chain-adapter" }
+chain-adapter-evm = { path = "../chain-adapter-evm" }
+chain-adapter-svm = { path = "../chain-adapter-svm" }
+storage = { path = "../storage" }
+consensus = { path = "../consensus" }
+network = { path = "../network" }
+discovery = { path = "../discovery" }
+rpc = { path = "../rpc" }
+light-client = { path = "../light-client" }
+loadgen = { path = "../loadgen" }
+serde.workspace = true
+toml.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+thiserror.workspace = true

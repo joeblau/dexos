@@ -1,0 +1,15 @@
+[package]
+name = "markets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+types = { path = "../types" }
+execution = { path = "../execution" }
+orderbook = { path = "../orderbook" }
+risk = { path = "../risk" }

@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+results.json
+*.profraw
+perf.data*
+flamegraph.svg
+/data
+.DS_Store
