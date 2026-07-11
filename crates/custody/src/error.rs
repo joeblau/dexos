@@ -74,6 +74,13 @@ pub enum CustodyError {
     /// A share referenced a signer index outside the set.
     #[error("unknown signer index")]
     UnknownSigner,
+    /// No key is provisioned in the HSM / KMS backend for the given handle.
+    #[error("no key provisioned for the given handle")]
+    UnknownKeyHandle,
+    /// The HSM-reported public key did not match the ceremony-published key a
+    /// rotation attested against (a key-substitution attempt).
+    #[error("HSM public key does not match the published key")]
+    KeyAttestationFailed,
 
     // ---- certificate verification ----------------------------------------
     /// `withdrawal_id` did not equal the id derived from the request.

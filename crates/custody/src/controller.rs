@@ -11,6 +11,7 @@
 //! root and an identical signed-withdrawal set.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use crypto::{hash_leaf, hash_node, QuorumCertificate, ValidatorSet};
 use types::{Amount, Hash, SequenceNumber};
@@ -18,7 +19,7 @@ use types::{Amount, Hash, SequenceNumber};
 use crate::chain::ChainId;
 use crate::error::CustodyError;
 use crate::policy::ChainPolicy;
-use crate::signer::{Signer, SignerSet, SoftSigner, MAX_SIGNERS};
+use crate::signer::{HsmBackend, HsmSigner, KeyHandle, KeyRef, SignerSet, MAX_SIGNERS};
 use crate::wire::{Reader, Writer};
 use crate::withdrawal::{verify_certificate, WithdrawalCertificate, WithdrawalId};
 
@@ -42,6 +43,12 @@ pub struct SignedWithdrawal {
 }
 
 /// A control-plane command against the custody controller.
+///
+/// Rotation carries **public keys and handles only** ([`KeyRef`]); raw seed or
+/// private-key material is never accepted on the control plane. The new signers'
+/// private keys are provisioned into the HSM / KMS out of band in an offline key
+/// ceremony, and the controller reconstitutes live signers by binding each
+/// handle through its [`HsmBackend`] and attesting the published public key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlCommand {
     /// Rotate to a new signer set at a strictly newer epoch.
@@ -50,8 +57,9 @@ pub enum ControlCommand {
         epoch: u64,
         /// The new threshold `t`.
         threshold: u32,
-        /// The new signers' seeds (software simulator).
-        seeds: Vec<[u8; 32]>,
+        /// The new signers' public identities (handle + published public key).
+        /// Never seeds.
+        keys: Vec<KeyRef>,
     },
     /// Engage emergency halt (blocks all signing).
     Halt,
@@ -74,15 +82,16 @@ impl ControlCommand {
             Self::Rotate {
                 epoch,
                 threshold,
-                seeds,
+                keys,
             } => {
                 w.u8(CTRL_ROTATE);
                 w.u64(*epoch);
                 w.u32(*threshold);
-                let n = u32::try_from(seeds.len()).map_err(|_| CustodyError::Decode)?;
+                let n = u32::try_from(keys.len()).map_err(|_| CustodyError::Decode)?;
                 w.u32(n);
-                for s in seeds {
-                    w.raw(s);
+                for k in keys {
+                    w.var_bytes(k.handle.as_bytes())?;
+                    w.raw(&k.public_key);
                 }
             }
             Self::Halt => w.u8(CTRL_HALT),
@@ -104,17 +113,21 @@ impl ControlCommand {
                 let epoch = r.u64()?;
                 let threshold = r.u32()?;
                 let n = usize::try_from(r.u32()?).map_err(|_| CustodyError::Decode)?;
-                if n > r.remaining() / 32 {
+                // Each key needs at least a 4-byte handle length prefix plus a
+                // 32-byte public key, so bound the allocation against the input.
+                if n > r.remaining() / 36 {
                     return Err(CustodyError::Decode);
                 }
-                let mut seeds = Vec::with_capacity(n);
+                let mut keys = Vec::with_capacity(n);
                 for _ in 0..n {
-                    seeds.push(r.array::<32>()?);
+                    let handle = KeyHandle::from_bytes(&r.var_bytes()?);
+                    let public_key = r.array::<32>()?;
+                    keys.push(KeyRef { handle, public_key });
                 }
                 Self::Rotate {
                     epoch,
                     threshold,
-                    seeds,
+                    keys,
                 }
             }
             CTRL_HALT => Self::Halt,
@@ -129,11 +142,17 @@ impl ControlCommand {
     }
 }
 
-/// The custody controller, generic over the [`Signer`] implementation so the
-/// software simulator and a real HSM are interchangeable.
+/// The custody controller over an HSM-backed threshold signer set.
+///
+/// Every signing key lives behind the [`HsmBackend`] boundary ([`HsmSigner`]);
+/// the controller holds only public keys and opaque handles. The same backend is
+/// used to reconstitute signers on rotation, so a control-plane operator can
+/// never inject a key they secretly control (rotation attests every published
+/// public key against the HSM) nor ship raw seed material.
 #[derive(Debug, Clone)]
-pub struct CustodyController<S: Signer> {
-    signers: SignerSet<S>,
+pub struct CustodyController {
+    backend: Arc<dyn HsmBackend>,
+    signers: SignerSet<HsmSigner>,
     consensus: ValidatorSet,
     halted: bool,
     policies: BTreeMap<u64, ChainPolicy>,
@@ -144,10 +163,19 @@ pub struct CustodyController<S: Signer> {
     audit_len: u64,
 }
 
-impl<S: Signer> CustodyController<S> {
-    /// Create a controller with a signer set and the consensus verifier set.
-    pub fn new(signers: SignerSet<S>, consensus: ValidatorSet) -> Self {
+impl CustodyController {
+    /// Create a controller over `backend` with an HSM-bound signer set and the
+    /// consensus verifier set.
+    ///
+    /// All signers in `signers` must be bound to `backend`; rotation binds new
+    /// handles through this same backend.
+    pub fn new(
+        backend: Arc<dyn HsmBackend>,
+        signers: SignerSet<HsmSigner>,
+        consensus: ValidatorSet,
+    ) -> Self {
         Self {
+            backend,
             signers,
             consensus,
             halted: false,
@@ -216,7 +244,7 @@ impl<S: Signer> CustodyController<S> {
     /// current one; the old set is discarded and can no longer sign. The
     /// duplicate-sign ledger is preserved, so an id signed under the old set can
     /// never be re-signed under the new one.
-    pub fn rotate(&mut self, new_signers: SignerSet<S>) -> Result<(), CustodyError> {
+    pub fn rotate(&mut self, new_signers: SignerSet<HsmSigner>) -> Result<(), CustodyError> {
         if new_signers.epoch() <= self.signers.epoch() {
             return Err(CustodyError::StaleEpoch);
         }
@@ -315,22 +343,36 @@ impl<S: Signer> CustodyController<S> {
     }
 }
 
-impl CustodyController<SoftSigner> {
-    /// Apply a decoded [`ControlCommand`] to a software-simulator controller.
+impl CustodyController {
+    /// Apply a decoded [`ControlCommand`].
     ///
-    /// This drives the deterministic replay harness: the same command stream
-    /// yields an identical audit root and signer set on every node.
+    /// A [`Rotate`](ControlCommand::Rotate) installs **public keys only**: each
+    /// published [`KeyRef`] is bound through the controller's [`HsmBackend`] and
+    /// its public key is attested against the HSM-reported key
+    /// ([`CustodyError::KeyAttestationFailed`] on mismatch), so the private key
+    /// stays inside the token and an operator cannot substitute a key they
+    /// control. This also drives the deterministic replay harness: the same
+    /// command stream over the same backend yields an identical audit root and
+    /// signer set on every node.
     pub fn apply_control(&mut self, cmd: &ControlCommand) -> Result<(), CustodyError> {
         match cmd {
             ControlCommand::Rotate {
                 epoch,
                 threshold,
-                seeds,
+                keys,
             } => {
-                if seeds.len() > MAX_SIGNERS {
+                if keys.is_empty() || keys.len() > MAX_SIGNERS {
                     return Err(CustodyError::InvalidThreshold);
                 }
-                let set = SignerSet::from_seeds(seeds, u64::from(*threshold), *epoch)?;
+                let mut signers = Vec::with_capacity(keys.len());
+                for key in keys {
+                    signers.push(HsmSigner::bind_attested(
+                        self.backend.clone(),
+                        key.handle.clone(),
+                        key.public_key,
+                    )?);
+                }
+                let set = SignerSet::new(signers, u64::from(*threshold), *epoch)?;
                 self.rotate(set)
             }
             ControlCommand::Halt => {
@@ -353,6 +395,7 @@ impl CustodyController<SoftSigner> {
 mod tests {
     use super::*;
     use crate::chain::WalletAddress;
+    use crate::signer::MockHsm;
     use crate::withdrawal::{withdrawal_authorization_digest, ReservationProof, WithdrawalRequest};
     use crypto::{MerkleTree, ThresholdSigners};
     use types::AccountId;
@@ -361,14 +404,52 @@ mod tests {
         (0..n).map(|i| [u8::try_from(i).unwrap() + 1; 32]).collect()
     }
 
+    fn seeds_offset(n: usize, off: u8) -> Vec<[u8; 32]> {
+        (0..n)
+            .map(|i| [u8::try_from(i).unwrap() + off; 32])
+            .collect()
+    }
+
     // A consensus threshold set (for certificate quorums).
     fn consensus() -> ThresholdSigners {
         ThresholdSigners::from_seeds(&[[10u8; 32], [11u8; 32], [12u8; 32], [13u8; 32]], 3)
     }
 
-    fn controller() -> CustodyController<SoftSigner> {
-        let custody = SignerSet::from_seeds(&seeds(4), 3, 1).unwrap();
-        let mut c = CustodyController::new(custody, consensus().validator_set());
+    // Provision `seeds` into `hsm` (deterministic label per key) and return the
+    // published key references (handle + public key) a rotation ships.
+    fn refs_for(hsm: &mut MockHsm, seeds: &[[u8; 32]]) -> Vec<KeyRef> {
+        seeds
+            .iter()
+            .map(|s| {
+                let handle = KeyHandle::from_label(&format!("seed-{}", s[0]));
+                let public_key = hsm.provision(&handle, s);
+                KeyRef::new(handle, public_key)
+            })
+            .collect()
+    }
+
+    // Bind already-provisioned `refs` from `backend` into a threshold signer set.
+    fn bind_set(
+        backend: &Arc<dyn HsmBackend>,
+        refs: &[KeyRef],
+        threshold: u64,
+        epoch: u64,
+    ) -> SignerSet<HsmSigner> {
+        let signers = refs
+            .iter()
+            .map(|r| {
+                HsmSigner::bind_attested(backend.clone(), r.handle.clone(), r.public_key).unwrap()
+            })
+            .collect();
+        SignerSet::new(signers, threshold, epoch).unwrap()
+    }
+
+    fn controller() -> CustodyController {
+        let mut hsm = MockHsm::new();
+        let refs = refs_for(&mut hsm, &seeds(4));
+        let backend: Arc<dyn HsmBackend> = Arc::new(hsm);
+        let custody = bind_set(&backend, &refs, 3, 1);
+        let mut c = CustodyController::new(backend, custody, consensus().validator_set());
         c.set_policy(ChainPolicy {
             chain: ChainId(1),
             max_per_tx: Amount::from_raw(1_000),
@@ -545,14 +626,20 @@ mod tests {
             .unwrap();
         assert!(old_vs.verify(&signed.certificate).is_ok());
 
-        // Rotate to a disjoint set at a newer epoch.
-        let new_set = SignerSet::from_seeds(&seeds_offset(4, 100), 3, 2).unwrap();
+        // Rotate to a disjoint set at a newer epoch, provisioned in its own HSM.
+        let mut hsm_new = MockHsm::new();
+        let refs_new = refs_for(&mut hsm_new, &seeds_offset(4, 100));
+        let backend_new: Arc<dyn HsmBackend> = Arc::new(hsm_new);
+        let new_set = bind_set(&backend_new, &refs_new, 3, 2);
         let new_vs = new_set.validator_set();
         c.rotate(new_set).unwrap();
         assert_eq!(c.epoch(), 2);
 
         // Stale rotation rejected.
-        let stale = SignerSet::from_seeds(&seeds(4), 3, 1).unwrap();
+        let mut hsm_stale = MockHsm::new();
+        let refs_stale = refs_for(&mut hsm_stale, &seeds(4));
+        let backend_stale: Arc<dyn HsmBackend> = Arc::new(hsm_stale);
+        let stale = bind_set(&backend_stale, &refs_stale, 3, 1);
         assert_eq!(c.rotate(stale), Err(CustodyError::StaleEpoch));
 
         // New signatures verify under the NEW set, not the old one.
@@ -570,23 +657,86 @@ mod tests {
         );
     }
 
-    fn seeds_offset(n: usize, off: u8) -> Vec<[u8; 32]> {
-        (0..n)
-            .map(|i| [u8::try_from(i).unwrap() + off; 32])
-            .collect()
+    #[test]
+    fn control_plane_rotation_installs_public_keys_only() {
+        // A rotation control command carries public keys + handles, never seeds,
+        // and the controller attests each key against its HSM before installing.
+        let mut hsm = MockHsm::new();
+        let base = refs_for(&mut hsm, &seeds(4));
+        let rotated = refs_for(&mut hsm, &seeds_offset(4, 100));
+        let backend: Arc<dyn HsmBackend> = Arc::new(hsm);
+        let custody = bind_set(&backend, &base, 3, 1);
+        let mut c = CustodyController::new(backend, custody, consensus().validator_set());
+
+        let expected_vs = {
+            let mut probe = MockHsm::new();
+            let refs = refs_for(&mut probe, &seeds_offset(4, 100));
+            let b: Arc<dyn HsmBackend> = Arc::new(probe);
+            bind_set(&b, &refs, 3, 2).validator_set()
+        };
+
+        c.apply_control(&ControlCommand::Rotate {
+            epoch: 2,
+            threshold: 3,
+            keys: rotated.clone(),
+        })
+        .unwrap();
+        assert_eq!(c.epoch(), 2);
+        assert_eq!(
+            c.signers.validator_set().total_weight(),
+            expected_vs.total_weight()
+        );
+
+        // Attestation failure: a published public key the HSM does not hold for
+        // the handle is rejected (key-substitution attempt).
+        let forged = vec![KeyRef::new(rotated[0].handle.clone(), [0xEE; 32])];
+        assert_eq!(
+            c.apply_control(&ControlCommand::Rotate {
+                epoch: 3,
+                threshold: 1,
+                keys: forged,
+            }),
+            Err(CustodyError::KeyAttestationFailed)
+        );
+
+        // A handle the HSM never provisioned is rejected, not silently trusted.
+        let unknown = vec![KeyRef::new(KeyHandle::from_label("ghost"), [1u8; 32])];
+        assert_eq!(
+            c.apply_control(&ControlCommand::Rotate {
+                epoch: 3,
+                threshold: 1,
+                keys: unknown,
+            }),
+            Err(CustodyError::UnknownKeyHandle)
+        );
     }
 
     #[test]
     fn deterministic_replay_yields_identical_audit_root_and_signed_set() {
         let run = || {
-            let mut c = controller();
+            // Base and rotation keys are provisioned into one HSM up front (the
+            // offline ceremony), so the public-key-only rotate command can bind
+            // the new handles when replayed.
+            let mut hsm = MockHsm::new();
+            let base = refs_for(&mut hsm, &seeds(4));
+            let rotated = refs_for(&mut hsm, &seeds_offset(4, 50));
+            let backend: Arc<dyn HsmBackend> = Arc::new(hsm);
+            let custody = bind_set(&backend, &base, 3, 1);
+            let mut c = CustodyController::new(backend, custody, consensus().validator_set());
+            c.set_policy(ChainPolicy {
+                chain: ChainId(1),
+                max_per_tx: Amount::from_raw(1_000),
+                max_pending: Amount::from_raw(2_000),
+                min_confirmations: 6,
+                rate_limit: 5,
+            });
             let stream = [
                 ControlCommand::Halt,
                 ControlCommand::Resume,
                 ControlCommand::Rotate {
                     epoch: 2,
                     threshold: 3,
-                    seeds: seeds_offset(4, 50),
+                    keys: rotated.clone(),
                 },
                 ControlCommand::SetPolicy(ChainPolicy {
                     chain: ChainId(2),
@@ -632,7 +782,13 @@ mod tests {
             ControlCommand::Rotate {
                 epoch: 9,
                 threshold: 2,
-                seeds: seeds(3),
+                // Handles of varying length, including an empty one, to exercise
+                // the length-prefixed decode bound.
+                keys: vec![
+                    KeyRef::new(KeyHandle::from_label("arn:aws:kms:key/a"), [1u8; 32]),
+                    KeyRef::new(KeyHandle::from_bytes(&[]), [2u8; 32]),
+                    KeyRef::new(KeyHandle::from_label("slot-3"), [3u8; 32]),
+                ],
             },
             ControlCommand::SetPolicy(ChainPolicy {
                 chain: ChainId(7),

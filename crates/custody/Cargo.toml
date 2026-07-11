@@ -9,6 +9,13 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Opt-in, deterministic software signers (`SoftSigner`, `MockHsm`) for tests and
+# simulations. A production node depends on this crate *without* this feature, so
+# a release build cannot construct a custody signer from a raw seed — signing is
+# only ever available through the `HsmBackend` (HSM / KMS / PKCS#11) boundary.
+mock-signers = []
+
 [dependencies]
 types = { path = "../types" }
 crypto = { path = "../crypto" }

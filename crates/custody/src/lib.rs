@@ -39,7 +39,9 @@ pub use chain::{evm_address_from_pubkey, ChainId, ChainKind, WalletAddress};
 pub use controller::{ControlCommand, CustodyController, SignedWithdrawal};
 pub use policy::ChainPolicy;
 pub use session::{AuthorizeSession, SessionKey, SessionRegistry, SessionScope, SESSION_DOMAIN};
-pub use signer::{HsmSigner, Signer, SignerSet, SoftSigner, MAX_SIGNERS};
+pub use signer::{HsmBackend, HsmSigner, KeyHandle, KeyRef, Signer, SignerSet, MAX_SIGNERS};
+#[cfg(any(feature = "mock-signers", test))]
+pub use signer::{MockHsm, SoftSigner};
 pub use withdrawal::{
     verify_certificate, withdrawal_authorization_digest, ReservationProof, WithdrawalCertificate,
     WithdrawalId, WithdrawalRequest, WITHDRAWAL_AUTH_DOMAIN, WITHDRAWAL_DOMAIN,
