@@ -10,3 +10,5 @@ workspace = true
 
 [dependencies]
 types = { path = "../types" }
+serde.workspace = true
+thiserror.workspace = true

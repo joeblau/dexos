@@ -1,8 +1,41 @@
-//! `orderbook` — deterministic native CLOB (price-time, O(1) cancel).
+//! `orderbook` — deterministic native CLOB plus a conditional/triggered order
+//! engine.
 //!
-//! Part of the DexOS decentralized market operating system.
-//! This crate is part of the deterministic execution core: no async runtime,
-//! no networking, no floating point, fixed-point integers only.
+//! Part of the DexOS deterministic execution core: no async runtime, no
+//! networking, no floating point, fixed-point integers only.
+//!
+//! # Order book
+//! [`OrderBook`] is a central-limit order book with strict price-time priority,
+//! O(1) cancellation (an id → slab-slot index), intrusive FIFO price levels,
+//! and a fixed-capacity slab arena with a free list (no per-operation heap
+//! allocation on the warm path). It supports Limit / Market / PostOnly /
+//! ReduceOnly order types, Gtc / Ioc / Fok time-in-force, self-trade
+//! prevention, client-assigned idempotency keys, atomic cancel-replace,
+//! baskets, and cancel-all.
+//!
+//! # Conditional engine
+//! [`ConditionalEngine`] evaluates stop-loss, take-profit, trailing-stop, OCO,
+//! and TWAP triggers against a mark price and emits canonical [`OrderIntent`]s.
+//! It never mutates the book directly.
+#![forbid(unsafe_code)]
+
+mod book;
+mod conditional;
+mod dedup;
+mod error;
+mod level;
+mod order;
+mod slab;
+
+pub use book::OrderBook;
+pub use conditional::{
+    decode_conditional, ConditionalConfig, ConditionalEngine, ConditionalId, DecodedConditional,
+    OcoLeg, OrderIntent, PlaceTemplate, TrailDirection, Trailing, TriggerKind,
+    ENCODED_CONDITIONAL_LEN,
+};
+pub use error::{ConditionalError, OrderError, SlabError};
+pub use order::{BookConfig, Fill, MatchResult, NewOrder, OrderOutcome, StpPolicy};
+pub use slab::Slab;
 
 /// Crate identity, used by the node composition root for a startup manifest.
 pub const CRATE_NAME: &str = "orderbook";

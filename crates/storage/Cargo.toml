@@ -10,5 +10,5 @@ workspace = true
 
 [dependencies]
 types = { path = "../types" }
-codec = { path = "../codec" }
 crypto = { path = "../crypto" }
+thiserror.workspace = true

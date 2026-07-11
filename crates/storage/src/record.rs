@@ -1,0 +1,309 @@
+//! On-wire framing for a single command-log record.
+//!
+//! A record frames an OPAQUE command payload (the storage layer never
+//! interprets the payload bytes) with the following little-endian layout:
+//!
+//! ```text
+//! | length(u32) | protocol_version(u16) | sequence(u64) |
+//! | timestamp(u64) | command_type(u16) | payload(bytes) | checksum(u32) |
+//! ```
+//!
+//! * `length` is the total encoded size of the record in bytes, including the
+//!   `length` field itself and the trailing `checksum`. It lets a reader walk a
+//!   segment byte buffer one record at a time and reject truncated tails.
+//! * `checksum` is a CRC-32 over every byte between `length` and `checksum`
+//!   (i.e. the header fields plus the payload). Any single-bit flip in the
+//!   header or payload therefore fails verification on read.
+//!
+//! Decoding never panics on arbitrary input: every length and bound is checked
+//! and surfaced as a typed [`RecordError`].
+
+use crate::crc::crc32;
+
+/// Protocol version stamped into every record this build writes.
+pub const PROTOCOL_VERSION: u16 = 1;
+
+const LEN_SIZE: usize = 4; // length: u32
+const PVER_SIZE: usize = 2; // protocol_version: u16
+const SEQ_SIZE: usize = 8; // sequence: u64
+const TS_SIZE: usize = 8; // timestamp: u64
+const CMD_SIZE: usize = 2; // command_type: u16
+const CRC_SIZE: usize = 4; // checksum: u32
+
+/// Header bytes that follow the `length` field and are covered by the checksum,
+/// excluding the payload.
+const HEADER_AFTER_LEN: usize = PVER_SIZE + SEQ_SIZE + TS_SIZE + CMD_SIZE;
+
+/// Fixed per-record overhead: everything except the payload bytes.
+pub const FRAME_OVERHEAD: usize = LEN_SIZE + HEADER_AFTER_LEN + CRC_SIZE;
+
+/// Errors produced while encoding or decoding a [`Record`].
+///
+/// Decoding is applied to untrusted, possibly corrupt or truncated bytes, so
+/// every failure mode is represented here rather than via a panic.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RecordError {
+    /// The buffer is smaller than the minimum framed record size.
+    #[error("record buffer too short: have {have} bytes, need at least {need}")]
+    TooShort {
+        /// Bytes available in the buffer.
+        have: usize,
+        /// Minimum bytes required.
+        need: usize,
+    },
+    /// The declared `length` field is inconsistent with the buffer.
+    #[error("record declared length {declared} invalid for buffer of {available} bytes")]
+    BadLength {
+        /// Length declared in the record header.
+        declared: usize,
+        /// Bytes actually available in the buffer.
+        available: usize,
+    },
+    /// The payload is larger than can be framed in a `u32` length field.
+    #[error("payload of {0} bytes exceeds maximum framable record size")]
+    PayloadTooLarge(usize),
+    /// The stored checksum did not match the recomputed checksum (corruption).
+    #[error("checksum mismatch: stored {stored:#010x}, computed {computed:#010x}")]
+    ChecksumMismatch {
+        /// Checksum read from the record.
+        stored: u32,
+        /// Checksum recomputed over the record bytes.
+        computed: u32,
+    },
+    /// The record's protocol version is not understood by this build.
+    #[error("unsupported protocol version {0}")]
+    UnsupportedVersion(u16),
+}
+
+/// A decoded command-log record with an opaque payload.
+///
+/// The `payload` bytes are never interpreted by the storage layer; they are the
+/// serialized command as produced by a higher layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Record {
+    /// Protocol version the record was written with.
+    pub protocol_version: u16,
+    /// Global, monotonically increasing sequence number.
+    pub sequence: u64,
+    /// Opaque application timestamp (units defined by the caller).
+    pub timestamp: u64,
+    /// Opaque command discriminant (defined by the caller).
+    pub command_type: u16,
+    /// Opaque serialized command bytes.
+    pub payload: Vec<u8>,
+}
+
+impl Record {
+    /// Total encoded size, in bytes, of a record carrying `payload_len` payload
+    /// bytes.
+    #[must_use]
+    pub const fn encoded_len(payload_len: usize) -> usize {
+        FRAME_OVERHEAD + payload_len
+    }
+
+    /// Encode this record to its framed byte representation.
+    ///
+    /// # Errors
+    /// Returns [`RecordError::PayloadTooLarge`] if the framed record would not
+    /// fit within the `u32` length field.
+    pub fn encode(&self) -> Result<Vec<u8>, RecordError> {
+        let total = Self::encoded_len(self.payload.len());
+        let length =
+            u32::try_from(total).map_err(|_| RecordError::PayloadTooLarge(self.payload.len()))?;
+
+        let mut buf = Vec::with_capacity(total);
+        buf.extend_from_slice(&length.to_le_bytes());
+        buf.extend_from_slice(&self.protocol_version.to_le_bytes());
+        buf.extend_from_slice(&self.sequence.to_le_bytes());
+        buf.extend_from_slice(&self.timestamp.to_le_bytes());
+        buf.extend_from_slice(&self.command_type.to_le_bytes());
+        buf.extend_from_slice(&self.payload);
+
+        // Checksum covers the header (after `length`) and the payload.
+        let checksum = crc32(&buf[LEN_SIZE..]);
+        buf.extend_from_slice(&checksum.to_le_bytes());
+        Ok(buf)
+    }
+
+    /// Decode a single record from the front of `bytes`.
+    ///
+    /// On success returns the decoded [`Record`] and the number of bytes it
+    /// consumed, so a caller can decode the next record at `&bytes[consumed..]`.
+    ///
+    /// This function is total: any input (including empty, truncated, or random
+    /// bytes) yields either `Ok` or a typed [`RecordError`], never a panic.
+    ///
+    /// # Errors
+    /// Returns a [`RecordError`] describing the first structural or integrity
+    /// problem encountered.
+    pub fn decode(bytes: &[u8]) -> Result<(Record, usize), RecordError> {
+        if bytes.len() < FRAME_OVERHEAD {
+            return Err(RecordError::TooShort {
+                have: bytes.len(),
+                need: FRAME_OVERHEAD,
+            });
+        }
+
+        let length_bytes: [u8; 4] =
+            bytes[0..LEN_SIZE]
+                .try_into()
+                .map_err(|_| RecordError::TooShort {
+                    have: bytes.len(),
+                    need: FRAME_OVERHEAD,
+                })?;
+        let declared = u32::from_le_bytes(length_bytes);
+        let total = usize::try_from(declared).map_err(|_| RecordError::BadLength {
+            declared: usize::MAX,
+            available: bytes.len(),
+        })?;
+
+        if total < FRAME_OVERHEAD || total > bytes.len() {
+            return Err(RecordError::BadLength {
+                declared: total,
+                available: bytes.len(),
+            });
+        }
+
+        let crc_start = total - CRC_SIZE;
+        let stored_bytes: [u8; 4] =
+            bytes[crc_start..total]
+                .try_into()
+                .map_err(|_| RecordError::BadLength {
+                    declared: total,
+                    available: bytes.len(),
+                })?;
+        let stored = u32::from_le_bytes(stored_bytes);
+        let computed = crc32(&bytes[LEN_SIZE..crc_start]);
+        if stored != computed {
+            return Err(RecordError::ChecksumMismatch { stored, computed });
+        }
+
+        // Fields live in the checksum-covered region between `length` and `crc`.
+        let region = &bytes[LEN_SIZE..crc_start];
+        // `region.len() == total - FRAME_OVERHEAD + HEADER_AFTER_LEN >= HEADER_AFTER_LEN`.
+        let pver = u16::from_le_bytes(read2(region, 0)?);
+        let sequence = u64::from_le_bytes(read8(region, PVER_SIZE)?);
+        let timestamp = u64::from_le_bytes(read8(region, PVER_SIZE + SEQ_SIZE)?);
+        let command_type = u16::from_le_bytes(read2(region, PVER_SIZE + SEQ_SIZE + TS_SIZE)?);
+
+        if pver != PROTOCOL_VERSION {
+            return Err(RecordError::UnsupportedVersion(pver));
+        }
+
+        let payload = region[HEADER_AFTER_LEN..].to_vec();
+        Ok((
+            Record {
+                protocol_version: pver,
+                sequence,
+                timestamp,
+                command_type,
+                payload,
+            },
+            total,
+        ))
+    }
+}
+
+/// Read a little-endian `u16`-sized slice at `off`, checked.
+fn read2(region: &[u8], off: usize) -> Result<[u8; 2], RecordError> {
+    region
+        .get(off..off + 2)
+        .and_then(|s| s.try_into().ok())
+        .ok_or(RecordError::TooShort {
+            have: region.len(),
+            need: off + 2,
+        })
+}
+
+/// Read a little-endian `u64`-sized slice at `off`, checked.
+fn read8(region: &[u8], off: usize) -> Result<[u8; 8], RecordError> {
+    region
+        .get(off..off + 8)
+        .and_then(|s| s.try_into().ok())
+        .ok_or(RecordError::TooShort {
+            have: region.len(),
+            need: off + 8,
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(seq: u64, payload: &[u8]) -> Record {
+        Record {
+            protocol_version: PROTOCOL_VERSION,
+            sequence: seq,
+            timestamp: 42,
+            command_type: 7,
+            payload: payload.to_vec(),
+        }
+    }
+
+    #[test]
+    fn round_trip_identical_payload() {
+        let rec = sample(9, b"place-order-payload");
+        let bytes = rec.encode().unwrap();
+        assert_eq!(bytes.len(), Record::encoded_len(rec.payload.len()));
+        let (back, consumed) = Record::decode(&bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(back, rec);
+        assert_eq!(back.payload, rec.payload);
+    }
+
+    #[test]
+    fn empty_payload_round_trips() {
+        let rec = sample(0, b"");
+        let bytes = rec.encode().unwrap();
+        let (back, _) = Record::decode(&bytes).unwrap();
+        assert_eq!(back, rec);
+    }
+
+    #[test]
+    fn flipped_payload_bit_fails_checksum() {
+        let rec = sample(3, b"hello");
+        let mut bytes = rec.encode().unwrap();
+        let last = bytes.len() - CRC_SIZE - 1; // last payload byte
+        bytes[last] ^= 0x01;
+        match Record::decode(&bytes) {
+            Err(RecordError::ChecksumMismatch { .. }) => {}
+            other => panic!("expected checksum mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flipped_header_bit_fails_checksum() {
+        let rec = sample(3, b"hello");
+        let mut bytes = rec.encode().unwrap();
+        // Flip a bit inside the sequence field (header, checksum-covered).
+        bytes[LEN_SIZE + PVER_SIZE] ^= 0x80;
+        assert!(matches!(
+            Record::decode(&bytes),
+            Err(RecordError::ChecksumMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn truncated_buffer_is_typed_error() {
+        let rec = sample(1, b"abcdefgh");
+        let bytes = rec.encode().unwrap();
+        for cut in 0..bytes.len() {
+            // Any truncation must return a typed error, never a panic.
+            let _ = Record::decode(&bytes[..cut]);
+        }
+        assert!(Record::decode(&bytes[..FRAME_OVERHEAD - 1]).is_err());
+    }
+
+    #[test]
+    fn declared_length_beyond_buffer_rejected() {
+        let rec = sample(1, b"xyz");
+        let mut bytes = rec.encode().unwrap();
+        // Inflate the declared length to point past the buffer.
+        let huge = u32::try_from(bytes.len() + 100).unwrap();
+        bytes[0..4].copy_from_slice(&huge.to_le_bytes());
+        assert!(matches!(
+            Record::decode(&bytes),
+            Err(RecordError::BadLength { .. })
+        ));
+    }
+}

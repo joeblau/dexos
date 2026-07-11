@@ -10,3 +10,12 @@ workspace = true
 
 [dependencies]
 types = { path = "../types" }
+serde.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+sha3.workspace = true
+ed25519-dalek.workspace = true
+k256.workspace = true
+
+[dev-dependencies]
+hex.workspace = true
