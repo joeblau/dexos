@@ -5,7 +5,14 @@
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+ignore = [
+    # atomic-polyfill (unmaintained). Pulled in transitively only via
+    # postcard 1.x -> heapless 0.7, and only for bare-metal targets without
+    # native atomics (e.g. thumbv6m). dexos builds only for server targets
+    # that use core atomics, so this crate is never compiled. postcard 1.1.3
+    # (latest) still pins heapless ^0.7, so there is no upgrade path yet.
+    "RUSTSEC-2023-0089",
+]
 
 [licenses]
 version = 2
@@ -26,6 +33,10 @@ allow = [
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Internal workspace crates are referenced by path with no version requirement,
+# which cargo-deny counts as a wildcard. Exempt path deps; registry wildcards
+# are still denied.
+allow-wildcard-paths = true
 # Generic-blockchain frameworks are a non-goal; keep them out of the tree entirely.
 deny = []
 

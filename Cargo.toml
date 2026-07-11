@@ -8,6 +8,10 @@ edition = "2021"
 license = "Apache-2.0"
 rust-version = "1.92"
 repository = "https://github.com/joeblau/dexos"
+# Application workspace: crates reference each other by path and are not published
+# to a registry. Marking them unpublishable also lets cargo-deny's wildcard gate
+# exempt intra-workspace path dependencies (allow-wildcard-paths).
+publish = false
 
 # Engineering standards, mechanically enforced.
 #
