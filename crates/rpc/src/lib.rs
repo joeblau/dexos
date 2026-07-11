@@ -17,6 +17,7 @@
 //! - [`backend`] — the [`RpcBackend`] trait and [`dispatch`].
 //! - [`transport`] — framing into [`codec::Frame`]s.
 //! - [`server`] — the async TCP server.
+//! - [`limits`] — connection admission control (per-IP caps and rate limits).
 //! - [`stream`] — the streaming subscription registry.
 //! - [`stub`] — an in-memory backend for tests.
 #![forbid(unsafe_code)]
@@ -24,6 +25,7 @@
 pub mod backend;
 pub mod command;
 pub mod error;
+pub mod limits;
 pub mod request;
 pub mod response;
 pub mod server;
@@ -44,9 +46,12 @@ pub use command::{
     SubmitOrderParams,
 };
 pub use error::RpcError;
+pub use limits::RateLimit;
 pub use request::{RpcMethod, RpcRequest};
 pub use response::{RpcOk, RpcResponse, RpcResult};
-pub use server::{handle_connection, serve, ServerError};
+pub use server::{
+    handle_connection, handle_connection_with, serve, serve_with_config, ServerConfig, ServerError,
+};
 pub use session::Session;
 pub use stream::{
     EventKind, Gap, Progress, Recovery, Reliability, SequenceTracker, StreamError, StreamEvent,

@@ -1370,3 +1370,212 @@ async fn tcp_server_rejects_write_in_read_only_mode() {
     let resp = crate::server::round_trip(addr, &req).await.unwrap();
     assert_eq!(resp.result, Err(RpcError::ReadOnly));
 }
+
+// ---------------------------------------------------------------------------
+// Connection admission control (DoS hardening): global + per-IP budgets,
+// slowloris timeouts. These exercise the async accept loop over real loopback
+// TCP; the pure per-IP / rate-limit logic is unit-tested in `crate::limits`.
+// ---------------------------------------------------------------------------
+
+/// Read exactly one framed message from `reader` (test-local mirror of the
+/// server's frame reader; the server's is module-private).
+async fn read_one_frame<R>(reader: &mut R) -> std::io::Result<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut header = [0u8; codec::FRAME_HEADER_LEN];
+    reader.read_exact(&mut header).await?;
+    let plen = u32::from_le_bytes([header[15], header[16], header[17], header[18]]);
+    let plen = usize::try_from(plen).unwrap();
+    assert!(
+        plen <= codec::MAX_FRAME_PAYLOAD,
+        "frame payload out of bounds"
+    );
+    let mut buf = vec![0u8; codec::FRAME_HEADER_LEN + plen];
+    buf[..codec::FRAME_HEADER_LEN].copy_from_slice(&header);
+    reader
+        .read_exact(&mut buf[codec::FRAME_HEADER_LEN..])
+        .await?;
+    Ok(buf)
+}
+
+/// Open a persistent connection, prove the server is serving it (one full
+/// request/response round-trip), and return the still-open stream so the
+/// connection keeps occupying its admission slot for the caller.
+async fn connect_and_confirm(addr: std::net::SocketAddr) -> tokio::net::TcpStream {
+    use tokio::io::AsyncWriteExt;
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let req = RpcRequest::new(1, RpcMethod::GetNetworkStatus);
+    let out = encode_request(&req).unwrap();
+    stream.write_all(&out).await.unwrap();
+    stream.flush().await.unwrap();
+    let frame = read_one_frame(&mut stream).await.unwrap();
+    let resp = decode_response(&frame).unwrap();
+    assert!(matches!(resp.result, Ok(RpcOk::NetworkStatus(_))));
+    stream
+}
+
+/// A wide-open budget over loopback (all connections share one source IP, so
+/// per-IP limits are disabled here and governed instead by `max_connections`).
+fn budget_config(max_connections: usize) -> crate::server::ServerConfig {
+    crate::server::ServerConfig {
+        max_connections,
+        max_connections_per_ip: u32::MAX,
+        per_ip_rate: None,
+        idle_timeout: std::time::Duration::from_secs(30),
+        read_timeout: std::time::Duration::from_secs(30),
+        write_timeout: std::time::Duration::from_secs(5),
+        max_tracked_ips: 1_024,
+    }
+}
+
+/// Acceptance: a configurable maximum number of connections is enforced and the
+/// excess is rejected cleanly with a `Backpressure` reply, without disturbing
+/// the connections already within budget.
+#[tokio::test]
+async fn tcp_server_caps_connections_and_rejects_excess_cleanly() {
+    use std::sync::Arc;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::{TcpListener, TcpStream};
+
+    let backend: Arc<dyn RpcBackend> = Arc::new(populated_backend(RpcMode::Full));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ =
+            crate::server::serve_with_config(listener, backend, RpcMode::Full, budget_config(4))
+                .await;
+    });
+
+    // Saturate the budget with four confirmed, parked connections.
+    let mut parked = Vec::new();
+    for _ in 0..4 {
+        parked.push(connect_and_confirm(addr).await);
+    }
+
+    // The fifth connection is over budget: the server sends one Backpressure
+    // reply and closes, rather than accepting unbounded work.
+    let mut extra = TcpStream::connect(addr).await.unwrap();
+    let frame = read_one_frame(&mut extra).await.unwrap();
+    let resp = decode_response(&frame).unwrap();
+    assert_eq!(resp.result, Err(RpcError::Backpressure));
+
+    // The connections within budget are undisturbed and keep serving.
+    let survivor = parked.first_mut().unwrap();
+    let req = RpcRequest::new(99, RpcMethod::GetNetworkStatus);
+    let out = encode_request(&req).unwrap();
+    survivor.write_all(&out).await.unwrap();
+    survivor.flush().await.unwrap();
+    let frame = read_one_frame(survivor).await.unwrap();
+    let resp = decode_response(&frame).unwrap();
+    assert_eq!(resp.request_id, 99);
+    assert!(matches!(resp.result, Ok(RpcOk::NetworkStatus(_))));
+}
+
+/// Acceptance: slowloris-style stalled clients are timed out. A peer that opens
+/// a connection but never completes a request frame is evicted after the idle /
+/// read timeout, observed as the server closing the socket (EOF).
+#[tokio::test]
+async fn tcp_server_evicts_slowloris_clients() {
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    let backend: Arc<dyn RpcBackend> = Arc::new(populated_backend(RpcMode::Full));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let cfg = crate::server::ServerConfig {
+        max_connections: 16,
+        max_connections_per_ip: u32::MAX,
+        per_ip_rate: None,
+        idle_timeout: Duration::from_millis(150),
+        read_timeout: Duration::from_millis(150),
+        write_timeout: Duration::from_secs(5),
+        max_tracked_ips: 1_024,
+    };
+    tokio::spawn(async move {
+        let _ = crate::server::serve_with_config(listener, backend, RpcMode::Full, cfg).await;
+    });
+
+    // A client that connects and sends nothing is evicted after idle_timeout.
+    let mut silent = TcpStream::connect(addr).await.unwrap();
+    let mut buf = [0u8; 1];
+    match tokio::time::timeout(Duration::from_secs(2), silent.read(&mut buf)).await {
+        Ok(Ok(0)) => {}  // clean EOF: the idle client was closed.
+        Ok(Err(_)) => {} // reset: also an eviction.
+        Ok(Ok(n)) => panic!("stalled client unexpectedly received {n} bytes"),
+        Err(_) => panic!("server failed to evict an idle client within the slack"),
+    }
+
+    // A client that dribbles a partial frame header and then stalls is likewise
+    // evicted (the header read cannot complete within the timeout).
+    let mut partial = TcpStream::connect(addr).await.unwrap();
+    partial.write_all(&[0u8, 1, 2]).await.unwrap();
+    partial.flush().await.unwrap();
+    match tokio::time::timeout(Duration::from_secs(2), partial.read(&mut buf)).await {
+        Ok(Ok(0)) | Ok(Err(_)) => {}
+        Ok(Ok(n)) => panic!("partial-header client unexpectedly received {n} bytes"),
+        Err(_) => panic!("server failed to evict a partial-header slowloris client"),
+    }
+}
+
+/// Acceptance: load test documenting the connection budget under a flood. With
+/// the budget saturated, a burst of many simultaneous excess connections are
+/// every one rejected cleanly, and the budget itself is never corrupted — the
+/// in-budget connections keep serving throughout.
+#[tokio::test]
+async fn tcp_server_connection_budget_holds_under_flood() {
+    use std::sync::Arc;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::{TcpListener, TcpStream};
+
+    const BUDGET: usize = 8;
+    const FLOOD: usize = 32;
+
+    let backend: Arc<dyn RpcBackend> = Arc::new(populated_backend(RpcMode::Full));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = crate::server::serve_with_config(
+            listener,
+            backend,
+            RpcMode::Full,
+            budget_config(BUDGET),
+        )
+        .await;
+    });
+
+    // Saturate the budget with confirmed, parked connections.
+    let mut parked = Vec::new();
+    for _ in 0..BUDGET {
+        parked.push(connect_and_confirm(addr).await);
+    }
+
+    // Flood with many simultaneous excess connections; each must be cleanly
+    // rejected with Backpressure (the server never exceeds its budget).
+    let mut floods = Vec::new();
+    for _ in 0..FLOOD {
+        floods.push(tokio::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            let frame = read_one_frame(&mut stream).await.unwrap();
+            decode_response(&frame).unwrap().result
+        }));
+    }
+    for handle in floods {
+        assert_eq!(handle.await.unwrap(), Err(RpcError::Backpressure));
+    }
+
+    // The in-budget connections were never disturbed by the flood.
+    for stream in parked.iter_mut() {
+        let req = RpcRequest::new(7, RpcMethod::GetNetworkStatus);
+        let out = encode_request(&req).unwrap();
+        stream.write_all(&out).await.unwrap();
+        stream.flush().await.unwrap();
+        let frame = read_one_frame(stream).await.unwrap();
+        let resp = decode_response(&frame).unwrap();
+        assert_eq!(resp.request_id, 7);
+        assert!(matches!(resp.result, Ok(RpcOk::NetworkStatus(_))));
+    }
+}
