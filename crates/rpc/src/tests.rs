@@ -38,12 +38,27 @@ fn a(id: u32) -> AccountId {
     AccountId::new(id)
 }
 
+/// An unsigned envelope: used only by paths that never reach signature
+/// verification (codec round-trips, read-only-mode rejection).
 fn sample_meta() -> ControlMeta {
     ControlMeta {
         client_id: 7,
         nonce: 1,
         session_pubkey: None,
+        signer: [0u8; 32],
+        signature: [0u8; 64],
     }
+}
+
+/// The canonical account-root keypair used by fixtures; its public key is
+/// registered for account `a(1)` in [`populated_backend`].
+fn account_kp() -> crypto::KeyPair {
+    crypto::KeyPair::from_seed(&[11u8; 32])
+}
+
+/// A signed direct (non-delegated) envelope authorizing `command`.
+fn signed_meta(kp: &crypto::KeyPair, client_id: u64, nonce: u64, command: &Command) -> ControlMeta {
+    ControlMeta::signed(client_id, nonce, None, kp, command)
 }
 
 fn sample_submit() -> SubmitOrderParams {
@@ -392,6 +407,9 @@ fn populated_backend(mode: RpcMode) -> StubBackend {
         outcomes: 1,
     });
     b.insert_account(fixture_account(1, Amount::ONE)).unwrap();
+    // Register account a(1)'s root authorization key so signed direct commands
+    // for it can be authenticated.
+    b.register_account_key(a(1), account_kp().public());
     b.commit_checkpoint(1, 1000);
     b
 }
@@ -421,7 +439,10 @@ fn dispatch_routes_query_to_correct_handler() {
 #[test]
 fn dispatch_write_succeeds_in_full_mode() {
     let b = populated_backend(RpcMode::Full);
-    let req = RpcRequest::new(9, RpcMethod::SubmitOrder(sample_meta(), sample_submit()));
+    let kp = account_kp();
+    let params = sample_submit();
+    let meta = signed_meta(&kp, 7, 1, &params.to_command());
+    let req = RpcRequest::new(9, RpcMethod::SubmitOrder(meta, params));
     let resp = dispatch(&b, RpcMode::Full, req);
     assert!(matches!(resp.result, Ok(RpcOk::CommandAck(_))));
 }
@@ -579,18 +600,19 @@ fn session_validation_rejects_each_class() {
 #[test]
 fn commands_are_idempotent_by_client_id_and_nonce() {
     let b = StubBackend::new(RpcMode::Full);
-    let meta = ControlMeta {
-        client_id: 1,
-        nonce: 1,
-        session_pubkey: None,
-    };
-    let ack1 = b.submit_order(&meta, &sample_submit()).unwrap();
-    let ack2 = b.submit_order(&meta, &sample_submit()).unwrap();
+    let kp = account_kp();
+    b.register_account_key(a(1), kp.public());
+    let params = sample_submit();
+    let cmd = params.to_command();
+    let meta = signed_meta(&kp, 1, 1, &cmd);
+    let ack1 = b.submit_order(&meta, &params).unwrap();
+    let ack2 = b.submit_order(&meta, &params).unwrap();
     assert_eq!(ack1, ack2, "retransmit must be exactly-once");
     assert_eq!(b.ingested_count(), 1);
-    // A new nonce is a distinct command.
-    let meta2 = ControlMeta { nonce: 2, ..meta };
-    let _ = b.submit_order(&meta2, &sample_submit()).unwrap();
+    // A new nonce is a distinct command; it must be signed afresh over the new
+    // nonce (the signature commits to the nonce).
+    let meta2 = signed_meta(&kp, 1, 2, &cmd);
+    let _ = b.submit_order(&meta2, &params).unwrap();
     assert_eq!(b.ingested_count(), 2);
 }
 
@@ -603,6 +625,230 @@ fn saturated_ingress_returns_backpressure() {
         b.submit_order(&meta, &sample_submit()),
         Err(RpcError::Backpressure)
     );
+}
+
+// ---------------------------------------------------------------------------
+// Signed control envelopes (authentication + replay resistance)
+// ---------------------------------------------------------------------------
+
+/// Unsigned `PlaceOrder` / `Withdraw` / `Cancel` are rejected at both the pure
+/// dispatch router and the backend, in full (writeable) mode.
+#[test]
+fn unsigned_control_commands_are_rejected() {
+    let b = populated_backend(RpcMode::Full);
+    let unsigned = sample_meta();
+
+    let place = RpcMethod::SubmitOrder(unsigned, sample_submit());
+    assert_eq!(
+        dispatch(&b, RpcMode::Full, RpcRequest::new(1, place)).result,
+        Err(RpcError::InvalidSignature)
+    );
+    let withdraw = RpcMethod::RequestWithdrawal(
+        unsigned,
+        RequestWithdrawalParams {
+            account: a(1),
+            amount: Amount::ONE,
+            destination: [3u8; 20],
+        },
+    );
+    assert_eq!(
+        dispatch(&b, RpcMode::Full, RpcRequest::new(2, withdraw)).result,
+        Err(RpcError::InvalidSignature)
+    );
+    let cancel = RpcMethod::CancelOrder(
+        unsigned,
+        CancelOrderParams {
+            account: a(1),
+            market: m(1),
+            order_id: OrderId::new(9),
+        },
+    );
+    assert_eq!(
+        dispatch(&b, RpcMode::Full, RpcRequest::new(3, cancel)).result,
+        Err(RpcError::InvalidSignature)
+    );
+
+    // The backend is an independent guard: direct calls reject unsigned too.
+    assert_eq!(
+        b.submit_order(&unsigned, &sample_submit()),
+        Err(RpcError::InvalidSignature)
+    );
+    assert_eq!(
+        b.request_withdrawal(
+            &unsigned,
+            &RequestWithdrawalParams {
+                account: a(1),
+                amount: Amount::ONE,
+                destination: [3u8; 20],
+            }
+        ),
+        Err(RpcError::InvalidSignature)
+    );
+}
+
+/// The signature commits to method + params + nonce + client + session key:
+/// tampering with any of them invalidates it.
+#[test]
+fn signature_binds_method_params_nonce_and_session() {
+    let kp = account_kp();
+    let params = sample_submit();
+    let cmd = params.to_command();
+    let meta = signed_meta(&kp, 5, 9, &cmd);
+    assert!(meta.verify_signature(&cmd).is_ok());
+
+    // Different params (a different market) -> different message.
+    let other_cmd = SubmitOrderParams {
+        market: m(2),
+        ..params
+    }
+    .to_command();
+    assert_eq!(
+        meta.verify_signature(&other_cmd),
+        Err(RpcError::InvalidSignature)
+    );
+
+    // Tampered nonce.
+    let mut n = meta;
+    n.nonce = 10;
+    assert_eq!(n.verify_signature(&cmd), Err(RpcError::InvalidSignature));
+
+    // Tampered client id.
+    let mut c = meta;
+    c.client_id = 6;
+    assert_eq!(c.verify_signature(&cmd), Err(RpcError::InvalidSignature));
+
+    // Tampered session-key claim.
+    let mut s = meta;
+    s.session_pubkey = Some([9u8; 32]);
+    assert_eq!(s.verify_signature(&cmd), Err(RpcError::InvalidSignature));
+
+    // Tampered signature bytes.
+    let mut sig = meta;
+    sig.signature[0] ^= 1;
+    assert_eq!(sig.verify_signature(&cmd), Err(RpcError::InvalidSignature));
+}
+
+/// A byte-for-byte replay of a signed envelope executes exactly once; lifting
+/// the captured signature onto a fresh nonce to dodge the dedupe filter fails.
+#[test]
+fn signed_replay_is_rejected_exactly_once() {
+    let b = populated_backend(RpcMode::Full);
+    let kp = account_kp();
+    let params = sample_submit();
+    let cmd = params.to_command();
+    let meta = signed_meta(&kp, 3, 7, &cmd);
+
+    let ack1 = b.submit_order(&meta, &params).unwrap();
+    let ack2 = b.submit_order(&meta, &params).unwrap();
+    assert_eq!(ack1, ack2, "replay must be exactly-once");
+    assert_eq!(b.ingested_count(), 1);
+
+    // The signature covers the nonce, so it cannot be reused on a new one.
+    let mut forged = meta;
+    forged.nonce = 8;
+    assert_eq!(
+        b.submit_order(&forged, &params),
+        Err(RpcError::InvalidSignature)
+    );
+    assert_eq!(b.ingested_count(), 1);
+}
+
+/// An authentically signed command by a key that is not the account's
+/// registered root key (or when the account has no key at all) is unauthorized.
+#[test]
+fn wrong_signer_for_account_is_unauthorized() {
+    let b = populated_backend(RpcMode::Full);
+    let attacker = crypto::KeyPair::from_seed(&[99u8; 32]);
+    let params = sample_submit();
+    let cmd = params.to_command();
+    let meta = signed_meta(&attacker, 1, 1, &cmd);
+
+    // The envelope is authentic (the attacker really signed it) ...
+    assert!(meta.verify_signature(&cmd).is_ok());
+    // ... but the signer is not a(1)'s registered key.
+    assert_eq!(b.submit_order(&meta, &params), Err(RpcError::Unauthorized));
+
+    // An account with no registered key cannot authorize direct commands.
+    let empty = StubBackend::new(RpcMode::Full);
+    assert_eq!(
+        empty.submit_order(&meta, &params),
+        Err(RpcError::Unauthorized)
+    );
+}
+
+/// Delegated commands must be signed by the claimed session key; an authentic
+/// signature from any other key over the same envelope is rejected.
+#[test]
+fn delegated_commands_require_the_session_key_to_sign() {
+    let b = StubBackend::new(RpcMode::Full);
+    let session_kp = crypto::KeyPair::from_seed(&[42u8; 32]);
+    let session_pk = session_kp.public();
+    b.register_session(
+        a(1),
+        Session {
+            session_pubkey: session_pk,
+            scope: sample_scope(vec![m(1)]),
+        },
+    );
+    b.set_now(0);
+    let params = sample_submit();
+    let cmd = params.to_command();
+
+    // Signed by the session key, claiming the session -> accepted.
+    let good = ControlMeta::signed(1, 1, Some(session_pk), &session_kp, &cmd);
+    assert!(b.submit_order(&good, &params).is_ok());
+
+    // Signed by a different key but still claiming the session -> the signer is
+    // authentic but is not the session key: unauthorized.
+    let other = crypto::KeyPair::from_seed(&[43u8; 32]);
+    let bad = ControlMeta::signed(1, 2, Some(session_pk), &other, &cmd);
+    assert_eq!(b.submit_order(&bad, &params), Err(RpcError::Unauthorized));
+}
+
+/// Property: adversarial `signer` / `signature` / `session` bytes never
+/// authorize a control command, through either the backend or dispatch.
+#[test]
+fn adversarial_bytes_never_authorize() {
+    let b = populated_backend(RpcMode::Full);
+    let mut lcg = Lcg(0xA11CE5);
+    for _ in 0..5_000 {
+        let mut signer = [0u8; 32];
+        for byte in signer.iter_mut() {
+            *byte = lcg.next().to_le_bytes()[0];
+        }
+        let mut signature = [0u8; 64];
+        for byte in signature.iter_mut() {
+            *byte = lcg.next().to_le_bytes()[0];
+        }
+        let session_pubkey = if lcg.range(2) == 0 {
+            None
+        } else {
+            let mut pk = [0u8; 32];
+            for byte in pk.iter_mut() {
+                *byte = lcg.next().to_le_bytes()[0];
+            }
+            Some(pk)
+        };
+        let meta = ControlMeta {
+            client_id: lcg.next(),
+            nonce: lcg.next(),
+            session_pubkey,
+            signer,
+            signature,
+        };
+        let params = sample_submit();
+        assert!(
+            b.submit_order(&meta, &params).is_err(),
+            "adversarial envelope authorized at backend"
+        );
+        let req = RpcRequest::new(1, RpcMethod::SubmitOrder(meta, params));
+        let resp = dispatch(&b, RpcMode::Full, req);
+        assert!(
+            resp.result.is_err(),
+            "adversarial envelope authorized via dispatch: {:?}",
+            resp.result
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -874,6 +1120,8 @@ fn random_request(lcg: &mut Lcg) -> RpcRequest {
                 client_id: lcg.next(),
                 nonce: lcg.next(),
                 session_pubkey: None,
+                signer: [0u8; 32],
+                signature: [0u8; 64],
             },
             sample_submit(),
         ),

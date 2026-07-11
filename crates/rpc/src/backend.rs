@@ -146,9 +146,18 @@ pub fn dispatch(backend: &dyn RpcBackend, mode: RpcMode, request: RpcRequest) ->
 }
 
 fn route(backend: &dyn RpcBackend, mode: RpcMode, method: RpcMethod) -> Result<RpcOk, RpcError> {
-    // Reject writes up front on read-only / light nodes.
-    if method.is_control() && !mode.allows_writes() {
-        return Err(RpcError::ReadOnly);
+    if method.is_control() {
+        // Reject writes up front on read-only / light nodes.
+        if !mode.allows_writes() {
+            return Err(RpcError::ReadOnly);
+        }
+        // Authenticate the signed envelope before it can reach the engine: an
+        // unsigned or forged control command is rejected here regardless of
+        // backend state. The backend re-verifies and additionally binds the
+        // signer to the target account.
+        if let (Some(meta), Some(command)) = (method.control_meta(), method.to_command()) {
+            meta.verify_signature(&command)?;
+        }
     }
     match method {
         RpcMethod::GetNodeInfo => backend.get_node_info().map(RpcOk::NodeInfo),

@@ -7,12 +7,42 @@ use types::{
     Side, SponsorId, TimeInForce,
 };
 
+use crate::error::RpcError;
 use crate::wire::FinalityStatus;
+
+/// Domain tag mixed into every control-envelope signature. Binds a signature to
+/// this protocol and version so bytes signed for any other purpose can never be
+/// replayed as an authorized control command.
+const CONTROL_SIGNING_DOMAIN: &[u8] = b"dexos.rpc.control.v1";
+
+/// serde adapter for a single `[u8; 64]` signature — serde has no built-in impl
+/// for byte arrays longer than 32, so it is carried on the wire as a byte
+/// sequence and validated back to a fixed array on decode.
+mod sig64 {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(v: &[u8; 64], s: S) -> Result<S::Ok, S::Error> {
+        v.as_slice().serialize(s)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 64], D::Error> {
+        let v: Vec<u8> = Vec::deserialize(d)?;
+        <[u8; 64]>::try_from(v.as_slice())
+            .map_err(|_| serde::de::Error::custom("signature must be 64 bytes"))
+    }
+}
 
 /// Idempotency and authorization metadata attached to every control request.
 ///
 /// A `(client_id, nonce)` pair identifies a command exactly once: a retransmit
 /// with the same pair must execute at most once, while a new nonce is accepted.
+///
+/// Every control command must be authenticated: `signer` holds the ed25519
+/// public key that authorizes the command (an account's root key, or the
+/// delegated `session_pubkey` when set), and `signature` is that key's ed25519
+/// signature over the [canonical signing bytes](ControlMeta::signing_bytes),
+/// which commit to the method, its parameters, the nonce, and the session key.
+/// The backend rejects any envelope whose signature does not verify.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ControlMeta {
     /// Stable per-client identifier.
@@ -21,6 +51,73 @@ pub struct ControlMeta {
     pub nonce: u64,
     /// Session key authorizing the command, if delegated.
     pub session_pubkey: Option<[u8; 32]>,
+    /// ed25519 public key that signed this envelope. When `session_pubkey` is
+    /// set it must equal that session key; otherwise it is the account's root
+    /// authorization key.
+    pub signer: [u8; 32],
+    /// ed25519 signature over [`ControlMeta::signing_bytes`] produced by
+    /// `signer`. An all-zero signature is treated as unsigned and rejected.
+    #[serde(with = "sig64")]
+    pub signature: [u8; 64],
+}
+
+impl ControlMeta {
+    /// The canonical bytes an envelope's signature commits to: a domain tag
+    /// followed by the idempotency context (`client_id`, `nonce`,
+    /// `session_pubkey`) and the lowered `command`. The `signer` and
+    /// `signature` fields are deliberately excluded so the signature cannot sign
+    /// over its own value while still binding the nonce and session key.
+    pub fn signing_bytes(&self, command: &Command) -> Vec<u8> {
+        #[derive(Serialize)]
+        struct Payload<'a> {
+            client_id: u64,
+            nonce: u64,
+            session_pubkey: Option<[u8; 32]>,
+            command: &'a Command,
+        }
+        let payload = Payload {
+            client_id: self.client_id,
+            nonce: self.nonce,
+            session_pubkey: self.session_pubkey,
+            command,
+        };
+        let mut bytes = CONTROL_SIGNING_DOMAIN.to_vec();
+        bytes.extend_from_slice(&codec::encode(&payload).unwrap_or_default());
+        bytes
+    }
+
+    /// Verify the envelope is authentically signed by `signer` over the
+    /// canonical bytes for `command`. This proves possession of the signer's
+    /// private key and binds the method, params, nonce, and session key; it does
+    /// not by itself bind `signer` to the command's account (the backend does
+    /// that). Returns [`RpcError::InvalidSignature`] on any failure, and never
+    /// panics on adversarial `signer`/`signature` bytes.
+    pub fn verify_signature(&self, command: &Command) -> Result<(), RpcError> {
+        let message = self.signing_bytes(command);
+        crypto::verify_ed25519(&self.signer, &message, &self.signature)
+            .map_err(|_| RpcError::InvalidSignature)
+    }
+
+    /// Build a signed control envelope: sign the canonical bytes for `command`
+    /// with `keypair`, populating `signer` and `signature`. Convenience for
+    /// clients and tests; the server only ever verifies, never signs.
+    pub fn signed(
+        client_id: u64,
+        nonce: u64,
+        session_pubkey: Option<[u8; 32]>,
+        keypair: &crypto::KeyPair,
+        command: &Command,
+    ) -> Self {
+        let mut meta = ControlMeta {
+            client_id,
+            nonce,
+            session_pubkey,
+            signer: keypair.public(),
+            signature: [0u8; 64],
+        };
+        meta.signature = keypair.sign(&meta.signing_bytes(command));
+        meta
+    }
 }
 
 /// Parameters for `submit_order`.

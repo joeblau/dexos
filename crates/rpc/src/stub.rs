@@ -49,6 +49,7 @@ struct Inner {
     withdrawals: HashMap<Hash, WithdrawalStatus>,
     network: NetworkStatus,
     sessions: HashMap<[u8; 32], BoundSession>,
+    account_keys: HashMap<AccountId, [u8; 32]>,
     seen: HashMap<(u64, u64), CommandAck>,
     tree: MerkleTree,
     now: u64,
@@ -99,6 +100,7 @@ impl StubBackend {
                 withdrawals: HashMap::new(),
                 network,
                 sessions: HashMap::new(),
+                account_keys: HashMap::new(),
                 seen: HashMap::new(),
                 tree: MerkleTree::new(1024),
                 now: 0,
@@ -214,6 +216,14 @@ impl StubBackend {
             .insert(session.session_pubkey, BoundSession { account, session });
     }
 
+    /// Register (or rotate) an account's ed25519 root authorization key. Direct
+    /// (non-delegated) control commands for the account must be signed by this
+    /// key; an account with no registered key cannot authorize direct commands.
+    pub fn register_account_key(&self, account: AccountId, pubkey: [u8; 32]) {
+        let mut g = self.lock();
+        g.account_keys.insert(account, pubkey);
+    }
+
     /// The current account-tree root, i.e. the latest checkpoint state root.
     pub fn state_root(&self) -> Hash {
         self.lock().tree.root()
@@ -272,22 +282,41 @@ impl StubBackend {
         if g.saturated {
             return Err(RpcError::Backpressure);
         }
-        // Exactly-once: a repeated (client_id, nonce) returns the stored ack.
-        if let Some(existing) = g.seen.get(&(meta.client_id, meta.nonce)) {
-            return Ok(existing.clone());
-        }
-        // Delegated session validation.
+        // Authenticate the envelope first, before any dedupe lookup: an unsigned
+        // or forged command must never resolve to a cached ack. Because the
+        // signature commits to `(client_id, nonce, session_pubkey, command)`, an
+        // attacker cannot lift a captured signature onto a fresh nonce to slip
+        // past the exactly-once filter.
+        meta.verify_signature(&command)?;
+        // Bind the authenticated signer to the account the command acts on.
         if let Some(pk) = meta.session_pubkey {
+            // Delegated: the session key must be the signer, must be registered
+            // and bound to exactly one account, and its scope must permit the
+            // command.
+            if meta.signer != pk {
+                return Err(RpcError::Unauthorized);
+            }
             let now = g.now;
             let bound = g.sessions.get(&pk).ok_or(RpcError::Unauthorized)?;
-            // A session is bound to exactly one account; reject commands that
-            // act on any other account.
             if let Some(account) = command.account() {
                 if account != bound.account {
                     return Err(RpcError::Unauthorized);
                 }
             }
             bound.session.authorize(&command, now)?;
+        } else if let Some(account) = command.account() {
+            // Direct: the signer must be the account's registered root key.
+            // An account with no registered key cannot authorize direct
+            // commands (fail closed).
+            let key = g.account_keys.get(&account).ok_or(RpcError::Unauthorized)?;
+            if *key != meta.signer {
+                return Err(RpcError::Unauthorized);
+            }
+        }
+        // Exactly-once: a repeated (client_id, nonce) returns the stored ack
+        // without re-executing. The replay was already re-authenticated above.
+        if let Some(existing) = g.seen.get(&(meta.client_id, meta.nonce)) {
+            return Ok(existing.clone());
         }
         let ack = CommandAck {
             command_hash: command_hash(&command),

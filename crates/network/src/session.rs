@@ -330,12 +330,27 @@ mod adversarial_probe {
         // If they share (key, nonce), the ChaCha20 keystream is identical, so the
         // ciphertext bodies XOR to the plaintext XOR. Demonstrate keystream reuse.
         let n = p_x.len();
-        let ks_x: Vec<u8> = ct_x[..n].iter().zip(p_x.iter()).map(|(c, p)| c ^ p).collect();
-        let ks_y: Vec<u8> = ct_y[..n].iter().zip(p_y.iter()).map(|(c, p)| c ^ p).collect();
-        assert_eq!(ks_x, ks_y, "KEYSTREAM REUSE: same key+nonce across two senders");
+        let ks_x: Vec<u8> = ct_x[..n]
+            .iter()
+            .zip(p_x.iter())
+            .map(|(c, p)| c ^ p)
+            .collect();
+        let ks_y: Vec<u8> = ct_y[..n]
+            .iter()
+            .zip(p_y.iter())
+            .map(|(c, p)| c ^ p)
+            .collect();
+        assert_eq!(
+            ks_x, ks_y,
+            "KEYSTREAM REUSE: same key+nonce across two senders"
+        );
 
         // And XOR of the two ciphertext bodies == XOR of the two plaintexts.
-        let ct_xor: Vec<u8> = ct_x[..n].iter().zip(ct_y[..n].iter()).map(|(a, b)| a ^ b).collect();
+        let ct_xor: Vec<u8> = ct_x[..n]
+            .iter()
+            .zip(ct_y[..n].iter())
+            .map(|(a, b)| a ^ b)
+            .collect();
         let pt_xor: Vec<u8> = p_x.iter().zip(p_y.iter()).map(|(a, b)| a ^ b).collect();
         assert_eq!(ct_xor, pt_xor, "passive observer recovers P_x XOR P_y");
     }

@@ -27,6 +27,10 @@ pub enum RpcError {
     /// The caller is not authorized for this action.
     #[error("unauthorized")]
     Unauthorized,
+    /// The control envelope was unsigned, malformed, or its signature did not
+    /// verify against the declared signer over the canonical request bytes.
+    #[error("invalid or missing command signature")]
+    InvalidSignature,
     /// The presented session key has expired.
     #[error("session expired")]
     SessionExpired,
