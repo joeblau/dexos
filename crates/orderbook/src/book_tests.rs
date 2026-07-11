@@ -321,6 +321,180 @@ fn basket_rejects_atomically_on_bad_leg() {
     assert!(b.contains(OrderId::new(20)));
 }
 
+/// A non-crossing limit that cannot rest because the book is at capacity must
+/// fail with a typed error and leave the book bit-identical: no fill occurred,
+/// so nothing may be stranded behind the `Err`.
+#[test]
+fn capacity_exhausted_non_crossing_limit_leaves_book_bit_identical() {
+    let mut b = OrderBook::new(BookConfig { capacity: 2, ..cfg() });
+    b.submit(limit(1, 1, Side::Bid, 100, 5)).unwrap();
+    b.submit(limit(2, 1, Side::Bid, 99, 5)).unwrap();
+    assert_eq!(b.resting_len(), 2);
+    let root_before = b.state_root();
+    // Third resting order has nowhere to go: the slab is full and it does not
+    // cross, so it cannot free a slot by matching.
+    assert_eq!(
+        b.submit(limit(3, 2, Side::Bid, 98, 5)),
+        Err(OrderError::CapacityExhausted)
+    );
+    assert_eq!(b.state_root(), root_before);
+    assert_eq!(b.resting_len(), 2);
+    assert!(!b.contains(OrderId::new(3)));
+}
+
+/// A basket whose later leg exhausts capacity *after* an earlier leg has already
+/// filled a resting maker must roll back completely: the consumed maker is
+/// restored and no leg rests. This is the "capacity-exhausted after partial
+/// fill" case.
+#[test]
+fn basket_capacity_exhaustion_after_partial_fill_rolls_back() {
+    let mut b = OrderBook::new(BookConfig { capacity: 3, ..cfg() });
+    // Two resting asks owned by account 1; one slot remains free.
+    b.submit(limit(1, 1, Side::Ask, 100, 5)).unwrap();
+    b.submit(limit(2, 1, Side::Ask, 101, 5)).unwrap();
+    assert_eq!(b.resting_len(), 2);
+    let root_before = b.state_root();
+
+    let legs = [
+        // Leg 1 crosses and partially consumes maker id 1 (fills 3, fully filled
+        // so it does not rest): an irreversible fill.
+        limit(10, 2, Side::Bid, 100, 3),
+        // Leg 2 does not cross and rests, filling the book to capacity.
+        limit(11, 2, Side::Bid, 95, 5),
+        // Leg 3 does not cross and has nowhere to rest -> CapacityExhausted.
+        limit(12, 2, Side::Bid, 94, 5),
+    ];
+    assert_eq!(
+        b.submit_basket(&legs),
+        Err(OrderError::CapacityExhausted)
+    );
+
+    // Whole basket rolled back: maker id 1 restored to its full size, no leg
+    // rests, and the book hashes identically to before the basket.
+    assert_eq!(b.state_root(), root_before);
+    assert_eq!(b.resting_len(), 2);
+    assert_eq!(
+        b.level_quantity(Side::Ask, Price::from_raw(100)),
+        Quantity::from_raw(5)
+    );
+    assert!(!b.contains(OrderId::new(10)));
+    assert!(!b.contains(OrderId::new(11)));
+    assert!(!b.contains(OrderId::new(12)));
+}
+
+/// Rollback is deterministic: replaying the identical pre-state and failing
+/// basket yields the identical state root. Guards the replay path for
+/// capacity-exhausted-after-partial-fill.
+#[test]
+fn basket_capacity_rollback_is_deterministic_on_replay() {
+    fn run() -> types::Hash {
+        let mut b = OrderBook::new(BookConfig { capacity: 3, ..cfg() });
+        b.submit(limit(1, 1, Side::Ask, 100, 5)).unwrap();
+        b.submit(limit(2, 1, Side::Ask, 101, 5)).unwrap();
+        let legs = [
+            limit(10, 2, Side::Bid, 100, 3),
+            limit(11, 2, Side::Bid, 95, 5),
+            limit(12, 2, Side::Bid, 94, 5),
+        ];
+        assert!(b.submit_basket(&legs).is_err());
+        // A valid follow-up still applies normally after a rolled-back basket.
+        b.submit(limit(20, 3, Side::Bid, 90, 1)).unwrap();
+        b.state_root()
+    }
+    assert_eq!(run(), run());
+}
+
+/// Rollback must not over-reject: baskets whose legs all fully fill (needing no
+/// resting slot) succeed even at full capacity. A naive free-slot pre-check
+/// would wrongly reject these; speculative apply + rollback does not.
+#[test]
+fn basket_at_capacity_succeeds_when_all_legs_fully_fill() {
+    let mut b = OrderBook::new(BookConfig { capacity: 1, ..cfg() });
+    // Single resting maker fills the book to capacity.
+    b.submit(limit(1, 1, Side::Ask, 100, 10)).unwrap();
+    assert!(b.resting_len() == 1);
+    // Both legs cross and fully fill against the maker; neither needs a slot.
+    let legs = [limit(10, 2, Side::Bid, 100, 4), limit(11, 2, Side::Bid, 100, 3)];
+    let out = b.submit_basket(&legs).unwrap();
+    assert_eq!(out.len(), 2);
+    assert!(matches!(out[0].outcome, OrderOutcome::FullyFilled));
+    assert!(matches!(out[1].outcome, OrderOutcome::FullyFilled));
+    // Maker reduced by 7, still resting the remainder.
+    assert_eq!(
+        b.level_quantity(Side::Ask, Price::from_raw(100)),
+        Quantity::from_raw(3)
+    );
+}
+
+/// Property: every `Err` returned by `submit` or `submit_basket` leaves the book
+/// bit-identical to its pre-command state. Run against a deliberately small book
+/// so capacity exhaustion is exercised constantly.
+#[test]
+fn property_err_leaves_book_bit_identical() {
+    let mut r = Lcg(0xFACE_FEED);
+    let mut b = OrderBook::new(BookConfig {
+        capacity: 8,
+        dedup_capacity: 64,
+        max_basket_legs: 6,
+        ..cfg()
+    });
+    let mut next_id = 1u64;
+    for _ in 0..40_000 {
+        // Occasionally clear the book so both full and non-full states recur.
+        if r.below(40) == 0 {
+            for a in 0..4 {
+                b.cancel_all(AccountId::new(a));
+            }
+        }
+        let root_before = b.state_root();
+        if r.below(5) == 0 {
+            // Basket of 1..=4 legs with unique, monotonic order ids.
+            let n = 1 + r.below(4);
+            let mut legs = Vec::new();
+            for _ in 0..n {
+                let side = if r.below(2) == 0 { Side::Bid } else { Side::Ask };
+                let acct = u32::try_from(r.below(4)).unwrap();
+                let price = 90 + i64::try_from(r.below(15)).unwrap();
+                let qty = 1 + i64::try_from(r.below(5)).unwrap();
+                legs.push(limit_acct(next_id, acct, side, price, qty));
+                next_id += 1;
+            }
+            if b.submit_basket(&legs).is_err() {
+                assert_eq!(
+                    b.state_root(),
+                    root_before,
+                    "a rejected basket must leave the book bit-identical"
+                );
+            }
+        } else {
+            let side = if r.below(2) == 0 { Side::Bid } else { Side::Ask };
+            let acct = u32::try_from(r.below(4)).unwrap();
+            let price = 90 + i64::try_from(r.below(15)).unwrap();
+            let qty = 1 + i64::try_from(r.below(5)).unwrap();
+            let ot = match r.below(4) {
+                0 => OrderType::Limit,
+                1 => OrderType::Market,
+                2 => OrderType::PostOnly,
+                _ => OrderType::Limit,
+            };
+            let tif = match r.below(3) {
+                0 => TimeInForce::Gtc,
+                1 => TimeInForce::Ioc,
+                _ => TimeInForce::Fok,
+            };
+            let ord = order(next_id, acct, side, ot, tif, price, qty, next_id);
+            next_id += 1;
+            if b.submit(ord).is_err() {
+                assert_eq!(
+                    b.state_root(),
+                    root_before,
+                    "a rejected submit must leave the book bit-identical"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn duplicate_order_id_and_bad_input_are_typed_errors() {
     let mut b = OrderBook::new(cfg());

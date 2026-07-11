@@ -16,6 +16,7 @@ use crate::error::SlabError;
 pub(crate) const NIL: u32 = u32::MAX;
 
 /// A single arena slot: either an occupied value or a link in the free stack.
+#[derive(Clone)]
 enum Entry<T> {
     /// Holds a live value.
     Occupied(T),
@@ -24,6 +25,10 @@ enum Entry<T> {
 }
 
 /// A fixed-capacity arena with O(1) insert and remove and deterministic reuse.
+///
+/// [`Clone`] produces a bit-identical arena (same slots, same free list), which
+/// the order book relies on to snapshot and roll back speculative work.
+#[derive(Clone)]
 pub struct Slab<T> {
     entries: Vec<Entry<T>>,
     free_head: u32,

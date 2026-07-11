@@ -22,6 +22,7 @@ struct Key {
 }
 
 /// A fixed-capacity FIFO cache of recent submission results.
+#[derive(Clone)]
 pub(crate) struct DedupCache {
     capacity: usize,
     map: HashMap<Key, MatchResult>,

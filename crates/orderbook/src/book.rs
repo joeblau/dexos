@@ -26,6 +26,11 @@ struct Locator {
 /// within a price, the oldest resting order matches first (FIFO). Given an
 /// identical stream of commands the book reaches an identical state, verifiable
 /// via [`OrderBook::state_root`].
+///
+/// [`Clone`] yields a bit-identical, independent book. Baskets use it to
+/// snapshot before speculatively applying legs so a mid-basket failure can be
+/// rolled back to the exact pre-command state.
+#[derive(Clone)]
 pub struct OrderBook {
     config: BookConfig,
     slab: Slab<Node>,
@@ -175,10 +180,17 @@ impl OrderBook {
         self.execute(replacement)
     }
 
-    /// Submit a basket (all-or-nothing on validation). If any leg fails
-    /// structural validation, or the basket is oversized, or two legs share an
-    /// id, the whole basket is rejected and the book is left bit-identical to
-    /// its pre-command state. Once validated, each leg is submitted in order.
+    /// Submit a basket as a single all-or-nothing unit.
+    ///
+    /// Structural validation runs first (size, per-leg price/quantity, duplicate
+    /// ids); a failure there rejects the basket before touching the book. The
+    /// legs are then applied speculatively in order. Because matching a leg
+    /// mutates the book irreversibly — consuming makers and resting residuals —
+    /// validation alone cannot guarantee atomicity once a later leg fails (for
+    /// example on [`OrderError::CapacityExhausted`]). The book is therefore
+    /// snapshotted up front and, if any leg errors, restored to that snapshot so
+    /// the whole basket rolls back to a **bit-identical** pre-command state. On
+    /// success no earlier leg is ever partially applied.
     pub fn submit_basket(&mut self, legs: &[NewOrder]) -> Result<Vec<MatchResult>, OrderError> {
         if legs.len() > self.config.max_basket_legs {
             return Err(OrderError::BasketTooLarge);
@@ -199,9 +211,19 @@ impl OrderBook {
                 return Err(OrderError::DuplicateOrderId);
             }
         }
+        // Speculative apply + rollback. Snapshot before any leg runs; on the
+        // first leg error, restore the snapshot (undoing earlier legs' fills and
+        // rests) and surface the error, leaving the book untouched.
+        let snapshot = self.clone();
         let mut out = Vec::with_capacity(legs.len());
         for leg in legs {
-            out.push(self.submit(*leg)?);
+            match self.submit(*leg) {
+                Ok(res) => out.push(res),
+                Err(e) => {
+                    *self = snapshot;
+                    return Err(e);
+                }
+            }
         }
         Ok(out)
     }
@@ -326,13 +348,35 @@ impl OrderBook {
             && matches!(order.tif, TimeInForce::Gtc)
             && !matches!(order.order_type, OrderType::Market);
         if will_rest {
-            self.rest_order(&order, remaining)?;
-            let outcome = if filled.raw() > 0 {
-                OrderOutcome::PartiallyFilledResting { remaining }
-            } else {
-                OrderOutcome::Resting { remaining }
-            };
-            Ok(MatchResult { fills, outcome })
+            match self.rest_order(&order, remaining) {
+                Ok(()) => {
+                    let outcome = if filled.raw() > 0 {
+                        OrderOutcome::PartiallyFilledResting { remaining }
+                    } else {
+                        OrderOutcome::Resting { remaining }
+                    };
+                    Ok(MatchResult { fills, outcome })
+                }
+                // A fill is irreversible: matching already reduced or removed
+                // makers, so we must never surface an `Err` that would strand
+                // those fills (the caller applies fills only on `Ok`, so an
+                // `Err` here would diverge the book from risk/ledger). When a
+                // residual produced by real fills cannot rest, cancel it like an
+                // IOC remainder and return the fills. With no fills, `rest_order`
+                // never mutated the book (its `insert` fails first), so the book
+                // is bit-identical to its pre-command state and the capacity
+                // error is safe to propagate.
+                Err(e) => {
+                    if filled.raw() > 0 {
+                        Ok(MatchResult {
+                            fills,
+                            outcome: OrderOutcome::PartiallyFilledCancelled { filled },
+                        })
+                    } else {
+                        Err(e)
+                    }
+                }
+            }
         } else {
             let outcome = if filled.raw() > 0 {
                 OrderOutcome::PartiallyFilledCancelled { filled }

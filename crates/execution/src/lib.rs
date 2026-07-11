@@ -283,6 +283,55 @@ mod tests {
     }
 
     #[test]
+    fn rejected_place_order_does_not_diverge_committed_state() {
+        let mut e = engine();
+        e.execute(
+            seq(1),
+            Command::CreateAccount(CreateAccount {
+                initial_collateral: amt(100_000_000),
+            }),
+        )
+        .unwrap();
+        e.execute(
+            seq(2),
+            Command::CreateMarket(CreateMarket {
+                market: types::MarketId::new(0),
+                market_type: MarketType::Perpetual,
+                outcomes: 1,
+                mark_price: Price::from_raw(1_000_000),
+            }),
+        )
+        .unwrap();
+        let place = |order_id: u64, client_id: u64| {
+            Command::PlaceOrder(PlaceOrder {
+                account: types::AccountId::new(0),
+                market: types::MarketId::new(0),
+                order_id: OrderId::new(order_id),
+                side: Side::Bid,
+                order_type: OrderType::Limit,
+                tif: TimeInForce::Gtc,
+                price: Price::from_raw(1_000_000),
+                quantity: Quantity::from_raw(1_000_000),
+                client_id,
+                reduce_only: false,
+            })
+        };
+        // First order rests and advances the committed state root.
+        e.execute(seq(3), place(1, 1)).unwrap();
+        let root_after_rest = e.state_root();
+        // A colliding order id is rejected by the book. Because the book leaves
+        // itself bit-identical on error, the engine commits nothing and the
+        // state root is unchanged: book and risk/ledger cannot diverge.
+        assert_eq!(
+            e.execute(seq(4), place(1, 2)),
+            Err(ExecutionError::Order(
+                orderbook::OrderError::DuplicateOrderId
+            ))
+        );
+        assert_eq!(e.state_root(), root_after_rest);
+    }
+
+    #[test]
     fn deterministic_replay_yields_identical_state_roots() {
         let script = vec![
             Command::CreateAccount(CreateAccount {

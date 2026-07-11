@@ -96,6 +96,7 @@ impl Level {
 }
 
 /// One side of the book: a price-ordered index of levels over a shared slab.
+#[derive(Clone)]
 pub(crate) struct SideBook {
     side: Side,
     levels: BTreeMap<Price, Level>,
