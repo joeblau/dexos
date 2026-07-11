@@ -13,4 +13,6 @@ types = { path = "../types" }
 crypto = { path = "../crypto" }
 codec = { path = "../codec" }
 network = { path = "../network" }
+serde.workspace = true
+thiserror.workspace = true
 tokio.workspace = true

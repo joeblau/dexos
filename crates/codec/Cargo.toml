@@ -10,3 +10,9 @@ workspace = true
 
 [dependencies]
 types = { path = "../types" }
+serde.workspace = true
+postcard.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+crypto = { path = "../crypto" }

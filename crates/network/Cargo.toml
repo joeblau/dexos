@@ -13,3 +13,4 @@ types = { path = "../types" }
 codec = { path = "../codec" }
 crypto = { path = "../crypto" }
 tokio.workspace = true
+thiserror.workspace = true

@@ -12,3 +12,6 @@ workspace = true
 types = { path = "../types" }
 crypto = { path = "../crypto" }
 codec = { path = "../codec" }
+state-tree = { path = "../state-tree" }
+serde.workspace = true
+thiserror.workspace = true

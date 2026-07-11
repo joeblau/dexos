@@ -1,14 +1,252 @@
-//! `codec` — compact binary wire codec (no JSON in latency paths).
+//! `codec` — the compact binary wire codec for DexOS.
 //!
-//! Part of the DexOS decentralized market operating system.
+//! A deterministic length-prefixed binary format (postcard) plus a priority-tagged
+//! frame envelope for the peer protocol. No JSON anywhere. All decode paths are
+//! total: adversarial or truncated bytes return a typed [`CodecError`], never a panic.
+
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 
 /// Crate identity, used by the node composition root for a startup manifest.
 pub const CRATE_NAME: &str = "codec";
 
+/// Wire magic for a DexOS frame.
+pub const FRAME_MAGIC: u16 = 0xDE05;
+/// Current frame protocol version.
+pub const FRAME_VERSION: u16 = 1;
+/// Fixed frame header length: magic(2)+version(2)+class(1)+msg_type(2)+sequence(8)+len(4).
+pub const FRAME_HEADER_LEN: usize = 19;
+/// Maximum payload accepted by the frame decoder (16 MiB) — bounds allocation.
+pub const MAX_FRAME_PAYLOAD: usize = 16 * 1024 * 1024;
+
+/// A codec failure.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CodecError {
+    /// Serialization failed.
+    #[error("serialize error")]
+    Serialize,
+    /// Deserialization failed (malformed/truncated payload).
+    #[error("deserialize error")]
+    Deserialize,
+    /// The frame was shorter than its declared structure.
+    #[error("truncated frame")]
+    Truncated,
+    /// The frame magic did not match.
+    #[error("bad frame magic")]
+    BadMagic,
+    /// Unsupported frame version.
+    #[error("unsupported frame version {0}")]
+    UnsupportedVersion(u16),
+    /// The declared payload length is implausible or exceeds the cap.
+    #[error("payload length out of range")]
+    LengthOutOfRange,
+    /// The traffic-class byte was not a known class.
+    #[error("unknown traffic class {0}")]
+    UnknownClass(u8),
+}
+
+/// Encode a value to compact binary.
+pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, CodecError> {
+    postcard::to_allocvec(value).map_err(|_| CodecError::Serialize)
+}
+
+/// Decode a value from compact binary. Total on adversarial input.
+pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CodecError> {
+    postcard::from_bytes(bytes).map_err(|_| CodecError::Deserialize)
+}
+
+/// Priority traffic classes (P0 highest). State sync and market data must never
+/// starve consensus or order traffic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum TrafficClass {
+    /// P0 — consensus votes and quorum certificates.
+    Consensus = 0,
+    /// P1 — cancels and risk-reducing commands.
+    RiskReducing = 1,
+    /// P2 — liquidations.
+    Liquidation = 2,
+    /// P3 — new orders.
+    NewOrder = 3,
+    /// P4 — execution receipts.
+    ExecutionReceipt = 4,
+    /// P5 — oracle certificates.
+    OracleCert = 5,
+    /// P6 — checkpoint dissemination.
+    Checkpoint = 6,
+    /// P7 — market data.
+    MarketData = 7,
+    /// P8 — historical sync and snapshots.
+    Sync = 8,
+}
+
+impl TrafficClass {
+    /// Map a raw priority byte to a class.
+    pub fn from_u8(v: u8) -> Option<TrafficClass> {
+        Some(match v {
+            0 => TrafficClass::Consensus,
+            1 => TrafficClass::RiskReducing,
+            2 => TrafficClass::Liquidation,
+            3 => TrafficClass::NewOrder,
+            4 => TrafficClass::ExecutionReceipt,
+            5 => TrafficClass::OracleCert,
+            6 => TrafficClass::Checkpoint,
+            7 => TrafficClass::MarketData,
+            8 => TrafficClass::Sync,
+            _ => return None,
+        })
+    }
+
+    /// The numeric priority (0 == highest).
+    pub fn priority(self) -> u8 {
+        self as u8
+    }
+}
+
+/// A framed peer-protocol message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Frame {
+    /// Traffic class / priority.
+    pub class: TrafficClass,
+    /// Application message type tag.
+    pub msg_type: u16,
+    /// Per-connection message sequence number (replay/dup detection).
+    pub sequence: u64,
+    /// Serialized payload.
+    pub payload: Vec<u8>,
+}
+
+impl Frame {
+    /// Encode the frame with its header.
+    pub fn encode(&self) -> Result<Vec<u8>, CodecError> {
+        if self.payload.len() > MAX_FRAME_PAYLOAD {
+            return Err(CodecError::LengthOutOfRange);
+        }
+        let plen = u32::try_from(self.payload.len()).map_err(|_| CodecError::LengthOutOfRange)?;
+        let mut out = Vec::with_capacity(FRAME_HEADER_LEN + self.payload.len());
+        out.extend_from_slice(&FRAME_MAGIC.to_le_bytes());
+        out.extend_from_slice(&FRAME_VERSION.to_le_bytes());
+        out.push(self.class.priority());
+        out.extend_from_slice(&self.msg_type.to_le_bytes());
+        out.extend_from_slice(&self.sequence.to_le_bytes());
+        out.extend_from_slice(&plen.to_le_bytes());
+        out.extend_from_slice(&self.payload);
+        Ok(out)
+    }
+
+    /// Decode one frame, returning it and the number of bytes consumed. Total.
+    pub fn decode(bytes: &[u8]) -> Result<(Frame, usize), CodecError> {
+        if bytes.len() < FRAME_HEADER_LEN {
+            return Err(CodecError::Truncated);
+        }
+        let magic = u16::from_le_bytes([bytes[0], bytes[1]]);
+        if magic != FRAME_MAGIC {
+            return Err(CodecError::BadMagic);
+        }
+        let version = u16::from_le_bytes([bytes[2], bytes[3]]);
+        if version != FRAME_VERSION {
+            return Err(CodecError::UnsupportedVersion(version));
+        }
+        let class = TrafficClass::from_u8(bytes[4]).ok_or(CodecError::UnknownClass(bytes[4]))?;
+        let msg_type = u16::from_le_bytes([bytes[5], bytes[6]]);
+        let sequence = u64::from_le_bytes([
+            bytes[7], bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14],
+        ]);
+        let plen = u32::from_le_bytes([bytes[15], bytes[16], bytes[17], bytes[18]]) as usize;
+        if plen > MAX_FRAME_PAYLOAD {
+            return Err(CodecError::LengthOutOfRange);
+        }
+        let end = FRAME_HEADER_LEN
+            .checked_add(plen)
+            .ok_or(CodecError::LengthOutOfRange)?;
+        let payload = bytes
+            .get(FRAME_HEADER_LEN..end)
+            .ok_or(CodecError::Truncated)?;
+        Ok((
+            Frame {
+                class,
+                msg_type,
+                sequence,
+                payload: payload.to_vec(),
+            },
+            end,
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct Msg {
+        a: u64,
+        b: Vec<u8>,
+        c: String,
+    }
+
     #[test]
-    fn crate_name_is_stable() {
-        assert_eq!(super::CRATE_NAME, "codec");
+    fn value_round_trip() {
+        let m = Msg {
+            a: 42,
+            b: vec![1, 2, 3],
+            c: "hello".into(),
+        };
+        let bytes = encode(&m).unwrap();
+        let back: Msg = decode(&bytes).unwrap();
+        assert_eq!(m, back);
+    }
+
+    #[test]
+    fn frame_round_trip_and_consumed_len() {
+        let f = Frame {
+            class: TrafficClass::NewOrder,
+            msg_type: 7,
+            sequence: 123,
+            payload: vec![9; 100],
+        };
+        let bytes = f.encode().unwrap();
+        let (back, consumed) = Frame::decode(&bytes).unwrap();
+        assert_eq!(f, back);
+        assert_eq!(consumed, bytes.len());
+    }
+
+    #[test]
+    fn traffic_class_priority_ordering() {
+        assert!(TrafficClass::Consensus < TrafficClass::NewOrder);
+        assert!(TrafficClass::NewOrder < TrafficClass::MarketData);
+        assert_eq!(TrafficClass::Consensus.priority(), 0);
+        assert_eq!(TrafficClass::from_u8(9), None);
+    }
+
+    #[test]
+    fn decode_never_panics_on_arbitrary_bytes() {
+        let mut state: u64 = 0xC0DEC;
+        for _ in 0..50_000 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let len = usize::try_from(state % 40).unwrap();
+            let mut buf = Vec::with_capacity(len);
+            for _ in 0..len {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                buf.push(state.to_le_bytes()[0]);
+            }
+            let _ = Frame::decode(&buf);
+            let _ = decode::<Msg>(&buf);
+        }
+    }
+
+    #[test]
+    fn rejects_bad_magic_and_truncation() {
+        let f = Frame {
+            class: TrafficClass::Consensus,
+            msg_type: 1,
+            sequence: 0,
+            payload: vec![1, 2],
+        };
+        let mut bytes = f.encode().unwrap();
+        bytes[0] ^= 0xFF;
+        assert_eq!(Frame::decode(&bytes), Err(CodecError::BadMagic));
+        assert_eq!(Frame::decode(&bytes[..5]), Err(CodecError::Truncated));
     }
 }
