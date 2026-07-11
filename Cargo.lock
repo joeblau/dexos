@@ -620,6 +620,9 @@ dependencies = [
  "codec",
  "consensus",
  "crypto",
+ "serde",
+ "state-tree",
+ "thiserror",
  "tokio",
  "types",
 ]
@@ -893,9 +896,9 @@ name = "rpc"
 version = "0.0.1"
 dependencies = [
  "codec",
- "consensus",
- "execution",
- "markets",
+ "crypto",
+ "serde",
+ "thiserror",
  "tokio",
  "types",
 ]

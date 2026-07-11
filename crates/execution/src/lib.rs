@@ -14,8 +14,8 @@ pub mod session;
 pub use command::{
     AuthorizeSession, BindWallet, CancelAll, CancelOrder, Command, CompleteSetOp, CreateAccount,
     CreateMarket, DepositCredit, DeterministicEngine, ExecutionReceipt, FinalizeWithdrawal,
-    PlaceOrder, ReceiptKind, ReplaceOrder, RequestWithdrawal, RevokeSession, SetMarkPrice,
-    Timestamp,
+    PlaceOrder, ProtocolUpgrade, ReceiptKind, ReplaceOrder, RequestWithdrawal, RevokeSession,
+    SetMarkPrice, Timestamp,
 };
 pub use engine::{Engine, EngineConfig};
 pub use error::ExecutionError;
@@ -364,5 +364,30 @@ mod tests {
             ),
             Err(ExecutionError::UnknownMarket)
         );
+    }
+
+    #[test]
+    fn protocol_upgrade_is_monotonic() {
+        use command::ProtocolUpgrade;
+        let mut e = engine();
+        assert_eq!(e.protocol_version(), 1);
+        e.execute(
+            seq(1),
+            Command::ProtocolUpgrade(ProtocolUpgrade { target_version: 2 }),
+        )
+        .unwrap();
+        assert_eq!(e.protocol_version(), 2);
+        // Downgrade / same version is rejected.
+        assert_eq!(
+            e.execute(
+                seq(2),
+                Command::ProtocolUpgrade(ProtocolUpgrade { target_version: 2 })
+            ),
+            Err(ExecutionError::ProtocolDowngrade {
+                current: 2,
+                requested: 2
+            })
+        );
+        assert_eq!(e.protocol_version(), 2);
     }
 }

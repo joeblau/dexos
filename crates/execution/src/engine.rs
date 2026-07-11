@@ -69,6 +69,7 @@ pub struct Engine {
     deposits_seen: HashSet<(u32, Vec<u8>, u32)>,
     withdrawals: HashMap<u64, Withdrawal>,
     next_withdrawal_id: u64,
+    protocol_version: u16,
 }
 
 impl Engine {
@@ -86,7 +87,13 @@ impl Engine {
             deposits_seen: HashSet::new(),
             withdrawals: HashMap::new(),
             next_withdrawal_id: 0,
+            protocol_version: 1,
         }
+    }
+
+    /// The active protocol version.
+    pub fn protocol_version(&self) -> u16 {
+        self.protocol_version
     }
 
     /// Read-only ledger access.
@@ -410,6 +417,16 @@ impl DeterministicEngine for Engine {
                 self.ledger.unlock(c.account, c.count)?;
                 self.commit_account(c.account)?;
                 Ok(self.receipt(seq, ReceiptKind::CompleteSet(c.count)))
+            }
+            Command::ProtocolUpgrade(c) => {
+                if c.target_version <= self.protocol_version {
+                    return Err(ExecutionError::ProtocolDowngrade {
+                        current: self.protocol_version,
+                        requested: c.target_version,
+                    });
+                }
+                self.protocol_version = c.target_version;
+                Ok(self.receipt(seq, ReceiptKind::ProtocolUpgraded(c.target_version)))
             }
         }
     }

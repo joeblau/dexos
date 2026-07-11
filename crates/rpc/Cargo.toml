@@ -11,7 +11,7 @@ workspace = true
 [dependencies]
 types = { path = "../types" }
 codec = { path = "../codec" }
-execution = { path = "../execution" }
-markets = { path = "../markets" }
-consensus = { path = "../consensus" }
+crypto = { path = "../crypto" }
+serde.workspace = true
+thiserror.workspace = true
 tokio.workspace = true

@@ -184,6 +184,14 @@ pub struct CompleteSetOp {
     pub count: types::Amount,
 }
 
+/// Upgrade the active protocol version. Monotonic: the target must exceed the
+/// current version. Later commands can be gated on the active version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProtocolUpgrade {
+    /// The new protocol version to activate.
+    pub target_version: u16,
+}
+
 /// The deterministic command set applied by the engine.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Command {
@@ -217,6 +225,8 @@ pub enum Command {
     MintCompleteSet(CompleteSetOp),
     /// Redeem complete sets.
     RedeemCompleteSet(CompleteSetOp),
+    /// Upgrade the protocol version.
+    ProtocolUpgrade(ProtocolUpgrade),
 }
 
 impl Command {
@@ -238,6 +248,7 @@ impl Command {
             Command::ReplaceOrder(_) => 13,
             Command::MintCompleteSet(_) => 14,
             Command::RedeemCompleteSet(_) => 15,
+            Command::ProtocolUpgrade(_) => 16,
         }
     }
 }
@@ -270,6 +281,8 @@ pub enum ReceiptKind {
     CompleteSet(types::Amount),
     /// A wallet was bound.
     WalletBound,
+    /// The protocol was upgraded to this version.
+    ProtocolUpgraded(u16),
 }
 
 /// The result of applying one command.

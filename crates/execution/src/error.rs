@@ -76,4 +76,12 @@ pub enum ExecutionError {
     /// A capability implemented in a later phase.
     #[error("not implemented yet: {0}")]
     NotImplemented(&'static str),
+    /// A protocol upgrade tried to move to a non-greater version.
+    #[error("protocol downgrade rejected: current {current}, requested {requested}")]
+    ProtocolDowngrade {
+        /// Current active version.
+        current: u16,
+        /// Requested version.
+        requested: u16,
+    },
 }
