@@ -39,6 +39,11 @@ pub enum TransportError {
     #[error("handshake protocol violation")]
     HandshakeFailed,
 
+    /// An encrypted record failed AEAD authentication (tamper, truncation,
+    /// reorder, or wrong session key). The link must be torn down.
+    #[error("session decryption failed")]
+    Decrypt,
+
     /// A message exceeded the maximum frame payload.
     #[error("message exceeds maximum frame payload")]
     MessageTooLarge,

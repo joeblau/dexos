@@ -8,21 +8,32 @@
 //!
 //! The handshake is symmetric — both sides run [`mutual_handshake`]:
 //!
-//! 1. each side sends `public_key(32) || nonce(32)`;
+//! 1. each side sends `public_key(32) || nonce(32) || ephemeral_x25519_pub(32)`;
 //! 2. each side signs the *peer's* nonce, bound into a transcript
-//!    `DOMAIN || peer_nonce || self_pub || peer_pub`, and sends the 64-byte
-//!    signature;
+//!    `DOMAIN || peer_nonce || self_pub || peer_pub || self_eph || peer_eph`,
+//!    and sends the 64-byte signature;
 //! 3. each side verifies the peer's signature over the transcript it expects,
-//!    proving the peer holds the private key for its claimed public key.
+//!    proving the peer holds the private key for its claimed public key **and**
+//!    authenticating both ephemeral keys against a man-in-the-middle.
 //!
 //! The dialer additionally checks the peer's public key equals the *expected*
 //! [`PeerId`] from the [`Peer`] descriptor. A forged or mismatched identity, or
 //! a malformed handshake, is rejected with [`TransportError::AuthFailed`] /
 //! [`TransportError::HandshakeFailed`] — never a panic.
 //!
-//! After the handshake the stream is split: a writer task drains the outbound
+//! # Encryption
+//!
+//! The authenticated ephemeral X25519 keys complete an ECDH whose secret is fed
+//! through HKDF-SHA256 into per-direction ChaCha20-Poly1305 keys (see
+//! [`crate::session`]). After the handshake every application frame crosses the
+//! wire as an AEAD record, so a passive observer or on-path middlebox sees only
+//! ciphertext and length prefixes, and the ephemeral secret gives forward
+//! secrecy. The frame `sequence` (and thus the replay window) lives inside the
+//! encrypted plaintext and is recovered before replay checking.
+//!
+//! After the handshake the stream is split: a writer task seals the outbound
 //! strict-priority channel (and datagram channel) to the socket, and a reader
-//! task frames inbound bytes and routes them to the inbound reliable / datagram
+//! task opens inbound records and routes them to the inbound reliable / datagram
 //! channels with the same bounded backpressure as the loopback transport.
 
 use std::net::SocketAddr;
@@ -38,8 +49,9 @@ use tokio::sync::mpsc;
 use crate::channel::AsyncPriorityChannel;
 use crate::connection::{Connection, TransportConfig, MSG_TYPE_DATAGRAM};
 use crate::error::TransportError;
-use crate::framing::{read_frame, write_frame};
+use crate::framing::{read_encrypted_frame, write_encrypted_frame};
 use crate::peer::{Peer, PeerId};
+use crate::session::{Ephemeral, Session, EPH_PUBLIC_LEN};
 use crate::transport::Transport;
 
 /// Domain separation tag for handshake signatures.
@@ -66,40 +78,65 @@ fn make_nonce(public_key: &[u8; 32]) -> [u8; 32] {
 }
 
 /// The signed handshake transcript.
-fn transcript(challenge: &[u8; 32], signer_pub: &[u8; 32], verifier_pub: &[u8; 32]) -> Vec<u8> {
-    let mut m = Vec::with_capacity(HS_DOMAIN.len() + 96);
+///
+/// Includes both parties' **ephemeral X25519 public keys** so the ed25519
+/// signature authenticates the session-key material: a man-in-the-middle cannot
+/// substitute its own ephemeral key without invalidating the signature.
+fn transcript(
+    challenge: &[u8; 32],
+    signer_pub: &[u8; 32],
+    verifier_pub: &[u8; 32],
+    signer_eph: &[u8; EPH_PUBLIC_LEN],
+    verifier_eph: &[u8; EPH_PUBLIC_LEN],
+) -> Vec<u8> {
+    let mut m = Vec::with_capacity(HS_DOMAIN.len() + 160);
     m.extend_from_slice(HS_DOMAIN);
     m.extend_from_slice(challenge);
     m.extend_from_slice(signer_pub);
     m.extend_from_slice(verifier_pub);
+    m.extend_from_slice(signer_eph);
+    m.extend_from_slice(verifier_eph);
     m
 }
 
-/// Run the mutual authentication handshake over `stream`.
+/// Run the mutual authentication handshake over `stream`, and establish an
+/// encrypted session.
 ///
 /// If `expected` is `Some`, the peer's authenticated identity must match it.
-/// Returns the peer's verified [`PeerId`].
+/// Returns the peer's verified [`PeerId`] and the derived [`Session`] ciphers.
 pub(crate) async fn mutual_handshake(
     stream: &mut TcpStream,
     keypair: &KeyPair,
     expected: Option<PeerId>,
-) -> Result<PeerId, TransportError> {
+) -> Result<(PeerId, Session), TransportError> {
     let our_pub = keypair.public();
     let our_nonce = make_nonce(&our_pub);
+    let ephemeral = Ephemeral::generate()?;
+    let our_eph = ephemeral.public();
 
-    // Phase 1: exchange (public key, nonce). Both sides write before reading;
-    // 64 bytes fit the socket buffer, so there is no deadlock.
+    // Phase 1: exchange (public key, nonce, ephemeral public key). Both sides
+    // write before reading; 96 bytes fit the socket buffer, so no deadlock.
     stream.write_all(&our_pub).await?;
     stream.write_all(&our_nonce).await?;
+    stream.write_all(&our_eph).await?;
     stream.flush().await?;
 
     let mut their_pub = [0u8; 32];
     let mut their_nonce = [0u8; 32];
+    let mut their_eph = [0u8; EPH_PUBLIC_LEN];
     stream.read_exact(&mut their_pub).await?;
     stream.read_exact(&mut their_nonce).await?;
+    stream.read_exact(&mut their_eph).await?;
 
-    // Phase 2: sign the peer's challenge, exchange signatures.
-    let our_sig = keypair.sign(&transcript(&their_nonce, &our_pub, &their_pub));
+    // Phase 2: sign the peer's challenge (binding both ephemeral keys), exchange
+    // signatures.
+    let our_sig = keypair.sign(&transcript(
+        &their_nonce,
+        &our_pub,
+        &their_pub,
+        &our_eph,
+        &their_eph,
+    ));
     stream.write_all(&our_sig).await?;
     stream.flush().await?;
 
@@ -108,7 +145,7 @@ pub(crate) async fn mutual_handshake(
 
     crypto::verify_ed25519(
         &their_pub,
-        &transcript(&our_nonce, &their_pub, &our_pub),
+        &transcript(&our_nonce, &their_pub, &our_pub, &their_eph, &our_eph),
         &their_sig,
     )
     .map_err(|_| TransportError::AuthFailed)?;
@@ -118,13 +155,26 @@ pub(crate) async fn mutual_handshake(
             return Err(TransportError::AuthFailed);
         }
     }
-    Ok(PeerId::from(their_pub))
+
+    // Both ephemeral keys are now authenticated; complete the ECDH and derive
+    // the directional session ciphers.
+    let session =
+        ephemeral.into_session(&their_eph, &our_pub, &their_pub, &our_nonce, &their_nonce);
+    Ok((PeerId::from(their_pub), session))
 }
 
-/// Split an authenticated [`TcpStream`] into a [`Connection`] with a writer and
-/// reader task.
-fn spawn_connection(stream: TcpStream, peer: PeerId, cfg: &TransportConfig) -> Connection {
+/// Split an authenticated, encrypted [`TcpStream`] into a [`Connection`] with a
+/// writer and reader task. Every frame is sealed/opened with the handshake
+/// [`Session`] ciphers, so nothing but ciphertext and length prefixes crosses
+/// the wire.
+fn spawn_connection(
+    stream: TcpStream,
+    peer: PeerId,
+    session: Session,
+    cfg: &TransportConfig,
+) -> Connection {
     let (mut read_half, mut write_half) = stream.into_split();
+    let (mut sealer, mut opener) = session.split();
 
     let out_reliable = Arc::new(AsyncPriorityChannel::new(cfg.queue_capacity));
     let in_reliable = Arc::new(AsyncPriorityChannel::new(cfg.queue_capacity));
@@ -142,7 +192,10 @@ fn spawn_connection(stream: TcpStream, peer: PeerId, cfg: &TransportConfig) -> C
                 biased;
                 reliable = writer_out.recv() => match reliable {
                     Some(frame) => {
-                        if write_frame(&mut write_half, &frame).await.is_err() {
+                        if write_encrypted_frame(&mut write_half, &mut sealer, &frame)
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -150,7 +203,10 @@ fn spawn_connection(stream: TcpStream, peer: PeerId, cfg: &TransportConfig) -> C
                 },
                 dgram = out_drx.recv(), if dgram_open => match dgram {
                     Some(frame) => {
-                        if write_frame(&mut write_half, &frame).await.is_err() {
+                        if write_encrypted_frame(&mut write_half, &mut sealer, &frame)
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -164,8 +220,9 @@ fn spawn_connection(stream: TcpStream, peer: PeerId, cfg: &TransportConfig) -> C
     let reader_in = in_reliable.clone();
     let max_payload = cfg.max_payload;
     let reader = tokio::spawn(async move {
-        // Loop ends when read_frame returns Err (EOF or malformed framing).
-        while let Ok(frame) = read_frame(&mut read_half, max_payload).await {
+        // Loop ends when a record fails to read/open (EOF, malformed framing, or
+        // AEAD authentication failure — any of which tears the link down).
+        while let Ok(frame) = read_encrypted_frame(&mut read_half, &mut opener, max_payload).await {
             if frame.msg_type == MSG_TYPE_DATAGRAM {
                 // Best-effort: shed on backpressure or closed receiver.
                 let _ = in_dtx.try_send(frame);
@@ -236,15 +293,16 @@ impl Transport for TcpTransport {
         let addr = peer.addr.ok_or(TransportError::NoAddress)?;
         let mut stream = TcpStream::connect(addr).await?;
         stream.set_nodelay(true).ok();
-        let verified = mutual_handshake(&mut stream, &self.keypair, Some(peer.id)).await?;
-        Ok(spawn_connection(stream, verified, &self.cfg))
+        let (verified, session) =
+            mutual_handshake(&mut stream, &self.keypair, Some(peer.id)).await?;
+        Ok(spawn_connection(stream, verified, session, &self.cfg))
     }
 
     async fn accept(&self) -> Result<Connection, TransportError> {
         let (mut stream, _remote) = self.listener.accept().await?;
         stream.set_nodelay(true).ok();
-        let verified = mutual_handshake(&mut stream, &self.keypair, None).await?;
-        Ok(spawn_connection(stream, verified, &self.cfg))
+        let (verified, session) = mutual_handshake(&mut stream, &self.keypair, None).await?;
+        Ok(spawn_connection(stream, verified, session, &self.cfg))
     }
 }
 

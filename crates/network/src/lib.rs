@@ -54,6 +54,7 @@ mod loopback;
 mod peer;
 mod replay;
 mod scheduler;
+mod session;
 mod tcp;
 mod transport;
 mod util;
