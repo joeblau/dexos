@@ -68,15 +68,31 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 ## Run
 
+`marketd` is a workspace binary — build it first, then run it from
+`target/release/`. It is **not** installed on your `PATH` by default.
+
 ```sh
-marketd run --config config/dev.toml            # full node
-marketd run --light --config config/light.toml  # read-only light node
-marketd run --role validator --role sequencer   # multiple roles
-marketd benchmark --suite all --output results.json
-marketd replay --snapshot <path> --log <path>
-marketd verify  --snapshot <path>
-marketd keygen
+cargo build --release --bin marketd     # produces target/release/marketd
+
+./target/release/marketd run --config config/dev.toml            # full node
+./target/release/marketd run --light --config config/light.toml  # read-only light node
+./target/release/marketd run --role validator --role sequencer   # multiple roles
+./target/release/marketd benchmark --suite all --output results.json
+./target/release/marketd replay --snapshot <path> --log <path>
+./target/release/marketd verify  --snapshot <path>
+./target/release/marketd keygen
 ```
+
+Prefer a bare `marketd`? Install it onto your `PATH` (`~/.cargo/bin`):
+
+```sh
+cargo install --path bin/marketd
+marketd run --config config/dev.toml
+```
+
+`marketd run` starts the node, prints its startup manifest, and idles until it
+receives Ctrl-C (SIGINT), at which point it drains its bounded queues and exits
+cleanly.
 
 ## Demo scripts
 
