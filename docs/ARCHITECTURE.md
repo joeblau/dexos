@@ -51,15 +51,30 @@ finalized checkpoint root — never trusting a proxy.
 ## Consensus & checkpoints
 
 `consensus` is a pure synchronous state machine (no async): continuous sequencing
-with gap detection, deterministic round-robin leader selection with timeout
-rotation, quorum-certificate formation, pipelined execution/finalization, epoch
-and validator-set transitions, and fork + double-sign/equivocation detection.
-`Checkpoint`s bind `{previous_state_root, new_state_root, command_root,
-execution_root, oracle_root}` under a quorum certificate and chain by ancestry.
+with gap detection, deterministic round-robin leader selection, quorum-certificate
+formation, pipelined execution/finalization, epoch and validator-set transitions,
+and fork + double-sign/equivocation detection. `Checkpoint`s bind
+`{previous_state_root, new_state_root, command_root, execution_root, oracle_root}`
+under a quorum certificate and chain by ancestry.
 
-The first demo uses three regional nodes for crash-tolerant replication; the code
-and configuration distinguish this from Byzantine fault tolerance, which requires
-≥ 4 validators (3f+1) for one Byzantine fault.
+The `BftEngine` runs in one of two explicit `ConsensusMode`s, and the distinction
+is enforced in code, not just configuration:
+
+- **`CrashTolerant` (demo).** Single-phase `Commit` certification with simple
+  timeout view rotation. This is the mode the first demo runs across three
+  regional nodes for crash-tolerant replication. It is **not** Byzantine-safe on
+  its own and must not be relied on past crash faults; it needs no more than three
+  nodes.
+- **`ByzantineFaultTolerant` (production).** The full HotStuff/PBFT pipeline:
+  chained `Prepare → PreCommit → Commit` quorum certificates, a high-QC / locking
+  rule, `parent_hash` ancestry validation against the pipeline tip, refusal to
+  certify a forked round, view changes that require a `TimeoutCertificate` (a
+  quorum of signed timeouts — no replica can advance a view unilaterally), and a
+  `finalize` that is refused until an execution commitment is certified by a
+  quorum. Tolerating one Byzantine fault requires a `3f+1` set (**≥ 4
+  validators**); the safety property (no two honest replicas finalize different
+  blocks at a height under partitions and a Byzantine leader) is covered by the
+  `consensus` unit tests and the `simulation` fault matrix.
 
 ## Networking
 

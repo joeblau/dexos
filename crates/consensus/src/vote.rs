@@ -19,6 +19,9 @@ use types::Hash;
 /// Domain tag for vote digests.
 pub const DOMAIN_VOTE: &[u8] = b"dexos:consensus:vote:v1";
 
+/// Domain tag for timeout (view-change) digests.
+pub const DOMAIN_TIMEOUT: &[u8] = b"dexos:consensus:timeout:v1";
+
 /// Maximum committee size — bounded by the 64-bit signer bitmap of a
 /// [`QuorumCertificate`].
 pub const MAX_VALIDATORS: usize = 64;
@@ -144,6 +147,13 @@ pub enum VoteError {
     /// The committee exceeds the 64-signer bitmap capacity.
     #[error("committee exceeds 64 validators")]
     TooManyValidators,
+    /// A timeout certificate's aggregate does not sign the expected
+    /// `(epoch, view)` digest.
+    #[error("timeout certificate digest mismatch")]
+    TimeoutDigestMismatch,
+    /// A timeout certificate carries below-threshold weight.
+    #[error("timeout certificate below threshold")]
+    TimeoutBelowThreshold,
 }
 
 /// The result of admitting a vote.
@@ -155,6 +165,81 @@ pub enum VoteOutcome {
     Duplicate,
     /// The validator equivocated; the vote was rejected and evidence recorded.
     Equivocated(Equivocation),
+}
+
+/// The canonical, domain-separated digest a validator signs to time out a view.
+///
+/// Binds `(epoch, view)` only, so every honest replica timing out the *same*
+/// view produces the *same* digest — allowing their signatures to aggregate
+/// into one [`QuorumCertificate`] (a timeout certificate). The high-QC each
+/// replica carries into the next view is tracked by the engine, not signed
+/// here, so the certificate stays single-message and verifiable by a
+/// [`ValidatorSet`].
+#[must_use]
+pub fn timeout_digest(epoch: u64, view: u64) -> Hash {
+    let mut buf = Vec::with_capacity(8 + 8);
+    buf.extend_from_slice(&epoch.to_le_bytes());
+    buf.extend_from_slice(&view.to_le_bytes());
+    hash_domain(DOMAIN_TIMEOUT, &buf)
+}
+
+/// A validator's signed timeout for a leader view — the view-change primitive.
+///
+/// A quorum of these forms a [`TimeoutCertificate`], which is the *only* thing
+/// that lets a Byzantine-fault-tolerant engine leave a view. This prevents a
+/// single replica (or a Byzantine leader) from advancing the view unilaterally.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimeoutVote {
+    /// Epoch of the validator set that produced this timeout.
+    pub epoch: u64,
+    /// The view the validator is abandoning.
+    pub view: u64,
+    /// Index of the signing validator within its committee.
+    pub validator_index: u32,
+    /// ed25519 signature over [`TimeoutVote::digest`].
+    #[serde(with = "crate::sig64")]
+    pub signature: [u8; 64],
+}
+
+impl TimeoutVote {
+    /// The digest this timeout signs.
+    #[must_use]
+    pub fn digest(&self) -> Hash {
+        timeout_digest(self.epoch, self.view)
+    }
+
+    /// Verify this timeout's signature against `public_key`.
+    pub fn verify(&self, public_key: &[u8; 32]) -> Result<(), VoteError> {
+        verify_ed25519(public_key, self.digest().as_bytes(), &self.signature)
+            .map_err(|_| VoteError::InvalidSignature)
+    }
+}
+
+/// Verifiable view-change evidence: a quorum of validators timed out `view`.
+///
+/// The embedded [`QuorumCertificate`] signs exactly `timeout_digest(epoch,
+/// view)`, so it verifies directly against a [`ValidatorSet`]. Advancing to
+/// `view + 1` requires exhibiting one of these.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimeoutCertificate {
+    /// Epoch of the certifying validator set.
+    pub epoch: u64,
+    /// The view that a quorum abandoned.
+    pub view: u64,
+    /// Aggregate signatures over [`timeout_digest`].
+    pub quorum: QuorumCertificate,
+}
+
+impl TimeoutCertificate {
+    /// Verify the certificate: the aggregate must sign `timeout_digest(epoch,
+    /// view)` and meet the set's threshold.
+    pub fn verify(&self, set: &ValidatorSet) -> Result<(), VoteError> {
+        if self.quorum.message != timeout_digest(self.epoch, self.view) {
+            return Err(VoteError::TimeoutDigestMismatch);
+        }
+        set.verify(&self.quorum)
+            .map_err(|_| VoteError::TimeoutBelowThreshold)
+    }
 }
 
 /// A committee: the validators of one epoch, with a BFT `2f+1` threshold and
@@ -363,5 +448,102 @@ impl VoteCollector {
     #[must_use]
     pub fn has_equivocation(&self) -> bool {
         !self.equivocations.is_empty()
+    }
+}
+
+/// Accumulates [`TimeoutVote`]s per view and forms [`TimeoutCertificate`]s.
+///
+/// Timeouts are keyed by `(epoch, view)`; a validator can only meaningfully time
+/// out a view once, so a repeat is idempotent (there is no equivocation to
+/// detect — the message binds nothing but the view being abandoned).
+#[derive(Debug, Clone, Default)]
+pub struct TimeoutCollector {
+    // (epoch, view) -> (validator_index -> signature)
+    timeouts: BTreeMap<(u64, u64), BTreeMap<u32, [u8; 64]>>,
+}
+
+impl TimeoutCollector {
+    /// A fresh, empty collector.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Admit a timeout. Verifies committee membership and the signature, then
+    /// deduplicates by validator index. Foreign / malformed timeouts error.
+    pub fn add_timeout(
+        &mut self,
+        committee: &Committee,
+        timeout: &TimeoutVote,
+    ) -> Result<VoteOutcome, VoteError> {
+        let idx = usize::try_from(timeout.validator_index)
+            .map_err(|_| VoteError::ForeignSigner(timeout.validator_index))?;
+        if idx >= committee.len() || idx >= MAX_VALIDATORS {
+            return Err(VoteError::ForeignSigner(timeout.validator_index));
+        }
+        let public_key = committee
+            .public_key(timeout.validator_index)
+            .ok_or(VoteError::ForeignSigner(timeout.validator_index))?;
+        timeout.verify(&public_key)?;
+
+        let per_view = self
+            .timeouts
+            .entry((timeout.epoch, timeout.view))
+            .or_default();
+        if per_view.contains_key(&timeout.validator_index) {
+            return Ok(VoteOutcome::Duplicate);
+        }
+        per_view.insert(timeout.validator_index, timeout.signature);
+        Ok(VoteOutcome::Accepted)
+    }
+
+    /// Total signed timeout weight currently collected for `(epoch, view)`.
+    #[must_use]
+    pub fn weight_for(&self, committee: &Committee, epoch: u64, view: u64) -> u64 {
+        self.timeouts
+            .get(&(epoch, view))
+            .map(|m| {
+                m.keys()
+                    .filter_map(|&i| committee.weight(i))
+                    .fold(0u64, u64::saturating_add)
+            })
+            .unwrap_or(0)
+    }
+
+    /// Attempt to form a [`TimeoutCertificate`] for `(epoch, view)`.
+    ///
+    /// Returns `Some(tc)` iff `>= threshold` distinct valid weight timed out the
+    /// view and the assembled certificate verifies against the committee's set.
+    #[must_use]
+    pub fn try_form_certificate(
+        &self,
+        committee: &Committee,
+        epoch: u64,
+        view: u64,
+    ) -> Option<TimeoutCertificate> {
+        let per_view = self.timeouts.get(&(epoch, view))?;
+        let mut bitmap: u64 = 0;
+        let mut signatures: Vec<[u8; 64]> = Vec::with_capacity(per_view.len());
+        let mut weight: u64 = 0;
+        for (&index, signature) in per_view {
+            // index < MAX_VALIDATORS (64) is guaranteed at insertion time.
+            bitmap |= 1u64 << index;
+            signatures.push(*signature);
+            weight = weight.saturating_add(committee.weight(index)?);
+        }
+        if weight < committee.threshold() {
+            return None;
+        }
+        let quorum = QuorumCertificate {
+            message: timeout_digest(epoch, view),
+            signer_bitmap: bitmap,
+            signatures,
+        };
+        committee.validator_set().verify(&quorum).ok()?;
+        Some(TimeoutCertificate {
+            epoch,
+            view,
+            quorum,
+        })
     }
 }

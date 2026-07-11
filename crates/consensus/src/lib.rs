@@ -12,8 +12,13 @@
 //!   `Accepted -> Executed -> Certified -> Finalized` lifecycle transitions.
 //! - [`vote`]: HotStuff-style votes, committees, deterministic leader selection,
 //!   Byzantine quorum-certificate formation, and equivocation detection.
-//! - [`bft`]: the pipelined leader-based lifecycle driver — proposals, view
-//!   rotation on timeout, epoch / validator-set transitions, fork detection.
+//! - [`bft`]: the pipelined leader-based lifecycle driver. In
+//!   `ByzantineFaultTolerant` mode it enforces the full HotStuff pipeline —
+//!   chained Prepare/PreCommit/Commit quorum certificates, high-QC locking,
+//!   parent/ancestry validation, timeout-certificate view changes, and
+//!   execution-certified finalization; in `CrashTolerant` (demo) mode it runs a
+//!   single-phase Commit path. Also epoch / validator-set transitions and fork
+//!   detection.
 //! - [`checkpoint`]: canonical checkpoint construction, hashing, quorum + root +
 //!   ancestry verification, and threshold witness receipts.
 //!
@@ -31,8 +36,8 @@ pub mod vote;
 pub(crate) mod sig64;
 
 pub use bft::{
-    proposal_digest, BftEngine, BftError, Fork, Proposal, ProposalOutcome, ValidatorSetUpdate,
-    DOMAIN_PROPOSAL,
+    execution_commitment_digest, proposal_digest, BftEngine, BftError, ConsensusMode, Fork,
+    Proposal, ProposalOutcome, ValidatorSetUpdate, DOMAIN_EXEC_COMMIT, DOMAIN_PROPOSAL,
 };
 pub use checkpoint::{
     build_checkpoint_header, checkpoint_hash, detect_checkpoint_fork, links_to, seal_checkpoint,
@@ -42,7 +47,8 @@ pub use checkpoint::{
 };
 pub use sequencer::{detect_gap, CommandRecord, CommandStatus, Sequencer, SequencerError};
 pub use vote::{
-    vote_digest, Committee, Equivocation, Vote, VoteCollector, VoteError, VoteOutcome, VotePhase,
+    timeout_digest, vote_digest, Committee, Equivocation, TimeoutCertificate, TimeoutCollector,
+    TimeoutVote, Vote, VoteCollector, VoteError, VoteOutcome, VotePhase, DOMAIN_TIMEOUT,
     DOMAIN_VOTE, MAX_VALIDATORS,
 };
 
@@ -53,7 +59,7 @@ pub const CRATE_NAME: &str = "consensus";
 mod tests {
     use super::*;
 
-    use crypto::{KeyPair, ThresholdSigners, Validator};
+    use crypto::{KeyPair, QuorumCertificate, ThresholdSigners, Validator};
     use types::{Hash, SequenceNumber, ShardId};
 
     // ---- deterministic in-test LCG (no external rng) ----------------------
@@ -153,6 +159,69 @@ mod tests {
             last_sequence: last,
             proposer_index: proposer,
             signature: kp.sign(d.as_bytes()),
+        }
+    }
+
+    fn signed_timeout(kp: &KeyPair, epoch: u64, view: u64, idx: u32) -> TimeoutVote {
+        let d = timeout_digest(epoch, view);
+        TimeoutVote {
+            epoch,
+            view,
+            validator_index: idx,
+            signature: kp.sign(d.as_bytes()),
+        }
+    }
+
+    /// Assemble a quorum certificate over `message` from `indices` (used for the
+    /// execution-commitment certificates the BFT finalize path requires).
+    fn quorum_over(kps: &[KeyPair], indices: &[u32], message: Hash) -> QuorumCertificate {
+        let mut idxs = indices.to_vec();
+        idxs.sort_unstable();
+        idxs.dedup();
+        let mut signer_bitmap = 0u64;
+        let mut signatures = Vec::new();
+        for &i in &idxs {
+            signer_bitmap |= 1u64 << i;
+            signatures.push(kps[usize::try_from(i).unwrap()].sign(message.as_bytes()));
+        }
+        QuorumCertificate {
+            message,
+            signer_bitmap,
+            signatures,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn phase_votes(
+        kps: &[KeyPair],
+        voters: &[u32],
+        epoch: u64,
+        view: u64,
+        height: u64,
+        phase: VotePhase,
+        block: Hash,
+    ) -> Vec<Vote> {
+        voters
+            .iter()
+            .map(|&i| {
+                signed_vote(
+                    &kps[usize::try_from(i).unwrap()],
+                    epoch,
+                    view,
+                    height,
+                    phase,
+                    block,
+                    i,
+                )
+            })
+            .collect()
+    }
+
+    fn add_votes_to_all(engines: &mut [BftEngine], votes: &[Vote]) {
+        for e in engines.iter_mut() {
+            for v in votes {
+                let _ = e.add_vote(v);
+            }
         }
     }
 
@@ -697,5 +766,416 @@ mod tests {
         let hb = codec::encode(&header).unwrap();
         let header_back: CheckpointHeader = codec::decode(&hb).unwrap();
         assert_eq!(header, header_back);
+    }
+
+    // ---- true BFT: chained QCs, locking, and execution-certified finalize --
+
+    #[test]
+    fn crash_tolerant_mode_is_single_phase_and_rotates() {
+        // The demo (crash-tolerant) mode certifies on a single Commit QC and
+        // finalizes without an execution certificate, and its timeout is a
+        // simple view rotation — the documented ≤3-node failover.
+        let (comm, kps) = committee(3, 0);
+        let mut engine = BftEngine::new(comm);
+        assert_eq!(engine.mode(), ConsensusMode::CrashTolerant);
+        assert!(!engine.is_bft());
+        let block = Hash::from_bytes([5; 32]);
+        engine
+            .receive_proposal(signed_proposal(
+                &kps[0],
+                0,
+                0,
+                1,
+                block,
+                Hash::ZERO,
+                0,
+                0,
+                0,
+            ))
+            .unwrap();
+        engine.execute(1).unwrap();
+        for i in 0..3u32 {
+            let v = signed_vote(&kps[i as usize], 0, 0, 1, VotePhase::Commit, block, i);
+            engine.add_vote(&v).unwrap();
+        }
+        assert!(engine.try_certify(1, VotePhase::Commit).unwrap().is_some());
+        // No execution certificate required in the demo mode.
+        assert_eq!(engine.finalize(1).unwrap(), block);
+        // Simple crash-failover rotation advances the view without a certificate.
+        assert_eq!(engine.on_timeout(), 1);
+        assert_eq!(engine.view(), 1);
+    }
+
+    #[test]
+    fn bft_pipeline_chains_locks_and_finalizes() {
+        let (comm, kps) = committee(4, 0); // 3f+1, threshold 3
+        let mut engine = BftEngine::new_byzantine(comm);
+        assert!(engine.is_bft());
+        let block = Hash::from_bytes([7; 32]);
+        engine
+            .receive_proposal(signed_proposal(
+                &kps[0],
+                0,
+                0,
+                1,
+                block,
+                Hash::ZERO,
+                0,
+                9,
+                0,
+            ))
+            .unwrap();
+        engine.execute(1).unwrap();
+
+        // Three Commit votes exist, but Commit cannot certify before the
+        // Prepare -> PreCommit chain is in place.
+        for i in 0..3u32 {
+            let v = signed_vote(&kps[i as usize], 0, 0, 1, VotePhase::Commit, block, i);
+            engine.add_vote(&v).unwrap();
+        }
+        assert!(matches!(
+            engine.try_certify(1, VotePhase::Commit),
+            Err(BftError::PhaseNotChained {
+                height: 1,
+                phase: VotePhase::Commit
+            })
+        ));
+        assert!(matches!(
+            engine.try_certify(1, VotePhase::PreCommit),
+            Err(BftError::PhaseNotChained {
+                height: 1,
+                phase: VotePhase::PreCommit
+            })
+        ));
+
+        // Chain Prepare then PreCommit; the PreCommit QC installs a lock.
+        for phase in [VotePhase::Prepare, VotePhase::PreCommit] {
+            add_votes_to_all(
+                std::slice::from_mut(&mut engine),
+                &phase_votes(&kps, &[0, 1, 2], 0, 0, 1, phase, block),
+            );
+            assert!(engine.try_certify(1, phase).unwrap().is_some());
+        }
+        assert_eq!(engine.locked_block(1), Some(block));
+        assert_eq!(engine.high_qc_view(), Some(0));
+
+        // Now Commit chains and certifies.
+        assert!(engine.try_certify(1, VotePhase::Commit).unwrap().is_some());
+        assert_eq!(engine.status(1), Some(CommandStatus::Certified));
+
+        // Finalize is refused without a certified execution commitment...
+        assert!(matches!(
+            engine.finalize(1),
+            Err(BftError::MissingExecutionCertificate(1))
+        ));
+        // ...and a certificate over the wrong root does not verify.
+        let bad = quorum_over(
+            &kps,
+            &[0, 1, 2],
+            execution_commitment_digest(0, 0, 1, block, Hash::from_bytes([0xAA; 32])),
+        );
+        assert!(matches!(
+            engine.certify_execution(1, Hash::from_bytes([0xBB; 32]), &bad),
+            Err(BftError::InvalidExecutionCertificate(1))
+        ));
+        assert!(matches!(
+            engine.finalize(1),
+            Err(BftError::MissingExecutionCertificate(1))
+        ));
+
+        // A correct execution certificate unlocks finalization.
+        let exec = Hash::from_bytes([21; 32]);
+        let cert = quorum_over(
+            &kps,
+            &[0, 1, 2],
+            execution_commitment_digest(0, 0, 1, block, exec),
+        );
+        engine.certify_execution(1, exec, &cert).unwrap();
+        assert_eq!(engine.execution_root(1), Some(exec));
+        assert_eq!(engine.finalize(1).unwrap(), block);
+        assert_eq!(engine.status(1), Some(CommandStatus::Finalized));
+    }
+
+    #[test]
+    fn bft_parent_ancestry_is_enforced() {
+        let (comm, kps) = committee(4, 0);
+        let mut engine = BftEngine::new_byzantine(comm);
+        let b1 = Hash::from_bytes([1; 32]);
+        engine
+            .receive_proposal(signed_proposal(&kps[0], 0, 0, 1, b1, Hash::ZERO, 0, 4, 0))
+            .unwrap();
+        // Height 2 with a parent that does not link to the block at height 1.
+        let wrong = signed_proposal(
+            &kps[0],
+            0,
+            0,
+            2,
+            Hash::from_bytes([2; 32]),
+            Hash::from_bytes([9; 32]),
+            5,
+            9,
+            0,
+        );
+        assert!(matches!(
+            engine.receive_proposal(wrong),
+            Err(BftError::AncestryMismatch { height: 2 })
+        ));
+        // The correctly-linked proposal is admitted.
+        let good = signed_proposal(&kps[0], 0, 0, 2, Hash::from_bytes([2; 32]), b1, 5, 9, 0);
+        assert_eq!(
+            engine.receive_proposal(good).unwrap(),
+            ProposalOutcome::Accepted
+        );
+    }
+
+    #[test]
+    fn bft_lock_rejects_conflicting_block_across_view_change() {
+        let (comm, kps) = committee(4, 0);
+        let mut engine = BftEngine::new_byzantine(comm);
+        let a = Hash::from_bytes([1; 32]);
+        engine
+            .receive_proposal(signed_proposal(&kps[0], 0, 0, 1, a, Hash::ZERO, 0, 4, 0))
+            .unwrap();
+        engine.execute(1).unwrap();
+        for phase in [VotePhase::Prepare, VotePhase::PreCommit] {
+            add_votes_to_all(
+                std::slice::from_mut(&mut engine),
+                &phase_votes(&kps, &[0, 1, 2], 0, 0, 1, phase, a),
+            );
+            assert!(engine.try_certify(1, phase).unwrap().is_some());
+        }
+        assert_eq!(engine.locked_block(1), Some(a));
+
+        // Advance to view 1 with a timeout certificate.
+        for i in 0..3u32 {
+            engine
+                .add_timeout(&signed_timeout(&kps[i as usize], 0, 0, i))
+                .unwrap();
+        }
+        let tc = engine.try_form_timeout_certificate(0).unwrap();
+        assert_eq!(engine.advance_view(&tc).unwrap(), 1);
+
+        // A conflicting block at the locked height is refused...
+        let b = Hash::from_bytes([2; 32]);
+        assert!(matches!(
+            engine.receive_proposal(signed_proposal(&kps[1], 0, 1, 1, b, Hash::ZERO, 0, 4, 1)),
+            Err(BftError::Locked { height: 1 })
+        ));
+        // ...but re-proposing the locked block at the new view is allowed.
+        assert_eq!(
+            engine
+                .receive_proposal(signed_proposal(&kps[1], 0, 1, 1, a, Hash::ZERO, 0, 4, 1))
+                .unwrap(),
+            ProposalOutcome::Accepted
+        );
+    }
+
+    #[test]
+    fn bft_view_change_requires_timeout_certificate() {
+        let (comm, kps) = committee(4, 0);
+        let mut engine = BftEngine::new_byzantine(comm);
+        assert_eq!(engine.view(), 0);
+        // A bare timeout does NOT advance the view in BFT mode.
+        assert_eq!(engine.on_timeout(), 0);
+        assert_eq!(engine.view(), 0);
+        // Below threshold, no certificate can form.
+        engine
+            .add_timeout(&signed_timeout(&kps[0], 0, 0, 0))
+            .unwrap();
+        engine
+            .add_timeout(&signed_timeout(&kps[1], 0, 0, 1))
+            .unwrap();
+        assert!(engine.try_form_timeout_certificate(0).is_none());
+        // The third timeout reaches the quorum.
+        engine
+            .add_timeout(&signed_timeout(&kps[2], 0, 0, 2))
+            .unwrap();
+        let tc = engine.try_form_timeout_certificate(0).unwrap();
+
+        // A certificate for the wrong view is rejected.
+        let wrong_view = TimeoutCertificate {
+            epoch: 0,
+            view: 5,
+            quorum: tc.quorum.clone(),
+        };
+        assert!(matches!(
+            engine.advance_view(&wrong_view),
+            Err(BftError::WrongViewChange {
+                expected: 0,
+                got: 5
+            })
+        ));
+        // A certificate whose aggregate signs the wrong digest is rejected.
+        let tampered = TimeoutCertificate {
+            epoch: 0,
+            view: 0,
+            quorum: quorum_over(&kps, &[0, 1, 2], Hash::from_bytes([0xEE; 32])),
+        };
+        assert!(matches!(
+            engine.advance_view(&tampered),
+            Err(BftError::Vote(VoteError::TimeoutDigestMismatch))
+        ));
+
+        // The valid certificate advances the view and rotates the leader.
+        assert_eq!(engine.advance_view(&tc).unwrap(), 1);
+        assert_eq!(engine.view(), 1);
+        assert_eq!(engine.leader(), 1); // (0 + 1) % 4
+        assert!(engine.last_view_change().is_some());
+    }
+
+    #[test]
+    fn bft_forked_round_halts_certification_then_recovers() {
+        let (comm, kps) = committee(4, 0);
+        let mut engine = BftEngine::new_byzantine(comm);
+        let a = Hash::from_bytes([1; 32]);
+        let b = Hash::from_bytes([2; 32]);
+        // Leader 0 equivocates at (height 1, view 0): two conflicting blocks.
+        engine
+            .receive_proposal(signed_proposal(&kps[0], 0, 0, 1, a, Hash::ZERO, 0, 4, 0))
+            .unwrap();
+        assert!(matches!(
+            engine
+                .receive_proposal(signed_proposal(&kps[0], 0, 0, 1, b, Hash::ZERO, 0, 4, 0))
+                .unwrap(),
+            ProposalOutcome::Forked(_)
+        ));
+        // Even with a Prepare quorum for A, the forked round refuses to certify.
+        add_votes_to_all(
+            std::slice::from_mut(&mut engine),
+            &phase_votes(&kps, &[0, 1, 2], 0, 0, 1, VotePhase::Prepare, a),
+        );
+        assert!(matches!(
+            engine.try_certify(1, VotePhase::Prepare),
+            Err(BftError::ForkedRound { height: 1, view: 0 })
+        ));
+
+        // A timeout certificate carries the height to view 1 under an honest leader.
+        for i in 0..3u32 {
+            engine
+                .add_timeout(&signed_timeout(&kps[i as usize], 0, 0, i))
+                .unwrap();
+        }
+        let tc = engine.try_form_timeout_certificate(0).unwrap();
+        engine.advance_view(&tc).unwrap();
+        engine
+            .receive_proposal(signed_proposal(&kps[1], 0, 1, 1, a, Hash::ZERO, 0, 4, 1))
+            .unwrap();
+        engine.execute(1).unwrap();
+        for phase in [VotePhase::Prepare, VotePhase::PreCommit, VotePhase::Commit] {
+            add_votes_to_all(
+                std::slice::from_mut(&mut engine),
+                &phase_votes(&kps, &[0, 1, 2], 0, 1, 1, phase, a),
+            );
+            assert!(engine.try_certify(1, phase).unwrap().is_some());
+        }
+        let exec = Hash::from_bytes([9; 32]);
+        let cert = quorum_over(
+            &kps,
+            &[0, 1, 2],
+            execution_commitment_digest(0, 1, 1, a, exec),
+        );
+        engine.certify_execution(1, exec, &cert).unwrap();
+        assert_eq!(engine.finalize(1).unwrap(), a);
+    }
+
+    // ---- safety property: partition + Byzantine leader (multi-replica) -----
+
+    #[test]
+    fn bft_safety_under_partition_and_byzantine_leader() {
+        let (comm, kps) = committee(4, 0);
+        let mut engines: Vec<BftEngine> = (0..4)
+            .map(|_| BftEngine::new_byzantine(comm.clone()))
+            .collect();
+        let a = Hash::from_bytes([0xAA; 32]);
+        let b = Hash::from_bytes([0xBB; 32]);
+
+        // View 0: a Byzantine leader equivocates across a 2/2 partition, sending
+        // block A to {0,1} and block B to {2,3}. No replica sees both, so the
+        // conflict is not locally detectable, yet neither block can reach quorum.
+        let pa = signed_proposal(&kps[0], 0, 0, 1, a, Hash::ZERO, 0, 0, 0);
+        let pb = signed_proposal(&kps[0], 0, 0, 1, b, Hash::ZERO, 0, 0, 0);
+        engines[0].receive_proposal(pa.clone()).unwrap();
+        engines[1].receive_proposal(pa).unwrap();
+        engines[2].receive_proposal(pb.clone()).unwrap();
+        engines[3].receive_proposal(pb).unwrap();
+        for e in engines.iter_mut() {
+            e.execute(1).unwrap();
+        }
+
+        // Prepare votes stay within each partition (two each) — below threshold.
+        let va = phase_votes(&kps, &[0, 1], 0, 0, 1, VotePhase::Prepare, a);
+        let vb = phase_votes(&kps, &[2, 3], 0, 0, 1, VotePhase::Prepare, b);
+        for (i, e) in engines.iter_mut().enumerate() {
+            let votes = if i < 2 { &va } else { &vb };
+            for v in votes {
+                let _ = e.add_vote(v);
+            }
+            assert!(
+                e.try_certify(1, VotePhase::Prepare).unwrap().is_none(),
+                "no QC may form under the partition"
+            );
+        }
+        // Safety under the split: nothing finalized, nothing locked.
+        for e in &engines {
+            assert_ne!(e.status(1), Some(CommandStatus::Finalized));
+            assert_eq!(e.locked_block(1), None);
+        }
+
+        // Heal + view change: all four replicas time out view 0, each forms the
+        // certificate, and advances to view 1.
+        let timeouts: Vec<TimeoutVote> = (0..4u32)
+            .map(|i| signed_timeout(&kps[usize::try_from(i).unwrap()], 0, 0, i))
+            .collect();
+        for e in engines.iter_mut() {
+            for t in &timeouts {
+                e.add_timeout(t).unwrap();
+            }
+            let tc = e
+                .try_form_timeout_certificate(0)
+                .expect("timeout certificate forms at quorum");
+            assert_eq!(e.advance_view(&tc).unwrap(), 1);
+        }
+
+        // View 1: the honest leader proposes block A to everyone; a full chained
+        // certification with all four honest votes follows.
+        let p1 = signed_proposal(&kps[1], 0, 1, 1, a, Hash::ZERO, 0, 0, 1);
+        for e in engines.iter_mut() {
+            assert_eq!(
+                e.receive_proposal(p1.clone()).unwrap(),
+                ProposalOutcome::Accepted
+            );
+            e.execute(1).unwrap();
+        }
+        for phase in [VotePhase::Prepare, VotePhase::PreCommit, VotePhase::Commit] {
+            let votes = phase_votes(&kps, &[0, 1, 2, 3], 0, 1, 1, phase, a);
+            add_votes_to_all(&mut engines, &votes);
+            for e in engines.iter_mut() {
+                e.try_certify(1, phase)
+                    .unwrap()
+                    .expect("QC forms with a full honest quorum");
+            }
+        }
+        let exec = Hash::from_bytes([0xCC; 32]);
+        let cert = quorum_over(
+            &kps,
+            &[0, 1, 2, 3],
+            execution_commitment_digest(0, 1, 1, a, exec),
+        );
+        for e in engines.iter_mut() {
+            e.certify_execution(1, exec, &cert).unwrap();
+            assert_eq!(e.finalize(1).unwrap(), a);
+        }
+
+        // Agreement: every honest replica finalized the SAME block, never B, and
+        // no replica observed a quorum fork.
+        let commit_digest = vote_digest(0, 1, 1, VotePhase::Commit, a);
+        for e in &engines {
+            assert_eq!(e.status(1), Some(CommandStatus::Finalized));
+            assert_eq!(
+                e.quorum_certificate(1).map(|q| q.message),
+                Some(commit_digest)
+            );
+            assert!(e.quorum_forks().is_empty());
+        }
     }
 }
