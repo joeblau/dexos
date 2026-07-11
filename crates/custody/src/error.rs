@@ -79,12 +79,13 @@ pub enum CustodyError {
     /// `withdrawal_id` did not equal the id derived from the request.
     #[error("withdrawal id mismatch")]
     MismatchedWithdrawalId,
-    /// The certificate is not marked finalized.
-    #[error("certificate not finalized")]
-    NotFinalized,
-    /// The ledger reservation for the withdrawal is not satisfied.
+    /// The reservation does not cover the requested amount.
     #[error("missing ledger reservation")]
     MissingLedgerReserve,
+    /// The withdrawal authorization digest is not committed under the finalizing
+    /// checkpoint (the inclusion proof did not verify against the signed root).
+    #[error("withdrawal authorization not proven under finalizing checkpoint")]
+    UnprovenAuthorization,
     /// The certificate is past its validity window.
     #[error("certificate expired")]
     Expired,

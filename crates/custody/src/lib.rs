@@ -41,7 +41,8 @@ pub use policy::ChainPolicy;
 pub use session::{AuthorizeSession, SessionKey, SessionRegistry, SessionScope, SESSION_DOMAIN};
 pub use signer::{HsmSigner, Signer, SignerSet, SoftSigner, MAX_SIGNERS};
 pub use withdrawal::{
-    verify_certificate, WithdrawalCertificate, WithdrawalId, WithdrawalRequest, WITHDRAWAL_DOMAIN,
+    verify_certificate, withdrawal_authorization_digest, ReservationProof, WithdrawalCertificate,
+    WithdrawalId, WithdrawalRequest, WITHDRAWAL_AUTH_DOMAIN, WITHDRAWAL_DOMAIN,
 };
 
 /// Crate identity, used by the node composition root for a startup manifest.

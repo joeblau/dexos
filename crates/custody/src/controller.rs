@@ -353,8 +353,8 @@ impl CustodyController<SoftSigner> {
 mod tests {
     use super::*;
     use crate::chain::WalletAddress;
-    use crate::withdrawal::WithdrawalRequest;
-    use crypto::ThresholdSigners;
+    use crate::withdrawal::{withdrawal_authorization_digest, ReservationProof, WithdrawalRequest};
+    use crypto::{MerkleTree, ThresholdSigners};
     use types::AccountId;
 
     fn seeds(n: usize) -> Vec<[u8; 32]> {
@@ -379,27 +379,58 @@ mod tests {
         c
     }
 
-    fn cert(nonce: u64, amount: i128, confirmations: u32) -> WithdrawalCertificate {
+    // Build a certificate whose finalizing checkpoint genuinely commits to the
+    // request's authorization digest via a Merkle inclusion proof, and whose
+    // consensus quorum signs that checkpoint. This mirrors what a correct
+    // sequencer would emit, so `verify_certificate` passes and the controller's
+    // policy/duplicate/signing logic is what the assertions exercise.
+    fn cert_for(req: WithdrawalRequest, confirmations: u32) -> WithdrawalCertificate {
         let cons = consensus();
-        let req = WithdrawalRequest {
-            account: AccountId::new(1),
-            chain: ChainId(1),
-            to: WalletAddress::Evm([0xAB; 20]),
-            amount: Amount::from_raw(amount),
-            nonce,
-        };
-        let checkpoint = Hash::from_bytes([9u8; 32]);
+        let reserved_amount = req.amount;
+        let reservation_seq = SequenceNumber::new(42);
+        let leaf_index = 3usize;
+        let digest = withdrawal_authorization_digest(
+            &req,
+            req.id(),
+            confirmations,
+            reserved_amount,
+            reservation_seq,
+        );
+        let mut tree = MerkleTree::new(8);
+        for i in 0..8usize {
+            tree.set(i, Hash::from_bytes([u8::try_from(i).unwrap() + 0x40; 32]))
+                .unwrap();
+        }
+        tree.set(leaf_index, digest).unwrap();
+        let checkpoint = tree.root();
         let quorum = cons.sign(checkpoint, vec![0, 1, 2]);
         WithdrawalCertificate {
             withdrawal_id: req.id(),
             request: req,
             checkpoint,
             quorum,
-            finalized: true,
             confirmations,
-            ledger_reserved: true,
+            reservation: ReservationProof {
+                reserved_amount,
+                reservation_seq,
+                leaf_index: leaf_index as u64,
+                branch: tree.proof(leaf_index).unwrap(),
+            },
             expiry: SequenceNumber::new(1000),
         }
+    }
+
+    fn cert(nonce: u64, amount: i128, confirmations: u32) -> WithdrawalCertificate {
+        cert_for(
+            WithdrawalRequest {
+                account: AccountId::new(1),
+                chain: ChainId(1),
+                to: WalletAddress::Evm([0xAB; 20]),
+                amount: Amount::from_raw(amount),
+                nonce,
+            },
+            confirmations,
+        )
     }
 
     #[test]
@@ -464,10 +495,18 @@ mod tests {
             c.authorize_withdrawal(&cert(2, 100, 3), &[0, 1, 2], SequenceNumber::new(2)),
             Err(CustodyError::PolicyViolation)
         );
-        // Unknown chain id.
-        let mut bad = cert(3, 100, 6);
-        bad.request.chain = ChainId(999);
-        bad.withdrawal_id = bad.request.id();
+        // Unknown chain id. Build the certificate for chain 999 directly so its
+        // inclusion proof is valid and the controller reaches the policy lookup.
+        let bad = cert_for(
+            WithdrawalRequest {
+                account: AccountId::new(1),
+                chain: ChainId(999),
+                to: WalletAddress::Evm([0xAB; 20]),
+                amount: Amount::from_raw(100),
+                nonce: 3,
+            },
+            6,
+        );
         assert_eq!(
             c.authorize_withdrawal(&bad, &[0, 1, 2], SequenceNumber::new(3)),
             Err(CustodyError::UnknownChain)

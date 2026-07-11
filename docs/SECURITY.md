@@ -10,7 +10,7 @@ externally-supplied byte treated as untrusted.
 | networking ↔ decoding | `codec` decoders are total; malformed/truncated bytes return a typed `CodecError`, never a panic or unchecked allocation. |
 | decoding ↔ command validation | commands are validated (structure, signatures, nonces) before execution. |
 | validation ↔ deterministic execution | the engine only sees validated, sequenced commands; every handler returns a typed `ExecutionError`. |
-| consensus ↔ custody | consensus *authorizes* a finalized withdrawal; custody signers *independently verify* the certificate before signing. Validators ≠ custody signers. |
+| consensus ↔ custody | consensus *authorizes* a finalized withdrawal; custody signers *independently verify* the certificate before signing. Verification re-derives a domain-separated **withdrawal authorization digest** binding the full request (account, chain, destination, amount, nonce), the confirmations, and the ledger reservation (amount + sequence), and requires a Merkle inclusion proof that this digest is committed under the finalizing checkpoint the consensus quorum signed — never a client-supplied `finalized`/`reserved` flag. A quorum over an unrelated checkpoint therefore cannot authorize a withdrawal. Validators ≠ custody signers. |
 | consensus ↔ chain adapters | chain adapters observe/attest deposits; the replicated ledger reserves/debits **before** any external transaction is signed. |
 | full nodes ↔ light nodes | light nodes verify quorum signatures + Merkle proofs and expose an explicit `Verified`/`Unverified` status — never a trusted proxy. |
 | sponsors ↔ protocol governance | sponsor rights are bounded by protocol constraints; slashing only on objectively-measurable faults. |
