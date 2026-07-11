@@ -10,6 +10,7 @@
 
 pub mod config;
 pub mod error;
+pub mod threading;
 
 use std::future::Future;
 

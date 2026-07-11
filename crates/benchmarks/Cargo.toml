@@ -8,8 +8,23 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+# The counting global allocator is installed by default so allocations/op can be
+# reported out of the box (including `cargo test -p benchmarks`). A downstream
+# binary that wants to keep its own `#[global_allocator]` can disable it with
+# `default-features = false`; the allocation columns then read as "unmeasured".
+default = ["count-alloc"]
+count-alloc = []
+
 [dependencies]
 types = { path = "../types" }
 orderbook = { path = "../orderbook" }
 risk = { path = "../risk" }
 execution = { path = "../execution" }
+crypto = { path = "../crypto" }
+codec = { path = "../codec" }
+state-tree = { path = "../state-tree" }
+storage = { path = "../storage" }
+consensus = { path = "../consensus" }
+serde.workspace = true
+thiserror.workspace = true

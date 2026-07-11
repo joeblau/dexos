@@ -92,9 +92,16 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 name = "benchmarks"
 version = "0.0.1"
 dependencies = [
+ "codec",
+ "consensus",
+ "crypto",
  "execution",
  "orderbook",
  "risk",
+ "serde",
+ "state-tree",
+ "storage",
+ "thiserror",
  "types",
 ]
 
@@ -640,8 +647,9 @@ name = "loadgen"
 version = "0.0.1"
 dependencies = [
  "codec",
+ "serde",
  "thiserror",
- "tokio",
+ "toml",
  "types",
 ]
 
@@ -664,7 +672,6 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 name = "market-loadgen"
 version = "0.0.1"
 dependencies = [
- "anyhow",
  "clap",
  "loadgen",
 ]
@@ -674,7 +681,9 @@ name = "marketd"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "benchmarks",
  "clap",
+ "crypto",
  "node",
 ]
 
@@ -770,6 +779,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
  "windows-sys",
+]
+
+[[package]]
+name = "observability"
+version = "0.0.1"
+dependencies = [
+ "thiserror",
+ "types",
 ]
 
 [[package]]
@@ -1046,10 +1063,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "simd"
+version = "0.0.1"
+dependencies = [
+ "crypto",
+ "types",
+]
+
+[[package]]
 name = "simulation"
 version = "0.0.1"
 dependencies = [
+ "codec",
  "consensus",
+ "crypto",
+ "thiserror",
  "types",
 ]
 

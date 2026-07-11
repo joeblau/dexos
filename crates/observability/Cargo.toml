@@ -1,5 +1,5 @@
 [package]
-name = "simulation"
+name = "observability"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,7 +10,4 @@ workspace = true
 
 [dependencies]
 types = { path = "../types" }
-crypto = { path = "../crypto" }
-codec = { path = "../codec" }
-consensus = { path = "../consensus" }
-thiserror = { workspace = true }
+thiserror.workspace = true

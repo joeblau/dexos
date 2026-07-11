@@ -14,5 +14,7 @@ workspace = true
 
 [dependencies]
 node = { path = "../../crates/node" }
+benchmarks = { path = "../../crates/benchmarks" }
+crypto = { path = "../../crates/crypto" }
 clap.workspace = true
 anyhow.workspace = true

@@ -45,6 +45,7 @@
 //! bounded before allocation; and all queues are bounded with explicit
 //! backpressure.
 
+pub mod batch;
 mod channel;
 mod connection;
 mod error;

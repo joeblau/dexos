@@ -160,8 +160,13 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
             Ok(())
         }
         Command::Benchmark(a) => {
+            let report = benchmarks::run_all();
+            let json = benchmarks::render_json(&report);
+            std::fs::write(&a.output, &json)
+                .map_err(|e| anyhow::anyhow!("writing {}: {e}", a.output.display()))?;
+            println!("{}", benchmarks::render_markdown(&report));
             println!(
-                "benchmark: suite='{}' output='{}' [Phase 0 stub — harness lands in the benchmark-suite epic]",
+                "suite='{}' — wrote machine-readable results to {}",
                 a.suite,
                 a.output.display()
             );
@@ -183,13 +188,19 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
             Ok(())
         }
         Command::Keygen(a) => {
-            println!(
-                "keygen: output={} [Phase 0 stub — keygen lands in the crypto epic]",
-                a.output
-                    .as_deref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "<stdout>".to_string())
-            );
+            let mut seed = [0u8; 32];
+            read_entropy(&mut seed);
+            let keypair = crypto::KeyPair::from_seed(&seed);
+            let public_hex = to_hex(&keypair.public());
+            match &a.output {
+                Some(path) => {
+                    std::fs::write(path, to_hex(&seed))
+                        .map_err(|e| anyhow::anyhow!("writing {}: {e}", path.display()))?;
+                    println!("public_key: {public_hex}");
+                    println!("wrote private seed to {}", path.display());
+                }
+                None => println!("public_key: {public_hex}"),
+            }
             Ok(())
         }
         Command::Snapshot(a) => {
@@ -209,6 +220,41 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
             );
             Ok(())
         }
+    }
+}
+
+/// Lowercase hex encoding (no external dep).
+fn to_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// Fill `buf` with entropy from the OS CSPRNG, falling back to a time-seeded
+/// mixer only if `/dev/urandom` is unavailable.
+fn read_entropy(buf: &mut [u8; 32]) {
+    use std::io::Read;
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        if f.read_exact(buf).is_ok() {
+            return;
+        }
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut state = u64::try_from(nanos % u128::from(u64::MAX))
+        .unwrap_or(1)
+        .max(1);
+    for chunk in buf.chunks_mut(8) {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let bytes = state.to_le_bytes();
+        chunk.copy_from_slice(&bytes[..chunk.len()]);
     }
 }
 

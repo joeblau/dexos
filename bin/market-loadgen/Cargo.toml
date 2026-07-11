@@ -15,4 +15,3 @@ workspace = true
 [dependencies]
 loadgen = { path = "../../crates/loadgen" }
 clap.workspace = true
-anyhow.workspace = true

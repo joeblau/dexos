@@ -1,123 +1,104 @@
-//! `loadgen` — distributed load generator engine for DexOS.
+//! `loadgen` — deterministic distributed load-generator engine for DexOS.
 //!
-//! Drives persistent sessions against a target node with a configurable order mix,
-//! cancel ratio, burst pattern, and injected loss/latency, capturing full-path
-//! timestamps. Phase 0 ships the configuration surface and a runnable stub; later
-//! phases implement the session drivers and measurement pipeline.
+//! The crate drives a configurable population of virtual users across multiple regions
+//! against a target node, with a tunable order mix, cancel/replace ratio, burst
+//! pattern, network impairment (loss, duplication, reordering, latency), adversarial
+//! frame injection, oracle-update and market-data workloads, and clock-synchronised
+//! full-path timestamping.
 //!
-//! Not part of the deterministic core, so floating-point knobs (e.g. cancel ratio)
-//! are permitted here.
+//! The core planning and measurement logic is **synchronous and deterministic**: every
+//! stochastic decision comes from a seeded [`Lcg`], so two runs with the same
+//! [`LoadScenario`] produce a bit-identical command sequence and equivalent aggregate
+//! latency percentiles. This makes runs reproducible in tests and CI without pulling in
+//! `rand`, `criterion`, or an async runtime.
+//!
+//! # Layout
+//! - [`config`] — the [`LoadConfig`]/[`LoadScenario`] surface and TOML parsing.
+//! - [`command`] — virtual-user sessions and generated commands.
+//! - [`timing`] — the ten-stage full-path timestamp pipeline.
+//! - [`metrics`] — fixed-capacity sampling and integer percentile aggregation.
+//! - [`impairment`] — network-impairment and adversarial-frame injection.
+//! - [`workload`] — oracle-update and market-data subscriber drivers.
+//! - [`engine`] — the simulation runner and [`LoadReport`].
+//!
+//! `loadgen` is not part of the deterministic execution core, so the CLI-facing
+//! [`LoadConfig::cancel_ratio`] is an `f64`; it is converted once to a fixed-point
+//! [`types::Ratio`] at the configuration boundary and the engine is integer-only
+//! thereafter.
 
-use std::time::Duration;
+pub mod command;
+pub mod config;
+pub mod engine;
+pub mod impairment;
+pub mod metrics;
+pub mod rng;
+pub mod timing;
+pub mod util;
+pub mod workload;
 
 /// Crate identity, used by the node composition root for a startup manifest.
 pub const CRATE_NAME: &str = "loadgen";
 
-/// A parsed, validated load-generation plan.
-#[derive(Debug, Clone, PartialEq)]
-pub struct LoadConfig {
-    /// Target node address.
-    pub target: String,
-    /// Number of simulated users / persistent sessions.
-    pub users: u64,
-    /// Market symbol to trade.
-    pub market: String,
-    /// Aggregate order submission rate.
-    pub orders_per_second: u64,
-    /// Fraction of orders that are cancels, in `[0.0, 1.0]`.
-    pub cancel_ratio: f64,
-    /// Total run duration.
-    pub duration: Duration,
-}
-
-/// Summary of a load run.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LoadReport {
-    /// Total orders the plan would submit over its duration.
-    pub planned_orders: u64,
-}
-
-/// Errors from configuring or running the load generator.
-#[derive(Debug, thiserror::Error)]
-pub enum LoadError {
-    /// A configuration value was invalid.
-    #[error("invalid load config: {0}")]
-    Invalid(String),
-    /// The async runtime could not be built.
-    #[error("failed to build async runtime: {0}")]
-    Runtime(#[source] std::io::Error),
-}
-
-impl LoadConfig {
-    /// Validate the plan without running it.
-    pub fn validate(&self) -> Result<(), LoadError> {
-        if !(0.0..=1.0).contains(&self.cancel_ratio) {
-            return Err(LoadError::Invalid(format!(
-                "cancel_ratio {} must be within [0.0, 1.0]",
-                self.cancel_ratio
-            )));
-        }
-        if self.users == 0 {
-            return Err(LoadError::Invalid("users must be greater than zero".into()));
-        }
-        if self.target.is_empty() {
-            return Err(LoadError::Invalid("target must not be empty".into()));
-        }
-        Ok(())
-    }
-
-    /// Orders the plan would submit over its duration.
-    pub fn planned_orders(&self) -> u64 {
-        self.orders_per_second
-            .saturating_mul(self.duration.as_secs())
-    }
-}
-
-/// Build a runtime and run the plan to completion (synchronous entry point).
-pub fn run_blocking(config: LoadConfig) -> Result<LoadReport, LoadError> {
-    config.validate()?;
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(LoadError::Runtime)?;
-    runtime.block_on(async move {
-        // Phase 0 stub: report the plan the driver will execute in later phases.
-        Ok(LoadReport {
-            planned_orders: config.planned_orders(),
-        })
-    })
-}
+pub use command::{CommandKind, GeneratedCommand, SessionState};
+pub use config::{
+    ratio_from_unit_f64, Adversarial, BurstKind, BurstPattern, ClockMethod, ConfigError,
+    Impairment, LoadConfig, LoadScenario, MarketDataWorkload, OracleWorkload, OrderMix,
+    RegionConfig,
+};
+pub use engine::{run_blocking, run_scenario, LoadError, LoadReport, RegionReport, SyncBarrier};
+pub use impairment::{AdversarialGenerator, DedupSet, Impairer, PacketDisposition};
+pub use metrics::{percentile_permille, Percentiles, SampleSet};
+pub use rng::Lcg;
+pub use timing::{ClockStamp, FullPathTimestamps, Stage, TimingError, STAGE_COUNT};
+pub use workload::{
+    oracle_outranks_orders, oracle_update_count, oracle_update_time_ns, SubscriberState,
+};
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn cfg() -> LoadConfig {
-        LoadConfig {
-            target: "127.0.0.1:9000".into(),
-            users: 100,
-            market: "BTC-PERP".into(),
-            orders_per_second: 1000,
-            cancel_ratio: 0.7,
-            duration: Duration::from_secs(60),
+    #[test]
+    fn crate_name_is_stable() {
+        assert_eq!(CRATE_NAME, "loadgen");
+    }
+
+    #[test]
+    fn end_to_end_smoke() {
+        let scenario = LoadScenario {
+            seed: 7,
+            orders_per_second: 200,
+            duration_secs: 3,
+            ..LoadScenario::default()
+        };
+        let report = run_scenario(&scenario).unwrap();
+        assert_eq!(report.planned_orders, 600);
+        assert!(report.end_to_end.count > 0);
+        assert!(!report.to_json().is_empty());
+    }
+
+    /// Deterministic LCG-driven property test: for a corpus of random scenarios, two
+    /// runs with the same scenario are always bit-identical, and reports never panic.
+    #[test]
+    fn property_reproducible_over_random_corpus() {
+        let mut r = Lcg::new(0x5EED_1234);
+        for _ in 0..64 {
+            let scenario = LoadScenario {
+                seed: r.next_u64(),
+                orders_per_second: r.below(1000),
+                duration_secs: 1 + r.below(5),
+                market_count: 1 + u32::try_from(r.below(8)).unwrap_or(0),
+                cancel_ratio: types::Ratio::from_raw(i64::try_from(r.below(500_000)).unwrap_or(0)),
+                sample_capacity: 1 + usize::try_from(r.below(2000)).unwrap_or(0),
+                ..LoadScenario::default()
+            };
+            if scenario.validate().is_err() {
+                continue;
+            }
+            let a = run_scenario(&scenario).unwrap();
+            let b = run_scenario(&scenario).unwrap();
+            assert_eq!(a.command_sequence_hash, b.command_sequence_hash);
+            assert_eq!(a.to_json(), b.to_json());
         }
-    }
-
-    #[test]
-    fn planned_orders_is_rate_times_duration() {
-        assert_eq!(cfg().planned_orders(), 60_000);
-    }
-
-    #[test]
-    fn rejects_out_of_range_cancel_ratio() {
-        let mut c = cfg();
-        c.cancel_ratio = 1.5;
-        assert!(c.validate().is_err());
-    }
-
-    #[test]
-    fn run_blocking_reports_plan() {
-        let report = run_blocking(cfg()).unwrap();
-        assert_eq!(report.planned_orders, 60_000);
     }
 }
