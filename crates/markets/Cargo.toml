@@ -10,6 +10,9 @@ workspace = true
 
 [dependencies]
 types = { path = "../types" }
-execution = { path = "../execution" }
-orderbook = { path = "../orderbook" }
+crypto = { path = "../crypto" }
 risk = { path = "../risk" }
+orderbook = { path = "../orderbook" }
+serde.workspace = true
+thiserror.workspace = true
+postcard.workspace = true
