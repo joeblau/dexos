@@ -17,3 +17,6 @@ state-tree = { path = "../state-tree" }
 crypto = { path = "../crypto" }
 serde.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+hex.workspace = true

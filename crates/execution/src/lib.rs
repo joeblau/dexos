@@ -29,11 +29,74 @@ pub const CRATE_NAME: &str = "execution";
 mod tests {
     use super::*;
     use types::{
-        Amount, MarketType, OrderId, OrderType, Price, Quantity, SequenceNumber, Side, TimeInForce,
+        AccountId, Amount, MarketId, MarketType, OrderId, OrderType, Price, Quantity,
+        SequenceNumber, Side, TimeInForce,
     };
 
     fn engine() -> Engine {
         Engine::new(EngineConfig::default())
+    }
+
+    // A perp market at mark 1.0 with two 100.0-collateral accounts, then a
+    // realized-PnL cycle followed by a withdrawal. Account 0 is the maker,
+    // account 1 the taker. The taker opens a short at 1.0, buys 1 back at 1.1
+    // (realizing a 0.1 loss into risk collateral only — the settlement ledger is
+    // untouched by fills), then withdraws 10.0. This is the "withdraw after
+    // trade" divergence scenario from the acceptance criteria.
+    fn trade_and_withdraw_script() -> Vec<Command> {
+        let market = MarketId::new(0);
+        let (maker, taker) = (AccountId::new(0), AccountId::new(1));
+        let order = |account, order_id, side, price, qty| {
+            Command::PlaceOrder(PlaceOrder {
+                account,
+                market,
+                order_id: OrderId::new(order_id),
+                side,
+                order_type: OrderType::Limit,
+                tif: TimeInForce::Gtc,
+                price: Price::from_raw(price),
+                quantity: Quantity::from_raw(qty),
+                client_id: order_id,
+                reduce_only: false,
+            })
+        };
+        vec![
+            Command::CreateAccount(CreateAccount {
+                initial_collateral: amt(100_000_000),
+            }),
+            Command::CreateAccount(CreateAccount {
+                initial_collateral: amt(100_000_000),
+            }),
+            Command::CreateMarket(CreateMarket {
+                market,
+                market_type: MarketType::Perpetual,
+                outcomes: 1,
+                mark_price: Price::from_raw(1_000_000),
+            }),
+            // Maker rests a bid; taker crosses -> maker long 2, taker short 2.
+            order(maker, 1, Side::Bid, 1_000_000, 2_000_000),
+            order(taker, 2, Side::Ask, 1_000_000, 2_000_000),
+            // Maker rests an ask at 1.1; taker buys 1 back -> realizes PnL.
+            order(maker, 3, Side::Ask, 1_100_000, 1_000_000),
+            order(taker, 4, Side::Bid, 1_100_000, 1_000_000),
+            // Taker withdraws 10.0 after the trade.
+            Command::RequestWithdrawal(RequestWithdrawal {
+                account: taker,
+                amount: amt(10_000_000),
+                nonce: 1,
+                destination_chain: 1,
+                destination_address: vec![1, 2, 3],
+            }),
+        ]
+    }
+
+    // Build a fresh engine and apply `cmds`, panicking on any failure.
+    fn apply_all(cmds: &[Command]) -> Engine {
+        let mut e = engine();
+        for (i, c) in cmds.iter().enumerate() {
+            e.execute(seq(i as u64 + 1), c.clone()).expect("apply");
+        }
+        e
     }
 
     fn seq(n: u64) -> SequenceNumber {
@@ -413,6 +476,228 @@ mod tests {
             ),
             Err(ExecutionError::UnknownMarket)
         );
+    }
+
+    // --- Unified committed economic state (positions + risk + ledger) ---
+
+    // Acceptance criterion: a post-trade account leaf changes when the account's
+    // position (and hence its risk state) changes.
+    #[test]
+    fn post_trade_account_leaf_and_root_change_with_position() {
+        let mut e = engine();
+        e.execute(
+            seq(1),
+            Command::CreateAccount(CreateAccount {
+                initial_collateral: amt(100_000_000),
+            }),
+        )
+        .unwrap();
+        e.execute(
+            seq(2),
+            Command::CreateAccount(CreateAccount {
+                initial_collateral: amt(100_000_000),
+            }),
+        )
+        .unwrap();
+        e.execute(
+            seq(3),
+            Command::CreateMarket(CreateMarket {
+                market: MarketId::new(0),
+                market_type: MarketType::Perpetual,
+                outcomes: 1,
+                mark_price: Price::from_raw(1_000_000),
+            }),
+        )
+        .unwrap();
+        let taker = AccountId::new(1);
+        // Committed leaf and root before the taker holds any position.
+        let leaf_before = e.account_leaf(taker).unwrap();
+        let root_before = e.state_root();
+
+        // Maker rests a bid; taker crosses with an ask -> both gain a position.
+        e.execute(
+            seq(4),
+            Command::PlaceOrder(PlaceOrder {
+                account: AccountId::new(0),
+                market: MarketId::new(0),
+                order_id: OrderId::new(1),
+                side: Side::Bid,
+                order_type: OrderType::Limit,
+                tif: TimeInForce::Gtc,
+                price: Price::from_raw(1_000_000),
+                quantity: Quantity::from_raw(2_000_000),
+                client_id: 1,
+                reduce_only: false,
+            }),
+        )
+        .unwrap();
+        e.execute(
+            seq(5),
+            Command::PlaceOrder(PlaceOrder {
+                account: taker,
+                market: MarketId::new(0),
+                order_id: OrderId::new(2),
+                side: Side::Ask,
+                order_type: OrderType::Limit,
+                tif: TimeInForce::Gtc,
+                price: Price::from_raw(1_000_000),
+                quantity: Quantity::from_raw(2_000_000),
+                client_id: 2,
+                reduce_only: false,
+            }),
+        )
+        .unwrap();
+
+        let leaf_after = e.account_leaf(taker).unwrap();
+        assert_ne!(
+            leaf_before, leaf_after,
+            "a new position must change the committed account leaf"
+        );
+        assert_ne!(
+            root_before,
+            e.state_root(),
+            "a trade must change the committed state root"
+        );
+    }
+
+    // Acceptance criterion: a light-client Merkle proof verifies trading balances
+    // (position + risk + ledger) against the shard root.
+    #[test]
+    fn light_client_proof_verifies_trading_balances() {
+        use state_tree::verify_account;
+        let e = apply_all(&trade_and_withdraw_script());
+        let taker = AccountId::new(1);
+
+        let root = e.state_root();
+        let leaf = e.account_leaf(taker).unwrap();
+        let proof = e.account_proof(taker).unwrap();
+
+        assert!(
+            verify_account(root, taker, &leaf, &proof),
+            "the committed trading leaf must verify against the shard root"
+        );
+
+        // Tampering any leaf byte (here the position/claim tail) breaks the proof.
+        let mut tampered = leaf.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0x01;
+        assert!(
+            !verify_account(root, taker, &tampered, &proof),
+            "a tampered trading leaf must not verify"
+        );
+    }
+
+    // Acceptance criterion: identical command streams (including fills, realized
+    // PnL, and a withdrawal) produce identical full economic state roots.
+    #[test]
+    fn identical_streams_yield_identical_full_economic_roots() {
+        let script = trade_and_withdraw_script();
+        let a = run(&script);
+        let b = run(&script);
+        assert_eq!(
+            a, b,
+            "identical command streams must yield identical economic state roots"
+        );
+        assert!(!a.is_zero());
+
+        // The trade genuinely moves the root: dropping the fills yields a
+        // different root even though the ledger deposits are identical.
+        let no_trade = vec![
+            Command::CreateAccount(CreateAccount {
+                initial_collateral: amt(100_000_000),
+            }),
+            Command::CreateAccount(CreateAccount {
+                initial_collateral: amt(100_000_000),
+            }),
+            Command::CreateMarket(CreateMarket {
+                market: MarketId::new(0),
+                market_type: MarketType::Perpetual,
+                outcomes: 1,
+                mark_price: Price::from_raw(1_000_000),
+            }),
+        ];
+        assert_ne!(
+            a,
+            run(&no_trade),
+            "positions and risk state must be reflected in the economic root"
+        );
+    }
+
+    // Acceptance criterion: no dual-ledger divergence under withdraw after trade.
+    // The realized loss moves risk collateral but not the settlement ledger; the
+    // committed leaf pins BOTH consistently, so a light client can never be shown
+    // a balance that disagrees with the trading state.
+    #[test]
+    fn no_dual_ledger_divergence_under_withdraw_after_trade() {
+        use state_tree::{verify_account, LeafReader};
+        let script = trade_and_withdraw_script();
+        let e = apply_all(&script);
+        let taker = AccountId::new(1);
+
+        // The committed leaf verifies against the shard root.
+        let root = e.state_root();
+        let leaf = e.account_leaf(taker).unwrap();
+        let proof = e.account_proof(taker).unwrap();
+        assert!(verify_account(root, taker, &leaf, &proof));
+
+        // Decode the leaf prefix and confirm it is a single, consistent snapshot
+        // of both ledgers rather than two divergent views.
+        let mut r = LeafReader::new(&leaf).unwrap();
+        let available = r.field_i128().unwrap();
+        let reserved = r.field_i128().unwrap();
+        let _locked = r.field_i128().unwrap();
+        let _auth_epoch = r.field_i64().unwrap();
+        let collateral = r.field_i128().unwrap();
+
+        // Ledger: 100.0 - 10.0 reserved for withdrawal.
+        assert_eq!(available, 90_000_000);
+        assert_eq!(reserved, 10_000_000);
+        assert_eq!(available, e.ledger().available(taker).unwrap().raw());
+        assert_eq!(reserved, e.ledger().reserved(taker).unwrap().raw());
+
+        // Risk collateral: 100.0 - 0.1 realized loss - 10.0 debited on withdrawal.
+        assert_eq!(collateral, 89_900_000);
+        assert_eq!(collateral, e.risk().collateral(taker).unwrap().raw());
+
+        // The divergence between settlement (available) and risk (collateral) is
+        // committed and verifiable — not hidden outside the root.
+        assert_ne!(available, collateral);
+
+        // Replay determinism holds across the full trade+withdraw stream.
+        assert_eq!(run(&script), root);
+    }
+
+    // Recommendation: golden vector pinning the committed account leaf layout so
+    // any silent field-layout drift is caught. A freshly created 5.0-collateral
+    // account has no positions or claims and no mark price, so equity == 5.0 and
+    // all margins are zero.
+    #[test]
+    fn account_leaf_layout_golden() {
+        let mut e = engine();
+        e.execute(
+            seq(1),
+            Command::CreateAccount(CreateAccount {
+                initial_collateral: amt(5_000_000),
+            }),
+        )
+        .unwrap();
+        let leaf = e.account_leaf(AccountId::new(0)).unwrap();
+        // version=1 | available 5.0 | reserved 0 | locked 0 | auth_epoch 0
+        // | collateral 5.0 | equity 5.0 | exposure 0 | im 0 | mm 0
+        // | position_count 0 | claim_group_count 0
+        let expected = "0100\
+                        404b4c00000000000000000000000000\
+                        00000000000000000000000000000000\
+                        00000000000000000000000000000000\
+                        0000000000000000\
+                        404b4c00000000000000000000000000\
+                        404b4c00000000000000000000000000\
+                        00000000000000000000000000000000\
+                        00000000000000000000000000000000\
+                        00000000000000000000000000000000\
+                        00000000\
+                        00000000";
+        assert_eq!(hex::encode(&leaf), expected);
     }
 
     #[test]

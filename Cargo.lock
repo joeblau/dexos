@@ -516,6 +516,7 @@ name = "execution"
 version = "0.0.1"
 dependencies = [
  "crypto",
+ "hex",
  "orderbook",
  "risk",
  "serde",

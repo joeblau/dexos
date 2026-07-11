@@ -113,8 +113,68 @@ impl Engine {
             .unwrap_or(Quantity::ZERO)
     }
 
+    /// The full committed leaf for `account`: settlement ledger balances, auth
+    /// epoch, risk collateral and the derived margin columns, open positions, and
+    /// outcome claims — the complete economic state a light client verifies
+    /// against the shard root.
+    ///
+    /// Positions and claim sets are emitted in ascending market order, and flat
+    /// positions / fully-redeemed (all-zero) claim sets are omitted, so the leaf
+    /// is canonical over economic state: replaying an identical command stream
+    /// reproduces bit-identical leaves and roots regardless of map iteration
+    /// order.
+    pub fn account_leaf(&self, account: AccountId) -> Result<Vec<u8>, ExecutionError> {
+        let mut w = LeafWriter::new();
+        // Settlement ledger: available / reserved / locked / auth epoch.
+        self.ledger.write_account_fields(account, &mut w)?;
+        // Risk authority: collateral plus the derived equity/exposure/margin
+        // columns, so trading state is committed alongside the ledger and the two
+        // cannot silently diverge.
+        w.field_i128(self.risk.collateral(account)?.raw())
+            .field_i128(self.risk.equity(account)?.raw())
+            .field_i128(self.risk.exposure(account)?.raw())
+            .field_i128(self.risk.initial_margin(account)?.raw())
+            .field_i128(self.risk.maintenance_margin(account)?.raw());
+        // Open positions, ascending by market; flats omitted.
+        let mut positions: Vec<(u32, i64)> = Vec::new();
+        for (&(a, m), qty) in &self.positions {
+            if a == account.get() && qty.raw() != 0 {
+                positions.push((m, qty.raw()));
+            }
+        }
+        positions.sort_unstable_by_key(|&(m, _)| m);
+        w.field_u32(u32::try_from(positions.len()).unwrap_or(u32::MAX));
+        for (m, qty) in &positions {
+            w.field_u32(*m).field_i64(*qty);
+        }
+        // Outcome claims, ascending by market; fully-redeemed sets omitted.
+        let mut claims: Vec<(u32, &[Amount])> = Vec::new();
+        for (&(a, m), amounts) in &self.claims {
+            if a == account.get() && amounts.iter().any(|v| v.raw() != 0) {
+                claims.push((m, amounts.as_slice()));
+            }
+        }
+        claims.sort_unstable_by_key(|&(m, _)| m);
+        w.field_u32(u32::try_from(claims.len()).unwrap_or(u32::MAX));
+        for (m, amounts) in &claims {
+            w.field_u32(*m)
+                .field_u32(u32::try_from(amounts.len()).unwrap_or(u32::MAX));
+            for v in *amounts {
+                w.field_i128(v.raw());
+            }
+        }
+        Ok(w.finish())
+    }
+
+    /// A light-client inclusion proof for `account`'s committed leaf against the
+    /// shard [`DeterministicEngine::state_root`]. Verify it with
+    /// [`state_tree::verify_account`] using the bytes from [`Self::account_leaf`].
+    pub fn account_proof(&self, account: AccountId) -> Result<Vec<Hash>, ExecutionError> {
+        Ok(self.tree.account_proof(account)?)
+    }
+
     fn commit_account(&mut self, account: AccountId) -> Result<(), ExecutionError> {
-        let leaf = self.ledger.account_leaf(account)?;
+        let leaf = self.account_leaf(account)?;
         self.tree.set_account(account, &leaf)?;
         Ok(())
     }

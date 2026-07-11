@@ -171,15 +171,35 @@ impl Ledger {
         Ok(self.auth_epoch[i])
     }
 
-    /// Canonical leaf bytes for the account's commitment.
-    pub fn account_leaf(&self, account: AccountId) -> Result<Vec<u8>, ExecutionError> {
+    /// Append this account's canonical ledger fields — `available`, `reserved`,
+    /// `locked`, and `auth_epoch` — to `writer`, without emitting a version tag
+    /// of its own.
+    ///
+    /// The engine composes these fields with risk collateral, positions, and
+    /// claims into a single committed account leaf (see
+    /// [`crate::Engine::account_leaf`]), so settlement and trading state share
+    /// one verifiable commitment rather than living in separate ledgers.
+    pub fn write_account_fields(
+        &self,
+        account: AccountId,
+        writer: &mut LeafWriter,
+    ) -> Result<(), ExecutionError> {
         let i = self.idx(account)?;
-        Ok(LeafWriter::new()
+        writer
             .field_i128(self.available[i].raw())
             .field_i128(self.reserved[i].raw())
             .field_i128(self.locked[i].raw())
-            .field_i64(i64::from_le_bytes(self.auth_epoch[i].to_le_bytes()))
-            .finish())
+            .field_i64(i64::from_le_bytes(self.auth_epoch[i].to_le_bytes()));
+        Ok(())
+    }
+
+    /// Canonical leaf bytes for the account's ledger-only commitment (balances
+    /// and auth epoch). The engine's committed leaf additionally folds in risk
+    /// collateral, positions, and claims.
+    pub fn account_leaf(&self, account: AccountId) -> Result<Vec<u8>, ExecutionError> {
+        let mut writer = LeafWriter::new();
+        self.write_account_fields(account, &mut writer)?;
+        Ok(writer.finish())
     }
 
     /// Verify the conservation invariant (used by tests).
