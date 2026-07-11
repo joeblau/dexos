@@ -100,7 +100,12 @@ impl TwapAccumulator {
     /// Fold the interval `[from, to)` carrying `price` into the accumulator,
     /// clamped to the window. Pure scalar arithmetic; never allocates.
     #[inline]
-    fn fold_interval(&mut self, from: u64, to: u64, price: Price) -> Result<(), DecisionMarketError> {
+    fn fold_interval(
+        &mut self,
+        from: u64,
+        to: u64,
+        price: Price,
+    ) -> Result<(), DecisionMarketError> {
         let lo = from.max(self.window.start);
         let hi = to.min(self.window.end);
         if hi <= lo {
@@ -168,7 +173,10 @@ pub fn time_weighted_average(
     let mut sorted = ticks.to_vec();
     // Canonicalize by (timestamp, price) so ties break deterministically and the
     // result is independent of input ordering even with duplicate timestamps.
-    sorted.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.price.raw().cmp(&b.price.raw())));
+    sorted.sort_by(|a, b| {
+        a.ts.cmp(&b.ts)
+            .then_with(|| a.price.raw().cmp(&b.price.raw()))
+    });
     let mut acc = TwapAccumulator::new(window);
     for tick in &sorted {
         acc.observe(tick.ts, tick.price)?;

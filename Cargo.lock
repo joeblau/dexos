@@ -130,6 +130,8 @@ name = "chain-adapter"
 version = "0.0.1"
 dependencies = [
  "crypto",
+ "serde",
+ "thiserror",
  "types",
 ]
 
@@ -318,6 +320,10 @@ name = "custody"
 version = "0.0.1"
 dependencies = [
  "crypto",
+ "hex",
+ "k256",
+ "serde",
+ "thiserror",
  "types",
 ]
 
@@ -325,7 +331,9 @@ dependencies = [
 name = "decision-markets"
 version = "0.0.1"
 dependencies = [
- "markets",
+ "crypto",
+ "serde",
+ "thiserror",
  "types",
 ]
 
@@ -674,9 +682,12 @@ dependencies = [
 name = "markets"
 version = "0.0.1"
 dependencies = [
- "execution",
+ "crypto",
  "orderbook",
+ "postcard",
  "risk",
+ "serde",
+ "thiserror",
  "types",
 ]
 
@@ -778,6 +789,10 @@ name = "oracle"
 version = "0.0.1"
 dependencies = [
  "crypto",
+ "hex",
+ "postcard",
+ "serde",
+ "thiserror",
  "types",
 ]
 
@@ -824,7 +839,10 @@ dependencies = [
 name = "prediction-markets"
 version = "0.0.1"
 dependencies = [
- "markets",
+ "crypto",
+ "postcard",
+ "serde",
+ "thiserror",
  "types",
 ]
 

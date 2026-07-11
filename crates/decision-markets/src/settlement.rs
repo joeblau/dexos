@@ -17,7 +17,10 @@ pub struct Settlement {
 }
 
 impl Settlement {
-    pub(crate) fn new(payouts: BTreeMap<(ActionId, AccountId), Amount>, total_paid: Amount) -> Self {
+    pub(crate) fn new(
+        payouts: BTreeMap<(ActionId, AccountId), Amount>,
+        total_paid: Amount,
+    ) -> Self {
         Self {
             payouts,
             total_paid,

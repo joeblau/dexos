@@ -104,10 +104,18 @@ mod tests {
         // par 1.0/set; mint 5 sets in action 0, 2 sets in action 1.
         let mut m = DecisionMarket::new(definition(UnselectedActionPolicy::Void)).unwrap();
         m.open_trading().unwrap();
-        m.mint(ActionId::new(0), AccountId::new(1), Quantity::from_raw(5_000_000))
-            .unwrap();
-        m.mint(ActionId::new(1), AccountId::new(2), Quantity::from_raw(2_000_000))
-            .unwrap();
+        m.mint(
+            ActionId::new(0),
+            AccountId::new(1),
+            Quantity::from_raw(5_000_000),
+        )
+        .unwrap();
+        m.mint(
+            ActionId::new(1),
+            AccountId::new(2),
+            Quantity::from_raw(2_000_000),
+        )
+        .unwrap();
         assert_eq!(
             m.worst_case_liability(ActionId::new(0)).unwrap(),
             Amount::from_raw(5_000_000)
@@ -125,8 +133,13 @@ mod tests {
         // Only a tiny amount of liquidity.
         m.mint(ActionId::new(0), AccountId::new(1), Quantity::from_raw(1))
             .unwrap();
-        m.observe_price(ActionId::new(0), OutcomeId::new(0), 0, Price::from_raw(600_000))
-            .unwrap();
+        m.observe_price(
+            ActionId::new(0),
+            OutcomeId::new(0),
+            0,
+            Price::from_raw(600_000),
+        )
+        .unwrap();
         m.lock_decision().unwrap();
         let guards = DecisionGuards::new(Amount::from_raw(1_000_000_000), Ratio::ONE);
         assert_eq!(
@@ -141,10 +154,18 @@ mod tests {
         let mut m = DecisionMarket::new(definition(UnselectedActionPolicy::Refund)).unwrap();
         m.open_trading().unwrap();
         // One account holds everything -> 100% concentration.
-        m.mint(ActionId::new(0), AccountId::new(1), Quantity::from_raw(10_000_000))
-            .unwrap();
-        m.mint(ActionId::new(1), AccountId::new(1), Quantity::from_raw(10_000_000))
-            .unwrap();
+        m.mint(
+            ActionId::new(0),
+            AccountId::new(1),
+            Quantity::from_raw(10_000_000),
+        )
+        .unwrap();
+        m.mint(
+            ActionId::new(1),
+            AccountId::new(1),
+            Quantity::from_raw(10_000_000),
+        )
+        .unwrap();
         m.lock_decision().unwrap();
         // Limit 50%.
         let guards = DecisionGuards::new(Amount::ZERO, Ratio::from_raw(500_000));
@@ -162,19 +183,47 @@ mod tests {
         let mut m = DecisionMarket::new(definition(UnselectedActionPolicy::Refund)).unwrap();
         m.open_trading().unwrap();
         // action 0: account 1 mints 4 sets; action 1: account 2 mints 6 sets.
-        m.mint(ActionId::new(0), AccountId::new(1), Quantity::from_raw(4_000_000))
-            .unwrap();
-        m.mint(ActionId::new(1), AccountId::new(2), Quantity::from_raw(6_000_000))
-            .unwrap();
+        m.mint(
+            ActionId::new(0),
+            AccountId::new(1),
+            Quantity::from_raw(4_000_000),
+        )
+        .unwrap();
+        m.mint(
+            ActionId::new(1),
+            AccountId::new(2),
+            Quantity::from_raw(6_000_000),
+        )
+        .unwrap();
         // Decision prices: action 0 favors outcome up (0.9), action 1 favors down.
-        m.observe_price(ActionId::new(0), OutcomeId::new(0), 0, Price::from_raw(900_000))
-            .unwrap();
-        m.observe_price(ActionId::new(0), OutcomeId::new(1), 0, Price::from_raw(100_000))
-            .unwrap();
-        m.observe_price(ActionId::new(1), OutcomeId::new(0), 0, Price::from_raw(100_000))
-            .unwrap();
-        m.observe_price(ActionId::new(1), OutcomeId::new(1), 0, Price::from_raw(900_000))
-            .unwrap();
+        m.observe_price(
+            ActionId::new(0),
+            OutcomeId::new(0),
+            0,
+            Price::from_raw(900_000),
+        )
+        .unwrap();
+        m.observe_price(
+            ActionId::new(0),
+            OutcomeId::new(1),
+            0,
+            Price::from_raw(100_000),
+        )
+        .unwrap();
+        m.observe_price(
+            ActionId::new(1),
+            OutcomeId::new(0),
+            0,
+            Price::from_raw(100_000),
+        )
+        .unwrap();
+        m.observe_price(
+            ActionId::new(1),
+            OutcomeId::new(1),
+            0,
+            Price::from_raw(900_000),
+        )
+        .unwrap();
         m.lock_decision().unwrap();
         let chosen = m.select_auto(lenient_guards()).unwrap();
         // Action 0 EU = 0.9 * 10 = 9.0 > Action 1 EU = 0.1 * 10 = 1.0.
@@ -202,8 +251,12 @@ mod tests {
         let mut m = DecisionMarket::new(definition(UnselectedActionPolicy::Void)).unwrap();
         m.open_trading().unwrap();
         // action 1 (unchosen): account 1 mints 2 sets then sells 2 "up" shares to account 2.
-        m.mint(ActionId::new(1), AccountId::new(1), Quantity::from_raw(2_000_000))
-            .unwrap();
+        m.mint(
+            ActionId::new(1),
+            AccountId::new(1),
+            Quantity::from_raw(2_000_000),
+        )
+        .unwrap();
         m.transfer(
             ActionId::new(1),
             OutcomeId::new(0),
@@ -213,16 +266,40 @@ mod tests {
         )
         .unwrap();
         // action 0 (chosen) liquidity so it can win.
-        m.mint(ActionId::new(0), AccountId::new(3), Quantity::from_raw(1_000_000))
-            .unwrap();
-        m.observe_price(ActionId::new(0), OutcomeId::new(0), 0, Price::from_raw(900_000))
-            .unwrap();
-        m.observe_price(ActionId::new(0), OutcomeId::new(1), 0, Price::from_raw(100_000))
-            .unwrap();
-        m.observe_price(ActionId::new(1), OutcomeId::new(0), 0, Price::from_raw(100_000))
-            .unwrap();
-        m.observe_price(ActionId::new(1), OutcomeId::new(1), 0, Price::from_raw(100_000))
-            .unwrap();
+        m.mint(
+            ActionId::new(0),
+            AccountId::new(3),
+            Quantity::from_raw(1_000_000),
+        )
+        .unwrap();
+        m.observe_price(
+            ActionId::new(0),
+            OutcomeId::new(0),
+            0,
+            Price::from_raw(900_000),
+        )
+        .unwrap();
+        m.observe_price(
+            ActionId::new(0),
+            OutcomeId::new(1),
+            0,
+            Price::from_raw(100_000),
+        )
+        .unwrap();
+        m.observe_price(
+            ActionId::new(1),
+            OutcomeId::new(0),
+            0,
+            Price::from_raw(100_000),
+        )
+        .unwrap();
+        m.observe_price(
+            ActionId::new(1),
+            OutcomeId::new(1),
+            0,
+            Price::from_raw(100_000),
+        )
+        .unwrap();
         m.lock_decision().unwrap();
         m.select_auto(lenient_guards()).unwrap();
         m.begin_evaluation().unwrap();
@@ -246,10 +323,18 @@ mod tests {
     fn external_confirmation_rejects_replay_and_bad_action() {
         let mut m = DecisionMarket::new(definition(UnselectedActionPolicy::Refund)).unwrap();
         m.open_trading().unwrap();
-        m.mint(ActionId::new(0), AccountId::new(1), Quantity::from_raw(5_000_000))
-            .unwrap();
-        m.mint(ActionId::new(1), AccountId::new(2), Quantity::from_raw(5_000_000))
-            .unwrap();
+        m.mint(
+            ActionId::new(0),
+            AccountId::new(1),
+            Quantity::from_raw(5_000_000),
+        )
+        .unwrap();
+        m.mint(
+            ActionId::new(1),
+            AccountId::new(2),
+            Quantity::from_raw(5_000_000),
+        )
+        .unwrap();
         m.lock_decision().unwrap();
         // Out-of-range action.
         let bad = ExternalConfirmation::new(ActionId::new(9), types::SequenceNumber::new(1));
@@ -266,7 +351,8 @@ mod tests {
         // Valid confirmation.
         let good = ExternalConfirmation::new(ActionId::new(1), types::SequenceNumber::new(1));
         assert_eq!(
-            m.select_confirmed(&good.encode(), lenient_guards()).unwrap(),
+            m.select_confirmed(&good.encode(), lenient_guards())
+                .unwrap(),
             ActionId::new(1)
         );
         assert_eq!(m.selected_action(), Some(ActionId::new(1)));

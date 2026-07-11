@@ -11,3 +11,9 @@ workspace = true
 [dependencies]
 types = { path = "../types" }
 crypto = { path = "../crypto" }
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+hex.workspace = true
+k256.workspace = true

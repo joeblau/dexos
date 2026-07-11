@@ -323,8 +323,8 @@ impl DecisionMarketDefinition {
         if !r.is_empty() {
             return Err(DecisionMarketError::MalformedDefinition);
         }
-        let selection_window =
-            TimeWindow::new(sel_start, sel_end).map_err(|_| DecisionMarketError::MalformedDefinition)?;
+        let selection_window = TimeWindow::new(sel_start, sel_end)
+            .map_err(|_| DecisionMarketError::MalformedDefinition)?;
         let evaluation_window = TimeWindow::new(eval_start, eval_end)
             .map_err(|_| DecisionMarketError::MalformedDefinition)?;
         let def = Self {

@@ -502,7 +502,13 @@ impl DecisionMarket {
             let market_total = market.total_collateral()?;
             let entries = if action == selected {
                 Self::distribute(market, market_total, |pos| {
-                    i128::from(pos.shares.get(winner).copied().unwrap_or(Quantity::ZERO).raw())
+                    i128::from(
+                        pos.shares
+                            .get(winner)
+                            .copied()
+                            .unwrap_or(Quantity::ZERO)
+                            .raw(),
+                    )
                 })?
             } else {
                 Self::settle_unselected(market, market_total, policy)?
@@ -548,9 +554,7 @@ impl DecisionMarket {
             // Void: complete sets redeem at par to current holders, pro-rata by
             // total shares held.
             UnselectedActionPolicy::Void => {
-                Self::distribute(market, market_total, |pos| {
-                    pos.total_shares().unwrap_or(0)
-                })
+                Self::distribute(market, market_total, |pos| pos.total_shares().unwrap_or(0))
             }
         }
     }

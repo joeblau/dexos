@@ -60,31 +60,78 @@ fn full_lifecycle_from_creation_to_settled_conserves_collateral() {
     m.open_trading().unwrap();
 
     // Fund each contingent market.
-    m.mint(ActionId::new(0), AccountId::new(1), Quantity::from_raw(10_000_000))
-        .unwrap();
-    m.mint(ActionId::new(1), AccountId::new(2), Quantity::from_raw(5_000_000))
-        .unwrap();
-    m.mint(ActionId::new(2), AccountId::new(3), Quantity::from_raw(4_000_000))
-        .unwrap();
+    m.mint(
+        ActionId::new(0),
+        AccountId::new(1),
+        Quantity::from_raw(10_000_000),
+    )
+    .unwrap();
+    m.mint(
+        ActionId::new(1),
+        AccountId::new(2),
+        Quantity::from_raw(5_000_000),
+    )
+    .unwrap();
+    m.mint(
+        ActionId::new(2),
+        AccountId::new(3),
+        Quantity::from_raw(4_000_000),
+    )
+    .unwrap();
     let funded = 10_000_000 + 5_000_000 + 4_000_000;
 
     // Time-weighted decision prices: launch is most likely to succeed.
     // A late spike on "delay" must NOT flip the selection (TWAP, not last tick).
-    m.observe_price(ActionId::new(0), OutcomeId::new(0), 0, Price::from_raw(800_000))
-        .unwrap();
-    m.observe_price(ActionId::new(0), OutcomeId::new(1), 0, Price::from_raw(200_000))
-        .unwrap();
-    m.observe_price(ActionId::new(1), OutcomeId::new(0), 0, Price::from_raw(300_000))
-        .unwrap();
-    m.observe_price(ActionId::new(1), OutcomeId::new(1), 0, Price::from_raw(700_000))
-        .unwrap();
+    m.observe_price(
+        ActionId::new(0),
+        OutcomeId::new(0),
+        0,
+        Price::from_raw(800_000),
+    )
+    .unwrap();
+    m.observe_price(
+        ActionId::new(0),
+        OutcomeId::new(1),
+        0,
+        Price::from_raw(200_000),
+    )
+    .unwrap();
+    m.observe_price(
+        ActionId::new(1),
+        OutcomeId::new(0),
+        0,
+        Price::from_raw(300_000),
+    )
+    .unwrap();
+    m.observe_price(
+        ActionId::new(1),
+        OutcomeId::new(1),
+        0,
+        Price::from_raw(700_000),
+    )
+    .unwrap();
     // Final-tick spike for delay->success at t=999 (1 unit of a 1000-unit window).
-    m.observe_price(ActionId::new(1), OutcomeId::new(0), 999, Price::from_raw(1_000_000))
-        .unwrap();
-    m.observe_price(ActionId::new(2), OutcomeId::new(0), 0, Price::from_raw(100_000))
-        .unwrap();
-    m.observe_price(ActionId::new(2), OutcomeId::new(1), 0, Price::from_raw(900_000))
-        .unwrap();
+    m.observe_price(
+        ActionId::new(1),
+        OutcomeId::new(0),
+        999,
+        Price::from_raw(1_000_000),
+    )
+    .unwrap();
+    m.observe_price(
+        ActionId::new(2),
+        OutcomeId::new(0),
+        0,
+        Price::from_raw(100_000),
+    )
+    .unwrap();
+    m.observe_price(
+        ActionId::new(2),
+        OutcomeId::new(1),
+        0,
+        Price::from_raw(900_000),
+    )
+    .unwrap();
 
     m.lock_decision().unwrap();
     let guards = DecisionGuards::new(Amount::from_raw(1_000_000), Ratio::ONE);
