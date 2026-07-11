@@ -186,16 +186,38 @@ pub struct BasketParams {
 }
 
 /// The scope a session key is authorized to act within.
+///
+/// The scope is least-privilege by construction: every privileged capability is
+/// opt-in. An empty [`markets`](SessionScope::markets) list with
+/// [`all_markets`](SessionScope::all_markets) unset denies trading outright
+/// (deny-all rather than allow-all), and the account-administration and
+/// market-creation flags default to denied. Authorizing and revoking session
+/// keys is never delegable and remains the account root key's exclusive
+/// privilege regardless of these flags.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionScope {
-    /// Authorized markets. Empty means all markets.
+    /// Authorized markets. An empty list denies every market unless
+    /// [`all_markets`](SessionScope::all_markets) is set; there is no implicit
+    /// wildcard.
     pub markets: Vec<MarketId>,
+    /// Explicit wildcard: when `true`, the session may trade any market and the
+    /// [`markets`](SessionScope::markets) allow-list is ignored. Requiring an
+    /// explicit flag prevents an empty list from silently granting all markets.
+    pub all_markets: bool,
     /// Maximum per-command notional.
     pub max_notional: Amount,
     /// Maximum leverage.
     pub max_leverage: Ratio,
     /// Whether the session may request withdrawals.
     pub allow_withdrawal: bool,
+    /// Whether the session may issue delegable account-administration commands
+    /// (currently [`Command::BindWallet`]). Defaults to denied. Session
+    /// authorization and revocation are *not* covered by this flag — they are
+    /// root-key-exclusive and can never be delegated.
+    pub allow_session_admin: bool,
+    /// Whether the session may create markets ([`Command::CreateMarket`]).
+    /// Defaults to denied.
+    pub allow_market_create: bool,
     /// Session expiry (unix millis).
     pub expiry: u64,
 }

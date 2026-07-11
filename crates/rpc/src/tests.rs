@@ -77,9 +77,12 @@ fn sample_submit() -> SubmitOrderParams {
 fn sample_scope(markets: Vec<MarketId>) -> SessionScope {
     SessionScope {
         markets,
+        all_markets: false,
         max_notional: Amount::MAX,
         max_leverage: Ratio::ONE,
         allow_withdrawal: false,
+        allow_session_admin: false,
+        allow_market_create: false,
         expiry: 1_000,
     }
 }
@@ -542,9 +545,12 @@ fn session_validation_rejects_each_class() {
         session_pubkey: [1u8; 32],
         scope: SessionScope {
             markets: vec![m(1)],
+            all_markets: false,
             max_notional: Amount::from_raw(1),
             max_leverage: Ratio::ONE,
             allow_withdrawal: false,
+            allow_session_admin: false,
+            allow_market_create: false,
             expiry: 1_000,
         },
     };
@@ -591,6 +597,157 @@ fn session_validation_rejects_each_class() {
         ok_session.authorize(&sample_submit().to_command(), 0),
         Ok(())
     );
+}
+
+/// The four privileged admin commands. `scope`'s admin flags decide each.
+fn authorize_session_cmd() -> Command {
+    Command::AuthorizeSession {
+        account: a(1),
+        session_pubkey: [9u8; 32],
+        scope: sample_scope(vec![m(1)]),
+    }
+}
+fn revoke_session_cmd() -> Command {
+    Command::RevokeSession {
+        account: a(1),
+        session_pubkey: [9u8; 32],
+    }
+}
+fn bind_wallet_cmd() -> Command {
+    Command::BindWallet {
+        account: a(1),
+        wallet: [2u8; 20],
+        signature: vec![1, 2, 3],
+    }
+}
+fn create_market_cmd() -> Command {
+    Command::CreateMarket {
+        creator: a(1),
+        market_type: MarketType::Perpetual,
+        symbol: "TEST-PERP".to_string(),
+        outcomes: 1,
+    }
+}
+
+/// Acceptance: a trading-scoped session (no admin capability flags set) cannot
+/// authorize new sessions, revoke sessions, bind wallets, or create markets.
+/// Every privileged command class is default-deny.
+#[test]
+fn trading_scoped_session_cannot_perform_admin_commands() {
+    let session = Session {
+        session_pubkey: [1u8; 32],
+        scope: sample_scope(vec![m(1)]),
+    };
+    // sample_scope leaves allow_session_admin / allow_market_create false.
+    for cmd in [
+        authorize_session_cmd(),
+        revoke_session_cmd(),
+        bind_wallet_cmd(),
+        create_market_cmd(),
+    ] {
+        assert_eq!(
+            session.authorize(&cmd, 0),
+            Err(RpcError::Unauthorized),
+            "trading session must not be able to run {cmd:?}"
+        );
+    }
+    // The within-scope trading command it *is* allowed to run still works, so
+    // the deny is specific to admin classes rather than a blanket rejection.
+    assert_eq!(session.authorize(&sample_submit().to_command(), 0), Ok(()));
+}
+
+/// Acceptance: session authorization and revocation are the account root key's
+/// exclusive privilege — they can never be delegated, even to a session that
+/// has been granted the account-admin capability flag.
+#[test]
+fn session_authorize_and_revoke_are_never_delegable() {
+    let mut scope = sample_scope(vec![m(1)]);
+    scope.allow_session_admin = true;
+    scope.allow_market_create = true;
+    let session = Session {
+        session_pubkey: [1u8; 32],
+        scope,
+    };
+    assert_eq!(
+        session.authorize(&authorize_session_cmd(), 0),
+        Err(RpcError::Unauthorized)
+    );
+    assert_eq!(
+        session.authorize(&revoke_session_cmd(), 0),
+        Err(RpcError::Unauthorized)
+    );
+}
+
+/// Acceptance: `allow_session_admin` gates the delegable account-administration
+/// command (`BindWallet`), and `allow_market_create` gates `CreateMarket`. When
+/// set, the corresponding command is permitted while unrelated admin classes
+/// remain denied.
+#[test]
+fn admin_capability_flags_are_independent() {
+    // Only wallet binding is delegated.
+    let mut wallet_scope = sample_scope(vec![m(1)]);
+    wallet_scope.allow_session_admin = true;
+    let wallet_session = Session {
+        session_pubkey: [1u8; 32],
+        scope: wallet_scope,
+    };
+    assert_eq!(wallet_session.authorize(&bind_wallet_cmd(), 0), Ok(()));
+    // Market creation is not granted by the account-admin flag.
+    assert_eq!(
+        wallet_session.authorize(&create_market_cmd(), 0),
+        Err(RpcError::Unauthorized)
+    );
+
+    // Only market creation is delegated.
+    let mut market_scope = sample_scope(vec![m(1)]);
+    market_scope.allow_market_create = true;
+    let market_session = Session {
+        session_pubkey: [2u8; 32],
+        scope: market_scope,
+    };
+    assert_eq!(market_session.authorize(&create_market_cmd(), 0), Ok(()));
+    // Wallet binding is not granted by the market-create flag.
+    assert_eq!(
+        market_session.authorize(&bind_wallet_cmd(), 0),
+        Err(RpcError::Unauthorized)
+    );
+}
+
+/// Acceptance: an empty `markets` allow-list with no wildcard denies all
+/// trading; an explicit market entry or the `all_markets` wildcard is required
+/// before any order is accepted.
+#[test]
+fn empty_markets_scope_denies_trading_until_explicit() {
+    // Empty list, no wildcard -> every market is out of scope.
+    let deny_all = Session {
+        session_pubkey: [1u8; 32],
+        scope: sample_scope(vec![]),
+    };
+    assert_eq!(
+        deny_all.authorize(&sample_submit().to_command(), 0),
+        Err(RpcError::OutOfScope)
+    );
+
+    // Explicit market entry -> that market is now in scope.
+    let listed = Session {
+        session_pubkey: [1u8; 32],
+        scope: sample_scope(vec![m(1)]),
+    };
+    assert_eq!(listed.authorize(&sample_submit().to_command(), 0), Ok(()));
+
+    // Explicit wildcard -> any market is in scope even with an empty list.
+    let mut wildcard_scope = sample_scope(vec![]);
+    wildcard_scope.all_markets = true;
+    let wildcard = Session {
+        session_pubkey: [1u8; 32],
+        scope: wildcard_scope,
+    };
+    let other_market = SubmitOrderParams {
+        market: m(42),
+        ..sample_submit()
+    }
+    .to_command();
+    assert_eq!(wildcard.authorize(&other_market, 0), Ok(()));
 }
 
 // ---------------------------------------------------------------------------

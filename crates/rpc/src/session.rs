@@ -79,16 +79,37 @@ impl Session {
                 }
                 Ok(())
             }
-            // Account-management commands carry no market/notional scope.
-            Command::AuthorizeSession { .. }
-            | Command::RevokeSession { .. }
-            | Command::BindWallet { .. }
-            | Command::CreateMarket { .. } => Ok(()),
+            // Session-key management is the account root key's exclusive
+            // privilege: a delegated session may never mint a new (possibly
+            // broader) session or revoke one, which would otherwise allow a
+            // limited key to escalate its own privileges. This is not gated by
+            // any scope flag — it is unconditionally denied for sessions.
+            Command::AuthorizeSession { .. } | Command::RevokeSession { .. } => {
+                Err(RpcError::Unauthorized)
+            }
+            // Account-administration and market-creation ops are default-deny
+            // and require an explicit capability flag on the scope.
+            Command::BindWallet { .. } => {
+                if self.scope.allow_session_admin {
+                    Ok(())
+                } else {
+                    Err(RpcError::Unauthorized)
+                }
+            }
+            Command::CreateMarket { .. } => {
+                if self.scope.allow_market_create {
+                    Ok(())
+                } else {
+                    Err(RpcError::Unauthorized)
+                }
+            }
         }
     }
 
     fn check_market(&self, market: types::MarketId) -> Result<(), RpcError> {
-        if self.scope.markets.is_empty() || self.scope.markets.contains(&market) {
+        // An empty allow-list denies every market: the wildcard must be granted
+        // explicitly via `all_markets`, so an unconfigured scope never trades.
+        if self.scope.all_markets || self.scope.markets.contains(&market) {
             Ok(())
         } else {
             Err(RpcError::OutOfScope)
