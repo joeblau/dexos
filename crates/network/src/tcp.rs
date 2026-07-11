@@ -226,15 +226,12 @@ fn spawn_connection(
             if frame.msg_type == MSG_TYPE_DATAGRAM {
                 // Best-effort: shed on backpressure or closed receiver.
                 let _ = in_dtx.try_send(frame);
-            } else {
-                match reader_in.try_send(frame) {
-                    Ok(()) => {}
-                    Err(TransportError::Backpressure { .. }) => {
-                        // Inbound reliable queue full: shed per policy
-                        // rather than grow unbounded.
-                    }
-                    Err(_) => break,
-                }
+            } else if reader_in.send(frame).await.is_err() {
+                // Reliable frames are *never* shed: `send` awaits queue space, so
+                // a full inbound queue stops us draining the socket and closes the
+                // peer's TCP window instead of dropping a frame the sender already
+                // observed as delivered. An error means the stream is closed.
+                break;
             }
         }
         reader_in.close();
@@ -401,6 +398,67 @@ mod tests {
         let result = client.connect(&Peer::dial(wrong_id, server_addr)).await;
         assert!(matches!(result, Err(TransportError::AuthFailed)));
         let _ = acceptor.await;
+    }
+
+    #[tokio::test]
+    async fn slow_consumer_never_loses_reliable_frames() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        // Tight per-class queues so the inbound reliable buffer fills quickly and
+        // the reader must stall the peer's TCP window rather than shed frames.
+        let mut c = cfg();
+        c.queue_capacity = 4;
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server = Arc::new(TcpTransport::bind(addr, kp(20), c).await.unwrap());
+        let client = Arc::new(TcpTransport::bind(addr, kp(21), c).await.unwrap());
+        let server_addr = server.local_addr().unwrap();
+        let server_id = server.id();
+
+        let acceptor = {
+            let server = server.clone();
+            tokio::spawn(async move { server.accept().await })
+        };
+        let client_conn = client
+            .connect(&Peer::dial(server_id, server_addr))
+            .await
+            .unwrap();
+        let server_conn = acceptor.await.unwrap().unwrap();
+
+        const N: u64 = 300;
+        // Producer: send N consensus frames, retrying (never dropping) on
+        // backpressure — the sender always eventually succeeds for each frame.
+        let sender = tokio::spawn(async move {
+            for i in 0..N {
+                loop {
+                    match client_conn.send_priority(TrafficClass::Consensus, &i.to_le_bytes()) {
+                        Ok(()) => break,
+                        Err(TransportError::Backpressure { .. }) => tokio::task::yield_now().await,
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+            // Keep the connection alive until the consumer has drained everything.
+            Ok::<_, TransportError>(client_conn)
+        });
+
+        // Slow consumer: pause so the inbound buffer saturates and the reader has
+        // to backpressure the wire, then drain everything and prove nothing was
+        // lost — every consensus frame arrives exactly once, strictly in order.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        for i in 0..N {
+            let frame = timeout(Duration::from_secs(10), server_conn.recv())
+                .await
+                .expect("slow consumer must not lose frames under backpressure")
+                .expect("reliable frame delivered without gap");
+            assert_eq!(frame.class, TrafficClass::Consensus);
+            assert_eq!(
+                frame.payload,
+                i.to_le_bytes(),
+                "consensus frame {i} lost or reordered"
+            );
+        }
+        let _kept_alive = sender.await.unwrap().unwrap();
     }
 
     #[tokio::test]

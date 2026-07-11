@@ -9,9 +9,17 @@
 //!   [`Connection::recv_datagram`]) backed by a bounded `mpsc` channel that
 //!   sheds (returns backpressure) rather than growing under overload.
 //!
-//! Both directions stamp a monotonic per-stream sequence number and apply a
-//! [`ReplayWindow`] on receive, so duplicates and stale replays are suppressed
-//! and each `(sequence)` is delivered at most once.
+//! The **datagram** stream stamps a monotonic per-stream sequence and applies a
+//! sliding [`ReplayWindow`] on receive, so duplicates and stale replays of the
+//! best-effort, unordered path are suppressed.
+//!
+//! The **reliable** stream is different: each [`TrafficClass`] is an independent
+//! strict-FIFO sub-stream (the priority scheduler never reorders within a class,
+//! and the transport never sheds a reliable frame), so its per-class sequence
+//! must arrive contiguously from zero. Receive therefore does exact per-class
+//! gap detection ([`ReliableOrder`]): a duplicate is suppressed, but a *skipped*
+//! sequence means a frame vanished and is surfaced as
+//! [`TransportError::ReliableGap`] with the link torn down — never hidden.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -25,11 +33,64 @@ use crate::channel::AsyncPriorityChannel;
 use crate::error::TransportError;
 use crate::peer::PeerId;
 use crate::replay::ReplayWindow;
+use crate::scheduler::NUM_CLASSES;
 
 /// Reserved `msg_type` marking a frame as an unreliable datagram on transports
 /// that multiplex both streams over one wire (e.g. TCP). Application reliable
 /// messages must not use this value.
 pub const MSG_TYPE_DATAGRAM: u16 = 0xFFFF;
+
+/// The outcome of admitting one reliable frame into [`ReliableOrder`].
+enum Admit {
+    /// A fresh, in-order frame; deliver it.
+    Fresh,
+    /// A duplicate or already-superseded sequence; suppress it.
+    Duplicate,
+    /// A sequence was skipped on an ordered class: `expected` was due next but
+    /// `got` arrived, so a reliable frame was lost.
+    Gap { expected: u64, got: u64 },
+}
+
+/// Per-class, in-order tracking for the reliable stream: duplicate suppression
+/// plus exact gap detection.
+///
+/// Each reliable [`TrafficClass`] is an independent strict-FIFO sub-stream, so a
+/// class's per-class sequence must arrive contiguously starting at zero. A
+/// duplicate/old sequence is suppressed; a *skipped* sequence is reported as a
+/// [`Admit::Gap`] so the caller can tear the link down and resync rather than
+/// silently proceeding past a lost frame.
+#[derive(Debug)]
+struct ReliableOrder {
+    /// Last contiguously-accepted sequence per class (`None` before the first).
+    last: [Option<u64>; NUM_CLASSES],
+}
+
+impl ReliableOrder {
+    fn new() -> Self {
+        Self {
+            last: [None; NUM_CLASSES],
+        }
+    }
+
+    /// Test-and-record `seq` on `class`.
+    fn admit(&mut self, class: TrafficClass, seq: u64) -> Admit {
+        let idx = usize::from(class.priority());
+        // `priority()` is always 0..=8 for a valid class; guard defensively
+        // rather than index out of bounds, suppressing an impossible class.
+        let Some(slot) = self.last.get_mut(idx) else {
+            return Admit::Duplicate;
+        };
+        let expected = slot.map_or(0, |l| l.saturating_add(1));
+        if seq == expected {
+            *slot = Some(seq);
+            Admit::Fresh
+        } else if slot.is_some_and(|l| seq <= l) {
+            Admit::Duplicate
+        } else {
+            Admit::Gap { expected, got: seq }
+        }
+    }
+}
 
 /// Tunables shared by all transports.
 #[derive(Debug, Clone, Copy)]
@@ -66,9 +127,12 @@ pub struct Connection {
     in_reliable: Arc<AsyncPriorityChannel>,
     out_datagram: mpsc::Sender<Frame>,
     in_datagram: AsyncMutex<mpsc::Receiver<Frame>>,
-    seq_reliable: AtomicU64,
+    /// Per-class outbound sequence counters. Stamped onto reliable frames and
+    /// advanced only when the frame is actually enqueued, so a backpressured
+    /// send never tears a hole the receiver would read as a lost frame.
+    seq_reliable: Mutex<[u64; NUM_CLASSES]>,
     seq_datagram: AtomicU64,
-    dedup_reliable: Mutex<ReplayWindow>,
+    order_reliable: Mutex<ReliableOrder>,
     dedup_datagram: Mutex<ReplayWindow>,
     max_payload: usize,
     tasks: Vec<JoinHandle<()>>,
@@ -92,9 +156,9 @@ impl Connection {
             in_reliable,
             out_datagram,
             in_datagram: AsyncMutex::new(in_datagram),
-            seq_reliable: AtomicU64::new(0),
+            seq_reliable: Mutex::new([0; NUM_CLASSES]),
             seq_datagram: AtomicU64::new(0),
-            dedup_reliable: Mutex::new(ReplayWindow::new(cfg.dedup_window)),
+            order_reliable: Mutex::new(ReliableOrder::new()),
             dedup_datagram: Mutex::new(ReplayWindow::new(cfg.dedup_window)),
             max_payload: cfg.max_payload.min(MAX_FRAME_PAYLOAD),
             tasks,
@@ -126,14 +190,25 @@ impl Connection {
         if message.len() > self.max_payload {
             return Err(TransportError::MessageTooLarge);
         }
-        let sequence = self.seq_reliable.fetch_add(1, Ordering::Relaxed);
+        let idx = usize::from(class.priority());
+        let mut counters = self.seq_reliable.lock().expect("sequence mutex poisoned");
+        // `priority()` is always 0..=8 for a valid class; guard defensively.
+        let slot = counters
+            .get_mut(idx)
+            .ok_or(TransportError::Backpressure { class })?;
+        let sequence = *slot;
         let frame = Frame {
             class,
             msg_type,
             sequence,
             payload: message.to_vec(),
         };
-        self.out_reliable.try_send(frame)
+        // Advance the per-class counter only after the frame is actually
+        // enqueued: a rejected (backpressured) send must not consume a sequence,
+        // or the receiver would later see a gap where nothing was ever lost.
+        self.out_reliable.try_send(frame)?;
+        *slot = sequence.saturating_add(1);
+        Ok(())
     }
 
     /// Send a best-effort datagram (unreliable, unordered).
@@ -161,8 +236,13 @@ impl Connection {
         }
     }
 
-    /// Await the next reliable message, in strict priority order, after
-    /// duplicate/replay suppression. Returns the delivered [`Frame`].
+    /// Await the next reliable message, in strict priority order.
+    ///
+    /// A duplicate/replayed frame is suppressed and receiving continues. A
+    /// **gap** in a class's contiguous sequence means a reliable frame was lost:
+    /// the inbound stream is closed and [`TransportError::ReliableGap`] is
+    /// returned so the caller resyncs instead of silently proceeding past the
+    /// hole. Returns [`TransportError::ConnectionClosed`] once the link ends.
     pub async fn recv(&self) -> Result<Frame, TransportError> {
         loop {
             let frame = self
@@ -170,15 +250,27 @@ impl Connection {
                 .recv()
                 .await
                 .ok_or(TransportError::ConnectionClosed)?;
-            let fresh = self
-                .dedup_reliable
+            let admit = self
+                .order_reliable
                 .lock()
-                .expect("dedup mutex poisoned")
-                .check(frame.sequence);
-            if fresh {
-                return Ok(frame);
+                .expect("order mutex poisoned")
+                .admit(frame.class, frame.sequence);
+            match admit {
+                Admit::Fresh => return Ok(frame),
+                // Duplicate / replay: suppress and wait for the next frame.
+                Admit::Duplicate => {}
+                Admit::Gap { expected, got } => {
+                    // A reliable frame vanished. Never deliver past the hole:
+                    // close the inbound stream so the link tears down and the
+                    // caller can resync.
+                    self.in_reliable.close();
+                    return Err(TransportError::ReliableGap {
+                        class: frame.class,
+                        expected,
+                        got,
+                    });
+                }
             }
-            // Duplicate / replay: suppress and wait for the next frame.
         }
     }
 
@@ -213,5 +305,149 @@ impl Drop for Connection {
         for task in &self.tasks {
             task.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn conn_with_inbound(in_reliable: Arc<AsyncPriorityChannel>) -> Connection {
+        let out_reliable = Arc::new(AsyncPriorityChannel::new(16));
+        let (out_dtx, _out_drx) = mpsc::channel(4);
+        let (_in_dtx, in_drx) = mpsc::channel(4);
+        Connection::new(
+            PeerId::from([9u8; 32]),
+            out_reliable,
+            in_reliable,
+            out_dtx,
+            in_drx,
+            &TransportConfig::default(),
+            Vec::new(),
+        )
+    }
+
+    fn rframe(class: TrafficClass, sequence: u64) -> Frame {
+        Frame {
+            class,
+            msg_type: 0,
+            sequence,
+            payload: sequence.to_le_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn reliable_order_fresh_duplicate_and_gap_per_class() {
+        let mut o = ReliableOrder::new();
+        // A class must start contiguously at 0.
+        assert!(matches!(o.admit(TrafficClass::Consensus, 0), Admit::Fresh));
+        // Replays of accepted-or-older sequences are suppressed.
+        assert!(matches!(
+            o.admit(TrafficClass::Consensus, 0),
+            Admit::Duplicate
+        ));
+        assert!(matches!(o.admit(TrafficClass::Consensus, 1), Admit::Fresh));
+        assert!(matches!(
+            o.admit(TrafficClass::Consensus, 1),
+            Admit::Duplicate
+        ));
+        // A skipped sequence is a hard gap (2 was due, 4 arrived).
+        assert!(matches!(
+            o.admit(TrafficClass::Consensus, 4),
+            Admit::Gap {
+                expected: 2,
+                got: 4
+            }
+        ));
+        // Classes are independent: NewOrder still expects its own 0 first.
+        assert!(matches!(o.admit(TrafficClass::NewOrder, 0), Admit::Fresh));
+        // A nonzero first frame on a fresh class is itself a gap.
+        assert!(matches!(
+            o.admit(TrafficClass::MarketData, 5),
+            Admit::Gap {
+                expected: 0,
+                got: 5
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn recv_detects_reliable_gap_and_closes_stream() {
+        let inbound = Arc::new(AsyncPriorityChannel::new(16));
+        let conn = conn_with_inbound(inbound.clone());
+        // Deliver seq 0 then seq 2 on the same class: sequence 1 is skipped.
+        inbound
+            .try_send(rframe(TrafficClass::Consensus, 0))
+            .unwrap();
+        inbound
+            .try_send(rframe(TrafficClass::Consensus, 2))
+            .unwrap();
+
+        // The contiguous frame is delivered.
+        assert_eq!(conn.recv().await.unwrap().sequence, 0);
+        // The skip is surfaced as a hard, typed gap error, never hidden.
+        let err = conn.recv().await.unwrap_err();
+        assert!(matches!(
+            err,
+            TransportError::ReliableGap {
+                class: TrafficClass::Consensus,
+                expected: 1,
+                got: 2
+            }
+        ));
+        // The stream is now closed: further receives report closure.
+        assert!(matches!(
+            conn.recv().await,
+            Err(TransportError::ConnectionClosed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn recv_suppresses_duplicates_without_gap() {
+        let inbound = Arc::new(AsyncPriorityChannel::new(16));
+        let conn = conn_with_inbound(inbound.clone());
+        // A duplicate of seq 0 is interposed before the contiguous seq 1.
+        for seq in [0u64, 0, 1] {
+            inbound
+                .try_send(rframe(TrafficClass::Consensus, seq))
+                .unwrap();
+        }
+        assert_eq!(conn.recv().await.unwrap().sequence, 0);
+        // The duplicate is swallowed; the next delivered frame is seq 1.
+        assert_eq!(conn.recv().await.unwrap().sequence, 1);
+    }
+
+    #[tokio::test]
+    async fn backpressured_send_does_not_open_a_sequence_gap() {
+        // Capacity of one frame per class: the second same-class send is rejected
+        // and must not consume a sequence number.
+        let out = Arc::new(AsyncPriorityChannel::new(1));
+        let (out_dtx, _out_drx) = mpsc::channel(4);
+        let (_in_dtx, in_drx) = mpsc::channel(4);
+        let conn = Connection::new(
+            PeerId::from([7u8; 32]),
+            out.clone(),
+            Arc::new(AsyncPriorityChannel::new(16)),
+            out_dtx,
+            in_drx,
+            &TransportConfig::default(),
+            Vec::new(),
+        );
+
+        conn.send_priority(TrafficClass::NewOrder, b"a").unwrap();
+        // The class is full: this send backpressures (sequence not consumed).
+        assert!(matches!(
+            conn.send_priority(TrafficClass::NewOrder, b"b"),
+            Err(TransportError::Backpressure {
+                class: TrafficClass::NewOrder
+            })
+        ));
+        // Drain the first frame, freeing the slot, then send again.
+        let first = out.recv().await.unwrap();
+        assert_eq!(first.sequence, 0);
+        conn.send_priority(TrafficClass::NewOrder, b"b").unwrap();
+        // The retried send reuses sequence 1 (contiguous), not 2 — no gap.
+        let second = out.recv().await.unwrap();
+        assert_eq!(second.sequence, 1);
     }
 }

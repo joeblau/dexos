@@ -7,9 +7,14 @@
 //! channel is drained by a writer task on the send side and filled by a reader
 //! task on the receive side.
 //!
-//! Sends are non-blocking and return [`TransportError::Backpressure`] when a
-//! class queue is full, so a slow consumer can never make a producer allocate
-//! without bound.
+//! [`AsyncPriorityChannel::try_send`] is non-blocking and returns
+//! [`TransportError::Backpressure`] when a class queue is full, so a caller that
+//! can shed (the loopback producer, the datagram path) never makes a producer
+//! allocate without bound. For the reliable inbound path — where a shed frame
+//! would vanish silently after the sender already observed success on the wire —
+//! [`AsyncPriorityChannel::send`] instead *awaits* queue space, so the reader
+//! stalls (and, over TCP, closes the peer's window) rather than dropping a
+//! reliable frame.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -24,7 +29,11 @@ use crate::scheduler::PriorityScheduler;
 #[derive(Debug)]
 pub(crate) struct AsyncPriorityChannel {
     inner: Mutex<PriorityScheduler>,
+    /// Wakes a blocked receiver when a frame is enqueued or the channel closes.
     notify: Notify,
+    /// Wakes a blocked [`send`](Self::send) when a frame is dequeued (freeing a
+    /// class slot) or the channel closes.
+    space: Notify,
     closed: AtomicBool,
 }
 
@@ -34,6 +43,7 @@ impl AsyncPriorityChannel {
         Self {
             inner: Mutex::new(PriorityScheduler::new(capacity_per_class)),
             notify: Notify::new(),
+            space: Notify::new(),
             closed: AtomicBool::new(false),
         }
     }
@@ -53,6 +63,36 @@ impl AsyncPriorityChannel {
         Ok(())
     }
 
+    /// Enqueue a frame, **awaiting queue space** if the frame's class is full
+    /// rather than shedding it. Errors with [`TransportError::ConnectionClosed`]
+    /// if the channel is closed.
+    ///
+    /// This is the reliable inbound path: a full class parks the caller until a
+    /// [`recv`](Self::recv) frees a slot, so the reader stops draining its
+    /// socket and the peer's TCP window closes — the sender is throttled instead
+    /// of a reliable frame being lost after the sender already saw it written.
+    pub(crate) async fn send(&self, frame: Frame) -> Result<(), TransportError> {
+        loop {
+            // Register interest *before* checking so a `recv` (or `close`) that
+            // frees space between the check and the await cannot be lost.
+            let notified = self.space.notified();
+            {
+                if self.closed.load(Ordering::Acquire) {
+                    return Err(TransportError::ConnectionClosed);
+                }
+                let mut sched = self.inner.lock().expect("scheduler mutex poisoned");
+                if sched.class_len(frame.class) < sched.capacity_per_class() {
+                    // Space is available, so this enqueue cannot backpressure.
+                    sched.enqueue(frame)?;
+                    drop(sched);
+                    self.notify.notify_one();
+                    return Ok(());
+                }
+            }
+            notified.await;
+        }
+    }
+
     /// Await and remove the highest-priority frame. Returns `None` once the
     /// channel is closed and fully drained.
     pub(crate) async fn recv(&self) -> Option<Frame> {
@@ -63,6 +103,9 @@ impl AsyncPriorityChannel {
             {
                 let mut sched = self.inner.lock().expect("scheduler mutex poisoned");
                 if let Some(frame) = sched.dequeue() {
+                    drop(sched);
+                    // A class slot just freed up: wake a sender blocked in `send`.
+                    self.space.notify_one();
                     return Some(frame);
                 }
                 if self.closed.load(Ordering::Acquire) {
@@ -73,14 +116,113 @@ impl AsyncPriorityChannel {
         }
     }
 
-    /// Signal closure and wake any waiters. Buffered frames remain drainable.
+    /// Signal closure and wake any waiters (both receivers and blocked senders).
+    /// Buffered frames remain drainable.
     pub(crate) fn close(&self) {
         self.closed.store(true, Ordering::Release);
         self.notify.notify_waiters();
+        self.space.notify_waiters();
     }
 
     /// Frames currently buffered across all classes (for backpressure tests).
     pub(crate) fn pending(&self) -> usize {
         self.inner.lock().expect("scheduler mutex poisoned").len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use codec::{Frame, TrafficClass};
+    use tokio::time::timeout;
+
+    use super::AsyncPriorityChannel;
+    use crate::error::TransportError;
+
+    fn frame(class: TrafficClass, sequence: u64) -> Frame {
+        Frame {
+            class,
+            msg_type: 0,
+            sequence,
+            payload: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn async_send_blocks_until_space_then_wakes() {
+        // Capacity of one frame per class: the second reliable send on the same
+        // class has nowhere to go and must park rather than shed.
+        let ch = Arc::new(AsyncPriorityChannel::new(1));
+        ch.try_send(frame(TrafficClass::Consensus, 0)).unwrap();
+
+        let sender_ch = ch.clone();
+        let sender =
+            tokio::spawn(async move { sender_ch.send(frame(TrafficClass::Consensus, 1)).await });
+
+        // The send is genuinely blocked: no capacity, no shed.
+        tokio::task::yield_now().await;
+        assert!(
+            !sender.is_finished(),
+            "send must block while the class is full"
+        );
+
+        // Draining one frame frees the slot and must wake the blocked sender.
+        assert_eq!(ch.recv().await.unwrap().sequence, 0);
+        let res = timeout(Duration::from_secs(5), sender)
+            .await
+            .expect("blocked send should wake after a dequeue")
+            .unwrap();
+        assert!(res.is_ok(), "send completes once space frees up");
+
+        // The previously-blocked frame is now buffered and delivered in order.
+        assert_eq!(ch.recv().await.unwrap().sequence, 1);
+    }
+
+    #[tokio::test]
+    async fn async_send_unblocks_on_close_without_shedding() {
+        let ch = Arc::new(AsyncPriorityChannel::new(1));
+        ch.try_send(frame(TrafficClass::Consensus, 0)).unwrap();
+
+        let sender_ch = ch.clone();
+        let sender =
+            tokio::spawn(async move { sender_ch.send(frame(TrafficClass::Consensus, 1)).await });
+        tokio::task::yield_now().await;
+        assert!(!sender.is_finished());
+
+        // Closing the channel wakes the blocked sender with a typed error — the
+        // frame is reported as undeliverable, never silently dropped.
+        ch.close();
+        let res = timeout(Duration::from_secs(5), sender)
+            .await
+            .expect("close should wake a blocked send")
+            .unwrap();
+        assert!(matches!(res, Err(TransportError::ConnectionClosed)));
+    }
+
+    #[tokio::test]
+    async fn async_send_never_sheds_a_full_stream_of_frames() {
+        // A tight capacity with a lagging receiver: every reliable frame must be
+        // delivered exactly once, in order — none shed under backpressure.
+        let ch = Arc::new(AsyncPriorityChannel::new(2));
+        let n = 64u64;
+        let producer = ch.clone();
+        let writer = tokio::spawn(async move {
+            for i in 0..n {
+                producer
+                    .send(frame(TrafficClass::NewOrder, i))
+                    .await
+                    .unwrap();
+            }
+        });
+        for i in 0..n {
+            let got = timeout(Duration::from_secs(5), ch.recv())
+                .await
+                .expect("receiver should not stall")
+                .unwrap();
+            assert_eq!(got.sequence, i, "frames delivered contiguously, none shed");
+        }
+        writer.await.unwrap();
     }
 }

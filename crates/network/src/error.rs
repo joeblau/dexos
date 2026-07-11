@@ -52,6 +52,20 @@ pub enum TransportError {
     #[error("duplicate or replayed message suppressed")]
     Duplicate,
 
+    /// A reliable ordered sub-stream skipped a sequence number: a frame was lost
+    /// permanently. The link is torn down so the caller resyncs rather than
+    /// silently proceeding past the hole. `expected` was due next on `class`;
+    /// `got` arrived instead.
+    #[error("reliable sequence gap on class {class:?}: expected {expected}, got {got}")]
+    ReliableGap {
+        /// The traffic class whose ordered sub-stream skipped a sequence.
+        class: TrafficClass,
+        /// The sequence number that was due next on that class.
+        expected: u64,
+        /// The sequence number that actually arrived.
+        got: u64,
+    },
+
     /// The bounded dedup / path table is at capacity and cannot admit a new key.
     #[error("dedup table capacity exceeded")]
     DedupCapacity,
