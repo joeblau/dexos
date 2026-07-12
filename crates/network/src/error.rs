@@ -66,6 +66,17 @@ pub enum TransportError {
         got: u64,
     },
 
+    /// A reliable class exhausted its 2^64 per-class sequence space: `u64::MAX`
+    /// has already been stamped, so there is no further contiguous sequence to
+    /// assign. Reusing it would make the receiver drop the frame as a duplicate,
+    /// silently losing a reliable message; the send is refused so the caller
+    /// re-keys / resyncs the link instead.
+    #[error("reliable sequence space exhausted on class {class:?}")]
+    SequenceExhausted {
+        /// The traffic class whose per-class sequence space is exhausted.
+        class: TrafficClass,
+    },
+
     /// The bounded dedup / path table is at capacity and cannot admit a new key.
     #[error("dedup table capacity exceeded")]
     DedupCapacity,

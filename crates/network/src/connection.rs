@@ -41,6 +41,7 @@ use crate::scheduler::NUM_CLASSES;
 pub const MSG_TYPE_DATAGRAM: u16 = 0xFFFF;
 
 /// The outcome of admitting one reliable frame into [`ReliableOrder`].
+#[derive(Debug)]
 enum Admit {
     /// A fresh, in-order frame; deliver it.
     Fresh,
@@ -80,7 +81,17 @@ impl ReliableOrder {
         let Some(slot) = self.last.get_mut(idx) else {
             return Admit::Duplicate;
         };
-        let expected = slot.map_or(0, |l| l.saturating_add(1));
+        // The next contiguous sequence for this class. Once `u64::MAX` has been
+        // accepted the 2^64 space is exhausted: every possible sequence has
+        // already been delivered, so any further arrival is a duplicate/replay
+        // (never a fresh re-accept of `u64::MAX`, which would double-deliver).
+        let expected = match slot {
+            None => 0,
+            Some(last) => match last.checked_add(1) {
+                Some(next) => next,
+                None => return Admit::Duplicate,
+            },
+        };
         if seq == expected {
             *slot = Some(seq);
             Admit::Fresh
@@ -205,10 +216,14 @@ pub struct Connection {
     in_reliable: Arc<AsyncPriorityChannel>,
     out_datagram: mpsc::Sender<Frame>,
     in_datagram: AsyncMutex<mpsc::Receiver<Frame>>,
-    /// Per-class outbound sequence counters. Stamped onto reliable frames and
-    /// advanced only when the frame is actually enqueued, so a backpressured
-    /// send never tears a hole the receiver would read as a lost frame.
-    seq_reliable: Mutex<[u64; NUM_CLASSES]>,
+    /// Per-class outbound sequence counters: the last sequence stamped on each
+    /// reliable class (`None` before the first send). Advanced only when the
+    /// frame is actually enqueued, so a backpressured send never tears a hole
+    /// the receiver would read as a lost frame. Each class owns an independent
+    /// sequence space, so the strict-priority scheduler reordering a low-priority
+    /// class behind a burst of a higher-priority class can never make either
+    /// class's contiguous sequence look lost or replayed.
+    seq_reliable: Mutex<[Option<u64>; NUM_CLASSES]>,
     seq_datagram: AtomicU64,
     order_reliable: Mutex<ReliableOrder>,
     dedup_datagram: Mutex<ReplayWindow>,
@@ -239,7 +254,7 @@ impl Connection {
             in_reliable,
             out_datagram,
             in_datagram: AsyncMutex::new(in_datagram),
-            seq_reliable: Mutex::new([0; NUM_CLASSES]),
+            seq_reliable: Mutex::new([None; NUM_CLASSES]),
             seq_datagram: AtomicU64::new(0),
             order_reliable: Mutex::new(ReliableOrder::new()),
             dedup_datagram: Mutex::new(ReplayWindow::new(cfg.dedup_window)),
@@ -295,7 +310,17 @@ impl Connection {
         let slot = counters
             .get_mut(idx)
             .ok_or(TransportError::Backpressure { class })?;
-        let sequence = *slot;
+        // The next contiguous sequence for this class. A class that has already
+        // stamped `u64::MAX` has exhausted its 2^64 sequence space: refuse to
+        // reuse it (the receiver would drop the reused frame as a duplicate,
+        // silently losing a reliable message) and surface a typed error so the
+        // caller re-keys / resyncs the link.
+        let sequence = match slot {
+            None => 0,
+            Some(last) => last
+                .checked_add(1)
+                .ok_or(TransportError::SequenceExhausted { class })?,
+        };
         let frame = Frame {
             class,
             msg_type,
@@ -306,7 +331,7 @@ impl Connection {
         // enqueued: a rejected (backpressured) send must not consume a sequence,
         // or the receiver would later see a gap where nothing was ever lost.
         self.out_reliable.try_send(frame)?;
-        *slot = sequence.saturating_add(1);
+        *slot = Some(sequence);
         Ok(())
     }
 
@@ -447,6 +472,7 @@ impl Drop for Connection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scheduler::PriorityScheduler;
 
     fn conn_with_inbound(in_reliable: Arc<AsyncPriorityChannel>) -> Connection {
         let out_reliable = Arc::new(AsyncPriorityChannel::new(16));
@@ -714,5 +740,231 @@ mod tests {
         // A second send still works (sequence advanced through the recovered guard).
         conn.send_priority(TrafficClass::NewOrder, b"ok2").unwrap();
         assert_eq!(conn.pending_outbound(), 2);
+    }
+
+    fn conn_with_inbound_cap(cap: usize) -> (Connection, Arc<AsyncPriorityChannel>) {
+        let inbound = Arc::new(AsyncPriorityChannel::new(cap));
+        (conn_with_inbound(inbound.clone()), inbound)
+    }
+
+    /// Acceptance criterion: a valid low-priority reliable frame overtaken by a
+    /// higher-priority burst *wider than the replay window* is still delivered,
+    /// and every reliable frame is delivered exactly once.
+    ///
+    /// The strict-priority inbound channel drains the entire P0 (`Consensus`)
+    /// burst before it ever yields the single P8 (`Sync`) frame, so on a *global*
+    /// sequence space the P8 frame — overtaken by ~1.5x the window — would have
+    /// slid out and been silently discarded. Per-class sequence spaces make the
+    /// P8 frame contiguous on its *own* class regardless of cross-class ordering.
+    #[tokio::test]
+    async fn low_priority_overtaken_by_more_than_window_still_delivers_exactly_once() {
+        // A burst larger than the default replay window (1024).
+        let burst = crate::replay::DEFAULT_WINDOW + 500;
+        let cap = usize::try_from(burst).unwrap() + 8;
+        let (conn, inbound) = conn_with_inbound_cap(cap);
+
+        // Enqueue one low-priority frame first, then overtake it with the burst.
+        inbound.try_send(rframe(TrafficClass::Sync, 0)).unwrap();
+        for seq in 0..burst {
+            inbound
+                .try_send(rframe(TrafficClass::Consensus, seq))
+                .unwrap();
+        }
+
+        // Strict priority drains all of Consensus first, contiguously 0..burst.
+        for seq in 0..burst {
+            let f = conn.recv().await.unwrap();
+            assert_eq!(f.class, TrafficClass::Consensus);
+            assert_eq!(f.sequence, seq, "consensus delivered in order, none lost");
+        }
+        // The overtaken low-priority frame is delivered last — never discarded as
+        // a stale replay despite being overtaken by more than the window width.
+        let tail = conn.recv().await.unwrap();
+        assert_eq!(tail.class, TrafficClass::Sync);
+        assert_eq!(tail.sequence, 0);
+    }
+
+    /// Acceptance criterion: gaps trigger explicit resync, never a "harmless
+    /// replay". A forward jump larger than any dedup window is a hard gap, not an
+    /// in-window duplicate — the distinction a global replay window would erase.
+    #[test]
+    fn large_forward_jump_is_a_gap_not_a_replay() {
+        let mut o = ReliableOrder::new();
+        assert!(matches!(o.admit(TrafficClass::Consensus, 0), Admit::Fresh));
+        // A jump far beyond the widest supported replay window.
+        let jump = crate::replay::MAX_WINDOW * 4 + 7;
+        assert!(matches!(
+            o.admit(TrafficClass::Consensus, jump),
+            Admit::Gap { expected: 1, got } if got == jump
+        ));
+    }
+
+    /// Acceptance criterion (wrap/exhaustion boundary): once a class has accepted
+    /// `u64::MAX` its space is exhausted; a repeat of `u64::MAX` is a duplicate,
+    /// never a fresh re-accept that would double-deliver.
+    #[test]
+    fn receive_sequence_exhaustion_is_not_a_double_delivery() {
+        let mut o = ReliableOrder::new();
+        // Drive the class to the top of its space (private field, same module).
+        o.last[usize::from(TrafficClass::Consensus.priority())] = Some(u64::MAX);
+        // The final sequence is already delivered: replays are suppressed.
+        assert!(matches!(
+            o.admit(TrafficClass::Consensus, u64::MAX),
+            Admit::Duplicate
+        ));
+        assert!(matches!(
+            o.admit(TrafficClass::Consensus, u64::MAX - 1),
+            Admit::Duplicate
+        ));
+        // A different class is unaffected and still starts contiguously at 0.
+        assert!(matches!(o.admit(TrafficClass::NewOrder, 0), Admit::Fresh));
+    }
+
+    /// Acceptance criterion (wrap/exhaustion boundary): the sender stamps the
+    /// final `u64::MAX` sequence, then refuses to reuse it — surfacing a typed
+    /// error instead of silently re-stamping a sequence the receiver would drop.
+    #[tokio::test]
+    async fn send_refuses_to_reuse_exhausted_sequence_space() {
+        let (conn, _inbound) = conn_with_inbound_cap(4);
+        // Prime the class one below the top: the next send stamps `u64::MAX`.
+        {
+            let mut counters = conn
+                .seq_reliable
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            counters[usize::from(TrafficClass::Consensus.priority())] = Some(u64::MAX - 1);
+        }
+        // The final, still-valid `u64::MAX` sequence is stamped and enqueued.
+        conn.send_priority(TrafficClass::Consensus, b"last")
+            .unwrap();
+        assert_eq!(conn.pending_outbound(), 1);
+        let last = conn.out_reliable.recv().await.unwrap();
+        assert_eq!(
+            last.sequence,
+            u64::MAX,
+            "final sequence stamped exactly once"
+        );
+
+        // The space is now exhausted: a further send is refused, not silent.
+        let err = conn
+            .send_priority(TrafficClass::Consensus, b"overflow")
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            TransportError::SequenceExhausted {
+                class: TrafficClass::Consensus
+            }
+        ));
+        // No phantom frame was enqueued by the refused send.
+        assert_eq!(conn.pending_outbound(), 0);
+        // A different class is unaffected by the exhausted one.
+        conn.send_priority(TrafficClass::NewOrder, b"ok").unwrap();
+        assert_eq!(conn.pending_outbound(), 1);
+    }
+
+    /// Acceptance criterion: reconnect starts a fresh per-class sequence space.
+    /// A new [`Connection`] (a new epoch in the sense of #283) tracks ordering
+    /// independently, so the previous epoch's accepted sequences neither leak
+    /// into nor gap the new one. Wire-level `(epoch, seq)` negotiation across a
+    /// shared window is tracked in #283; this proves the sequence-space reset the
+    /// separation relies on.
+    #[tokio::test]
+    async fn reconnect_resets_per_class_sequence_spaces() {
+        // First epoch: deliver a contiguous prefix, then tear down.
+        let first = Arc::new(AsyncPriorityChannel::new(16));
+        {
+            let conn = conn_with_inbound(first.clone());
+            for seq in 0..3u64 {
+                first
+                    .try_send(rframe(TrafficClass::Consensus, seq))
+                    .unwrap();
+            }
+            for seq in 0..3u64 {
+                assert_eq!(conn.recv().await.unwrap().sequence, seq);
+            }
+        }
+        // Second epoch (reconnect): a brand-new connection expects its own 0
+        // again — the old epoch's advanced sequences do not carry over, and a
+        // fresh 0 is delivered rather than being suppressed as an old replay.
+        let second = Arc::new(AsyncPriorityChannel::new(16));
+        let conn = conn_with_inbound(second.clone());
+        second.try_send(rframe(TrafficClass::Consensus, 0)).unwrap();
+        assert_eq!(conn.recv().await.unwrap().sequence, 0);
+    }
+
+    /// Acceptance criterion: property test over arbitrary priority interleavings.
+    /// A deterministic LCG drives an adversarial mix of per-class contiguous
+    /// enqueues and strict-priority dequeues; the receiver-side [`ReliableOrder`]
+    /// must admit every dequeued frame as `Fresh`, in per-class order, and never
+    /// manufacture a false gap or duplicate. Total delivered == total produced.
+    #[test]
+    fn arbitrary_priority_interleaving_delivers_each_class_exactly_once_property() {
+        let mut state: u64 = 0xC0FF_EE12_3456_789A;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state
+        };
+        // Capacity comfortably above the worst-case per-class backlog so the
+        // interleave, not backpressure, drives ordering.
+        let mut sched = PriorityScheduler::new(1 << 16);
+        let mut send_seq = [0u64; NUM_CLASSES];
+        let mut expect_recv = [0u64; NUM_CLASSES];
+        let mut order = ReliableOrder::new();
+        let mut produced = 0usize;
+        let mut delivered = 0usize;
+
+        for _ in 0..40_000 {
+            let r = next();
+            if r & 1 == 0 {
+                let classes = u64::try_from(NUM_CLASSES).unwrap();
+                let class_byte = u8::try_from((r >> 8) % classes).unwrap_or(0);
+                if let Some(class) = TrafficClass::from_u8(class_byte) {
+                    let idx = usize::from(class.priority());
+                    let frame = Frame {
+                        class,
+                        msg_type: 0,
+                        sequence: send_seq[idx],
+                        payload: Vec::new(),
+                    };
+                    // On backpressure, don't advance: a not-enqueued frame must
+                    // not consume a sequence (no manufactured gap).
+                    if sched.enqueue(frame).is_ok() {
+                        send_seq[idx] += 1;
+                        produced += 1;
+                    }
+                }
+            } else if let Some(frame) = sched.dequeue() {
+                let idx = usize::from(frame.class.priority());
+                match order.admit(frame.class, frame.sequence) {
+                    Admit::Fresh => {
+                        assert_eq!(frame.sequence, expect_recv[idx]);
+                        expect_recv[idx] += 1;
+                        delivered += 1;
+                    }
+                    other => panic!(
+                        "priority interleaving manufactured {other:?} for class {:?} seq {}",
+                        frame.class, frame.sequence
+                    ),
+                }
+            }
+        }
+        // Drain the remainder: still exactly-once, still in per-class order.
+        while let Some(frame) = sched.dequeue() {
+            let idx = usize::from(frame.class.priority());
+            assert!(matches!(
+                order.admit(frame.class, frame.sequence),
+                Admit::Fresh
+            ));
+            assert_eq!(frame.sequence, expect_recv[idx]);
+            expect_recv[idx] += 1;
+            delivered += 1;
+        }
+        assert_eq!(
+            produced, delivered,
+            "every reliable frame delivered exactly once across arbitrary interleavings"
+        );
+        assert!(produced > 1000, "property exercised a meaningful volume");
     }
 }
