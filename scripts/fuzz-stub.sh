@@ -1,24 +1,23 @@
 #!/usr/bin/env bash
-# Time-boxed fuzz / property-test stub for CI.
+# Fuzz / property-test stub for CI.
 #
-# Full cargo-fuzz targets for codec/RPC/storage/config land with those epics.
-# Until then this job runs existing deterministic LCG property tests that exercise
-# the same surfaces, with a wall-clock budget so the job stays bounded.
+# These are placeholder steps (existing workspace test invocations) until real
+# cargo-fuzz targets for codec/RPC/storage/config land with those epics. The
+# deterministic LCG property tests below exercise the same surfaces.
+#
+# The former per-step soft time budget (SECONDS-based deadline) was removed:
+# SECONDS includes cargo compile time, so on a cold cache the first step could
+# consume the whole budget and every later step was silently skipped while the
+# job still passed. All steps now run unconditionally; wall-clock is bounded by
+# the GitHub Actions job-level timeout instead.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-BUDGET_SECS="${FUZZ_BUDGET_SECS:-120}"
-echo "==> fuzz stub (budget ${BUDGET_SECS}s) — property tests as interim coverage"
-
-deadline=$((SECONDS + BUDGET_SECS))
+echo "==> fuzz stub — property tests as interim coverage (all steps run unconditionally)"
 
 run_step() {
   local label="$1"
   shift
-  if (( SECONDS >= deadline )); then
-    echo "budget exhausted before: ${label}"
-    return 0
-  fi
   echo "-- ${label}"
   "$@"
 }
@@ -36,5 +35,5 @@ run_step "storage + rpc unit surfaces" \
   cargo test -p storage -p rpc --locked
 
 echo
-echo "==> fuzz stub completed in ${SECONDS}s (budget ${BUDGET_SECS}s)"
+echo "==> fuzz stub completed"
 echo "note: replace with cargo-fuzz targets when codec/RPC/storage fuzz harnesses land"
