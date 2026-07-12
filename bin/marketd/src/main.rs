@@ -38,7 +38,8 @@ enum Command {
     Keygen(KeygenArgs),
     /// Produce a verified state snapshot.
     Snapshot(SnapshotArgs),
-    /// Verify a snapshot's state root and checkpoint ancestry.
+    /// Verify a snapshot's integrity (frame CRC, version, content digest,
+    /// state-length bounds), and its state root when --expect-root is given.
     Verify(VerifyArgs),
 }
 
@@ -103,6 +104,10 @@ struct ReplayArgs {
     /// Command log to replay.
     #[arg(long, value_name = "PATH")]
     log: PathBuf,
+    /// Trusted checkpoint state root (exactly 64 lowercase hex chars) to verify
+    /// the snapshot against. Without it the embedded root is NOT verified.
+    #[arg(long, value_name = "HEX", value_parser = parse_expect_root)]
+    expect_root: Option<types::Hash>,
 }
 
 #[derive(Args, Debug)]
@@ -137,6 +142,10 @@ struct VerifyArgs {
     /// Snapshot to verify.
     #[arg(long, value_name = "PATH")]
     snapshot: PathBuf,
+    /// Trusted checkpoint state root (exactly 64 lowercase hex chars) to verify
+    /// the snapshot against. Without it the embedded root is NOT verified.
+    #[arg(long, value_name = "HEX", value_parser = parse_expect_root)]
+    expect_root: Option<types::Hash>,
 }
 
 /// Resolve the effective configuration for a `run` invocation: file values first,
@@ -218,16 +227,20 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
     }
 }
 
-/// Load a snapshot + durable WAL, verify integrity, and count applied records.
+/// Load a snapshot + durable WAL, verify what can actually be verified, and
+/// count applied records.
+///
+/// `Snapshot::load` already fail-closes on frame CRC, version, content digest,
+/// and state-length bounds, so those are not re-checked here. The embedded
+/// state root is only *verified* when the operator supplies a trusted
+/// checkpoint root via `--expect-root`; otherwise it is reported as unverified.
+/// The durable log is checked for record CRCs, sequence continuity, and sealed
+/// chain tips, and `DurableLog::replay` enforces contiguous sequences from
+/// `snapshot_seq + 1`.
 fn run_replay(args: &ReplayArgs) -> anyhow::Result<()> {
     let snap = storage::Snapshot::load(&args.snapshot)
         .map_err(|e| anyhow::anyhow!("loading snapshot {}: {e}", args.snapshot.display()))?;
-    if !snap.verify(snap.state_root()) {
-        anyhow::bail!(
-            "snapshot {} failed self-verify (content digest / version)",
-            args.snapshot.display()
-        );
-    }
+    let root_status = describe_state_root(&snap, args.expect_root)?;
 
     let log = storage::DurableLog::open(
         storage::DurableConfig::new(&args.log).with_sync(storage::SyncPolicy::Never),
@@ -244,30 +257,70 @@ fn run_replay(args: &ReplayArgs) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("replay failed: {e}"))?;
 
     println!(
-        "replay: snapshot_seq={} state_root={} applied={} last_seq={} log_records={}",
+        "replay: snapshot_seq={} applied={} last_seq={} log_records={}",
         snap.last_sequence(),
-        to_hex(snap.state_root().as_bytes()),
         applied,
         last,
         log.len()
     );
+    println!("state_root={root_status}");
+    println!(
+        "log: verified record CRCs, sequence continuity, and sealed chain tips; \
+         replay enforced contiguous sequences from {}",
+        snap.last_sequence().saturating_add(1)
+    );
     Ok(())
 }
 
-/// Decode and self-verify a snapshot file (content digest + CRC).
+/// Decode a snapshot and report exactly which checks ran.
+///
+/// `Snapshot::load` fail-closes on frame CRC, version, content digest, and
+/// state-length bounds — those are the only checks a bare `verify` performs.
+/// The embedded state root is only *verified* when `--expect-root` supplies a
+/// trusted checkpoint root to compare against; on its own the embedded root is
+/// just data from the file and proves nothing.
 fn run_verify(args: &VerifyArgs) -> anyhow::Result<()> {
     let snap = storage::Snapshot::load(&args.snapshot)
         .map_err(|e| anyhow::anyhow!("loading snapshot {}: {e}", args.snapshot.display()))?;
-    if !snap.verify(snap.state_root()) {
-        anyhow::bail!("snapshot self-verify failed");
-    }
+    let root_status = describe_state_root(&snap, args.expect_root)?;
     println!(
-        "verify: ok snapshot_seq={} state_root={} state_bytes={}",
+        "verify: ok snapshot_seq={} state_bytes={} \
+         checked=[frame CRC, version, content digest, state-length bounds]",
         snap.last_sequence(),
-        to_hex(snap.state_root().as_bytes()),
         snap.state().len()
     );
+    println!("state_root={root_status}");
     Ok(())
+}
+
+/// Enforce `--expect-root` when present and describe the state root honestly.
+///
+/// The embedded root cannot self-verify — comparing it to itself is a
+/// tautology (issue #423). Only an operator-supplied checkpoint root makes
+/// [`storage::Snapshot::verify`] meaningful; without one, the returned
+/// description says explicitly that no root verification happened.
+///
+/// # Errors
+/// Fails when `expected` is present and does not match the embedded root.
+fn describe_state_root(
+    snap: &storage::Snapshot,
+    expected: Option<types::Hash>,
+) -> anyhow::Result<String> {
+    let embedded = to_hex(snap.state_root().as_bytes());
+    match expected {
+        Some(root) => {
+            if !snap.verify(root) {
+                anyhow::bail!(
+                    "state root mismatch: snapshot embeds {embedded} but --expect-root is {}",
+                    to_hex(root.as_bytes())
+                );
+            }
+            Ok(format!("{embedded} (verified against --expect-root)"))
+        }
+        None => Ok(format!(
+            "{embedded} (embedded; NOT verified — pass --expect-root <checkpoint root> to verify)"
+        )),
+    }
 }
 
 /// Inspect a single sequence from a durable WAL directory.
@@ -344,6 +397,41 @@ fn run_benchmark(args: &BenchmarkArgs, config: benchmarks::Config) -> anyhow::Re
         anyhow::bail!("spec-target gate FAILED — see the report above");
     }
     Ok(())
+}
+
+/// Strictly decode an operator-supplied expected state root: exactly 64
+/// lowercase hex characters (no `0x` prefix, no uppercase) into a 32-byte
+/// [`types::Hash`].
+///
+/// Used as a clap value parser, so malformed input becomes a typed argument
+/// error and a nonzero exit — never a panic.
+///
+/// # Errors
+/// Returns a descriptive error on wrong length or non-lowercase-hex input.
+fn parse_expect_root(s: &str) -> anyhow::Result<types::Hash> {
+    if s.len() != 64 {
+        anyhow::bail!(
+            "expected exactly 64 lowercase hex characters (32 bytes), got {}",
+            s.len()
+        );
+    }
+    let mut bytes = [0u8; 32];
+    for (byte, pair) in bytes.iter_mut().zip(s.as_bytes().chunks_exact(2)) {
+        *byte = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
+    }
+    Ok(types::Hash::from_bytes(bytes))
+}
+
+/// Decode one lowercase hex digit; uppercase and non-hex bytes are rejected.
+fn hex_nibble(b: u8) -> anyhow::Result<u8> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        _ => anyhow::bail!(
+            "invalid hex character {:?}; only lowercase [0-9a-f] is accepted",
+            char::from(b)
+        ),
+    }
 }
 
 /// Lowercase hex encoding (no external dep).
@@ -524,6 +612,152 @@ mod tests {
         assert!(Cli::try_parse_from(["marketd", "replay", "--snapshot", "s"]).is_err());
         // Negative sequence (u64).
         assert!(Cli::try_parse_from(["marketd", "inspect", "--sequence", "-1"]).is_err());
+    }
+
+    #[test]
+    fn expect_root_parses_valid_64_lowercase_hex_on_replay_and_verify() {
+        let hex = "ab".repeat(32);
+        let want = types::Hash::from_bytes([0xab; 32]);
+
+        let cli = Cli::try_parse_from([
+            "marketd",
+            "replay",
+            "--snapshot",
+            "s.snap",
+            "--log",
+            "c.log",
+            "--expect-root",
+            hex.as_str(),
+        ])
+        .expect("valid --expect-root must parse on replay");
+        let Command::Replay(args) = cli.command else {
+            panic!("expected replay");
+        };
+        assert_eq!(args.expect_root, Some(want));
+
+        let cli = Cli::try_parse_from([
+            "marketd",
+            "verify",
+            "--snapshot",
+            "s.snap",
+            "--expect-root",
+            hex.as_str(),
+        ])
+        .expect("valid --expect-root must parse on verify");
+        let Command::Verify(args) = cli.command else {
+            panic!("expected verify");
+        };
+        assert_eq!(args.expect_root, Some(want));
+    }
+
+    #[test]
+    fn expect_root_rejects_malformed_input_without_panic() {
+        let bad = [
+            "ab".repeat(31),                  // too short (62 chars)
+            "ab".repeat(33),                  // too long (66 chars)
+            format!("{}g", "a".repeat(63)),   // non-hex character, right length
+            "AB".repeat(32),                  // uppercase is rejected
+            format!("0x{}", "ab".repeat(31)), // 0x prefix ('x' is not hex)
+            String::new(),                    // empty
+        ];
+        for value in &bad {
+            assert!(
+                Cli::try_parse_from([
+                    "marketd",
+                    "verify",
+                    "--snapshot",
+                    "s.snap",
+                    "--expect-root",
+                    value.as_str(),
+                ])
+                .is_err(),
+                "verify must reject --expect-root {value:?}"
+            );
+            assert!(
+                Cli::try_parse_from([
+                    "marketd",
+                    "replay",
+                    "--snapshot",
+                    "s.snap",
+                    "--log",
+                    "c.log",
+                    "--expect-root",
+                    value.as_str(),
+                ])
+                .is_err(),
+                "replay must reject --expect-root {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn replay_and_verify_parse_without_expect_root() {
+        let cli = Cli::try_parse_from(["marketd", "verify", "--snapshot", "s.snap"]).unwrap();
+        let Command::Verify(args) = cli.command else {
+            panic!("expected verify");
+        };
+        assert!(args.expect_root.is_none());
+
+        let cli = Cli::try_parse_from([
+            "marketd",
+            "replay",
+            "--snapshot",
+            "s.snap",
+            "--log",
+            "c.log",
+        ])
+        .unwrap();
+        let Command::Replay(args) = cli.command else {
+            panic!("expected replay");
+        };
+        assert!(args.expect_root.is_none());
+    }
+
+    #[test]
+    fn parse_expect_root_round_trips_to_hex_and_rejects_uppercase() {
+        let hex = to_hex(&[0x5a; 32]);
+        assert_eq!(
+            parse_expect_root(&hex).expect("to_hex output must parse back"),
+            types::Hash::from_bytes([0x5a; 32])
+        );
+        let err = parse_expect_root(&hex.to_uppercase()).expect_err("uppercase must be rejected");
+        assert!(format!("{err:#}").contains("lowercase"), "{err:#}");
+    }
+
+    #[test]
+    fn verify_enforces_expect_root_against_a_real_snapshot() {
+        let path = unique_temp_path("verify-root");
+        let root = types::Hash::from_bytes([7u8; 32]);
+        storage::Snapshot::new(root, 42, b"engine-state".to_vec())
+            .install_atomic(&path)
+            .expect("fixture snapshot installs");
+
+        // The correct checkpoint root passes.
+        run_verify(&VerifyArgs {
+            snapshot: path.clone(),
+            expect_root: Some(root),
+        })
+        .expect("matching --expect-root must pass");
+
+        // A wrong checkpoint root bails with a typed error naming the mismatch.
+        let err = run_verify(&VerifyArgs {
+            snapshot: path.clone(),
+            expect_root: Some(types::Hash::from_bytes([8u8; 32])),
+        })
+        .expect_err("wrong --expect-root must fail");
+        assert!(
+            format!("{err:#}").contains("state root mismatch"),
+            "{err:#}"
+        );
+
+        // Without --expect-root only the load-time checks run; no root claim.
+        run_verify(&VerifyArgs {
+            snapshot: path.clone(),
+            expect_root: None,
+        })
+        .expect("verify without --expect-root still succeeds");
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
