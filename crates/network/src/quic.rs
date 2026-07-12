@@ -10,7 +10,12 @@
 //! * each reliable [`TrafficClass`] owns an independent bidirectional stream;
 //! * market-data datagrams use native QUIC DATAGRAM frames (RFC 9221), never the
 //!   reliable stream scheduler;
-//! * stream-level flow control is sized so sync credit cannot starve consensus.
+//! * every stream shares one **uniform** 2 MiB receive window — quinn's
+//!   `TransportConfig` cannot size receive windows per stream — so cross-class
+//!   precedence is enforced on the transmit side: each class stream carries a
+//!   transmit priority (`SendStream::set_priority`, set at stream open) under
+//!   which quinn drains Consensus first and Sync last when the path is
+//!   congested, and sync writers additionally chunk and yield aggressively.
 //!
 //! # Authentication
 //!
@@ -73,14 +78,24 @@ const ALPN_DEXOS: &[u8] = b"dexos/quic/1";
 /// Server name presented during TLS (unused for identity; PeerId is application-bound).
 const TLS_SERVER_NAME: &str = "dexos-peer";
 
-/// Per-stream receive window for P0 consensus (bytes). Sized for a burst of votes.
+/// Chunking hint for P0 consensus writers (bytes). **Not** a receive window:
+/// quinn's `TransportConfig` applies one uniform window to every stream (see
+/// `MID_STREAM_WINDOW`); this value only tunes writer yielding via
+/// `class_chunk_limit`.
 const P0_STREAM_WINDOW: u32 = 4 * 1024 * 1024;
-/// Per-stream receive window for mid-priority classes.
+/// The uniform per-stream receive window `transport_config` applies to
+/// **every** stream — quinn 0.11 cannot size receive windows per stream, so
+/// there is no per-class receive-window isolation. Cross-class precedence
+/// comes from per-stream transmit priorities (`class_stream_priority`) plus
+/// writer chunking (`class_chunk_limit`).
 const MID_STREAM_WINDOW: u32 = 2 * 1024 * 1024;
-/// Per-stream receive window for P8 sync — deliberately smaller than P0 so a
-/// saturated historical-sync peer cannot monopolize connection-level credit.
+/// Chunking hint for P8 sync writers (bytes): sync frames are chunked to a
+/// quarter of this so the sync writer yields often. **Not** a receive window
+/// (see `MID_STREAM_WINDOW`).
 const SYNC_STREAM_WINDOW: u32 = 512 * 1024;
-/// Connection-level receive window: enough for P0+mid concurrent, not 9× sync.
+/// Connection-level receive window: deliberately below 9 × the uniform stream
+/// window, so the class streams can never all hold full credit at once, and
+/// any single stream (sync included) holds at most `MID_STREAM_WINDOW` of it.
 const CONN_RECEIVE_WINDOW: u32 = 8 * 1024 * 1024;
 /// Max concurrent bidi streams: control + 9 classes.
 const MAX_BIDI_STREAMS: u32 = 16;
@@ -191,11 +206,14 @@ impl rustls::server::danger::ClientCertVerifier for SkipClientVerification {
 fn transport_config() -> Arc<quinn::TransportConfig> {
     let mut t = quinn::TransportConfig::default();
     t.max_concurrent_bidi_streams(MAX_BIDI_STREAMS.into());
-    // Connection window deliberately below 9 × sync so a single saturated sync
-    // peer cannot exhaust credit that consensus needs.
+    // Connection window deliberately below 9 × the uniform stream window so the
+    // class streams can never all hold full credit simultaneously; any single
+    // stream (sync included) is capped at one stream window of it.
     t.receive_window(quinn::VarInt::from_u32(CONN_RECEIVE_WINDOW));
-    // Default stream window is mid-tier; per-stream we still rely on independent
-    // streams for HOL isolation. Sync writers chunk aggressively (see writer).
+    // quinn sizes ONE uniform receive window for every stream — per-class
+    // receive windows are not expressible in TransportConfig. Cross-class
+    // precedence is enforced by transmit priorities set at stream open
+    // (class_stream_priority) plus sync writer chunking (class_chunk_limit).
     t.stream_receive_window(quinn::VarInt::from_u32(MID_STREAM_WINDOW));
     t.datagram_receive_buffer_size(Some(1024 * 1024));
     t.datagram_send_buffer_size(1024 * 1024);
@@ -294,6 +312,17 @@ fn map_read_err(e: quinn::ReadExactError) -> TransportError {
     }
 }
 
+/// Transmit priority for the class stream carrying `class_id`.
+///
+/// quinn drains pending data from higher-priority streams first, so Consensus
+/// (class 0) maps to the **largest** value and Sync (class `NUM_CLASSES - 1`)
+/// to the smallest: strictly monotonic decreasing over the valid class range.
+/// Total and panic-free — out-of-range ids saturate to the lowest priority.
+fn class_stream_priority(class_id: usize) -> i32 {
+    let inverted = NUM_CLASSES.saturating_sub(1).saturating_sub(class_id);
+    i32::try_from(inverted).unwrap_or(0)
+}
+
 /// Per-class stream window hint used by writers when chunking large sync frames.
 fn class_chunk_limit(class: TrafficClass) -> usize {
     match class {
@@ -346,13 +375,11 @@ fn spawn_quic_connection(
     // With per-class pulls, a parked Sync writer leaves frames queued in the
     // Sync class only; every other writer keeps draining independently, each
     // class stays FIFO, and cross-class precedence is expressed by the QUIC
-    // stream priorities set below.
+    // transmit priorities already set (fail-closed) when the class streams
+    // were opened — see class_stream_priority and open_class_streams_*.
     for (idx, mut send) in class_sends.into_iter().enumerate() {
         let class = TrafficClass::from_u8(u8::try_from(idx).unwrap_or(u8::MAX))
             .unwrap_or(TrafficClass::Sync);
-        // Higher classes get strictly higher stream priority so quinn transmits
-        // their pending stream data first when the path is congested.
-        let _ = send.set_priority(i32::try_from(NUM_CLASSES.saturating_sub(idx)).unwrap_or(0));
         let chunk = class_chunk_limit(class);
         let writer_out = out_reliable.clone();
         let writer_disconnects = disconnects.clone();
@@ -500,6 +527,10 @@ async fn open_class_streams_initiator(
             .open_bi()
             .await
             .map_err(|e| TransportError::Io(e.to_string()))?;
+        // Higher classes drain first when the path is congested. Fail closed:
+        // a stream that is already closed means the connection is unusable.
+        send.set_priority(class_stream_priority(class_id))
+            .map_err(|_closed| TransportError::ConnectionClosed)?;
         send.write_all(&[u8::try_from(class_id).unwrap_or(0)])
             .await
             .map_err(map_write_err)?;
@@ -529,8 +560,12 @@ async fn open_class_streams_responder(
     }
     let mut sends = Vec::with_capacity(NUM_CLASSES);
     let mut recvs = Vec::with_capacity(NUM_CLASSES);
-    for slot in by_class {
+    for (class_id, slot) in by_class.into_iter().enumerate() {
         let (s, r) = slot.ok_or(TransportError::HandshakeFailed)?;
+        // Mirror the initiator: this side's transmit scheduling must also
+        // drain higher classes first. Fail closed on an already-closed stream.
+        s.set_priority(class_stream_priority(class_id))
+            .map_err(|_closed| TransportError::ConnectionClosed)?;
         sends.push(s);
         recvs.push(r);
     }
@@ -1299,6 +1334,81 @@ mod tests {
                 .unwrap();
             assert_eq!(got.class, class);
             assert_eq!(got.payload, payload);
+        }
+    }
+
+    /// #414: the transmit-priority mapping must be strictly monotonic —
+    /// Consensus (class 0) outranks every class down to Sync (class 8) — and
+    /// total (panic-free) over any input.
+    #[test]
+    fn class_stream_priority_is_monotonic_consensus_first() {
+        assert!(
+            class_stream_priority(0) > class_stream_priority(NUM_CLASSES - 1),
+            "Consensus must strictly outrank Sync"
+        );
+        for class_id in 1..NUM_CLASSES {
+            assert!(
+                class_stream_priority(class_id - 1) > class_stream_priority(class_id),
+                "priority must strictly decrease from class {} to class {}",
+                class_id - 1,
+                class_id
+            );
+        }
+        // Sync is the floor, and out-of-range ids saturate to that floor
+        // instead of panicking.
+        assert_eq!(class_stream_priority(NUM_CLASSES - 1), 0);
+        assert_eq!(class_stream_priority(NUM_CLASSES), 0);
+        assert_eq!(class_stream_priority(usize::MAX), 0);
+    }
+
+    /// A raw quinn server endpoint sharing the transport's TLS/transport
+    /// config, without the accept pump (so tests can drive streams directly).
+    fn raw_server_endpoint() -> Endpoint {
+        let (cert, key) = make_tls_cert().unwrap();
+        let server_config = make_server_config(cert, key).unwrap();
+        Endpoint::server(server_config, "127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap()
+    }
+
+    /// #414: opening the class streams must apply the transmit priority on
+    /// **both** sides — initiator and responder — with Consensus strictly
+    /// above Sync, matching `class_stream_priority` exactly.
+    #[tokio::test]
+    async fn class_streams_carry_transmit_priorities_on_both_sides() {
+        let server = raw_server_endpoint();
+        let server_addr = server.local_addr().unwrap();
+        let client = raw_client_endpoint();
+
+        let server_task = tokio::spawn(async move {
+            let incoming = server.accept().await.unwrap();
+            let conn = incoming.await.unwrap();
+            let streams = open_class_streams_responder(&conn).await;
+            (conn, streams)
+        });
+        let client_conn = client
+            .connect(server_addr, TLS_SERVER_NAME)
+            .unwrap()
+            .await
+            .unwrap();
+        let (client_sends, _client_recvs) =
+            open_class_streams_initiator(&client_conn).await.unwrap();
+        let (_server_conn, server_streams) = server_task.await.unwrap();
+        let (server_sends, _server_recvs) = server_streams.unwrap();
+
+        for sends in [&client_sends, &server_sends] {
+            assert_eq!(sends.len(), NUM_CLASSES);
+            for (class_id, send) in sends.iter().enumerate() {
+                assert_eq!(
+                    send.priority().unwrap(),
+                    class_stream_priority(class_id),
+                    "class {class_id} stream must carry its mapped transmit priority"
+                );
+            }
+            // The property that matters for #414: Consensus drains strictly
+            // ahead of Sync when the path is congested.
+            assert!(
+                sends[0].priority().unwrap() > sends[NUM_CLASSES - 1].priority().unwrap(),
+                "Consensus stream priority must strictly exceed Sync's"
+            );
         }
     }
 
