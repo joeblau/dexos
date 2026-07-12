@@ -10,7 +10,9 @@
 //! over-read, or silent truncation.
 
 use codec::{Frame, FRAME_HEADER_LEN, MAX_FRAME_PAYLOAD};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt};
+#[cfg(test)]
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::error::TransportError;
 use crate::session::{Opener, Sealer, AEAD_OVERHEAD};
@@ -22,6 +24,7 @@ use crate::util::as_usize;
 /// The plaintext is the self-delimiting [`Frame`] byte string, so decryption
 /// yields exactly one frame. Only the 4-byte length prefix and opaque
 /// ciphertext appear on the wire.
+#[cfg(test)]
 pub(crate) async fn write_encrypted_frame<W>(
     writer: &mut W,
     sealer: &mut Sealer,
@@ -30,12 +33,29 @@ pub(crate) async fn write_encrypted_frame<W>(
 where
     W: AsyncWrite + Unpin,
 {
+    let mut record = Vec::new();
+    append_encrypted_record(&mut record, sealer, frame)?;
+    writer.write_all(&record).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+/// Append one complete encrypted record to a reusable output buffer.
+///
+/// Keeping record construction separate from I/O lets the TCP writer coalesce
+/// a bounded queue burst into one `write_all`/`flush` pair. Record boundaries
+/// remain self-describing, so readers and cryptographic sequence handling are
+/// unchanged.
+pub(crate) fn append_encrypted_record(
+    output: &mut Vec<u8>,
+    sealer: &mut Sealer,
+    frame: &Frame,
+) -> Result<(), TransportError> {
     let plaintext = frame.encode()?;
     let ciphertext = sealer.seal(&plaintext)?;
     let len = u32::try_from(ciphertext.len()).map_err(|_| TransportError::MessageTooLarge)?;
-    writer.write_all(&len.to_le_bytes()).await?;
-    writer.write_all(&ciphertext).await?;
-    writer.flush().await?;
+    output.extend_from_slice(&len.to_le_bytes());
+    output.extend_from_slice(&ciphertext);
     Ok(())
 }
 
