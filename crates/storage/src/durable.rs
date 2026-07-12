@@ -18,8 +18,11 @@
 //! ```
 //!
 //! Sealed segments end with a fixed trailer committing `chain_tip` over all
-//! framed records. The active tail may be trailer-less after a crash; recovery
-//! scans the valid prefix, discards a torn final frame, and reseals.
+//! framed records. Only the active (final) segment may be trailer-less after a
+//! crash; recovery scans its valid prefix and discards a torn final frame once
+//! all segments validate. A corrupt interior segment or a cross-segment
+//! sequence gap fails **closed** ([`DurableError::Integrity`]) without
+//! mutating any on-disk bytes.
 //!
 //! # Index recovery
 //!
@@ -205,8 +208,15 @@ impl DurableLog {
     /// Create or recover a durable log at `cfg.dir`.
     ///
     /// Recovery is deterministic: segments are listed, sorted by base sequence,
-    /// cryptographically verified, and sparse indexes rebuilt. A torn active
-    /// tail is truncated to the last complete record and resealed.
+    /// cryptographically verified, and sparse indexes rebuilt. Only the final
+    /// segment may be unsealed or torn (a crash mid-append/mid-rotation); its
+    /// torn tail is truncated to the last complete record, and only after every
+    /// segment has passed verification and the cross-segment continuity check.
+    ///
+    /// Recovery fails **closed**: a sealed interior segment with a corrupt
+    /// trailer or record region, or a sequence gap/overlap between segments,
+    /// returns [`DurableError::Integrity`] and leaves every on-disk byte
+    /// unmodified for inspection.
     ///
     /// # Errors
     /// Returns I/O or integrity errors.
@@ -220,14 +230,30 @@ impl DurableLog {
         let mut total_records = 0usize;
         let mut expected_base: Option<u64> = None;
 
-        for path in paths {
-            let meta = recover_segment(&path, &cfg, /*allow_unsealed*/ true)?;
+        for (i, path) in paths.iter().enumerate() {
+            // Only the final segment may legitimately be unsealed or torn;
+            // every interior segment was sealed by the writer before the next
+            // segment was created, so anything else there is corruption.
+            let is_last = i + 1 == paths.len();
+            let meta = recover_segment(path, &cfg, /*allow_unsealed*/ is_last)?;
+            // An empty segment is legitimate only in the final position (a
+            // crash between segment-create and the first append).
+            if meta.record_count == 0 && !is_last {
+                return Err(DurableError::Integrity(format!(
+                    "empty non-final segment {}",
+                    path.display()
+                )));
+            }
             if let Some(exp) = expected_base {
-                if meta.base_sequence < exp {
+                // Sequences must be exactly contiguous across segments: reject
+                // both gaps (silently missing acknowledged records) and
+                // overlaps. Empty segments carry no records and are exempt.
+                if meta.record_count > 0 && meta.base_sequence != exp {
                     return Err(DurableError::Integrity(format!(
-                        "segment base {} overlaps previous last {}",
+                        "segment base {} breaks continuity: expected {} in {}",
                         meta.base_sequence,
-                        exp.saturating_sub(1)
+                        exp,
+                        path.display()
                     )));
                 }
             }
@@ -239,12 +265,22 @@ impl DurableLog {
             segments.push(meta);
         }
 
-        // Only the final segment may remain unsealed; seal earlier ones if needed.
-        let n = segments.len();
-        for (i, seg) in segments.iter_mut().enumerate() {
-            if i + 1 < n && !seg.sealed {
-                seal_segment_file(seg)?;
+        // Every segment verified and continuity holds — only now is it safe to
+        // mutate disk state. Discard torn bytes after the valid prefix of the
+        // final (unsealed) segment. If any check above failed, `open` returned
+        // without modifying a single on-disk byte.
+        if let Some(seg) = segments.last() {
+            if !seg.sealed {
+                let disk_len = fs::metadata(&seg.path)?.len();
+                if disk_len > seg.records_len {
+                    let wf = OpenOptions::new().write(true).open(&seg.path)?;
+                    wf.set_len(seg.records_len)?;
+                    wf.sync_data()?;
+                }
             }
+        }
+
+        for (i, seg) in segments.iter_mut().enumerate() {
             seg.index = u64::try_from(i).unwrap_or(u64::MAX);
         }
 
@@ -794,62 +830,85 @@ fn recover_segment(
     // Try sealed trailer first.
     if file_len >= SEGMENT_TRAILER_LEN as u64 {
         let split = all.len() - SEGMENT_TRAILER_LEN;
-        if let Ok(trailer) = parse_trailer(&all[split..]) {
-            if u64::try_from(split).ok() == Some(trailer.records_len) {
-                let records = &all[..split];
-                let tip = chain_over_records(records, cfg.max_record_bytes).ok_or_else(|| {
-                    DurableError::Integrity(format!("chain walk failed for {}", path.display()))
-                })?;
-                if tip != trailer.chain_tip {
+        match parse_trailer(&all[split..]) {
+            Ok(trailer) => {
+                if u64::try_from(split).ok() == Some(trailer.records_len) {
+                    let records = &all[..split];
+                    let tip =
+                        chain_over_records(records, cfg.max_record_bytes).ok_or_else(|| {
+                            DurableError::Integrity(format!(
+                                "chain walk failed for {}",
+                                path.display()
+                            ))
+                        })?;
+                    if tip != trailer.chain_tip {
+                        return Err(DurableError::Integrity(format!(
+                            "chain tip mismatch in {}",
+                            path.display()
+                        )));
+                    }
+                    // Validate each record CRC and build index.
+                    let (count, last, points, base) =
+                        scan_records(records, cfg.max_record_bytes, cfg.index_stride)?;
+                    if count as u64 != trailer.record_count
+                        || last != Some(trailer.last_sequence)
+                        || base != trailer.base_sequence
+                    {
+                        return Err(DurableError::Integrity(format!(
+                            "trailer metadata mismatch in {}",
+                            path.display()
+                        )));
+                    }
+                    return Ok(SegmentMeta {
+                        path: path.to_path_buf(),
+                        index: 0,
+                        base_sequence: base,
+                        last_sequence: last,
+                        record_count: count,
+                        records_len: trailer.records_len,
+                        sealed: true,
+                        chain_tip: tip,
+                        index_points: points,
+                    });
+                }
+                // The trailer parsed but disagrees with the file layout. A
+                // non-final segment was sealed by the writer, so this is
+                // corruption of acknowledged data — fail closed rather than
+                // fall through to the torn-tail scan.
+                if !allow_unsealed {
                     return Err(DurableError::Integrity(format!(
-                        "chain tip mismatch in {}",
+                        "trailer records_len mismatch in non-final segment {}",
                         path.display()
                     )));
                 }
-                // Validate each record CRC and build index.
-                let (count, last, points, base) =
-                    scan_records(records, cfg.max_record_bytes, cfg.index_stride)?;
-                if count as u64 != trailer.record_count
-                    || last != Some(trailer.last_sequence)
-                    || base != trailer.base_sequence
-                {
+            }
+            Err(err) => {
+                // A non-final segment must carry a valid trailer; a parse
+                // failure (e.g. a single flipped byte) is corruption of
+                // acknowledged data, not a torn tail — fail closed.
+                if !allow_unsealed {
                     return Err(DurableError::Integrity(format!(
-                        "trailer metadata mismatch in {}",
+                        "invalid trailer in non-final segment {}: {err}",
                         path.display()
                     )));
                 }
-                return Ok(SegmentMeta {
-                    path: path.to_path_buf(),
-                    index: 0,
-                    base_sequence: base,
-                    last_sequence: last,
-                    record_count: count,
-                    records_len: trailer.records_len,
-                    sealed: true,
-                    chain_tip: tip,
-                    index_points: points,
-                });
             }
         }
     }
 
     if !allow_unsealed {
         return Err(DurableError::Integrity(format!(
-            "unsealed segment {}",
+            "unsealed non-final segment {}",
             path.display()
         )));
     }
 
-    // Crash recovery: scan valid prefix, truncate torn tail.
+    // Crash recovery (final segment only): scan the valid record prefix. The
+    // torn suffix, if any, is NOT truncated here — `open()` truncates it only
+    // after the full cross-segment continuity pass succeeds, so a failed open
+    // leaves every on-disk byte untouched for forensics.
     let (valid_len, count, last, points, base, tip) =
         scan_valid_prefix(&all, cfg.max_record_bytes, cfg.index_stride)?;
-
-    // Truncate torn bytes and leave unsealed (caller may seal non-tail segments).
-    if (valid_len as u64) < file_len {
-        let wf = OpenOptions::new().write(true).open(path)?;
-        wf.set_len(valid_len as u64)?;
-        wf.sync_data()?;
-    }
 
     Ok(SegmentMeta {
         path: path.to_path_buf(),
@@ -857,7 +916,7 @@ fn recover_segment(
         base_sequence: base,
         last_sequence: last,
         record_count: count,
-        records_len: valid_len as u64,
+        records_len: u64::try_from(valid_len).unwrap_or(u64::MAX),
         sealed: false,
         chain_tip: tip,
         index_points: points,
@@ -1233,6 +1292,123 @@ mod tests {
             );
         }
         assert!(log.find(99).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn sorted_segment_paths(dir: &Path) -> Vec<PathBuf> {
+        let mut segs: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("log"))
+            .collect();
+        segs.sort();
+        segs
+    }
+
+    #[test]
+    fn corrupt_interior_segment_fails_closed_without_mutation() {
+        let dir = temp_dir("interior-corrupt");
+        {
+            let mut log = DurableLog::open(cfg(&dir)).unwrap();
+            for seq in 1..=20u64 {
+                log.append(seq, 0, 1, b"payload!").unwrap();
+            }
+        }
+        let segs = sorted_segment_paths(&dir);
+        assert!(segs.len() >= 2, "need a sealed interior segment");
+
+        // Flip a byte inside a record AND a trailer byte of the first
+        // (interior, sealed) segment. A broken trailer used to route the
+        // segment into the torn-tail path, where scan_valid_prefix stopped at
+        // the flipped record and open() truncated acknowledged, fdatasync'd
+        // records on disk — laundering silent data loss as a clean recovery.
+        let target = &segs[0];
+        let mut bytes = fs::read(target).unwrap();
+        assert!(bytes.len() > SEGMENT_TRAILER_LEN + 20);
+        bytes[12] ^= 0xFF; // record region
+        let end = bytes.len();
+        bytes[end - 1] ^= 0xFF; // trailer CRC byte
+        fs::write(target, &bytes).unwrap();
+
+        let before: Vec<Vec<u8>> = segs.iter().map(|p| fs::read(p).unwrap()).collect();
+        let err = match DurableLog::open(cfg(&dir)) {
+            Ok(_) => panic!("open must fail closed on interior corruption"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, DurableError::Integrity(_)),
+            "expected Integrity, got {err:?}"
+        );
+
+        // Fail closed: the failed open modified no byte of any segment.
+        for (path, want) in segs.iter().zip(&before) {
+            let got = fs::read(path).unwrap();
+            assert_eq!(
+                got.len(),
+                want.len(),
+                "length changed for {}",
+                path.display()
+            );
+            assert_eq!(&got, want, "bytes changed for {}", path.display());
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn torn_final_tail_still_recovers_valid_prefix() {
+        let dir = temp_dir("torn-final");
+        {
+            let mut log = DurableLog::open(cfg(&dir)).unwrap();
+            for seq in 1..=20u64 {
+                log.append(seq, 0, 1, b"payload!").unwrap();
+            }
+        }
+        let segs = sorted_segment_paths(&dir);
+        assert!(segs.len() >= 2, "need a multi-segment log");
+
+        // Tear the FINAL (active) segment: legitimate crash recovery must
+        // still truncate the torn suffix and keep every acknowledged record.
+        let last = segs.last().unwrap();
+        let valid_len = fs::metadata(last).unwrap().len();
+        let mut f = OpenOptions::new().append(true).open(last).unwrap();
+        f.write_all(&[0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02]).unwrap();
+        f.sync_data().unwrap();
+        drop(f);
+
+        let log = DurableLog::open(cfg(&dir)).unwrap();
+        assert_eq!(log.len(), 20);
+        assert_eq!(log.last_sequence(), Some(20));
+        log.verify().unwrap();
+        // The torn bytes were discarded on disk after validation succeeded.
+        assert_eq!(fs::metadata(last).unwrap().len(), valid_len);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sequence_gap_across_segments_is_rejected() {
+        let dir = temp_dir("seq-gap");
+        {
+            let mut log = DurableLog::open(cfg(&dir)).unwrap();
+            for seq in 1..=30u64 {
+                log.append(seq, 0, 1, b"payload!").unwrap();
+            }
+        }
+        let segs = sorted_segment_paths(&dir);
+        assert!(segs.len() >= 3, "need an interior segment to remove");
+
+        // Removing an interior segment leaves a hole in the sequence space.
+        // Each remaining segment is individually valid, so only the
+        // cross-segment continuity check can catch the missing records.
+        fs::remove_file(&segs[1]).unwrap();
+
+        let err = match DurableLog::open(cfg(&dir)) {
+            Ok(_) => panic!("open must reject a cross-segment sequence gap"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, DurableError::Integrity(_)),
+            "expected Integrity, got {err:?}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }
