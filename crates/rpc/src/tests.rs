@@ -60,7 +60,7 @@ fn account_kp() -> crypto::KeyPair {
 
 /// A signed direct (non-delegated) envelope authorizing `command`.
 fn signed_meta(kp: &crypto::KeyPair, client_id: u64, nonce: u64, command: &Command) -> ControlMeta {
-    ControlMeta::signed(client_id, nonce, None, kp, command)
+    ControlMeta::signed(client_id, nonce, None, kp, command).expect("test command must encode")
 }
 
 fn sample_submit() -> SubmitOrderParams {
@@ -954,13 +954,15 @@ fn delegated_commands_require_the_session_key_to_sign() {
     let cmd = params.to_command();
 
     // Signed by the session key, claiming the session -> accepted.
-    let good = ControlMeta::signed(1, 1, Some(session_pk), &session_kp, &cmd);
+    let good = ControlMeta::signed(1, 1, Some(session_pk), &session_kp, &cmd)
+        .expect("test command must encode");
     assert!(b.submit_order(&good, &params).is_ok());
 
     // Signed by a different key but still claiming the session -> the signer is
     // authentic but is not the session key: unauthorized.
     let other = crypto::KeyPair::from_seed(&[43u8; 32]);
-    let bad = ControlMeta::signed(1, 2, Some(session_pk), &other, &cmd);
+    let bad = ControlMeta::signed(1, 2, Some(session_pk), &other, &cmd)
+        .expect("test command must encode");
     assert_eq!(b.submit_order(&bad, &params), Err(RpcError::Unauthorized));
 }
 
@@ -1824,7 +1826,8 @@ fn authorize_session_installs_usable_session() {
     // Delegated trading with the installed session succeeds.
     let order = sample_submit();
     let order_cmd = order.to_command();
-    let sess_meta = ControlMeta::signed(2, 1, Some(session_pk), &session_kp, &order_cmd);
+    let sess_meta = ControlMeta::signed(2, 1, Some(session_pk), &session_kp, &order_cmd)
+        .expect("test command must encode");
     b.set_now(0);
     assert!(b.submit_order(&sess_meta, &order).is_ok());
 

@@ -619,13 +619,9 @@ fn build_method(cli: &Cli) -> anyhow::Result<RpcMethod> {
 /// `ControlMeta` a write method carries.
 fn control_meta(cli: &Cli, command: &RpcCommand) -> anyhow::Result<ControlMeta> {
     let (keypair, session_pubkey) = load_signer(cli)?;
-    Ok(ControlMeta::signed(
-        cli.client_id,
-        cli.nonce,
-        session_pubkey,
-        &keypair,
-        command,
-    ))
+    let meta = ControlMeta::signed(cli.client_id, cli.nonce, session_pubkey, &keypair, command)
+        .map_err(|e| anyhow::anyhow!("signing control command: {e}"))?;
+    Ok(meta)
 }
 
 /// Resolve the signing key: a delegated session key if `--session-key` is set,
@@ -843,7 +839,8 @@ mod tests {
             market: None,
         };
         let command = params.to_command();
-        let meta = ControlMeta::signed(1, 0, None, &keypair, &command);
+        let meta =
+            ControlMeta::signed(1, 0, None, &keypair, &command).expect("test command must encode");
         assert!(meta.verify_signature(&command).is_ok());
         // The signer is the root key (no session delegation).
         assert_eq!(meta.signer, keypair.public());
