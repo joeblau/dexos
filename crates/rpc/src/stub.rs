@@ -1,12 +1,14 @@
 //! An in-memory [`RpcBackend`] for tests and local development.
 //!
 //! It is deterministic, enforces page bounds, dedupes commands by
-//! `(client_id, nonce)` for exactly-once semantics, validates sessions, and can
+//! `(client_id, nonce)` for exactly-once semantics via a bounded TTL/LRU store,
+//! validates sessions (and **installs** them on `authorize_session`), and can
 //! simulate ingress backpressure. It maintains a real account Merkle tree so
 //! [`RpcBackend::get_account_proof`] returns verifiable proofs.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use crypto::MerkleTree;
 use types::{AccountId, Amount, Hash, MarketId, OrderId, Price, Quantity, SequenceNumber, Side};
@@ -18,18 +20,13 @@ use crate::command::{
     RequestWithdrawalParams, RevokeSessionParams, StakeMarketParams, SubmitOrderParams,
 };
 use crate::error::RpcError;
-use crate::session::Session;
+use crate::idempotency::{IdempotencyConfig, IdempotencyStore};
+use crate::session::{Session, SessionBinding, SessionLookup, SessionRegistry};
 use crate::wire::{
     Account, AccountProof, Book, Checkpoint, DepositStatus, ExecutionReceipt, FinalityStatus,
     MarketDetail, MarketStatus, MarketSummary, NetworkStatus, NodeInfo, OracleStatus, Order,
     PageParams, PeerInfo, Position, RpcMode, Trade, VerificationStatus, WithdrawalStatus,
 };
-
-/// Registration of a session key bound to an account.
-struct BoundSession {
-    account: AccountId,
-    session: Session,
-}
 
 struct Inner {
     node: NodeInfo,
@@ -48,9 +45,15 @@ struct Inner {
     deposits: HashMap<Hash, DepositStatus>,
     withdrawals: HashMap<Hash, WithdrawalStatus>,
     network: NetworkStatus,
-    sessions: HashMap<[u8; 32], BoundSession>,
+    /// Shared registry consulted by stream subscription (server-side binding).
+    sessions: SessionRegistry,
     account_keys: HashMap<AccountId, [u8; 32]>,
-    seen: HashMap<(u64, u64), CommandAck>,
+    /// Bounded, TTL/LRU-capped exactly-once store for `(client_id, nonce)`.
+    seen: IdempotencyStore<(u64, u64), CommandAck>,
+    /// Monotonic logical clock used for the idempotency store when wall clock
+    /// is not injected; advanced on every insert so capacity eviction is
+    /// deterministic in tests.
+    seen_tick: Instant,
     tree: MerkleTree,
     now: u64,
     next_order: u64,
@@ -68,6 +71,12 @@ impl StubBackend {
     /// A fresh backend in the given mode with a default page limit of 100 and an
     /// account tree sized for 1024 leaves.
     pub fn new(mode: RpcMode) -> Self {
+        Self::with_idempotency(mode, IdempotencyConfig::default())
+    }
+
+    /// Like [`Self::new`] but with an explicit idempotency-store configuration
+    /// (used by flood / capacity tests).
+    pub fn with_idempotency(mode: RpcMode, idempotency: IdempotencyConfig) -> Self {
         let node = NodeInfo {
             node_id: [0u8; 32],
             chain_id: 1,
@@ -99,9 +108,10 @@ impl StubBackend {
                 deposits: HashMap::new(),
                 withdrawals: HashMap::new(),
                 network,
-                sessions: HashMap::new(),
+                sessions: SessionRegistry::new(),
                 account_keys: HashMap::new(),
-                seen: HashMap::new(),
+                seen: IdempotencyStore::new(idempotency),
+                seen_tick: Instant::now(),
                 tree: MerkleTree::new(1024),
                 now: 0,
                 next_order: 1,
@@ -109,6 +119,12 @@ impl StubBackend {
                 saturated: false,
             }),
         }
+    }
+
+    /// Shared session registry (installs from `authorize_session`; looked up by
+    /// private stream subscription).
+    pub fn sessions(&self) -> SessionRegistry {
+        self.lock().sessions.clone()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -211,9 +227,7 @@ impl StubBackend {
 
     /// Register a session key bound to an account with a validated scope.
     pub fn register_session(&self, account: AccountId, session: Session) {
-        let mut g = self.lock();
-        g.sessions
-            .insert(session.session_pubkey, BoundSession { account, session });
+        self.lock().sessions.insert(account, session);
     }
 
     /// Register (or rotate) an account's ed25519 root authorization key. Direct
@@ -297,7 +311,10 @@ impl StubBackend {
                 return Err(RpcError::Unauthorized);
             }
             let now = g.now;
-            let bound = g.sessions.get(&pk).ok_or(RpcError::Unauthorized)?;
+            let bound = g
+                .sessions
+                .lookup_session(&pk)
+                .ok_or(RpcError::Unauthorized)?;
             if let Some(account) = command.account() {
                 if account != bound.account {
                     return Err(RpcError::Unauthorized);
@@ -315,8 +332,11 @@ impl StubBackend {
         }
         // Exactly-once: a repeated (client_id, nonce) returns the stored ack
         // without re-executing. The replay was already re-authenticated above.
-        if let Some(existing) = g.seen.get(&(meta.client_id, meta.nonce)) {
-            return Ok(existing.clone());
+        // Advance a logical tick so capacity/TTL tests are deterministic.
+        g.seen_tick += Duration::from_nanos(1);
+        let tick = g.seen_tick;
+        if let Some(existing) = g.seen.get(&(meta.client_id, meta.nonce), tick) {
+            return Ok(existing);
         }
         let ack = CommandAck {
             command_hash: command_hash(&command),
@@ -324,8 +344,15 @@ impl StubBackend {
             order_id,
             market_id,
         };
-        g.seen.insert((meta.client_id, meta.nonce), ack.clone());
+        g.seen
+            .insert((meta.client_id, meta.nonce), ack.clone(), tick);
         Ok(ack)
+    }
+}
+
+impl SessionLookup for StubBackend {
+    fn lookup_session(&self, session_pubkey: &[u8; 32]) -> Option<SessionBinding> {
+        self.lock().sessions.lookup_session(session_pubkey)
     }
 }
 
@@ -548,7 +575,18 @@ impl RpcBackend for StubBackend {
         meta: &ControlMeta,
         params: &AuthorizeSessionParams,
     ) -> Result<CommandAck, RpcError> {
-        self.ingest(meta, params.to_command(), None, None)
+        // Install the session *after* a successful ingest so a rejected
+        // (unsigned / unauthorized / replay-conflict) call never mutates the
+        // registry — but a fresh authorize actually produces a usable binding.
+        let ack = self.ingest(meta, params.to_command(), None, None)?;
+        self.lock().sessions.insert(
+            params.account,
+            Session {
+                session_pubkey: params.session_pubkey,
+                scope: params.scope.clone(),
+            },
+        );
+        Ok(ack)
     }
 
     fn revoke_session(
@@ -556,7 +594,9 @@ impl RpcBackend for StubBackend {
         meta: &ControlMeta,
         params: &RevokeSessionParams,
     ) -> Result<CommandAck, RpcError> {
-        self.ingest(meta, params.to_command(), None, None)
+        let ack = self.ingest(meta, params.to_command(), None, None)?;
+        self.lock().sessions.revoke(&params.session_pubkey);
+        Ok(ack)
     }
 
     fn bind_wallet(
@@ -641,5 +681,11 @@ impl StubBackend {
     /// The set of seen idempotency keys.
     pub fn seen_keys(&self) -> HashSet<(u64, u64)> {
         self.lock().seen.keys().copied().collect()
+    }
+
+    /// Whether a session key is currently installed and bound to `account`.
+    pub fn session_bound_to(&self, session_pubkey: &[u8; 32], account: AccountId) -> bool {
+        self.lookup_session(session_pubkey)
+            .is_some_and(|b| b.account == account)
     }
 }

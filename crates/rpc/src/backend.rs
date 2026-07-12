@@ -137,6 +137,10 @@ pub trait RpcBackend: Send + Sync {
 
 use crate::wire::RpcMode;
 
+/// Central clamp on `GetMarketBook` depth. Applied in [`dispatch`] so every
+/// backend sees a bounded level count regardless of the client-supplied value.
+pub const MAX_BOOK_DEPTH: u32 = 100;
+
 /// Route a decoded request to the backend, echoing its `request_id`. Control
 /// methods are rejected with [`RpcError::ReadOnly`] unless `mode` allows writes.
 /// This function is pure and never panics.
@@ -165,6 +169,7 @@ fn route(backend: &dyn RpcBackend, mode: RpcMode, method: RpcMethod) -> Result<R
         RpcMethod::GetMarkets(page) => backend.get_markets(page).map(RpcOk::Markets),
         RpcMethod::GetMarket(m) => backend.get_market(m).map(RpcOk::Market),
         RpcMethod::GetMarketBook(m, depth) => {
+            let depth = depth.min(MAX_BOOK_DEPTH);
             backend.get_market_book(m, depth).map(RpcOk::MarketBook)
         }
         RpcMethod::GetMarketTrades(m, page) => {

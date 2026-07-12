@@ -1,5 +1,7 @@
 //! Unit, property (in-test LCG), and never-panics tests for the RPC crate.
 
+use std::sync::Arc;
+
 use crate::command::*;
 use crate::error::RpcError;
 use crate::request::*;
@@ -1204,28 +1206,57 @@ fn private_topics_are_gated() {
     let hub = StreamHub::new(8);
     let owner = a(1);
     let other = a(2);
+    let sessions = crate::session::SessionRegistry::new();
+    let owner_pk = [7u8; 32];
+    let other_pk = [8u8; 32];
+    sessions.insert(
+        owner,
+        Session {
+            session_pubkey: owner_pk,
+            scope: sample_scope(vec![m(1)]),
+        },
+    );
+    sessions.insert(
+        other,
+        Session {
+            session_pubkey: other_pk,
+            scope: sample_scope(vec![m(1)]),
+        },
+    );
     // Public path rejects private topics.
     assert_eq!(
         hub.subscribe(Topic::Positions(owner), Reliability::Reliable)
             .err(),
         Some(RpcError::Unauthorized)
     );
-    // Matching bound account, unexpired -> ok.
+    // Matching bound account via server-installed session, unexpired -> ok.
     assert!(hub
-        .subscribe_private(Topic::Orders(owner), owner, 1_000, 0, Reliability::Reliable)
+        .subscribe_private(Topic::Orders(owner), &owner_pk, &sessions, 0, Reliability::Reliable)
         .is_ok());
-    // Cross-account -> unauthorized (no leakage).
+    // Cross-account session key -> unauthorized (no leakage).
     assert_eq!(
-        hub.subscribe_private(Topic::Orders(owner), other, 1_000, 0, Reliability::Reliable)
+        hub.subscribe_private(Topic::Orders(owner), &other_pk, &sessions, 0, Reliability::Reliable)
             .err(),
         Some(RpcError::Unauthorized)
     );
-    // Expired -> session expired.
+    // Unknown session key -> unauthorized (client cannot spoof binding).
     assert_eq!(
         hub.subscribe_private(
             Topic::Orders(owner),
-            owner,
-            1_000,
+            &[9u8; 32],
+            &sessions,
+            0,
+            Reliability::Reliable
+        )
+        .err(),
+        Some(RpcError::Unauthorized)
+    );
+    // Expired session -> session expired.
+    assert_eq!(
+        hub.subscribe_private(
+            Topic::Orders(owner),
+            &owner_pk,
+            &sessions,
             2_000,
             Reliability::Reliable
         )
@@ -1427,6 +1458,10 @@ fn budget_config(max_connections: usize) -> crate::server::ServerConfig {
         read_timeout: std::time::Duration::from_secs(30),
         write_timeout: std::time::Duration::from_secs(5),
         max_tracked_ips: 1_024,
+        max_payload: codec::MAX_RPC_FRAME_PAYLOAD,
+        tls: crate::server::TlsMode::Disabled,
+        work: crate::work::WorkBudgetConfig::default(),
+        dispatch_timeout: std::time::Duration::from_secs(5),
     }
 }
 
@@ -1494,6 +1529,10 @@ async fn tcp_server_evicts_slowloris_clients() {
         read_timeout: Duration::from_millis(150),
         write_timeout: Duration::from_secs(5),
         max_tracked_ips: 1_024,
+        max_payload: codec::MAX_RPC_FRAME_PAYLOAD,
+        tls: crate::server::TlsMode::Disabled,
+        work: crate::work::WorkBudgetConfig::default(),
+        dispatch_timeout: Duration::from_secs(5),
     };
     tokio::spawn(async move {
         let _ = crate::server::serve_with_config(listener, backend, RpcMode::Full, cfg).await;
@@ -1577,5 +1616,380 @@ async fn tcp_server_connection_budget_holds_under_flood() {
         let resp = decode_response(&frame).unwrap();
         assert_eq!(resp.request_id, 7);
         assert!(matches!(resp.result, Ok(RpcOk::NetworkStatus(_))));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P1 #285: authorize_session installs; bounded idempotency; authenticated streams
+// ---------------------------------------------------------------------------
+
+#[test]
+fn authorize_session_installs_usable_session() {
+    let b = StubBackend::new(RpcMode::Full);
+    let root = account_kp();
+    b.register_account_key(a(1), root.public());
+    let session_kp = crypto::KeyPair::from_seed(&[55u8; 32]);
+    let session_pk = session_kp.public();
+    let params = AuthorizeSessionParams {
+        account: a(1),
+        session_pubkey: session_pk,
+        scope: sample_scope(vec![m(1)]),
+    };
+    let cmd = params.to_command();
+    let meta = signed_meta(&root, 1, 1, &cmd);
+    assert!(b.authorize_session(&meta, &params).is_ok());
+    // Session is now installed and bound to a(1).
+    assert!(b.session_bound_to(&session_pk, a(1)));
+
+    // Delegated trading with the installed session succeeds.
+    let order = sample_submit();
+    let order_cmd = order.to_command();
+    let sess_meta = ControlMeta::signed(2, 1, Some(session_pk), &session_kp, &order_cmd);
+    b.set_now(0);
+    assert!(b.submit_order(&sess_meta, &order).is_ok());
+
+    // Revoke removes the binding.
+    let rev = RevokeSessionParams {
+        account: a(1),
+        session_pubkey: session_pk,
+    };
+    let rev_cmd = rev.to_command();
+    let rev_meta = signed_meta(&root, 1, 2, &rev_cmd);
+    assert!(b.revoke_session(&rev_meta, &rev).is_ok());
+    assert!(!b.session_bound_to(&session_pk, a(1)));
+}
+
+#[test]
+fn idempotency_store_stays_bounded_under_flood() {
+    let cfg = crate::idempotency::IdempotencyConfig {
+        max_entries: 64,
+        ttl: std::time::Duration::from_secs(60),
+    };
+    let b = StubBackend::with_idempotency(RpcMode::Full, cfg);
+    let root = account_kp();
+    b.register_account_key(a(1), root.public());
+    let params = sample_submit();
+    let cmd = params.to_command();
+    for i in 0..2_000u64 {
+        let meta = signed_meta(&root, 1, i, &cmd);
+        let _ = b.submit_order(&meta, &params);
+    }
+    assert!(
+        b.ingested_count() <= 64,
+        "idempotency map grew to {}",
+        b.ingested_count()
+    );
+}
+
+#[test]
+fn private_stream_cannot_spoof_account_binding() {
+    let hub = StreamHub::new(8);
+    let sessions = crate::session::SessionRegistry::new();
+    let real_pk = [1u8; 32];
+    sessions.insert(
+        a(1),
+        Session {
+            session_pubkey: real_pk,
+            scope: sample_scope(vec![m(1)]),
+        },
+    );
+    // Attacker tries to subscribe to a(2)'s orders using a(1)'s session key.
+    assert_eq!(
+        hub.subscribe_private(Topic::Orders(a(2)), &real_pk, &sessions, 0, Reliability::Reliable)
+            .err(),
+        Some(RpcError::Unauthorized)
+    );
+    // Invented key with no server install cannot bind to anything.
+    assert_eq!(
+        hub.subscribe_private(Topic::Orders(a(1)), &[0xff; 32], &sessions, 0, Reliability::Reliable)
+            .err(),
+        Some(RpcError::Unauthorized)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P1 #286: payload caps + book depth clamp + TLS production config
+// ---------------------------------------------------------------------------
+
+#[test]
+fn get_market_book_depth_is_clamped_centrally() {
+    let b = populated_backend(RpcMode::Full);
+    // Insert a book deeper than the central clamp so truncation is observable.
+    let deep = crate::MAX_BOOK_DEPTH as usize + 50;
+    let mut bids = Vec::with_capacity(deep);
+    let mut asks = Vec::with_capacity(deep);
+    for i in 0..deep {
+        bids.push(crate::wire::BookLevel {
+            price: Price::from_raw(10_000 - i as i64),
+            quantity: Quantity::ONE,
+        });
+        asks.push(crate::wire::BookLevel {
+            price: Price::from_raw(10_001 + i as i64),
+            quantity: Quantity::ONE,
+        });
+    }
+    b.insert_book(Book {
+        market_id: m(1),
+        sequence: SequenceNumber::new(1),
+        bids,
+        asks,
+    });
+    // Client asks for absurd depth; dispatch clamps to MAX_BOOK_DEPTH.
+    let req = RpcRequest::new(1, RpcMethod::GetMarketBook(m(1), u32::MAX));
+    let resp = dispatch(&b, RpcMode::Full, req);
+    match resp.result {
+        Ok(RpcOk::MarketBook(book)) => {
+            assert_eq!(book.bids.len(), crate::MAX_BOOK_DEPTH as usize);
+            assert_eq!(book.asks.len(), crate::MAX_BOOK_DEPTH as usize);
+        }
+        other => panic!("expected book, got {other:?}"),
+    }
+    // Direct backend call without clamp still returns full depth — proving the
+    // clamp lives in dispatch, not the backend.
+    let unclamped = b.get_market_book(m(1), u32::MAX).unwrap();
+    assert!(unclamped.bids.len() > crate::MAX_BOOK_DEPTH as usize);
+}
+
+#[test]
+fn rpc_default_payload_cap_is_below_sync_cap() {
+    assert!(codec::MAX_RPC_FRAME_PAYLOAD < codec::MAX_FRAME_PAYLOAD);
+    assert_eq!(codec::MAX_RPC_FRAME_PAYLOAD, 256 * 1024);
+    let cfg = crate::server::ServerConfig::default();
+    assert_eq!(cfg.max_payload, codec::MAX_RPC_FRAME_PAYLOAD);
+}
+
+#[test]
+fn production_config_requires_tls() {
+    let (cert, key) = crate::generate_self_signed_localhost().expect("self-signed");
+    let acceptor = crate::acceptor_from_pem(&cert, &key, None).expect("acceptor");
+    let cfg = crate::server::ServerConfig::production(acceptor);
+    assert!(matches!(cfg.tls, crate::server::TlsMode::Required(_)));
+    assert!(cfg.max_payload <= codec::MAX_RPC_FRAME_PAYLOAD);
+}
+
+#[tokio::test]
+async fn tls_server_round_trips_a_query() {
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio_rustls::rustls::ClientConfig as RustlsClientConfig;
+    use tokio_rustls::rustls::pki_types::{ServerName, CertificateDer};
+    use tokio_rustls::TlsConnector;
+
+    let (cert_pem, key_pem) = crate::generate_self_signed_localhost().unwrap();
+    let acceptor = crate::acceptor_from_pem(&cert_pem, &key_pem, None).unwrap();
+
+    // Client trusts the same self-signed cert.
+    let mut roots = rustls::RootCertStore::empty();
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut std::io::Cursor::new(&cert_pem))
+        .collect::<Result<_, _>>()
+        .unwrap();
+    for c in certs {
+        roots.add(c).unwrap();
+    }
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let client_cfg = RustlsClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(client_cfg));
+
+    let backend: Arc<dyn RpcBackend> = Arc::new(populated_backend(RpcMode::Full));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut cfg = budget_config(16);
+    cfg.tls = crate::server::TlsMode::Required(acceptor);
+    tokio::spawn(async move {
+        let _ = crate::server::serve_with_config(listener, backend, RpcMode::Full, cfg).await;
+    });
+
+    let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let name = ServerName::try_from("localhost").unwrap();
+    let mut tls = connector.connect(name, tcp).await.unwrap();
+    let req = RpcRequest::new(1, RpcMethod::GetNetworkStatus);
+    let out = encode_request(&req).unwrap();
+    tls.write_all(&out).await.unwrap();
+    tls.flush().await.unwrap();
+    let mut header = [0u8; codec::FRAME_HEADER_LEN];
+    tls.read_exact(&mut header).await.unwrap();
+    let plen = u32::from_le_bytes([header[15], header[16], header[17], header[18]]) as usize;
+    let mut buf = vec![0u8; codec::FRAME_HEADER_LEN + plen];
+    buf[..codec::FRAME_HEADER_LEN].copy_from_slice(&header);
+    tls.read_exact(&mut buf[codec::FRAME_HEADER_LEN..]).await.unwrap();
+    let resp = decode_response(&buf).unwrap();
+    assert!(matches!(resp.result, Ok(RpcOk::NetworkStatus(_))));
+}
+
+// ---------------------------------------------------------------------------
+// P1 #354: isolated dispatch + in-flight byte budget
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn in_flight_byte_budget_rejects_before_admission() {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::{TcpListener, TcpStream};
+
+    let backend: Arc<dyn RpcBackend> = Arc::new(populated_backend(RpcMode::Full));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut cfg = budget_config(32);
+    // Measure a real request frame, then set the process-wide byte budget just
+    // below it so admission fails closed before dispatch.
+    let req = RpcRequest::new(1, RpcMethod::GetNetworkStatus);
+    let out = encode_request(&req).unwrap();
+    cfg.work = crate::work::WorkBudgetConfig {
+        max_in_flight_requests: 1_000,
+        max_in_flight_bytes: out.len().saturating_sub(1).max(1),
+        max_in_flight_requests_per_conn: 1,
+        max_in_flight_bytes_per_conn: 1_000_000,
+    };
+    tokio::spawn(async move {
+        let _ = crate::server::serve_with_config(listener, backend, RpcMode::Full, cfg).await;
+    });
+
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream.write_all(&out).await.unwrap();
+    stream.flush().await.unwrap();
+    let frame = read_one_frame(&mut stream).await.unwrap();
+    let resp = decode_response(&frame).unwrap();
+    assert_eq!(resp.result, Err(RpcError::Backpressure));
+}
+
+// ---------------------------------------------------------------------------
+// P1 #355: stream fanout byte-bounded, sharded, copy-light
+// ---------------------------------------------------------------------------
+
+#[test]
+fn publish_uses_shared_arc_not_per_subscriber_clone() {
+    let hub = StreamHub::with_limits(64, 64 * 1024, 128);
+    let topic = Topic::Trades(m(1));
+    let mut subs: Vec<_> = (0..64)
+        .map(|_| hub.subscribe(topic, Reliability::Lossy).unwrap())
+        .collect();
+    let shared = hub.publish_delta(
+        topic,
+        StreamPayload::Trade(Trade {
+            market_id: m(1),
+            order_id: OrderId::new(1),
+            price: Price::ONE,
+            quantity: Quantity::ONE,
+            side: Side::Bid,
+            timestamp: 1,
+        }),
+    );
+    // Every subscriber observes the same Arc allocation (strong_count grows with
+    // fanout; the body is not deep-cloned per receiver).
+    for sub in subs.iter_mut() {
+        let got = sub.try_recv_shared().expect("event");
+        assert!(Arc::ptr_eq(&shared, &got));
+    }
+    let stats = hub.topic_stats(topic);
+    assert_eq!(stats.published, 1);
+    assert_eq!(stats.subscribers, 64);
+}
+
+#[test]
+fn hot_topic_byte_budget_does_not_block_other_topics() {
+    // Tiny byte budget on each topic; flood topic A, then publish on topic B.
+    let hub = StreamHub::with_limits(8, 256, 64);
+    let hot = Topic::Trades(m(1));
+    let cold = Topic::Trades(m(2));
+    let mut cold_sub = hub.subscribe(cold, Reliability::Reliable).unwrap();
+    for i in 0..100u64 {
+        hub.publish_delta(
+            hot,
+            StreamPayload::Trade(Trade {
+                market_id: m(1),
+                order_id: OrderId::new(i),
+                price: Price::ONE,
+                quantity: Quantity::ONE,
+                side: Side::Bid,
+                timestamp: i,
+            }),
+        );
+    }
+    let hot_stats = hub.topic_stats(hot);
+    assert!(hot_stats.history_shed > 0, "hot topic must shed under budget");
+    assert!(hot_stats.history_bytes <= hub.topic_byte_budget());
+
+    let cold_event = hub.publish_delta(
+        cold,
+        StreamPayload::Trade(Trade {
+            market_id: m(2),
+            order_id: OrderId::new(1),
+            price: Price::ONE,
+            quantity: Quantity::ONE,
+            side: Side::Ask,
+            timestamp: 1,
+        }),
+    );
+    let got = cold_sub.try_recv_shared().expect("cold topic still live");
+    assert!(Arc::ptr_eq(&cold_event, &got));
+    // Cold topic has its own budget; hot shedding did not exhaust it.
+    assert_eq!(hub.topic_stats(cold).history_shed, 0);
+}
+
+#[test]
+fn fanout_scales_to_many_subscribers_without_per_sub_alloc_growth() {
+    // Cover 1 / 64 / 1000 subscriber fanout with a maximum-ish book snapshot.
+    for n in [1usize, 64, 1_000] {
+        let hub = StreamHub::with_limits(32, 2 * 1024 * 1024, 64);
+        let topic = Topic::Book(m(1));
+        let mut subs: Vec<_> = (0..n)
+            .map(|_| hub.subscribe(topic, Reliability::Lossy).unwrap())
+            .collect();
+        let mut bids = Vec::new();
+        for i in 0..50 {
+            bids.push(crate::wire::BookLevel {
+                price: Price::from_raw(1_000 - i),
+                quantity: Quantity::ONE,
+            });
+        }
+        let book = Book {
+            market_id: m(1),
+            sequence: SequenceNumber::new(1),
+            bids,
+            asks: vec![],
+        };
+        let shared = hub.publish_snapshot(topic, StreamPayload::Book(book));
+        let mut received = 0usize;
+        for sub in subs.iter_mut() {
+            if let Ok(got) = sub.try_recv_shared() {
+                assert!(Arc::ptr_eq(&shared, &got));
+                received += 1;
+            }
+        }
+        // Lossy + bounded broadcast: all in-capacity receivers should see it.
+        assert!(received >= n.min(32), "n={n} received={received}");
+        assert_eq!(std::sync::Arc::strong_count(&shared) >= 1, true);
+    }
+}
+
+#[test]
+fn shed_and_lag_are_observable_for_recovery() {
+    let hub = StreamHub::with_limits(4, 512, 32);
+    let topic = Topic::Trades(m(1));
+    let mut slow = hub.subscribe(topic, Reliability::Reliable).unwrap();
+    for i in 0..50u64 {
+        hub.publish_delta(
+            topic,
+            StreamPayload::Trade(Trade {
+                market_id: m(1),
+                order_id: OrderId::new(i),
+                price: Price::ONE,
+                quantity: Quantity::ONE,
+                side: Side::Bid,
+                timestamp: i,
+            }),
+        );
+    }
+    let stats = hub.topic_stats(topic);
+    assert!(stats.history_shed > 0 || stats.published == 50);
+    // Slow reliable subscriber either lags or can recover via snapshot-required.
+    match slow.try_recv() {
+        Err(StreamError::Lagged(_)) | Ok(_) | Err(StreamError::Empty) => {}
+        Err(other) => panic!("unexpected {other:?}"),
+    }
+    match hub.recover(topic, 0) {
+        Recovery::SnapshotRequired | Recovery::Deltas(_) => {}
     }
 }

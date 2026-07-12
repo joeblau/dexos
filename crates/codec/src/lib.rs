@@ -16,8 +16,16 @@ pub const FRAME_MAGIC: u16 = 0xDE05;
 pub const FRAME_VERSION: u16 = 1;
 /// Fixed frame header length: magic(2)+version(2)+class(1)+msg_type(2)+sequence(8)+len(4).
 pub const FRAME_HEADER_LEN: usize = 19;
-/// Maximum payload accepted by the frame decoder (16 MiB) — bounds allocation.
+/// Maximum payload accepted by the peer-protocol frame decoder (16 MiB) —
+/// bounds allocation for historical sync / large snapshot chunks.
 pub const MAX_FRAME_PAYLOAD: usize = 16 * 1024 * 1024;
+
+/// Default maximum payload for the public RPC control plane (256 KiB).
+///
+/// Trading API request/response frames are far smaller than peer-sync chunks;
+/// a lower default caps concurrent allocations under adversarial clients while
+/// remaining configurable per process via the RPC server config.
+pub const MAX_RPC_FRAME_PAYLOAD: usize = 256 * 1024;
 
 /// A codec failure.
 ///
@@ -160,9 +168,14 @@ pub struct Frame {
 }
 
 impl Frame {
-    /// Encode the frame with its header.
+    /// Encode the frame with its header, capped at [`MAX_FRAME_PAYLOAD`].
     pub fn encode(&self) -> Result<Vec<u8>, CodecError> {
-        if self.payload.len() > MAX_FRAME_PAYLOAD {
+        self.encode_with_max(MAX_FRAME_PAYLOAD)
+    }
+
+    /// Encode the frame, refusing payloads larger than `max_payload`.
+    pub fn encode_with_max(&self, max_payload: usize) -> Result<Vec<u8>, CodecError> {
+        if self.payload.len() > max_payload {
             return Err(CodecError::LengthOutOfRange);
         }
         let plen = u32::try_from(self.payload.len()).map_err(|_| CodecError::LengthOutOfRange)?;
@@ -178,7 +191,14 @@ impl Frame {
     }
 
     /// Decode one frame, returning it and the number of bytes consumed. Total.
+    /// Payload length is capped at [`MAX_FRAME_PAYLOAD`].
     pub fn decode(bytes: &[u8]) -> Result<(Frame, usize), CodecError> {
+        Self::decode_with_max(bytes, MAX_FRAME_PAYLOAD)
+    }
+
+    /// Decode one frame with an explicit payload ceiling (e.g. the lower RPC
+    /// control-plane cap). Total on adversarial input.
+    pub fn decode_with_max(bytes: &[u8], max_payload: usize) -> Result<(Frame, usize), CodecError> {
         if bytes.len() < FRAME_HEADER_LEN {
             return Err(CodecError::Truncated);
         }
@@ -196,7 +216,7 @@ impl Frame {
             bytes[7], bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14],
         ]);
         let plen = u32::from_le_bytes([bytes[15], bytes[16], bytes[17], bytes[18]]) as usize;
-        if plen > MAX_FRAME_PAYLOAD {
+        if plen > max_payload {
             return Err(CodecError::LengthOutOfRange);
         }
         let end = FRAME_HEADER_LEN
