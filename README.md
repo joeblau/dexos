@@ -74,9 +74,18 @@ optional macOS portability job).
 
 ```sh
 cargo build --workspace --locked
+cargo fmt --all --check
 cargo test  --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
 ./scripts/check-no-float.sh && ./scripts/check-core-deps.sh && ./scripts/check-unsafe.sh
+```
+
+Or run every PR-blocking CI gate in one shot (fmt, clippy, tests, docs, core
+guards, state-root agreement — add `--full` for the determinism suite):
+
+```sh
+./scripts/preflight.sh
 ```
 
 ## Run
