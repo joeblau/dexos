@@ -1,10 +1,8 @@
 name: release-artifacts
 
-# Tag-driven production artifact build. Runs the same scaffolding as CI's
-# release-artifacts job but for explicit version tags. Does not require write
-# permissions — artifacts are produced in the workspace for operators to
-# collect from the job log / local rerun; attach signatures offline with the
-# org signing key.
+# Tag-driven production artifact build for supported Linux architectures.
+# Produces binaries, SHA-256 checksums, SBOM, build metadata, rollback notes,
+# and Sigstore/cosign keyless signatures (OIDC) for each asset.
 on:
   push:
     tags:
@@ -13,36 +11,146 @@ on:
 
 permissions:
   contents: read
+  id-token: write # cosign keyless OIDC
 
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
 
 jobs:
-  artifacts-linux:
+  artifacts:
     name: linux artifacts (${{ matrix.target }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     permissions:
-      contents: read
+      contents: write # upload release assets on tags
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
-        # Host builds on ubuntu-latest are x86_64. aarch64 cross needs a
-        # toolchain; we still document the matrix entry and build host for now.
-        target: ["x86_64-unknown-linux-gnu"]
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
-      - name: build artifacts
+      - name: build artifacts (locked)
         env:
           TARGET: ${{ matrix.target }}
           OUT_DIR: dist-${{ matrix.target }}
         run: ./scripts/build-release-artifacts.sh
-      - name: smoke test
+      - name: smoke test published layout
         run: |
           BIN=$(ls dist-${{ matrix.target }}/marketd-* | head -1)
           "${BIN}" --help
           (cd dist-${{ matrix.target }} && shasum -a 256 -c SHA256SUMS)
           test -s dist-${{ matrix.target }}/sbom.cdx.json
           test -s dist-${{ matrix.target }}/ROLLBACK.md
+          test -s dist-${{ matrix.target }}/build-metadata.json
+          python3 -c "import json; m=json.load(open('dist-${{ matrix.target }}/build-metadata.json')); assert m['panic_strategy']=='abort', m"
+      - name: install cosign
+        uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da # v3.7.0
+      - name: sign artifacts (keyless OIDC)
+        env:
+          COSIGN_YES: "true"
+        run: |
+          set -euo pipefail
+          DIR="dist-${{ matrix.target }}"
+          BIN=$(ls "${DIR}"/marketd-* | head -1)
+          # Sign the binary and the checksums file. Keyless uses GitHub OIDC.
+          cosign sign-blob --yes \
+            --bundle "${BIN}.cosign.bundle" \
+            "${BIN}"
+          cosign sign-blob --yes \
+            --bundle "${DIR}/SHA256SUMS.cosign.bundle" \
+            "${DIR}/SHA256SUMS"
+          # Prove verification works against the public Rekor log.
+          cosign verify-blob \
+            --bundle "${BIN}.cosign.bundle" \
+            --certificate-identity-regexp "https://github.com/${{ github.repository }}/.*" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "${BIN}"
+          test -s "${BIN}.cosign.bundle"
+          test -s "${DIR}/SHA256SUMS.cosign.bundle"
+          ls -la "${DIR}"
+      - name: upload workflow artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist-${{ matrix.target }}/
+          if-no-files-found: error
+      - name: attach to GitHub Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: |
+            dist-${{ matrix.target }}/marketd-*
+            dist-${{ matrix.target }}/SHA256SUMS
+            dist-${{ matrix.target }}/SHA256SUMS.cosign.bundle
+            dist-${{ matrix.target }}/sbom.cdx.json
+            dist-${{ matrix.target }}/build-metadata.json
+            dist-${{ matrix.target }}/ROLLBACK.md
+            dist-${{ matrix.target }}/marketd-*.cosign.bundle
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release-manifest:
+    name: multi-arch release manifest
+    needs: artifacts
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: download x86_64
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-x86_64-unknown-linux-gnu
+          path: dist-x86_64
+      - name: download aarch64
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-aarch64-unknown-linux-gnu
+          path: dist-aarch64
+      - name: write multi-arch manifest
+        run: |
+          python3 - <<'PY'
+          import json, pathlib, hashlib, os
+          def sha256(p):
+              h = hashlib.sha256()
+              with open(p, "rb") as f:
+                  for chunk in iter(lambda: f.read(1 << 20), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+          manifest = {"version": os.environ.get("GITHUB_REF_NAME", "dev"), "targets": {}}
+          for name, d in [("x86_64-unknown-linux-gnu", "dist-x86_64"), ("aarch64-unknown-linux-gnu", "dist-aarch64")]:
+              root = pathlib.Path(d)
+              bins = list(root.glob("marketd-*"))
+              assert bins, f"missing binary under {d}"
+              b = bins[0]
+              manifest["targets"][name] = {
+                  "binary": b.name,
+                  "sha256": sha256(b),
+                  "sbom": "sbom.cdx.json",
+                  "checksums": "SHA256SUMS",
+                  "signature_bundle": b.name + ".cosign.bundle",
+              }
+          pathlib.Path("RELEASE_MANIFEST.json").write_text(json.dumps(manifest, indent=2) + "\n")
+          print(json.dumps(manifest, indent=2))
+          PY
+      - name: upload manifest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-manifest
+          path: RELEASE_MANIFEST.json
+      - name: attach manifest to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: RELEASE_MANIFEST.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -77,11 +77,49 @@ jobs:
       - name: verify-state-roots.sh
         run: ./scripts/verify-state-roots.sh
 
-  determinism:
-    name: scalar≡vectorized + endian notes
+  coverage:
+    name: coverage (llvm-cov lcov artifact)
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+      - name: install cargo-llvm-cov
+        uses: taiki-e/install-action@2ca9b94c269419b7b0c711c09d0b21c4e1d51145 # v2
+        with:
+          tool: cargo-llvm-cov
+      - name: workspace coverage (lcov)
+        run: |
+          cargo llvm-cov --workspace --locked --lcov --output-path lcov.info \
+            --ignore-filename-regex '(tests?/|target/)'
+          test -s lcov.info
+          # Floor: report must mention real crates (not empty).
+          grep -q 'SF:.*crates/' lcov.info
+      - name: upload lcov artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          if-no-files-found: error
+
+  determinism:
+    name: determinism (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: x86_64
+          # GitHub-hosted ARM64 Linux runners (public repos).
+          - os: ubuntu-24.04-arm
+            arch: aarch64
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
@@ -90,6 +128,82 @@ jobs:
         run: ./scripts/check-determinism.sh
       - name: publish digest
         run: cat determinism-digest.txt
+      - name: upload per-arch digest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: determinism-${{ matrix.arch }}
+          path: |
+            determinism-digest.txt
+          if-no-files-found: error
+
+  determinism-compare:
+    name: multi-arch digest gate
+    needs: determinism
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: fetch x86_64 digests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: determinism-x86_64
+          path: digests/x86_64
+      - name: fetch aarch64 digests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: determinism-aarch64
+          path: digests/aarch64
+      - name: fail on protocol-stable key divergence
+        run: |
+          ./scripts/compare-determinism-digests.sh \
+            digests/x86_64/determinism-digest.txt \
+            digests/aarch64/determinism-digest.txt
+
+  cross-arch-snapshot:
+    name: cross-arch snapshot transfer
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+      - name: export snapshot on x86_64
+        run: |
+          mkdir -p transfer
+          export CROSS_ARCH_SNAPSHOT_OUT="$PWD/transfer/state.snap"
+          cargo test -p storage --test cross_arch_snapshot --locked \
+            cross_arch_snapshot_round_trip -- --nocapture
+          test -s transfer/state.snap
+      - name: upload snapshot
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cross-arch-snapshot
+          path: transfer/
+          if-no-files-found: error
+
+  cross-arch-snapshot-import:
+    name: cross-arch snapshot import (aarch64)
+    needs: cross-arch-snapshot
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+      - name: download x86_64 snapshot
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: cross-arch-snapshot
+          path: transfer
+      - name: import + verify on aarch64
+        run: |
+          test -s transfer/state.snap
+          export CROSS_ARCH_SNAPSHOT_IN="$PWD/transfer/state.snap"
+          cargo test -p storage --test cross_arch_snapshot --locked \
+            cross_arch_snapshot_round_trip -- --nocapture
 
   fuzz-stub:
     name: fuzz stub (time-boxed)

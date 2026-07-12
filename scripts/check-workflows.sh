@@ -17,8 +17,16 @@ grep -qE '^permissions:[[:space:]]*$' .github/workflows/ci.yml || {
 grep -qE '^[[:space:]]+contents:[[:space:]]+read' .github/workflows/ci.yml || {
   echo "workflow may only grant contents: read" >&2; failed=1;
 }
-if grep -REn '(^|[[:space:]])(write-all|contents:[[:space:]]+write|pull-requests:[[:space:]]+write)' .github/workflows; then
-  echo "write permissions are forbidden in CI" >&2
+
+# contents: write is forbidden outside the tag-driven release workflow (which
+# must upload signed assets). ci.yml and other PR gates stay read-only.
+while IFS= read -r hit; do
+  file=${hit%%:*}
+  if [[ "$file" == ".github/workflows/release.yml" ]]; then
+    continue
+  fi
+  echo "write permissions are forbidden outside release.yml: $hit" >&2
   failed=1
-fi
+done < <(grep -REn '(^|[[:space:]])(write-all|contents:[[:space:]]+write|pull-requests:[[:space:]]+write)' .github/workflows || true)
+
 exit "$failed"
