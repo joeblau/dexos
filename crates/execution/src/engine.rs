@@ -219,10 +219,14 @@ pub struct Engine {
     /// fill-by-fill releases telescope to exactly the reserved amount (see
     /// [`OrderReserve`]).
     order_reserves: HashMap<OrderKey, OrderReserve>,
-    /// Outcome claims: (account, market) -> per-outcome balances. Live
+    /// Outcome claims: account -> market -> per-outcome balances. Live
     /// (spendable) claims only; claims backing resting asks are moved into
-    /// `ask_claims_escrow` while the order rests.
-    claims: HashMap<(u32, u32), Vec<Amount>>,
+    /// `ask_claims_escrow` while the order rests. Keyed by account first so
+    /// [`Self::account_leaf`] folds one account's claims without scanning
+    /// every other account's entries (#404); the inner `BTreeMap` iterates
+    /// markets in ascending key order — exactly the committed leaf's
+    /// serialization order, so no per-leaf sort is needed.
+    claims: HashMap<u32, BTreeMap<u32, Vec<Amount>>>,
     /// Committed reserved-premium column for resting claim-market bids, keyed
     /// `(account, market)`. The cash itself sits in the ledger's `escrowed`
     /// partition; this column is the per-market breakdown folded into the
@@ -310,7 +314,8 @@ impl Engine {
     /// in the committed reserved-claims column until the ask fills or releases.
     pub fn claim_balance(&self, account: AccountId, market: MarketId, instrument: u16) -> Amount {
         self.claims
-            .get(&(account.get(), market.get()))
+            .get(&account.get())
+            .and_then(|markets| markets.get(&market.get()))
             .and_then(|v| v.get(usize::from(instrument)))
             .copied()
             .unwrap_or(Amount::ZERO)
@@ -465,7 +470,8 @@ impl Engine {
                 let need = Amount::from_raw(i128::from(remaining.raw()));
                 let entry = self
                     .claims
-                    .get_mut(&(account.get(), market))
+                    .get_mut(&account.get())
+                    .and_then(|markets| markets.get_mut(&market))
                     .ok_or(ExecutionError::InsufficientClaims)?;
                 let inst = usize::from(instrument);
                 let held = entry.get(inst).copied().unwrap_or(Amount::ZERO);
@@ -530,7 +536,9 @@ impl Engine {
                     let outcomes = usize::from(instrument_count(meta.market_type, meta.outcomes));
                     let entry = self
                         .claims
-                        .entry((record.account.get(), market))
+                        .entry(record.account.get())
+                        .or_default()
+                        .entry(market)
                         .or_insert_with(|| vec![Amount::ZERO; outcomes]);
                     if entry.len() < outcomes {
                         entry.resize(outcomes, Amount::ZERO);
@@ -654,13 +662,21 @@ impl Engine {
             w.field_u32(*m).field_i64(*qty);
         }
         // Outcome claims, ascending by market; fully-redeemed sets omitted.
-        let mut claims: Vec<(u32, &[Amount])> = Vec::new();
-        for (&(a, m), amounts) in &self.claims {
-            if a == account.get() && amounts.iter().any(|v| v.raw() != 0) {
-                claims.push((m, amounts.as_slice()));
-            }
-        }
-        claims.sort_unstable_by_key(|&(m, _)| m);
+        // Claims are keyed by account first, so only this account's entries are
+        // walked (no global scan, #404); the inner `BTreeMap` iterates markets
+        // in ascending key order — byte-identical to the explicit
+        // sort-by-market this serialization previously performed.
+        let claims: Vec<(u32, &[Amount])> = self
+            .claims
+            .get(&account.get())
+            .map(|markets| {
+                markets
+                    .iter()
+                    .filter(|(_, amounts)| amounts.iter().any(|v| v.raw() != 0))
+                    .map(|(&m, amounts)| (m, amounts.as_slice()))
+                    .collect()
+            })
+            .unwrap_or_default();
         w.field_u32(u32::try_from(claims.len()).unwrap_or(u32::MAX));
         for (m, amounts) in &claims {
             w.field_u32(*m)
@@ -934,7 +950,9 @@ impl Engine {
         } else {
             let entry = self
                 .claims
-                .entry((seller.get(), market.get()))
+                .entry(seller.get())
+                .or_default()
+                .entry(market.get())
                 .or_insert_with(|| vec![Amount::ZERO; outcomes]);
             if entry.len() < outcomes {
                 entry.resize(outcomes, Amount::ZERO);
@@ -948,7 +966,9 @@ impl Engine {
         {
             let entry = self
                 .claims
-                .entry((buyer.get(), market.get()))
+                .entry(buyer.get())
+                .or_default()
+                .entry(market.get())
                 .or_insert_with(|| vec![Amount::ZERO; outcomes]);
             if entry.len() < outcomes {
                 entry.resize(outcomes, Amount::ZERO);
@@ -1610,7 +1630,9 @@ impl Engine {
                 self.risk.debit_collateral(c.account, c.count)?;
                 let entry = self
                     .claims
-                    .entry((c.account.get(), c.market.get()))
+                    .entry(c.account.get())
+                    .or_default()
+                    .entry(c.market.get())
                     .or_insert_with(|| vec![Amount::ZERO; outcomes]);
                 if entry.len() < outcomes {
                     entry.resize(outcomes, Amount::ZERO);
@@ -1640,7 +1662,8 @@ impl Engine {
                 }
                 let entry = self
                     .claims
-                    .get_mut(&(c.account.get(), c.market.get()))
+                    .get_mut(&c.account.get())
+                    .and_then(|markets| markets.get_mut(&c.market.get()))
                     .ok_or(ExecutionError::IncompleteSet)?;
                 if entry.iter().any(|v| *v < c.count) {
                     return Err(ExecutionError::IncompleteSet);
@@ -1959,15 +1982,21 @@ impl Engine {
                 let holders: Vec<(u32, Vec<Amount>)> = self
                     .claims
                     .iter()
-                    .filter(|((_, m), _)| *m == c.market.get())
-                    .map(|((a, _), v)| (*a, v.clone()))
+                    .filter_map(|(&a, markets)| {
+                        markets.get(&c.market.get()).map(|v| (a, v.clone()))
+                    })
                     .collect();
                 let mut paid = Amount::ZERO;
                 let mut touched: Vec<AccountId> = Vec::new();
                 for (acct, balances) in holders {
                     let account = AccountId::new(acct);
                     let payout = balances.get(win_idx).copied().unwrap_or(Amount::ZERO);
-                    self.claims.remove(&(acct, c.market.get()));
+                    if let Some(markets) = self.claims.get_mut(&acct) {
+                        markets.remove(&c.market.get());
+                        if markets.is_empty() {
+                            self.claims.remove(&acct);
+                        }
+                    }
                     if payout.raw() > 0 {
                         if pool < payout {
                             return Err(ExecutionError::IncompleteSet);
@@ -2304,7 +2333,11 @@ mod tests {
         let mut claims: Vec<(u32, u32, Vec<i128>)> = e
             .claims
             .iter()
-            .map(|(&(a, m), v)| (a, m, v.iter().map(|x| x.raw()).collect()))
+            .flat_map(|(&a, markets)| {
+                markets
+                    .iter()
+                    .map(move |(&m, v)| (a, m, v.iter().map(|x| x.raw()).collect()))
+            })
             .collect();
         claims.sort_unstable_by_key(|(a, m, _)| (*a, *m));
         w.field_i128(i128::try_from(claims.len()).unwrap());
@@ -3880,5 +3913,116 @@ mod tests {
         );
         assert!(e.order_reserves.is_empty());
         check_invariants(&e);
+    }
+
+    // #404 byte-identity golden: a multi-account, multi-market claim scenario
+    // whose committed leaves and state root were captured from the pre-re-key
+    // serialization (claims keyed `(account, market)` with an explicit
+    // sort-by-market in `account_leaf`). The re-keyed layout
+    // (account -> BTreeMap<market, _>) must reproduce these bytes exactly:
+    // BTreeMap ascending-key iteration == the old sort by market.
+    #[test]
+    fn claims_rekey_keeps_leaf_bytes_and_root_golden_404() {
+        let mut e = engine_with_caps(8, 4);
+        e.execute(seq(1), create_account(1_000_000_000)).unwrap(); // 0
+        e.execute(seq(2), create_account(1_000_000_000)).unwrap(); // 1
+        e.execute(seq(3), create_account(1_000_000_000)).unwrap(); // 2
+
+        // Claim markets created in non-ascending id order so map insertion
+        // order differs from the committed (ascending-market) leaf order.
+        e.execute(seq(4), create_claim(2)).unwrap();
+        e.execute(seq(5), create_claim(0)).unwrap();
+        e.execute(seq(6), create_claim(1)).unwrap();
+        // Account 0 holds claims in all three markets, minted out of order.
+        e.execute(seq(7), mint(0, 2, 40_000_000)).unwrap();
+        e.execute(seq(8), mint(0, 0, 30_000_000)).unwrap();
+        e.execute(seq(9), mint(0, 1, 20_000_000)).unwrap();
+        // Account 1 holds claims in market 1 only.
+        e.execute(seq(10), mint(1, 1, 10_000_000)).unwrap();
+        // A resting ask escrows account 0's market-2 claims into the
+        // reserved-claims column; a partial fill then moves 10.0 of them to
+        // account 1 (exercising apply_claim_fill and the escrow draw).
+        e.execute(
+            seq(11),
+            place_at(0, 2, 1, Side::Ask, 400_000, 25_000_000, 0, TimeInForce::Gtc),
+        )
+        .unwrap();
+        e.execute(
+            seq(12),
+            place_at(1, 2, 2, Side::Bid, 400_000, 10_000_000, 0, TimeInForce::Gtc),
+        )
+        .unwrap();
+        // A resting bid escrows account 1 premium in market 0.
+        e.execute(
+            seq(13),
+            place_at(1, 0, 3, Side::Bid, 300_000, 5_000_000, 0, TimeInForce::Gtc),
+        )
+        .unwrap();
+        // Account 2 mints then fully redeems: its all-zero claim set must be
+        // omitted from the committed leaf exactly as before.
+        e.execute(seq(14), mint(2, 0, 50_000_000)).unwrap();
+        e.execute(
+            seq(15),
+            Command::RedeemCompleteSet(CompleteSetOp {
+                account: AccountId::new(2),
+                market: MarketId::new(0),
+                count: Amount::from_raw(50_000_000),
+            }),
+        )
+        .unwrap();
+
+        // Every committed leaf must verify against the root, and the escrow
+        // columns must reconcile with the per-order records.
+        check_invariants(&e);
+
+        // Account 0: claim groups for markets 0 (30/30), 1 (20/20), and
+        // 2 (15 live / 40 — 25 escrowed by the ask, 10 of those sold), plus
+        // the reserved-claims column entry (market 2, instrument 0, 15.0).
+        assert_eq!(
+            hex::encode(e.account_leaf(AccountId::new(0)).unwrap()),
+            "010080887a360000000000000000000000000000000000000000000000000000\
+             0000804a5d05000000000000000000000000000000000000000080887a360000\
+             0000000000000000000080887a36000000000000000000000000000000000000\
+             0000000000000000000000000000000000000000000000000000000000000000\
+             000000000000000000000000000003000000000000000200000080c3c9010000\
+             0000000000000000000080c3c901000000000000000000000000010000000200\
+             0000002d3101000000000000000000000000002d310100000000000000000000\
+             00000200000002000000c0e1e400000000000000000000000000005a62020000\
+             0000000000000000000000000000010000000200000000000000c0e1e4000000\
+             0000000000000000000001000000010000000000000000000000000000000000\
+             0000",
+        );
+        // Account 1: claim groups for markets 1 (10/10) and 2 (10/0 — bought
+        // from the fill), plus the reserved-premium column entry (market 0,
+        // 1.5 escrowed by the resting bid).
+        assert_eq!(
+            hex::encode(e.account_leaf(AccountId::new(1)).unwrap()),
+            "01002047ae3a0000000000000000000000000000000000000000000000000000\
+             00008096980000000000000000000000000000000000000000002047ae3a0000\
+             000000000000000000002047ae3a000000000000000000000000000000000000\
+             0000000000000000000000000000000000000000000000000000000000000000\
+             0000000000000000000000000000020000000100000002000000809698000000\
+             0000000000000000000080969800000000000000000000000000020000000200\
+             0000809698000000000000000000000000000000000000000000000000000000\
+             0000010000000000000060e31600000000000000000000000000000000000100\
+             00000300000000000000000000000000000000000000",
+        );
+        // Account 2: fully-redeemed (all-zero) claim set is omitted — its leaf
+        // carries zero claim groups, exactly as before the re-key.
+        assert_eq!(
+            hex::encode(e.account_leaf(AccountId::new(2)).unwrap()),
+            "010000ca9a3b0000000000000000000000000000000000000000000000000000\
+             000000000000000000000000000000000000000000000000000000ca9a3b0000\
+             0000000000000000000000ca9a3b000000000000000000000000000000000000\
+             0000000000000000000000000000000000000000000000000000000000000000\
+             0000000000000000000000000000000000000000000000000000000000000000\
+             000000000000000000000000000000000000",
+        );
+        // The committed state root over the whole scenario is pinned too: any
+        // leaf-byte drift anywhere moves it.
+        assert_eq!(
+            hex::encode(e.state_root().as_bytes()),
+            "16873ec5c49c71a33f4efb6f8e73d1d714ed5a8dc34644d76efdb8b14bd60693",
+        );
     }
 }
