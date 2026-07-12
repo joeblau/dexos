@@ -26,6 +26,7 @@ node = { path = "../../crates/node" }
 benchmarks = { path = "../../crates/benchmarks", optional = true }
 crypto = { path = "../../crates/crypto" }
 storage = { path = "../../crates/storage" }
+types = { path = "../../crates/types" }
 clap.workspace = true
 anyhow.workspace = true
 getrandom.workspace = true
