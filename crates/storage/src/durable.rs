@@ -497,20 +497,34 @@ impl DurableLog {
     /// the retained prefix).
     ///
     /// # Errors
-    /// Returns I/O or decode errors while locating the cut point.
+    /// Returns I/O or decode errors while locating the cut point, and
+    /// propagates a failed segment unlink. On error the in-memory metadata
+    /// (`last_sequence`, `total_records`, segment list) still matches disk,
+    /// so a reopen cannot resurrect a suffix that truncation claimed to drop.
     pub fn truncate_after(&mut self, keep_through: u64) -> Result<(), DurableError> {
-        // Drop whole segments entirely after keep_through.
+        // Drop whole segments entirely after keep_through, highest-first. The
+        // fallible unlink precedes every in-memory mutation and propagates:
+        // if the OS refuses the unlink (EACCES, EIO, an immutable directory,
+        // a backup agent holding the file), reporting Ok while the file
+        // survives on disk would resurrect the rolled-back suffix on the
+        // next open.
+        let mut removed_any = false;
         while let Some(last) = self.segments.last() {
             if last.base_sequence > keep_through {
                 // Entire segment is after the cut.
-                let path = last.path.clone();
-                self.total_records = self.total_records.saturating_sub(last.record_count);
-                self.segments.pop();
                 self.active = None;
-                let _ = fs::remove_file(path);
+                fs::remove_file(&last.path)?;
+                removed_any = true;
+                let seg = self.segments.pop().expect("checked non-empty");
+                self.total_records = self.total_records.saturating_sub(seg.record_count);
                 continue;
             }
             break;
+        }
+        if removed_any {
+            // Make the unlinks themselves durable: without a directory fsync,
+            // power loss can resurrect the deleted segment files.
+            File::open(&self.cfg.dir)?.sync_all()?;
         }
 
         if self.segments.is_empty() {
@@ -571,11 +585,13 @@ impl DurableLog {
         }
 
         if kept_count == 0 {
-            // Segment became empty — remove it.
-            let path = seg.path.clone();
-            self.segments.pop();
+            // Segment became empty — remove it. Same fail-closed ordering as
+            // the whole-segment drops above: the unlink precedes and gates
+            // the metadata mutation, and the deletion is made durable.
             self.active = None;
-            let _ = fs::remove_file(path);
+            fs::remove_file(&seg.path)?;
+            File::open(&self.cfg.dir)?.sync_all()?;
+            self.segments.pop();
             self.last_sequence = self.segments.last().and_then(|s| s.last_sequence);
             self.active_chain = self
                 .segments
@@ -1230,6 +1246,81 @@ mod tests {
         let log = DurableLog::open(cfg(&dir)).unwrap();
         assert_eq!(log.len(), 10);
         assert!(log.find(11).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn truncate_after_whole_segment_drop_survives_reopen() {
+        // Happy path for the whole-segment-drop branch: the suffix segments
+        // are unlinked, the unlinks are dir-fsynced, and a reopen sees the
+        // truncated state (no resurrection).
+        let dir = temp_dir("trunc-drop");
+        {
+            let mut log = DurableLog::open(cfg(&dir).with_segment_max_bytes(64)).unwrap();
+            for seq in 1..=30u64 {
+                log.append(seq, 0, 1, b"payload!!").unwrap();
+            }
+            assert!(log.segment_count() >= 2);
+            log.truncate_after(5).unwrap();
+            assert_eq!(log.last_sequence(), Some(5));
+            assert_eq!(log.len(), 5);
+            log.verify().unwrap();
+        }
+        let log = DurableLog::open(cfg(&dir).with_segment_max_bytes(64)).unwrap();
+        assert_eq!(log.len(), 5);
+        assert_eq!(log.last_sequence(), Some(5));
+        assert!(log.find(6).is_err());
+        log.verify().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn truncate_after_unlink_failure_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Regression for the swallowed-unlink bug: `truncate_after` used to
+        // ignore fs::remove_file errors, return Ok, and mutate in-memory
+        // metadata — so the rolled-back suffix resurrected on the next open.
+        let dir = temp_dir("trunc-unlink-fail");
+        let mut log = DurableLog::open(cfg(&dir).with_segment_max_bytes(64)).unwrap();
+        for seq in 1..=30u64 {
+            log.append(seq, 0, 1, b"payload!!").unwrap();
+        }
+        assert!(log.segment_count() >= 2);
+
+        // POSIX unlink needs write permission on the parent directory; drop
+        // it to force remove_file to fail. Probe first: if this environment
+        // can unlink anyway (e.g. running as root), the fault injection is
+        // void — skip rather than assert on a failure that cannot happen.
+        let probe = dir.join("probe.tmp");
+        fs::write(&probe, b"x").unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+        if fs::remove_file(&probe).is_ok() {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        }
+
+        let err = log.truncate_after(5);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            matches!(err, Err(DurableError::Io(_))),
+            "expected Io error from failed unlink, got {err:?}"
+        );
+
+        // Fail closed: in-memory metadata is unchanged and matches disk.
+        assert_eq!(log.last_sequence(), Some(30));
+        assert_eq!(log.len(), 30);
+        drop(log);
+
+        // A reopen agrees with what the caller was told: truncation failed,
+        // so all 30 records are still (correctly) present — nothing was
+        // half-applied in memory only.
+        let log = DurableLog::open(cfg(&dir).with_segment_max_bytes(64)).unwrap();
+        assert_eq!(log.len(), 30);
+        assert_eq!(log.last_sequence(), Some(30));
+        log.verify().unwrap();
         let _ = fs::remove_dir_all(&dir);
     }
 
