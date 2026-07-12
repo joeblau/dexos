@@ -190,11 +190,8 @@ mod tests {
                 let q = q.clone();
                 scope.spawn(move || {
                     for _ in 0..10_000 {
-                        if q.try_push() {
-                            q.pop();
-                        } else {
-                            q.pop();
-                        }
+                        let _ = q.try_push();
+                        q.pop();
                     }
                 });
             }

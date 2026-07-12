@@ -2,7 +2,7 @@
 //! cancellation, atomic cancel-replace, cancel-all, baskets, self-trade
 //! prevention, reduce-only clamping, and client idempotency.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
 use types::{AccountId, Hash, OrderId, OrderType, Price, Quantity, Side, TimeInForce};
 
@@ -37,7 +37,9 @@ pub struct OrderBook {
     bids: SideBook,
     asks: SideBook,
     id_index: HashMap<OrderId, Locator>,
-    account_orders: HashMap<AccountId, BTreeSet<OrderId>>,
+    // Sorted per-account ids make cancel-all proportional to that account's
+    // orders while retaining vector capacity across the steady-state path.
+    account_orders: HashMap<AccountId, Vec<OrderId>>,
     positions: HashMap<AccountId, Quantity>,
     dedup: DedupCache,
 }
@@ -551,10 +553,9 @@ impl OrderBook {
                 account: order.account,
             },
         );
-        self.account_orders
-            .entry(order.account)
-            .or_default()
-            .insert(order.order_id);
+        let ids = self.account_orders.entry(order.account).or_default();
+        let position = ids.binary_search(&order.order_id).unwrap_or_else(|p| p);
+        ids.insert(position, order.order_id);
         Ok(())
     }
 
@@ -572,7 +573,9 @@ impl OrderBook {
         let _ = self.slab.remove(slot);
         self.id_index.remove(&oid);
         if let Some(ids) = self.account_orders.get_mut(&account) {
-            ids.remove(&oid);
+            if let Ok(position) = ids.binary_search(&oid) {
+                ids.remove(position);
+            }
             if ids.is_empty() {
                 self.account_orders.remove(&account);
             }

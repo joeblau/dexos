@@ -84,7 +84,6 @@ mod tests {
         let perf = PerformanceSection {
             pin_threads: true,
             busy_poll: false,
-            ..PerformanceSection::default()
         };
         let p = ThreadPlacement::from_config(&perf);
         assert!(p.pin && !p.busy_poll);

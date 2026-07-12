@@ -66,7 +66,7 @@ impl Role {
 }
 
 /// `[node]` section.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeSection {
     /// Human-readable node name.
@@ -189,18 +189,6 @@ pub struct PerformanceSection {
     pub pin_threads: bool,
     /// Busy-poll ingress queues.
     pub busy_poll: bool,
-}
-
-impl Default for PerformanceSection {
-    fn default() -> Self {
-        Self {
-            // Fail closed by default: core pinning is a portable no-op and ingress
-            // busy-polling is not implemented in this release, so the honest default
-            // is off. Requesting either explicitly is rejected by `validate`.
-            pin_threads: false,
-            busy_poll: false,
-        }
-    }
 }
 
 /// A fully-parsed, validated node configuration.
