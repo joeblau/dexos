@@ -138,6 +138,11 @@ pub enum ExecutionError {
     /// Seller lacks sufficient outcome claims for the fill.
     #[error("insufficient outcome claims")]
     InsufficientClaims,
+    /// Internal escrow accounting for a resting claim-market order diverged
+    /// (impossible under correct operation); surfaced as a typed error instead
+    /// of panicking so the command rolls back fail-closed.
+    #[error("claim escrow accounting inconsistency")]
+    EscrowInconsistency,
     /// Market order is missing a positive protection collar / notional cap.
     #[error("market order requires a positive protection price collar")]
     MarketOrderCollarRequired,

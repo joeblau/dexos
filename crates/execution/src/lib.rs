@@ -705,6 +705,7 @@ mod tests {
         // version=1 | available 5.0 | reserved 0 | locked 0 | auth_epoch 0
         // | collateral 5.0 | equity 5.0 | exposure 0 | im 0 | mm 0
         // | position_count 0 | claim_group_count 0
+        // | reserved_premium_count 0 | reserved_claims_count 0
         // | order_watermark(present 0, value 0) | withdrawal_watermark(present 0, value 0)
         let expected = "0100\
                         404b4c00000000000000000000000000\
@@ -716,6 +717,8 @@ mod tests {
                         00000000000000000000000000000000\
                         00000000000000000000000000000000\
                         00000000000000000000000000000000\
+                        00000000\
+                        00000000\
                         00000000\
                         00000000\
                         00000000\
