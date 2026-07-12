@@ -130,6 +130,36 @@ impl RecordRef<'_> {
             payload: self.payload.to_vec(),
         }
     }
+
+    /// Encode this record view, appending the framed bytes into `buf`.
+    ///
+    /// Produces bytes identical to [`Record::encode_into`] for the same field
+    /// values (including the trailing CRC), without requiring an owned payload.
+    /// This is the allocation-free encode path used by the append hot paths.
+    ///
+    /// # Errors
+    /// Returns [`RecordError::PayloadTooLarge`] if the framed record would not
+    /// fit within the `u32` length field.
+    pub fn encode_into(&self, buf: &mut Vec<u8>) -> Result<(), RecordError> {
+        let total = Record::encoded_len(self.payload.len());
+        let length =
+            u32::try_from(total).map_err(|_| RecordError::PayloadTooLarge(self.payload.len()))?;
+
+        let start = buf.len();
+        buf.reserve(total);
+        buf.extend_from_slice(&length.to_le_bytes());
+        buf.extend_from_slice(&self.protocol_version.to_le_bytes());
+        buf.extend_from_slice(&self.sequence.to_le_bytes());
+        buf.extend_from_slice(&self.timestamp.to_le_bytes());
+        buf.extend_from_slice(&self.command_type.to_le_bytes());
+        buf.extend_from_slice(self.payload);
+
+        // Checksum covers the header (after `length`) and the payload.
+        let checksum = crc32(&buf[start + LEN_SIZE..]);
+        buf.extend_from_slice(&checksum.to_le_bytes());
+        debug_assert_eq!(buf.len() - start, total);
+        Ok(())
+    }
 }
 
 impl Record {
@@ -154,28 +184,26 @@ impl Record {
 
     /// Encode this record, appending the framed bytes into `buf`.
     ///
+    /// Delegates to [`RecordRef::encode_into`] over a borrowed view, so both
+    /// paths produce byte-identical framing and CRC.
+    ///
     /// # Errors
     /// Returns [`RecordError::PayloadTooLarge`] if the framed record would not
     /// fit within the `u32` length field.
     pub fn encode_into(&self, buf: &mut Vec<u8>) -> Result<(), RecordError> {
-        let total = Self::encoded_len(self.payload.len());
-        let length =
-            u32::try_from(total).map_err(|_| RecordError::PayloadTooLarge(self.payload.len()))?;
+        self.as_record_ref().encode_into(buf)
+    }
 
-        let start = buf.len();
-        buf.reserve(total);
-        buf.extend_from_slice(&length.to_le_bytes());
-        buf.extend_from_slice(&self.protocol_version.to_le_bytes());
-        buf.extend_from_slice(&self.sequence.to_le_bytes());
-        buf.extend_from_slice(&self.timestamp.to_le_bytes());
-        buf.extend_from_slice(&self.command_type.to_le_bytes());
-        buf.extend_from_slice(&self.payload);
-
-        // Checksum covers the header (after `length`) and the payload.
-        let checksum = crc32(&buf[start + LEN_SIZE..]);
-        buf.extend_from_slice(&checksum.to_le_bytes());
-        debug_assert_eq!(buf.len() - start, total);
-        Ok(())
+    /// Borrow this record as a [`RecordRef`] (no payload copy).
+    #[must_use]
+    pub fn as_record_ref(&self) -> RecordRef<'_> {
+        RecordRef {
+            protocol_version: self.protocol_version,
+            sequence: self.sequence,
+            timestamp: self.timestamp,
+            command_type: self.command_type,
+            payload: &self.payload,
+        }
     }
 
     /// Decode a single record from the front of `bytes` using
@@ -364,6 +392,50 @@ mod tests {
         let mut b = Vec::new();
         rec.encode_into(&mut b).unwrap();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn record_ref_encode_into_matches_record_byte_for_byte() {
+        // Byte-identity between the borrowed and owned encode paths — the
+        // durability wire format must not change under the RecordRef path.
+        for payload in [&b""[..], b"x", b"place-order-payload", &[0u8; 1024]] {
+            let rec = sample(11, payload);
+            let mut owned = Vec::new();
+            rec.encode_into(&mut owned).unwrap();
+
+            let rref = RecordRef {
+                protocol_version: rec.protocol_version,
+                sequence: rec.sequence,
+                timestamp: rec.timestamp,
+                command_type: rec.command_type,
+                payload,
+            };
+            let mut borrowed = Vec::new();
+            rref.encode_into(&mut borrowed).unwrap();
+
+            assert_eq!(owned, borrowed, "framed bytes must be identical");
+            // Same trailing CRC in particular.
+            assert_eq!(
+                &owned[owned.len() - CRC_SIZE..],
+                &borrowed[borrowed.len() - CRC_SIZE..]
+            );
+            // And the borrowed encoding decodes back to the same record.
+            let (back, consumed) = Record::decode(&borrowed).unwrap();
+            assert_eq!(consumed, borrowed.len());
+            assert_eq!(back, rec);
+        }
+    }
+
+    #[test]
+    fn as_record_ref_borrows_all_fields() {
+        let rec = sample(5, b"abc");
+        let rref = rec.as_record_ref();
+        assert_eq!(rref.protocol_version, rec.protocol_version);
+        assert_eq!(rref.sequence, rec.sequence);
+        assert_eq!(rref.timestamp, rec.timestamp);
+        assert_eq!(rref.command_type, rec.command_type);
+        assert_eq!(rref.payload, rec.payload.as_slice());
+        assert_eq!(rref.to_owned(), rec);
     }
 
     #[test]
