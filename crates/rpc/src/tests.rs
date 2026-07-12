@@ -1847,6 +1847,97 @@ async fn tls_server_round_trips_a_query() {
     assert!(matches!(resp.result, Ok(RpcOk::NetworkStatus(_))));
 }
 
+/// Acceptance (#399): a client that completes the TCP handshake but never sends
+/// its TLS ClientHello cannot pin admission permits. The handshake is bounded
+/// by `read_timeout`; when it fires, the connection task exits and releases both
+/// the global and the per-IP permit, so subsequent clients are served.
+#[tokio::test]
+async fn stalled_tls_handshake_times_out_and_releases_permits() {
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
+    use tokio_rustls::rustls::ClientConfig as RustlsClientConfig;
+    use tokio_rustls::TlsConnector;
+
+    let (cert_pem, key_pem) = crate::generate_self_signed_localhost().unwrap();
+    let acceptor = crate::acceptor_from_pem(&cert_pem, &key_pem, None).unwrap();
+
+    // Client trusts the same self-signed cert.
+    let mut roots = rustls::RootCertStore::empty();
+    let certs: Vec<CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut std::io::Cursor::new(&cert_pem))
+            .collect::<Result<_, _>>()
+            .unwrap();
+    for c in certs {
+        roots.add(c).unwrap();
+    }
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let client_cfg = RustlsClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(client_cfg));
+
+    // A budget of exactly one connection, globally and per source IP: if the
+    // stalled handshake leaked its permits, no later client could be admitted.
+    let backend: Arc<dyn RpcBackend> = Arc::new(populated_backend(RpcMode::Full));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut cfg = budget_config(1);
+    cfg.max_connections_per_ip = 1;
+    cfg.read_timeout = Duration::from_millis(150);
+    cfg.tls = crate::server::TlsMode::Required(acceptor);
+    tokio::spawn(async move {
+        let _ = crate::server::serve_with_config(listener, backend, RpcMode::Full, cfg).await;
+    });
+
+    // The attacker: TCP handshake completes, then silence — no ClientHello.
+    // The server must evict it within ~read_timeout, observed as EOF/reset.
+    let mut stalled = TcpStream::connect(addr).await.unwrap();
+    let mut probe = [0u8; 1];
+    match tokio::time::timeout(Duration::from_secs(2), stalled.read(&mut probe)).await {
+        Ok(Ok(0)) | Ok(Err(_)) => {} // clean FIN or reset: the stall was evicted.
+        Ok(Ok(n)) => panic!("stalled handshake unexpectedly received {n} bytes"),
+        Err(_) => panic!("server failed to time out a stalled TLS handshake"),
+    }
+
+    // Both permits must now be free: a well-behaved TLS client is admitted and
+    // served. Retry briefly to absorb the small window between the eviction FIN
+    // and the connection task actually exiting (which releases the permits).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let attempt = async {
+            let tcp = TcpStream::connect(addr).await.ok()?;
+            let name = ServerName::try_from("localhost").ok()?;
+            let mut tls = connector.connect(name, tcp).await.ok()?;
+            let req = RpcRequest::new(1, RpcMethod::GetNetworkStatus);
+            let out = encode_request(&req).ok()?;
+            tls.write_all(&out).await.ok()?;
+            tls.flush().await.ok()?;
+            let mut header = [0u8; codec::FRAME_HEADER_LEN];
+            tls.read_exact(&mut header).await.ok()?;
+            let plen =
+                u32::from_le_bytes([header[15], header[16], header[17], header[18]]) as usize;
+            let mut frame = vec![0u8; codec::FRAME_HEADER_LEN + plen];
+            frame[..codec::FRAME_HEADER_LEN].copy_from_slice(&header);
+            tls.read_exact(&mut frame[codec::FRAME_HEADER_LEN..])
+                .await
+                .ok()?;
+            decode_response(&frame).ok()
+        };
+        if let Some(resp) = attempt.await {
+            assert!(matches!(resp.result, Ok(RpcOk::NetworkStatus(_))));
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "permits were never released after the stalled handshake timed out"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // P1 #354: isolated dispatch + in-flight byte budget
 // ---------------------------------------------------------------------------
