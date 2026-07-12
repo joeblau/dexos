@@ -871,6 +871,7 @@ dependencies = [
  "risk",
  "rpc",
  "serde",
+ "simd",
  "state-tree",
  "storage",
  "thiserror",

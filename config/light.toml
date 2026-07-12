@@ -7,10 +7,8 @@ light = true
 roles = ["gateway", "observer"]
 
 [network]
-listen = "0.0.0.0:9001"
+listen = "0.0.0.0:9003"
 bootstrap_peers = ["us-1.dexos.local:9000"]
-# QUIC sessions and datagram dissemination are not implemented yet; leaving them
-# enabled would fail closed at startup. Set true once the transport lands.
 enable_quic = false
 enable_datagrams = false
 
@@ -25,9 +23,14 @@ snapshot_interval_sequences = 1000000
 segment_size_mb = 1024
 
 [rpc]
-listen = "0.0.0.0:8081"
+listen = "0.0.0.0:8083"
 read_only = true
 
 [performance]
 pin_threads = false
 busy_poll = false
+drain_timeout_ms = 30000
+
+[observability]
+log_format = "text"
+metrics_listen = "127.0.0.1:9103"

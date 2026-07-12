@@ -102,9 +102,24 @@ cargo install --path bin/marketd
 marketd run --config config/dev.toml
 ```
 
-`marketd run` starts the node, prints its startup manifest, and idles until it
-receives Ctrl-C (SIGINT), at which point it drains its bounded queues and exits
-cleanly.
+`marketd run` starts the node, prints its startup manifest (including the
+selected SIMD backend), binds optional `/metrics` + `/livez` + `/readyz` when
+`[observability].metrics_listen` is set, and idles until it receives SIGINT or
+SIGTERM. Shutdown runs flush hooks, drains bounded queues under
+`performance.drain_timeout_ms` (default 30s), and exits nonzero on drain
+timeout or critical-task failure.
+
+### Operator commands (real vs planned)
+
+| Command | Status |
+|---------|--------|
+| `run` | **Real** — composition root lifecycle, metrics/probes, graceful drain |
+| `keygen` | **Real** — OS CSPRNG ed25519 identity seed |
+| `benchmark` | **Real** when built with `--features dev-tools` |
+| `replay` / `inspect` / `verify` | **Real** — durable WAL / snapshot integrity (storage) |
+| `snapshot` | **Fail closed** — engine serialize not wired; exits nonzero |
+
+Release builds use `panic = "abort"`.
 
 ## Demo scripts
 

@@ -140,15 +140,27 @@ struct VerifyArgs {
 }
 
 /// Resolve the effective configuration for a `run` invocation: file values first,
-/// then CLI overrides, then validation.
+/// then CLI overrides, then validation. Duplicate `--role` flags fail closed.
 fn resolve_config(args: &RunArgs) -> anyhow::Result<NodeConfig> {
     let base = match &args.config {
         Some(path) => NodeConfig::load(path)?,
         None => NodeConfig::default(),
     };
+    let roles: Vec<Role> = args.roles.iter().map(|r| Role::from(*r)).collect();
+    // Surface duplicate CLI roles with the same message the TOML path uses.
+    let mut seen = Vec::new();
+    for role in &roles {
+        if seen.contains(role) {
+            anyhow::bail!(
+                "duplicate node role '{}'; each role may appear at most once",
+                role.as_str()
+            );
+        }
+        seen.push(*role);
+    }
     let overrides = ConfigOverrides {
         light: args.light,
-        roles: args.roles.iter().map(|r| Role::from(*r)).collect(),
+        roles,
     };
     Ok(base.with_overrides(&overrides)?)
 }
@@ -443,6 +455,35 @@ mod tests {
             "results.json",
         ])
         .is_ok());
+    }
+
+    #[test]
+    fn duplicate_role_flags_are_rejected() {
+        let cli = Cli::try_parse_from([
+            "marketd",
+            "run",
+            "--role",
+            "gateway",
+            "--role",
+            "gateway",
+        ])
+        .unwrap();
+        let Command::Run(args) = cli.command else {
+            panic!("expected run");
+        };
+        let err = resolve_config(&args).expect_err("duplicate roles must fail");
+        assert!(
+            format!("{err:#}").contains("duplicate"),
+            "error should name the problem: {err:#}"
+        );
+    }
+
+    #[test]
+    fn snapshot_command_fails_closed() {
+        // Snapshot remains fail-closed until engine serialize lands (#296).
+        let cli = Cli::try_parse_from(["marketd", "snapshot"]).unwrap();
+        let err = dispatch(cli).expect_err("snapshot must fail closed");
+        assert!(format!("{err:#}").contains("fail-closed"), "{err:#}");
     }
 
     #[test]

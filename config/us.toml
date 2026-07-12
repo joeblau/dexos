@@ -1,4 +1,5 @@
-# US region validator (three-region demo).
+# US region validator (three-region demo). Distinct ports so multi-node
+# demos on one host do not collide (see eu.toml / tokyo.toml).
 [node]
 name = "us-1"
 region = "us-east"
@@ -7,9 +8,7 @@ roles = ["validator", "sequencer", "witness", "gateway"]
 
 [network]
 listen = "0.0.0.0:9000"
-bootstrap_peers = ["eu-1.dexos.local:9000", "tokyo-1.dexos.local:9000"]
-# QUIC sessions and datagram dissemination are not implemented yet; leaving them
-# enabled would fail closed at startup. Set true once the transport lands.
+bootstrap_peers = ["eu-1.dexos.local:9001", "tokyo-1.dexos.local:9002"]
 enable_quic = false
 enable_datagrams = false
 
@@ -28,6 +27,10 @@ listen = "0.0.0.0:8080"
 read_only = false
 
 [performance]
-# Core pinning and busy-polled ingress are not implemented yet (fail closed).
 pin_threads = false
 busy_poll = false
+drain_timeout_ms = 30000
+
+[observability]
+log_format = "text"
+metrics_listen = "127.0.0.1:9100"

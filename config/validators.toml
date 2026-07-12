@@ -1,0 +1,20 @@
+# Example validator-set descriptor for local demos.
+# Production deployments replace this with the signed genesis validator set.
+#
+# Schema is intentionally minimal until the consensus epic lands a full
+# validator identity / stake / endpoint structure.
+
+[[validators]]
+name = "us-1"
+public_key = "0000000000000000000000000000000000000000000000000000000000000001"
+region = "us-east"
+
+[[validators]]
+name = "eu-1"
+public_key = "0000000000000000000000000000000000000000000000000000000000000002"
+region = "eu-central"
+
+[[validators]]
+name = "tokyo-1"
+public_key = "0000000000000000000000000000000000000000000000000000000000000003"
+region = "ap-northeast"

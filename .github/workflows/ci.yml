@@ -51,6 +51,88 @@ jobs:
       - name: test
         run: cargo test --workspace --locked
 
+  docs:
+    name: cargo doc
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+      - name: docs (fail on warnings)
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --workspace --no-deps --locked
+
+  state-roots:
+    name: state-root agreement
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+      - name: verify-state-roots.sh
+        run: ./scripts/verify-state-roots.sh
+
+  determinism:
+    name: scalar≡vectorized + endian notes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+      - name: determinism suite
+        run: ./scripts/check-determinism.sh
+      - name: publish digest
+        run: cat determinism-digest.txt
+
+  fuzz-stub:
+    name: fuzz stub (time-boxed)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+      - name: time-boxed property/fuzz stub
+        env:
+          FUZZ_BUDGET_SECS: "180"
+        run: ./scripts/fuzz-stub.sh
+
+  release-artifacts:
+    name: release artifact scaffolding
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+      - name: build signed-ready artifacts (checksum + SBOM + rollback)
+        run: ./scripts/build-release-artifacts.sh
+      - name: smoke-test artifact
+        run: |
+          BIN=$(ls dist/marketd-* | head -1)
+          "${BIN}" --help
+          # Unwired ops must fail closed (nonzero) without --experimental.
+          if "${BIN}" replay --snapshot s --log l; then
+            echo "replay stub must exit nonzero" >&2
+            exit 1
+          fi
+          # Checksums verify.
+          (cd dist && shasum -a 256 -c SHA256SUMS)
+          test -f dist/sbom.cdx.json
+          test -f dist/build-metadata.json
+          test -f dist/ROLLBACK.md
+          python3 -c "import json; json.load(open('dist/sbom.cdx.json'))"
+          python3 -c "import json; m=json.load(open('dist/build-metadata.json')); assert m['panic_strategy']=='abort'"
+
   build-release:
     name: build (release)
     runs-on: ubuntu-latest
@@ -66,6 +148,9 @@ jobs:
         run: cargo build --release --locked --bin marketd --all-features
       - name: workspace
         run: cargo build --release --workspace --locked
+      - name: release profile is panic=abort
+        run: |
+          grep -q 'panic = "abort"' Cargo.toml
 
   gates:
     name: safety gates
@@ -115,3 +200,5 @@ jobs:
           ./scripts/check-no-float.sh
           ./scripts/check-core-deps.sh
           ./scripts/check-unsafe.sh
+      - name: determinism on macOS host
+        run: ./scripts/check-determinism.sh
