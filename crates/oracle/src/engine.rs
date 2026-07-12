@@ -141,6 +141,8 @@ mod tests {
             health,
             observed_at_ns: 1_000,
             sequence: seq,
+            producer_set_version: 1,
+            inputs_digest: Hash::from_bytes([9u8; 32]),
         }
     }
 

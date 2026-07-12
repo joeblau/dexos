@@ -3,13 +3,19 @@
 //! The oracle turns many signed per-venue [`PriceObservation`]s into a single
 //! trustworthy price through a deterministic, integer-only pipeline:
 //!
-//! 1. **Observation** — each venue signs a [`PriceObservation`] (ed25519 over
+//! 1. **Observation** — each signer signs a [`PriceObservation`] (ed25519 over
 //!    domain-separated canonical bytes); tampered fields and foreign signers are
-//!    rejected by [`PriceObservation::verify`].
-//! 2. **Local aggregation** ([`aggregate_local`]) — de-dup, staleness filtering,
-//!    a minimum distinct-source (venue) gate, robust `k·MAD` outlier rejection,
-//!    and a confidence/liquidity-weighted median, producing a [`LocalAggregate`]
-//!    with a confidence interval. Output is order-invariant and replay-stable.
+//!    rejected by [`PriceObservation::verify`]. An observation carries no
+//!    self-declared venue claim — source identity is the registry's, not the
+//!    reporter's.
+//! 2. **Local aggregation** ([`aggregate_local`]) — trusting only the authorized
+//!    [`ProducerRegistry`], it drops unknown/out-of-scope signers, forged
+//!    signatures, far-future and stale timestamps; keeps only the newest report
+//!    per signer; derives source identity and caps confidence locally; performs
+//!    robust `k·MAD` outlier rejection; recomputes the distinct-source and
+//!    minimum-observation gates from the survivors; and takes a
+//!    confidence/liquidity-weighted median, producing a [`LocalAggregate`] with a
+//!    confidence interval. Output is order-invariant and replay-stable.
 //! 3. **Cross-node aggregation** ([`median_across_nodes`]) — combine per-node
 //!    [`NodeAggregate`]s into a canonical [`AggregatePrice`], threshold-signed
 //!    into an [`OracleCertificate`] by the oracle validator set.
@@ -35,6 +41,7 @@ pub mod health;
 pub mod kernels;
 mod math;
 pub mod observation;
+pub mod producer;
 
 pub use adapter::{merge_reference, ExternalReference};
 pub use aggregate::{aggregate_local, AggregationConfig, LocalAggregate};
@@ -46,6 +53,7 @@ pub use health::{
     evaluate as evaluate_health, market_action, HealthConfig, HealthInputs, MarketAction,
 };
 pub use observation::PriceObservation;
+pub use producer::{MarketScope, Producer, ProducerRegistry, MAX_SOURCES};
 
 // Re-export the shared health enum for convenience.
 pub use types::OracleHealth;
@@ -88,7 +96,6 @@ mod tests {
             market_id: MarketId::new(u32::MAX),
             price: Price::from_raw(i64::MIN),
             confidence: Amount::from_raw(i128::MAX),
-            source_mask: u64::MAX,
             observed_at_ns: u64::MAX,
             sequence: u64::MAX,
             signer: [0xABu8; 32],
@@ -102,7 +109,6 @@ mod tests {
             market_id: MarketId::new(0),
             price: Price::from_raw(i64::MAX),
             confidence: Amount::from_raw(i128::MIN),
-            source_mask: 0,
             observed_at_ns: 0,
             sequence: 0,
             signer: [0u8; 32],
@@ -137,6 +143,8 @@ mod tests {
             health: OracleHealth::Degraded,
             observed_at_ns: u64::MAX,
             sequence: 42,
+            producer_set_version: 3,
+            inputs_digest: types::Hash::from_bytes([0x5Au8; 32]),
         };
         let cert = OracleCertificate::form(agg, &ts, vec![0, 1, 2]);
         let bytes = encode(&cert).unwrap();
@@ -154,7 +162,6 @@ mod tests {
                 market_id: MarketId::new(u32::try_from(r.next_u64() & 0xFFFF_FFFF).unwrap()),
                 price: Price::from_raw(r.next_i64()),
                 confidence: Amount::from_raw(r.next_i128()),
-                source_mask: r.next_u64(),
                 observed_at_ns: r.next_u64(),
                 sequence: r.next_u64(),
                 signer: r.next_u64().to_le_bytes().repeat(4)[..32]
@@ -190,15 +197,24 @@ mod tests {
     fn end_to_end_pipeline() {
         use crypto::KeyPair;
 
-        // Five signed venue observations for one market.
+        // Five signed venue observations for one market, from five authorized
+        // producers each bound to a distinct source.
         let mut obs = Vec::new();
+        let mut registry = ProducerRegistry::new(1);
         for (i, price) in [100i64, 101, 99, 100, 500].iter().enumerate() {
             let kp = KeyPair::from_seed(&[u8::try_from(i).unwrap() + 1; 32]);
+            registry
+                .authorize(
+                    kp.public(),
+                    u8::try_from(i).unwrap(),
+                    Amount::from_raw(1_000_000),
+                    MarketScope::All,
+                )
+                .unwrap();
             let mut o = PriceObservation::unsigned(
                 MarketId::new(1),
                 Price::from_raw(price * 1_000_000),
                 Amount::from_raw(1),
-                1u64 << i,
                 1_000,
                 1,
             );
@@ -211,7 +227,7 @@ mod tests {
             min_sources: 3,
             ..AggregationConfig::default()
         };
-        let local = aggregate_local(MarketId::new(1), &obs, 1_500, &cfg).unwrap();
+        let local = aggregate_local(MarketId::new(1), &obs, 1_500, &cfg, &registry).unwrap();
         // Gross outlier (500) dropped; median of the tight cluster.
         assert_eq!(local.price, Price::from_raw(100_000_000));
 
@@ -220,6 +236,8 @@ mod tests {
             price: local.price,
             confidence: local.confidence,
             observed_at_ns: 1_000,
+            producer_set_version: local.producer_set_version,
+            inputs_digest: local.inputs_digest,
         };
         let agg = median_across_nodes(MarketId::new(1), &[node], health, 1).unwrap();
 

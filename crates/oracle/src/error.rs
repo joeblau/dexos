@@ -20,6 +20,10 @@ pub enum OracleError {
     /// The named signer key was malformed (not a valid ed25519 public key).
     #[error("malformed signer key")]
     MalformedSigner,
+    /// A producer-registry entry was rejected (source id out of range, a negative
+    /// confidence cap, or a duplicate signer).
+    #[error("invalid producer registry entry")]
+    InvalidProducer,
     /// No observations remained to aggregate (all filtered, or none supplied).
     #[error("no observations to aggregate")]
     NoObservations,

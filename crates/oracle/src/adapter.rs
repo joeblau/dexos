@@ -41,6 +41,7 @@ pub fn merge_reference<R: ExternalReference>(
 mod tests {
     use super::*;
     use crate::aggregate::{aggregate_local, AggregationConfig};
+    use crate::producer::{MarketScope, ProducerRegistry};
     use crypto::KeyPair;
     use types::{Amount, Price, Ratio, RATIO_SCALE};
 
@@ -51,13 +52,12 @@ mod tests {
         }
     }
 
-    fn signed(price: i64, mask: u64, seed: u8) -> PriceObservation {
+    fn signed(price: i64, seed: u8) -> PriceObservation {
         let kp = KeyPair::from_seed(&[seed; 32]);
         let mut o = PriceObservation::unsigned(
             MarketId::new(1),
             Price::from_raw(price),
             Amount::from_raw(1),
-            mask,
             1000,
             1,
         );
@@ -65,35 +65,50 @@ mod tests {
         o
     }
 
+    fn registry(seeds: &[u8]) -> ProducerRegistry {
+        let mut reg = ProducerRegistry::new(1);
+        for (i, &s) in seeds.iter().enumerate() {
+            reg.authorize(
+                KeyPair::from_seed(&[s; 32]).public(),
+                u8::try_from(i).unwrap(),
+                Amount::from_raw(1_000_000_000),
+                MarketScope::All,
+            )
+            .unwrap();
+        }
+        reg
+    }
+
     fn cfg() -> AggregationConfig {
         AggregationConfig {
             max_age_ns: 1_000,
+            max_future_skew_ns: 1_000,
             min_observations: 3,
             min_sources: 3,
             mad_k: Ratio::from_raw(3 * RATIO_SCALE),
-            require_signature: true,
         }
     }
 
     #[test]
     fn duplicate_reference_does_not_change_aggregate() {
         let native = [
-            signed(100_000_000, 0b001, 1),
-            signed(101_000_000, 0b010, 2),
-            signed(99_000_000, 0b100, 3),
+            signed(100_000_000, 1),
+            signed(101_000_000, 2),
+            signed(99_000_000, 3),
         ];
-        let base = aggregate_local(MarketId::new(1), &native, 1000, &cfg()).unwrap();
+        let reg = registry(&[1, 2, 3]);
+        let base = aggregate_local(MarketId::new(1), &native, 1000, &cfg(), &reg).unwrap();
 
         // Adapter re-supplies an existing native sample -> identical result.
         let adapter = FixedRef(native[0]);
         let merged = merge_reference(&native, Some(&adapter), MarketId::new(1), 1000);
-        let with_ref = aggregate_local(MarketId::new(1), &merged, 1000, &cfg()).unwrap();
+        let with_ref = aggregate_local(MarketId::new(1), &merged, 1000, &cfg(), &reg).unwrap();
         assert_eq!(base, with_ref);
     }
 
     #[test]
     fn no_adapter_is_identity() {
-        let native = [signed(100_000_000, 0b001, 1)];
+        let native = [signed(100_000_000, 1)];
         let merged = merge_reference::<FixedRef>(&native, None, MarketId::new(1), 1000);
         assert_eq!(merged, native.to_vec());
     }

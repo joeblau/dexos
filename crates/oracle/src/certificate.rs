@@ -25,6 +25,10 @@ pub struct NodeAggregate {
     pub confidence: Amount,
     /// Node's freshest observation timestamp (ns).
     pub observed_at_ns: u64,
+    /// Version of the authorized producer set this node aggregated over.
+    pub producer_set_version: u64,
+    /// This node's commitment to exactly the authorized reports it aggregated.
+    pub inputs_digest: Hash,
 }
 
 /// The canonical aggregate price agreed across oracle nodes. This is the payload
@@ -43,34 +47,50 @@ pub struct AggregatePrice {
     pub observed_at_ns: u64,
     /// Monotonic oracle-update sequence for this market.
     pub sequence: u64,
+    /// Version of the authorized producer set that produced this price. Committed
+    /// so verifiers agree on which authorized set is responsible.
+    pub producer_set_version: u64,
+    /// Order-independent commitment over the per-node aggregation inputs.
+    pub inputs_digest: Hash,
 }
 
 impl AggregatePrice {
     /// Domain-separated 32-byte digest bound by the threshold signature. Fixed
     /// little-endian layout; deterministic across machines.
     pub fn digest(&self) -> Hash {
-        let mut buf = Vec::with_capacity(4 + 8 + 16 + 1 + 8 + 8);
+        let mut buf = Vec::with_capacity(4 + 8 + 16 + 1 + 8 + 8 + 8 + 32);
         buf.extend_from_slice(&self.market_id.get().to_le_bytes());
         buf.extend_from_slice(&self.price.raw().to_le_bytes());
         buf.extend_from_slice(&self.confidence.raw().to_le_bytes());
         buf.push(health_tag(self.health));
         buf.extend_from_slice(&self.observed_at_ns.to_le_bytes());
         buf.extend_from_slice(&self.sequence.to_le_bytes());
+        buf.extend_from_slice(&self.producer_set_version.to_le_bytes());
+        buf.extend_from_slice(self.inputs_digest.as_bytes());
         hash_domain(DOMAIN_ORACLE, &buf)
     }
 }
 
 /// Combine per-node aggregates into a canonical [`AggregatePrice`] by taking the
 /// confidence-weighted median across nodes. Order-independent. The `health` and
-/// `sequence` are supplied by the caller (engine policy). Returns `None` if no
-/// nodes are provided.
+/// `sequence` are supplied by the caller (engine policy). The producer-set
+/// version and an order-independent commitment over the per-node inputs are
+/// derived from `nodes` and committed into the result.
+///
+/// Returns `None` if no nodes are provided, or if the nodes do not all reference
+/// the same producer-set version (an inconsistent set cannot be certified).
 pub fn median_across_nodes(
     market_id: MarketId,
     nodes: &[NodeAggregate],
     health: OracleHealth,
     sequence: u64,
 ) -> Option<AggregatePrice> {
-    if nodes.is_empty() {
+    let (first, rest) = nodes.split_first()?;
+    let producer_set_version = first.producer_set_version;
+    if rest
+        .iter()
+        .any(|n| n.producer_set_version != producer_set_version)
+    {
         return None;
     }
     let samples: Vec<Sample> = nodes
@@ -85,6 +105,7 @@ pub fn median_across_nodes(
         .iter()
         .fold(Amount::ZERO, |acc, n| acc.saturating_add(n.confidence));
     let observed_at_ns = nodes.iter().map(|n| n.observed_at_ns).min().unwrap_or(0);
+    let inputs_digest = combine_node_inputs(producer_set_version, nodes);
     Some(AggregatePrice {
         market_id,
         price: Price::from_raw(price_raw),
@@ -92,7 +113,23 @@ pub fn median_across_nodes(
         health,
         observed_at_ns,
         sequence,
+        producer_set_version,
+        inputs_digest,
     })
+}
+
+/// Order-independent commitment folding the per-node input digests (sorted) and
+/// the producer-set version into a single domain-separated hash.
+fn combine_node_inputs(version: u64, nodes: &[NodeAggregate]) -> Hash {
+    let mut digests: Vec<[u8; 32]> = nodes.iter().map(|n| *n.inputs_digest.as_bytes()).collect();
+    digests.sort_unstable();
+    let mut buf = Vec::with_capacity(8 + 8 + digests.len() * 32);
+    buf.extend_from_slice(&version.to_le_bytes());
+    buf.extend_from_slice(&(digests.len() as u64).to_le_bytes());
+    for d in &digests {
+        buf.extend_from_slice(d);
+    }
+    hash_domain(DOMAIN_ORACLE, &buf)
 }
 
 /// A threshold-signed oracle price certificate.
@@ -147,31 +184,58 @@ mod tests {
             health: OracleHealth::Normal,
             observed_at_ns: 1_000,
             sequence: seq,
+            producer_set_version: 1,
+            inputs_digest: Hash::from_bytes([7u8; 32]),
+        }
+    }
+
+    fn node(price: i64, conf: i128, ts: u64, version: u64, digest: u8) -> NodeAggregate {
+        NodeAggregate {
+            price: Price::from_raw(price),
+            confidence: Amount::from_raw(conf),
+            observed_at_ns: ts,
+            producer_set_version: version,
+            inputs_digest: Hash::from_bytes([digest; 32]),
         }
     }
 
     #[test]
     fn median_across_nodes_hand_computed() {
         let nodes = [
-            NodeAggregate {
-                price: Price::from_raw(100),
-                confidence: Amount::from_raw(1),
-                observed_at_ns: 50,
-            },
-            NodeAggregate {
-                price: Price::from_raw(200),
-                confidence: Amount::from_raw(1),
-                observed_at_ns: 40,
-            },
-            NodeAggregate {
-                price: Price::from_raw(300),
-                confidence: Amount::from_raw(1),
-                observed_at_ns: 60,
-            },
+            node(100, 1, 50, 1, 10),
+            node(200, 1, 40, 1, 20),
+            node(300, 1, 60, 1, 30),
         ];
         let a = median_across_nodes(MarketId::new(3), &nodes, OracleHealth::Normal, 1).unwrap();
         assert_eq!(a.price, Price::from_raw(200));
         assert_eq!(a.observed_at_ns, 40); // conservative min
+        assert_eq!(a.producer_set_version, 1);
+    }
+
+    #[test]
+    fn median_across_nodes_rejects_producer_set_disagreement() {
+        // Two nodes reference different producer-set versions -> cannot certify.
+        let nodes = [node(100, 1, 50, 1, 10), node(200, 1, 40, 2, 20)];
+        assert!(median_across_nodes(MarketId::new(3), &nodes, OracleHealth::Normal, 1).is_none());
+    }
+
+    #[test]
+    fn tampered_producer_set_version_rejected() {
+        let ts = signers(4, 3);
+        let set = ts.validator_set();
+        let mut cert = OracleCertificate::form(agg(1, 100), &ts, vec![0, 1, 2]);
+        // The producer-set version is part of the signed digest.
+        cert.aggregate.producer_set_version = 999;
+        assert_eq!(cert.verify(&set), Err(OracleError::DigestMismatch));
+    }
+
+    #[test]
+    fn tampered_inputs_digest_rejected() {
+        let ts = signers(4, 3);
+        let set = ts.validator_set();
+        let mut cert = OracleCertificate::form(agg(1, 100), &ts, vec![0, 1, 2]);
+        cert.aggregate.inputs_digest = Hash::from_bytes([0xAB; 32]);
+        assert_eq!(cert.verify(&set), Err(OracleError::DigestMismatch));
     }
 
     #[test]
@@ -225,21 +289,9 @@ mod tests {
     fn identical_node_sets_yield_bit_identical_certificate() {
         let ts = signers(5, 3);
         let nodes = [
-            NodeAggregate {
-                price: Price::from_raw(100),
-                confidence: Amount::from_raw(2),
-                observed_at_ns: 10,
-            },
-            NodeAggregate {
-                price: Price::from_raw(110),
-                confidence: Amount::from_raw(1),
-                observed_at_ns: 20,
-            },
-            NodeAggregate {
-                price: Price::from_raw(90),
-                confidence: Amount::from_raw(3),
-                observed_at_ns: 30,
-            },
+            node(100, 2, 10, 1, 11),
+            node(110, 1, 20, 1, 22),
+            node(90, 3, 30, 1, 33),
         ];
         let mut reordered = nodes;
         reordered.reverse();
