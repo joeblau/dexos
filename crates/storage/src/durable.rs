@@ -10,6 +10,11 @@
 //! [`SyncPolicy::EveryN`] batches data-syncs (higher throughput, nonzero RPO of
 //! up to N-1 records). [`SyncPolicy::Never`] is for unit tests only.
 //!
+//! File fdatasync alone does not make a *new* file's directory entry durable:
+//! segment creation (rotation) fsyncs the WAL directory before the segment is
+//! used, and segment unlinks (`truncate_after`) fsync it after, so neither a
+//! fresh segment nor a truncation can be undone by power loss.
+//!
 //! # On-disk layout
 //!
 //! ```text
@@ -51,6 +56,7 @@ use std::path::{Path, PathBuf};
 use types::Hash;
 
 use crate::crc::crc32;
+use crate::fsutil::sync_dir;
 use crate::integrity::{chain_genesis, chain_mix, chain_over_records};
 use crate::limits::{
     DEFAULT_INDEX_STRIDE, DEFAULT_MAX_RECORD_BYTES, INTEGRITY_CHAIN_HASH, SEGMENT_TRAILER_LEN,
@@ -654,7 +660,7 @@ impl DurableLog {
         if removed_any {
             // Make the unlinks themselves durable: without a directory fsync,
             // power loss can resurrect the deleted segment files.
-            File::open(&self.cfg.dir)?.sync_all()?;
+            sync_dir(&self.cfg.dir)?;
         }
 
         if self.segments.is_empty() {
@@ -720,7 +726,7 @@ impl DurableLog {
             // the metadata mutation, and the deletion is made durable.
             self.active = None;
             fs::remove_file(&seg.path)?;
-            File::open(&self.cfg.dir)?.sync_all()?;
+            sync_dir(&self.cfg.dir)?;
             self.segments.pop();
             self.last_sequence = self.segments.last().and_then(|s| s.last_sequence);
             self.active_chain = self
@@ -835,6 +841,14 @@ impl DurableLog {
             .write(true)
             .create_new(true)
             .open(&path)?;
+        // Make the new segment's directory entry durable BEFORE any append on
+        // it can be acknowledged. fdatasync on the file covers its bytes, not
+        // its dirent: per POSIX crash semantics (ext4/XFS), a crash after
+        // rotation could otherwise drop the entry and the entire segment —
+        // losing every append acked under SyncPolicy::Always since the
+        // rotation and breaking the RPO=0 contract. Fail-closed: on error the
+        // segment is not registered and the append is not acknowledged.
+        sync_dir(&self.cfg.dir)?;
         let index = u64::try_from(self.segments.len()).unwrap_or(u64::MAX);
         self.segments.push(SegmentMeta {
             path,
@@ -1343,6 +1357,34 @@ mod tests {
         let log = DurableLog::open(cfg(&dir)).unwrap();
         assert_eq!(log.len(), 1);
         assert_eq!(log.find(1).unwrap().payload, b"durable");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotation_new_segment_survives_kill_after_ack() {
+        // Models kill -9 right after an acknowledged append that landed on a
+        // freshly rotated segment. ensure_active_segment fsyncs the WAL
+        // directory after create_new, so the new segment's dirent — not just
+        // its bytes — is durable before any append on it is acked; a reopen
+        // must see every record, including all of those in the last segment.
+        let dir = temp_dir("rotate-kill9");
+        {
+            let mut log = DurableLog::open(cfg(&dir).with_segment_max_bytes(64)).unwrap();
+            for seq in 1..=30u64 {
+                log.append(seq, 0, 1, b"payload!!").unwrap();
+            }
+            assert!(log.segment_count() >= 2, "log must have rotated");
+            // Leak the active segment handle so no graceful close/flush runs
+            // (see kill_after_ack_retains_records for why wal.lock is dropped
+            // normally instead of being forgotten).
+            std::mem::forget(log.active.take());
+            drop(log);
+        }
+        let log = DurableLog::open(cfg(&dir).with_segment_max_bytes(64)).unwrap();
+        assert_eq!(log.len(), 30);
+        assert_eq!(log.last_sequence(), Some(30));
+        assert_eq!(log.find(30).unwrap().payload, b"payload!!");
+        log.verify().unwrap();
         let _ = fs::remove_dir_all(&dir);
     }
 
