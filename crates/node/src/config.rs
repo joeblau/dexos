@@ -123,9 +123,10 @@ impl Default for NetworkSection {
         Self {
             listen: "0.0.0.0:9000".to_string(),
             bootstrap_peers: Vec::new(),
-            // Fail closed by default: neither the QUIC session layer nor datagram
-            // dissemination is wired into the node yet, so the safe default is off.
-            // Requesting either explicitly is rejected by `validate`.
+            // Defaults stay off so configs that omit the keys remain valid on
+            // builds without the `quic` feature. When compiled with `quic`,
+            // operators may set both to true; `validate` fails closed if the
+            // binary lacks the implementation (never a silent no-op).
             enable_quic: false,
             enable_datagrams: false,
         }
@@ -542,22 +543,37 @@ impl NodeConfig {
     }
 
     /// Reject feature flags and modes whose implementations have not landed in
-    /// this release. Silently no-oping them would let an operator believe a
-    /// capability is active when it is not.
+    /// this release (or were not compiled in). Silently no-oping them would let
+    /// an operator believe a capability is active when it is not.
     fn reject_unsupported_features(&self) -> Result<(), ConfigError> {
-        if self.network.enable_quic {
+        // Real QUIC + native datagrams require the `quic` feature on `network`
+        // (enabled by default via `node`'s `quic` feature). Without it, both
+        // flags must stay false — never a silent no-op.
+        if self.network.enable_quic && !network::quic_supported() {
             return Err(ConfigError::Unsupported {
                 field: "network.enable_quic",
-                detail: "QUIC reliable sessions are not implemented in this release; \
-                         set network.enable_quic = false",
+                detail: "QUIC transport was not compiled into this binary \
+                         (build with --features quic); set network.enable_quic = false \
+                         or rebuild with the quic feature",
             });
         }
         if self.network.enable_datagrams {
-            return Err(ConfigError::Unsupported {
-                field: "network.enable_datagrams",
-                detail: "datagram market-data dissemination is not implemented in this \
-                         release; set network.enable_datagrams = false",
-            });
+            if !self.network.enable_quic {
+                return Err(ConfigError::Unsupported {
+                    field: "network.enable_datagrams",
+                    detail: "native datagrams require QUIC (network.enable_quic = true); \
+                             TCP multiplexes 'datagrams' onto the ordered byte stream \
+                             with reduced HOL guarantees and is not a substitute",
+                });
+            }
+            if !network::quic_supported() {
+                return Err(ConfigError::Unsupported {
+                    field: "network.enable_datagrams",
+                    detail: "QUIC datagram support was not compiled into this binary \
+                             (build with --features quic); set network.enable_datagrams = false \
+                             or rebuild with the quic feature",
+                });
+            }
         }
         // pin_threads is implemented on Linux/macOS; reject only elsewhere.
         if self.performance.pin_threads && !crate::threading::pinning_supported() {
@@ -795,22 +811,29 @@ metrics_listen = "127.0.0.1:9100"
     }
 
     #[test]
-    fn rejects_unsupported_quic() {
+    fn quic_flag_requires_compiled_support() {
         let mut cfg = NodeConfig::default();
         cfg.network.enable_quic = true;
-        assert!(matches!(
-            cfg.validate(),
-            Err(ConfigError::Unsupported {
-                field: "network.enable_quic",
-                ..
-            })
-        ));
+        if network::quic_supported() {
+            cfg.validate()
+                .expect("enable_quic must be accepted when the quic feature is compiled in");
+        } else {
+            assert!(matches!(
+                cfg.validate(),
+                Err(ConfigError::Unsupported {
+                    field: "network.enable_quic",
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]
-    fn rejects_unsupported_datagrams() {
+    fn datagrams_require_quic_enabled() {
         let mut cfg = NodeConfig::default();
+        // Datagrams without QUIC: always rejected (TCP is not a substitute).
         cfg.network.enable_datagrams = true;
+        cfg.network.enable_quic = false;
         assert!(matches!(
             cfg.validate(),
             Err(ConfigError::Unsupported {
@@ -818,6 +841,27 @@ metrics_listen = "127.0.0.1:9100"
                 ..
             })
         ));
+
+        cfg.network.enable_quic = true;
+        if network::quic_supported() {
+            cfg.validate()
+                .expect("datagrams + quic accepted when feature is present");
+        } else {
+            let err = cfg.validate().unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::Unsupported {
+                        field: "network.enable_datagrams",
+                        ..
+                    } | ConfigError::Unsupported {
+                        field: "network.enable_quic",
+                        ..
+                    }
+                ),
+                "expected unsupported quic/datagrams, got {err:?}"
+            );
+        }
     }
 
     #[test]
@@ -851,16 +895,21 @@ metrics_listen = "127.0.0.1:9100"
     }
 
     #[test]
-    fn unsupported_flag_rejected_through_full_toml_load() {
+    fn quic_flag_through_full_toml_load_is_feature_gated() {
         let toml = "[network]\nlisten = \"0.0.0.0:9000\"\nbootstrap_peers = []\n\
                     enable_quic = true\nenable_datagrams = false";
-        assert!(matches!(
-            NodeConfig::from_toml_str(toml),
-            Err(ConfigError::Unsupported {
-                field: "network.enable_quic",
-                ..
-            })
-        ));
+        let result = NodeConfig::from_toml_str(toml);
+        if network::quic_supported() {
+            result.expect("quic enabled config valid with feature");
+        } else {
+            assert!(matches!(
+                result,
+                Err(ConfigError::Unsupported {
+                    field: "network.enable_quic",
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]

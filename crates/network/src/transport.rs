@@ -1,10 +1,11 @@
 //! The [`Transport`] trait: the pluggable authenticated peer-transport surface.
 //!
-//! Implementations: [`crate::LoopbackTransport`] (in-process, deterministic) and
-//! [`crate::TcpTransport`] (real sockets, authenticated handshake, length-prefixed
-//! framing). A QUIC adapter is a documented future implementation behind this
-//! same trait — see the crate docs — and deliberately not built yet (no `quinn`
-//! dependency is introduced).
+//! Implementations:
+//! * [`crate::LoopbackTransport`] — in-process, deterministic;
+//! * [`crate::TcpTransport`] — TCP sockets (shared ordered stream; reduced
+//!   HOL guarantees — see crate docs);
+//! * [`crate::QuicTransport`] *(feature = `"quic"`)* — independent streams per
+//!   latency class and native QUIC datagrams.
 //!
 //! The per-message send / receive operations live on the [`Connection`] handle
 //! returned by [`Transport::connect`] / [`Transport::accept`], so a caller can

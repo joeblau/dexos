@@ -212,14 +212,21 @@ fn configure_socket(stream: &TcpStream, cfg: &TransportConfig) -> Result<(), Tra
 }
 
 /// Run the mutual authentication + version/network negotiation handshake.
-pub(crate) async fn mutual_handshake(
-    stream: &mut TcpStream,
+///
+/// Stream-agnostic so both the TCP path and the QUIC control stream can share
+/// the same identity-binding transcript (network id, wire version, capabilities,
+/// epoch, ephemeral X25519 keys).
+pub(crate) async fn mutual_handshake<S>(
+    stream: &mut S,
     keypair: &KeyPair,
     expected: Option<PeerId>,
     is_initiator: bool,
     cfg: &TransportConfig,
     local_epoch: u64,
-) -> Result<(HandshakeResult, Session), TransportError> {
+) -> Result<(HandshakeResult, Session), TransportError>
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin,
+{
     let our_pub = keypair.public();
     let our_nonce = make_nonce()?;
     let ephemeral = Ephemeral::generate()?;

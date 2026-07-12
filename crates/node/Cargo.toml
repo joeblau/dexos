@@ -10,7 +10,7 @@ publish.workspace = true
 workspace = true
 
 [features]
-default = ["metrics-http"]
+default = ["metrics-http", "quic"]
 dev-tools = ["dep:loadgen"]
 mock-chains = ["chain-adapter-evm/mock", "chain-adapter-svm/mock"]
 # Prometheus /livez scrape server (always available; bound only when
@@ -18,6 +18,10 @@ mock-chains = ["chain-adapter-evm/mock", "chain-adapter-svm/mock"]
 # binaries can strip it if desired.
 metrics-http = []
 simd = []
+# Real QUIC peer transport (independent streams + native datagrams).
+# Production path: enabled by default. Builds without this feature must keep
+# network.enable_quic / enable_datagrams = false (fail-closed at config load).
+quic = ["network/quic"]
 
 [dependencies]
 types = { path = "../types" }
