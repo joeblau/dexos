@@ -18,7 +18,10 @@
 //!   limit (`ConnectionLimiter`);
 //! - process-wide and per-connection **in-flight request / byte** budgets
 //!   ([`crate::work::WorkBudget`]) so large frames and slow handlers cannot
-//!   exhaust RSS independently of connection count;
+//!   exhaust RSS independently of connection count — charged from the frame
+//!   header's **declared** size before the payload is read or allocated
+//!   (#427), so an unadmitted flood cannot force `max_payload`-sized
+//!   allocations either;
 //! - idle, read, and write [timeouts](ServerConfig) that evict slowloris-style
 //!   stalled clients;
 //! - classified `accept()` error handling (#406): transient per-connection
@@ -213,29 +216,85 @@ async fn read_frame<R: AsyncRead + Unpin>(
     Ok(buf)
 }
 
-/// Like [`read_frame`], but bounds the wait for the header by `idle_timeout` and
-/// the wait for the payload by `read_timeout`. A timeout in either phase yields
-/// [`ServerError::Timeout`], evicting stalled (slowloris-style) clients instead
-/// of holding the connection open indefinitely.
-async fn read_frame_timed<R: AsyncRead + Unpin>(
+/// A frame header read off the wire, before its payload (#427).
+///
+/// Holding one of these means exactly [`FRAME_HEADER_LEN`] bytes have been
+/// consumed and the declared payload length passed the `max_payload` cap —
+/// nothing of the payload has been read, and **no payload-sized buffer has
+/// been allocated**. The payload is only read (via [`read_payload_timed`])
+/// after the work budgets admit the declared frame size.
+struct FrameHeader {
+    /// The raw header bytes, kept so the full frame can be reassembled for
+    /// [`decode_request`] once the payload arrives.
+    raw: [u8; FRAME_HEADER_LEN],
+    /// The declared payload length (already validated against `max_payload`).
+    plen: usize,
+}
+
+impl FrameHeader {
+    /// The header-level protocol checks [`codec::Frame::decode`] performs —
+    /// magic, frame version, traffic class — surfaced at header time so a
+    /// non-protocol peer is rejected before any budget is charged or payload
+    /// byte buffered. Returns exactly the [`RpcError`] the full decode used to
+    /// report when these checks ran after the payload was read. `msg_type` and
+    /// the payload body are still validated by [`decode_request`] once the
+    /// frame is assembled.
+    fn validate(&self) -> Result<(), RpcError> {
+        let magic = u16::from_le_bytes([self.raw[0], self.raw[1]]);
+        if magic != codec::FRAME_MAGIC {
+            return Err(RpcError::from(codec::CodecError::BadMagic));
+        }
+        let version = u16::from_le_bytes([self.raw[2], self.raw[3]]);
+        if version != codec::FRAME_VERSION {
+            return Err(RpcError::from(codec::CodecError::UnsupportedVersion(
+                version,
+            )));
+        }
+        if codec::TrafficClass::from_u8(self.raw[4]).is_none() {
+            return Err(RpcError::from(codec::CodecError::UnknownClass(self.raw[4])));
+        }
+        Ok(())
+    }
+}
+
+/// Phase 1 of the framed read (#427): read exactly the [`FRAME_HEADER_LEN`]
+/// header bytes, bounded by `idle_timeout` (this is the between-requests wait,
+/// so the idle budget applies), parse the declared payload length, and enforce
+/// the `max_payload` cap **first** — an oversize declaration is rejected from
+/// the header alone, before any payload-sized allocation could exist. A stall
+/// yields [`ServerError::Timeout`], evicting slowloris-style clients.
+async fn read_header_timed<R: AsyncRead + Unpin>(
     reader: &mut R,
     idle_timeout: Duration,
-    read_timeout: Duration,
     max_payload: usize,
-) -> Result<Vec<u8>, ServerError> {
-    let mut header = [0u8; FRAME_HEADER_LEN];
-    match tokio::time::timeout(idle_timeout, reader.read_exact(&mut header)).await {
+) -> Result<FrameHeader, ServerError> {
+    let mut raw = [0u8; FRAME_HEADER_LEN];
+    match tokio::time::timeout(idle_timeout, reader.read_exact(&mut raw)).await {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => return Err(ServerError::Io(e)),
         Err(_elapsed) => return Err(ServerError::Timeout),
     }
-    let plen = u32::from_le_bytes([header[15], header[16], header[17], header[18]]);
+    // Payload length lives in the last 4 header bytes (little-endian).
+    let plen = u32::from_le_bytes([raw[15], raw[16], raw[17], raw[18]]);
     let plen = usize::try_from(plen).map_err(|_| ServerError::Oversize)?;
     if plen > max_payload {
         return Err(ServerError::Oversize);
     }
-    let mut buf = vec![0u8; FRAME_HEADER_LEN + plen];
-    buf[..FRAME_HEADER_LEN].copy_from_slice(&header);
+    Ok(FrameHeader { raw, plen })
+}
+
+/// Phase 2 of the framed read (#427): allocate the frame buffer — legal only
+/// now, after the work budgets admitted `FRAME_HEADER_LEN + plen` — and read
+/// the declared payload, bounded by `read_timeout` (the header has arrived, so
+/// the body budget applies). Returns the reassembled full frame bytes for
+/// [`decode_request`]. A stall yields [`ServerError::Timeout`].
+async fn read_payload_timed<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    header: &FrameHeader,
+    read_timeout: Duration,
+) -> Result<Vec<u8>, ServerError> {
+    let mut buf = vec![0u8; FRAME_HEADER_LEN + header.plen];
+    buf[..FRAME_HEADER_LEN].copy_from_slice(&header.raw);
     match tokio::time::timeout(
         read_timeout,
         reader.read_exact(&mut buf[FRAME_HEADER_LEN..]),
@@ -243,6 +302,42 @@ async fn read_frame_timed<R: AsyncRead + Unpin>(
     .await
     {
         Ok(Ok(_)) => Ok(buf),
+        Ok(Err(e)) => Err(ServerError::Io(e)),
+        Err(_elapsed) => Err(ServerError::Timeout),
+    }
+}
+
+/// Consume and discard `plen` declared payload bytes through a small fixed
+/// buffer — never a `plen`-sized allocation — bounded as a whole by
+/// `read_timeout`, exactly like an admitted payload read. Used when a frame is
+/// refused at header time (work-budget backpressure, header-level protocol
+/// violation) so the length-prefixed session stays framed for the client's
+/// next request instead of desynchronizing.
+async fn discard_payload_timed<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    plen: usize,
+    read_timeout: Duration,
+) -> Result<(), ServerError> {
+    /// Fixed drain chunk: bounds the rejection path's memory at a constant,
+    /// independent of the frame's declared (up to `max_payload`) size.
+    const DISCARD_CHUNK: usize = 4096;
+    let drain = async {
+        let mut chunk = [0u8; DISCARD_CHUNK];
+        let mut remaining = plen;
+        while remaining > 0 {
+            let want = remaining.min(DISCARD_CHUNK);
+            let n = reader.read(&mut chunk[..want]).await?;
+            if n == 0 {
+                // Mirror `read_exact`: EOF mid-payload is an IO error, which
+                // the caller treats as a clean peer hang-up.
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+            }
+            remaining -= n;
+        }
+        Ok(())
+    };
+    match tokio::time::timeout(read_timeout, drain).await {
+        Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(ServerError::Io(e)),
         Err(_elapsed) => Err(ServerError::Timeout),
     }
@@ -286,8 +381,10 @@ where
 /// Synchronous backend work is isolated onto Tokio's blocking pool so a slow
 /// handler cannot starve the accept loop or other IO workers. Admission against
 /// `work_budget` (process-wide) and a per-connection ceiling happens
-/// **before** dispatch: a rejected request gets [`RpcError::Backpressure`] and
-/// is never committed.
+/// **before** dispatch — and, since #427, before the request payload is even
+/// read: budgets are charged from the frame header's declared size, so a
+/// rejected request never costs the server a payload-sized buffer. A rejected
+/// request gets [`RpcError::Backpressure`] and is never committed.
 pub async fn handle_connection_with<S>(
     stream: S,
     backend: Arc<dyn RpcBackend>,
@@ -342,20 +439,17 @@ where
     let max_payload = config.max_payload.clamp(1, codec::MAX_FRAME_PAYLOAD);
 
     loop {
+        // Phase 1 (#427): header only. The declared payload is neither read
+        // nor allocated until the work budgets admit it below.
         let read = tokio::select! {
             biased;
             // Shutdown between requests: close instead of reading another. The
             // previous request (if any) has already been fully replied to.
             _ = stop_requested(&mut stop) => return Ok(()),
-            read = read_frame_timed(
-                &mut stream,
-                config.idle_timeout,
-                config.read_timeout,
-                max_payload,
-            ) => read,
+            read = read_header_timed(&mut stream, config.idle_timeout, max_payload) => read,
         };
-        let bytes = match read {
-            Ok(bytes) => bytes,
+        let header = match read {
+            Ok(header) => header,
             // A clean EOF/reset ends the session without a hard error.
             Err(ServerError::Io(_)) => return Ok(()),
             // A stalled-client (slowloris) eviction also ends the session
@@ -372,7 +466,9 @@ where
                     m.record_oversize();
                 }
                 // Size violations are not admission pressure — use the
-                // dedicated error so clients can distinguish retries.
+                // dedicated error so clients can distinguish retries. The
+                // oversize declaration was refused on the header alone (#427):
+                // no payload byte was read, no payload buffer allocated.
                 let resp = RpcResponse::new(0, Err(RpcError::MessageTooLarge));
                 let out = encode_response(&resp)?;
                 let _ = write_all_timed(&mut stream, &out, config.write_timeout).await;
@@ -381,85 +477,156 @@ where
             Err(other) => return Err(other),
         };
 
-        let frame_bytes = bytes.len();
-        // Pre-admission: hold process + connection permits for the whole
-        // dispatch. Failure here means the command was never submitted.
-        let response = match (
+        // Header-level protocol violations (bad magic/version/class) are
+        // refused before any budget is charged or payload byte buffered. The
+        // reply is the identical codec error `decode_request` reported when
+        // this check ran after the full read, and it is sent at the same
+        // point — after the declared bytes have arrived (drained through a
+        // fixed-size buffer) — so the session stays framed and keeps serving,
+        // exactly as before the #427 split.
+        if let Err(err) = header.validate() {
+            match discard_payload_timed(&mut stream, header.plen, config.read_timeout).await {
+                Ok(()) => {}
+                Err(ServerError::Io(_)) => return Ok(()),
+                Err(ServerError::Timeout) => {
+                    if let Some(m) = &metrics {
+                        m.record_read_timeout();
+                    }
+                    return Ok(());
+                }
+                Err(other) => return Err(other),
+            }
+            let resp = RpcResponse::new(0, Err(err));
+            let out = encode_response(&resp)?;
+            write_all_timed(&mut stream, &out, config.write_timeout).await?;
+            continue;
+        }
+
+        // Pre-admission (#427): charge process + connection budgets from the
+        // frame's *declared* size, before any payload-sized buffer exists.
+        // The permits are held for the whole dispatch; failure here means the
+        // payload was never read past its header, never allocated, and the
+        // command was never submitted — an over-budget flood can no longer
+        // force `max_payload`-sized allocations.
+        let frame_bytes = FRAME_HEADER_LEN + header.plen;
+        let (proc_permit, conn_permit) = match (
             work_budget.try_acquire(frame_bytes),
             conn_budget.try_acquire(frame_bytes),
         ) {
-            (Some(proc_permit), Some(conn_permit)) => {
-                match decode_request(&bytes) {
-                    Ok(request) => {
-                        let span = tracing::debug_span!(
-                            "rpc.request",
-                            request_id = request.request_id,
-                            method = ?request.method,
-                        );
-                        let _g = span.enter();
-                        let request_id = request.request_id;
-                        let backend = Arc::clone(&backend);
-                        let dispatch_timeout = config.dispatch_timeout;
-                        // Isolate synchronous backend work off the IO worker.
-                        let mut join =
-                            tokio::task::spawn_blocking(move || dispatch(&*backend, mode, request));
-                        // Poll the JoinHandle by reference: on timeout the handle
-                        // must survive so the still-running blocking task (which
-                        // cannot be aborted) can be reaped below.
-                        let result = match tokio::time::timeout(dispatch_timeout, &mut join).await {
-                            Ok(Ok(resp)) => resp,
-                            // The dispatch task died (a panic — it is never
-                            // aborted). The request was decoded, so like every
-                            // post-decode error reply this one echoes the
-                            // request's id: a pipelining client correlates
-                            // in-flight requests by `request_id`, and an
-                            // uncorrelated reply would break that (#421).
-                            Ok(Err(join_err)) => RpcResponse::new(
-                                request_id,
-                                Err(RpcError::Internal(format!("dispatch join: {join_err}"))),
-                            ),
-                            Err(_elapsed) => {
-                                // Pre-admission succeeded but the handler outran
-                                // the wait budget. We cannot cancel a committed
-                                // command, and a `spawn_blocking` task cannot be
-                                // aborted: it keeps running on the blocking pool.
-                                // Keep the process-wide work permit charged until
-                                // that orphaned task really finishes so the budget
-                                // reflects in-flight work; the per-connection
-                                // permit dies with this connection, which is
-                                // failed closed after the reply below.
-                                if let Some(m) = &metrics {
-                                    m.record_dispatch_timeout();
-                                }
-                                tokio::spawn(async move {
-                                    let _proc_permit = proc_permit;
-                                    let _ = join.await;
-                                });
-                                let resp =
-                                    RpcResponse::new(request_id, Err(RpcError::Backpressure));
-                                let out = encode_response(&resp)?;
-                                let _ =
-                                    write_all_timed(&mut stream, &out, config.write_timeout).await;
-                                return Ok(());
-                            }
-                        };
-                        drop(proc_permit);
-                        drop(conn_permit);
-                        result
-                    }
-                    Err(err) => {
-                        drop(proc_permit);
-                        drop(conn_permit);
-                        RpcResponse::new(0, Err(err))
-                    }
-                }
-            }
-            _ => {
-                // Not admitted: command was never submitted to the backend.
+            (Some(proc_permit), Some(conn_permit)) => (proc_permit, conn_permit),
+            partial => {
+                // Not admitted. Release whichever half was granted before
+                // draining, so a rejected frame cannot pin budget while its
+                // payload is discarded.
+                drop(partial);
                 if let Some(m) = &metrics {
                     m.record_backpressure();
                 }
-                RpcResponse::new(0, Err(RpcError::Backpressure))
+                // Signal the rejection immediately — the payload is not
+                // waited for, so a client mid-upload learns to back off as
+                // soon as its header is on the wire.
+                let resp = RpcResponse::new(0, Err(RpcError::Backpressure));
+                let out = encode_response(&resp)?;
+                write_all_timed(&mut stream, &out, config.write_timeout).await?;
+                // Keep the session framed for the retry: drain the declared
+                // payload through a fixed-size buffer (never a `plen`-sized
+                // allocation), bounded by the payload read timeout.
+                match discard_payload_timed(&mut stream, header.plen, config.read_timeout).await {
+                    Ok(()) => continue,
+                    Err(ServerError::Io(_)) => return Ok(()),
+                    Err(ServerError::Timeout) => {
+                        if let Some(m) = &metrics {
+                            m.record_read_timeout();
+                        }
+                        return Ok(());
+                    }
+                    Err(other) => return Err(other),
+                }
+            }
+        };
+
+        // Phase 2 (#427): admitted — the frame buffer may now exist. Payload
+        // assembly is bounded by `read_timeout` and still races shutdown
+        // (#407): a request whose frame has not fully arrived when the stop
+        // fires is abandoned — nothing has been dispatched, so no committed
+        // work is lost, and the permits drop with the early return.
+        let read = tokio::select! {
+            biased;
+            _ = stop_requested(&mut stop) => return Ok(()),
+            read = read_payload_timed(&mut stream, &header, config.read_timeout) => read,
+        };
+        let bytes = match read {
+            Ok(bytes) => bytes,
+            Err(ServerError::Io(_)) => return Ok(()),
+            Err(ServerError::Timeout) => {
+                if let Some(m) = &metrics {
+                    m.record_read_timeout();
+                }
+                return Ok(());
+            }
+            Err(other) => return Err(other),
+        };
+
+        let response = match decode_request(&bytes) {
+            Ok(request) => {
+                let span = tracing::debug_span!(
+                    "rpc.request",
+                    request_id = request.request_id,
+                    method = ?request.method,
+                );
+                let _g = span.enter();
+                let request_id = request.request_id;
+                let backend = Arc::clone(&backend);
+                let dispatch_timeout = config.dispatch_timeout;
+                // Isolate synchronous backend work off the IO worker.
+                let mut join =
+                    tokio::task::spawn_blocking(move || dispatch(&*backend, mode, request));
+                // Poll the JoinHandle by reference: on timeout the handle
+                // must survive so the still-running blocking task (which
+                // cannot be aborted) can be reaped below.
+                let result = match tokio::time::timeout(dispatch_timeout, &mut join).await {
+                    Ok(Ok(resp)) => resp,
+                    // The dispatch task died (a panic — it is never
+                    // aborted). The request was decoded, so like every
+                    // post-decode error reply this one echoes the
+                    // request's id: a pipelining client correlates
+                    // in-flight requests by `request_id`, and an
+                    // uncorrelated reply would break that (#421).
+                    Ok(Err(join_err)) => RpcResponse::new(
+                        request_id,
+                        Err(RpcError::Internal(format!("dispatch join: {join_err}"))),
+                    ),
+                    Err(_elapsed) => {
+                        // Pre-admission succeeded but the handler outran
+                        // the wait budget. We cannot cancel a committed
+                        // command, and a `spawn_blocking` task cannot be
+                        // aborted: it keeps running on the blocking pool.
+                        // Keep the process-wide work permit charged until
+                        // that orphaned task really finishes so the budget
+                        // reflects in-flight work; the per-connection
+                        // permit dies with this connection, which is
+                        // failed closed after the reply below.
+                        if let Some(m) = &metrics {
+                            m.record_dispatch_timeout();
+                        }
+                        tokio::spawn(async move {
+                            let _proc_permit = proc_permit;
+                            let _ = join.await;
+                        });
+                        let resp = RpcResponse::new(request_id, Err(RpcError::Backpressure));
+                        let out = encode_response(&resp)?;
+                        let _ = write_all_timed(&mut stream, &out, config.write_timeout).await;
+                        return Ok(());
+                    }
+                };
+                drop(proc_permit);
+                drop(conn_permit);
+                result
+            }
+            Err(err) => {
+                drop(proc_permit);
+                drop(conn_permit);
+                RpcResponse::new(0, Err(err))
             }
         };
         let out = encode_response(&response)?;
