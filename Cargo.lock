@@ -1009,6 +1009,7 @@ dependencies = [
  "decision-markets",
  "discovery",
  "execution",
+ "getrandom 0.2.17",
  "light-client",
  "loadgen",
  "markets",
