@@ -780,7 +780,10 @@ impl RiskEngine {
     /// Counterparties holding the opposite side in each market are ranked by
     /// unrealized profit (descending, ties broken by ascending account index) —
     /// the standard ADL ordering that deleverages the most-profitable positions
-    /// first. Each transfer applies a reducing fill to both legs at the same mark
+    /// first. Candidates come from the market->holders reverse index, so ranking
+    /// work scales with the market's holders rather than every account, without
+    /// changing which counterparties are selected or in what order.
+    /// Each transfer applies a reducing fill to both legs at the same mark
     /// price, which is value-neutral. Any residual the counterparties cannot
     /// absorb (an unbalanced book) is closed on the liquidated account alone at
     /// the mark, which is likewise neutral for that account.
@@ -804,16 +807,25 @@ impl RiskEngine {
             };
 
             // Rank opposite-side solvent counterparties: (unrealized profit,
-            // account index, signed quantity).
+            // account index, signed quantity). The reverse index yields exactly
+            // the accounts holding this market, in ascending slab order — the
+            // same candidates the full `0..used.len()` scan visited — so ADL
+            // work scales with the market's holders, not total accounts.
+            let mi = market.index()?;
             let mut ranked: Vec<(i128, usize, i64)> = Vec::new();
-            for j in 0..self.used.len() {
-                if j == i || !self.open[j] {
-                    continue;
-                }
-                if let Some((cj, profit)) = self.market_leg(j, market, mark)? {
-                    let opposite = (cj > 0) != (victim_signed > 0);
-                    if opposite {
-                        ranked.push((profit, j, cj));
+            if let Some(holders) = self.market_holders.get(mi) {
+                for &j in holders {
+                    if j == i || !self.open[j] {
+                        continue;
+                    }
+                    // Re-verify the leg rather than trusting the index: a
+                    // rolled-back fill can leave a stale entry behind, and a
+                    // missing or flat leg is simply skipped.
+                    if let Some((cj, profit)) = self.market_leg(j, market, mark)? {
+                        let opposite = (cj > 0) != (victim_signed > 0);
+                        if opposite {
+                            ranked.push((profit, j, cj));
+                        }
                     }
                 }
             }
@@ -1939,6 +1951,91 @@ mod tests {
         }
         // ADL at the mark plus insurance/socialization conserves system value.
         assert_eq!(e.total_value().unwrap(), before);
+    }
+
+    #[test]
+    fn adl_reverse_index_matches_reference_full_scan() {
+        // The holder-index ADL path must select the same counterparties, in
+        // the same order and for the same amounts, as the definitional full
+        // scan over every account: rank opposite-side legs by unrealized
+        // profit descending, ties broken by ascending account index, then
+        // greedily absorb the victim's quantity.
+        let mut e = engine();
+        // Victim: long 12 @100 on thin collateral.
+        e.open_account(acct(1), amt(60)).unwrap();
+        // Opposite-side holders at distinct entries — including a profit tie
+        // between accounts 2 and 4 that only the index tie-break resolves —
+        // plus a same-side holder, an unrelated-market holder, and a former
+        // holder whose fully-closed leg is retained flat mid-book.
+        for a in 2..=8u32 {
+            e.open_account(acct(a), amt(10_000)).unwrap();
+        }
+        e.set_mark_price(mkt(1), price(100)).unwrap();
+        e.set_mark_price(mkt(2), price(50)).unwrap();
+        e.apply_fill(acct(1), mkt(1), qty(12), price(100)).unwrap();
+        e.apply_fill(acct(2), mkt(1), qty(-3), price(105)).unwrap(); // profit 45
+        e.apply_fill(acct(3), mkt(1), qty(-5), price(110)).unwrap(); // profit 100
+        e.apply_fill(acct(4), mkt(1), qty(-3), price(105)).unwrap(); // profit 45 (ties 2)
+        e.apply_fill(acct(5), mkt(1), qty(-2), price(95)).unwrap(); // profit 10
+        e.apply_fill(acct(6), mkt(1), qty(4), price(100)).unwrap(); // same side
+        e.apply_fill(acct(7), mkt(2), qty(2), price(50)).unwrap(); // other market
+        e.apply_fill(acct(8), mkt(1), qty(-2), price(100)).unwrap();
+        e.apply_fill(acct(8), mkt(2), qty(1), price(50)).unwrap();
+        e.apply_fill(acct(8), mkt(1), qty(2), price(100)).unwrap(); // closed flat
+        e.set_mark_price(mkt(1), price(90)).unwrap();
+        assert!(e.is_liquidatable(acct(1)).unwrap());
+        // Victim + accounts 2..=6 hold market 1; 7 and 8 do not.
+        assert_eq!(e.market_holder_count(mkt(1)).unwrap(), 6);
+
+        // Independent reference: scan EVERY account's book directly (no
+        // reverse index), rank, and simulate the greedy transfers.
+        let mark = price(90);
+        let mut reference: Vec<(i128, u32, i64)> = Vec::new();
+        for a in 2..=8u32 {
+            for p in e.perp_positions(acct(a)).unwrap() {
+                // Opposite side of the long victim only; flat legs are inert.
+                if p.market == mkt(1) && p.net_qty.raw() < 0 {
+                    reference.push((p.unrealized(mark).unwrap().raw(), a, p.net_qty.raw()));
+                }
+            }
+        }
+        reference.sort_by(|x, y| y.0.cmp(&x.0).then(x.1.cmp(&y.1)));
+        let mut remaining = qty(12).raw();
+        let mut expected: Vec<(AccountId, Quantity)> = Vec::new();
+        for (_, a, cj) in reference {
+            if remaining == 0 {
+                break;
+            }
+            let transfer = remaining.min(-cj);
+            expected.push((acct(a), Quantity::from_raw(transfer)));
+            remaining -= transfer;
+        }
+        // The book absorbs the victim fully: 5 + 3 + 3 + 1 of acct 5's 2.
+        assert_eq!(
+            expected,
+            vec![
+                (acct(3), qty(5)),
+                (acct(2), qty(3)),
+                (acct(4), qty(3)),
+                (acct(5), qty(1)),
+            ]
+        );
+
+        let outcome = e.liquidate(acct(1)).unwrap();
+        let got: Vec<(AccountId, Quantity)> = outcome
+            .adl_fills
+            .iter()
+            .map(|f| (f.counterparty, f.quantity))
+            .collect();
+        assert_eq!(got, expected);
+        for f in &outcome.adl_fills {
+            assert_eq!(f.market, mkt(1));
+            assert_eq!(f.price, mark);
+        }
+        // Victim flat; the partially deleveraged account keeps its residual.
+        assert_eq!(e.position(acct(1), mkt(1)).unwrap(), Quantity::ZERO);
+        assert_eq!(e.position(acct(5), mkt(1)).unwrap(), qty(-1));
+        assert_eq!(e.position(acct(6), mkt(1)).unwrap(), qty(4));
     }
 
     #[test]
