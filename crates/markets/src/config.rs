@@ -94,9 +94,11 @@ impl OracleConfig {
 }
 
 /// Resolution-oracle configuration: the committee threshold and challenge
-/// window. The actual committee keys live in
-/// [`crate::resolution::ResolutionRule`], which is referenced by `rules_hash`
-/// so the definition stays copyable and hashable.
+/// window. The actual committee keys and the immutable, versioned commitment
+/// live in [`crate::resolution::ResolutionPolicy`], which a market binds via
+/// [`crate::MarketRegistry::commit_resolution_policy`] so the definition stays
+/// copyable and hashable while resolution verification derives every input from
+/// the committed policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolverConfig {
     /// Number of resolvers in the committee.

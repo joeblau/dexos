@@ -132,6 +132,40 @@ pub enum ResolutionError {
     /// The quorum's signed message does not bind the certified outcome/evidence.
     #[error("resolution message does not bind the certified outcome")]
     ForgedMessage,
+    /// The certificate names a policy commitment other than the market's
+    /// committed one (a noncommitted committee, rule, deployment, or version).
+    #[error("resolution certificate does not match the committed policy")]
+    PolicyMismatch,
+    /// The certificate names a round the committed policy does not govern.
+    #[error("resolution certificate round mismatch")]
+    RoundMismatch,
+    /// The certificate authorizes a different transition than the one attempted.
+    #[error("resolution certificate phase mismatch")]
+    PhaseMismatch,
+    /// The market has no committed resolution policy to verify against.
+    #[error("market has no committed resolution policy")]
+    PolicyNotCommitted,
+    /// A resolution policy is already committed for this market.
+    #[error("resolution policy already committed")]
+    PolicyAlreadyCommitted,
+    /// The committed policy has expired and may no longer propose a resolution.
+    #[error("resolution policy expired")]
+    PolicyExpired,
+    /// The proposed challenge deadline is shorter than the committed window.
+    #[error("challenge deadline shorter than the committed window")]
+    WindowTooShort,
+    /// The challenge window has already closed; challenges are no longer accepted.
+    #[error("challenge window already closed")]
+    WindowClosed,
+    /// A resolution has already been proposed for the current round.
+    #[error("resolution already proposed for this round")]
+    ProposalExists,
+    /// No resolution has been proposed yet for the current round.
+    #[error("no resolution proposed for this round")]
+    NoProposal,
+    /// A challenged round cannot be finalized until it is adjudicated.
+    #[error("challenged resolution not yet adjudicated")]
+    UnresolvedChallenge,
     /// The committee quorum certificate failed verification.
     #[error("resolution quorum verification failed")]
     Quorum(#[from] crypto::QuorumError),

@@ -23,7 +23,10 @@ use crate::escrow::EscrowLedger;
 use crate::lifecycle;
 use crate::payout::{invalid_refund, CompleteSetPool, PayoutRule, Settlement};
 use crate::perpetual::PerpMarketState;
-use crate::resolution::{ResolutionCertificate, ResolutionRule};
+use crate::resolution::{
+    Challenge, ChallengeBook, ResolutionCertificate, ResolutionPhase, ResolutionPolicy,
+    MAX_CHALLENGES,
+};
 use crate::sponsor::{SlashableFault, SponsorSet};
 
 /// The immutable-once-created definition of a market.
@@ -76,6 +79,27 @@ pub struct LifecycleEvent {
     pub to: MarketLifecycle,
 }
 
+/// The per-round resolution progress bound to a market: the committee's proposed
+/// (and, once a dispute is adjudicated, final) outcome, the committee-attested
+/// challenge deadline, the staked challenge book, and whether adjudication has
+/// run. Persisted in the record so every verification input is derived from
+/// stored state, never a caller argument.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ResolutionRoundState {
+    /// The round this progress belongs to (must equal the committed policy round).
+    round: u64,
+    /// The committee-attested first sequence at which finalization is permitted.
+    deadline: SequenceNumber,
+    /// The proposed outcome; overwritten by the adjudicated outcome on dispute.
+    payout: PayoutVector,
+    /// The proposal's evidence commitment.
+    evidence_hash: Hash,
+    /// Staked challenges against the proposal.
+    challenges: ChallengeBook,
+    /// Whether a challenged round has been deterministically adjudicated.
+    adjudicated: bool,
+}
+
 /// The internal per-market registry record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct MarketRecord {
@@ -86,6 +110,10 @@ struct MarketRecord {
     perp: PerpMarketState,
     resolution: Option<PayoutVector>,
     settled: bool,
+    /// The immutable, versioned resolution policy this market committed to.
+    policy: Option<ResolutionPolicy>,
+    /// Progress of the current resolution round, once a proposal is made.
+    round_state: Option<ResolutionRoundState>,
 }
 
 /// A replayable market command over the lifecycle-management subset. Resolution
@@ -363,6 +391,8 @@ impl MarketRegistry {
             perp: PerpMarketState::default(),
             resolution: None,
             settled: false,
+            policy: None,
+            round_state: None,
         };
         self.markets.insert(record.definition.market_id, record);
         Ok(())
@@ -667,31 +697,293 @@ impl MarketRegistry {
 
     // ---- resolution & settlement -----------------------------------------
 
-    /// Resolve a `PendingResolution`/`Disputed` market with a verified committee
-    /// certificate. Records the certified outcome and advances to `Resolved`.
+    /// Commit the immutable, versioned [`ResolutionPolicy`] a market resolves
+    /// under. The committed policy is the *sole* source of truth for later
+    /// certificate verification; a caller can never supply a rule or committee at
+    /// resolution time.
+    ///
+    /// Allowed once, before the resolution round begins (any state up to and
+    /// including `PendingResolution`, before a proposal exists). Replacing a
+    /// committed policy is only possible via the explicit
+    /// [`MarketRegistry::rotate_resolution_policy`] transition.
     ///
     /// # Errors
-    /// [`MarketError::WrongLifecycleState`], or [`MarketError::Resolution`] if
-    /// the certificate fails verification.
-    pub fn resolve_market(
+    /// [`MarketError::UnknownMarket`]; [`MarketError::WrongLifecycleState`] once
+    /// resolution is under way or the market is terminal; or
+    /// [`MarketError::Resolution`] with
+    /// [`ResolutionError::PolicyAlreadyCommitted`].
+    pub fn commit_resolution_policy(
+        &mut self,
+        market_id: MarketId,
+        policy: ResolutionPolicy,
+    ) -> Result<(), MarketError> {
+        let record = self.record_mut(market_id)?;
+        if record.policy.is_some() {
+            return Err(MarketError::Resolution(
+                ResolutionError::PolicyAlreadyCommitted,
+            ));
+        }
+        if !Self::policy_mutable(record.lifecycle) {
+            return Err(MarketError::WrongLifecycleState);
+        }
+        record.policy = Some(policy);
+        Ok(())
+    }
+
+    /// Rotate the committed resolution policy to an explicit successor generation.
+    ///
+    /// The successor's version and round strictly advance
+    /// ([`ResolutionPolicy::rotate`]), so a rotation can never rewrite or re-open
+    /// a past round. Any in-flight proposal for the old round is discarded and a
+    /// fresh proposal is required. Permitted only before finalization and never
+    /// while a dispute is open.
+    ///
+    /// # Errors
+    /// [`MarketError::UnknownMarket`]; [`MarketError::WrongLifecycleState`] once
+    /// the market is disputed/resolved/settled/archived; or
+    /// [`MarketError::Resolution`] with [`ResolutionError::PolicyNotCommitted`].
+    pub fn rotate_resolution_policy(
+        &mut self,
+        market_id: MarketId,
+        committee: crypto::ValidatorSet,
+        challenge_window: u64,
+        rules_hash: Hash,
+        expiry: SequenceNumber,
+    ) -> Result<(), MarketError> {
+        let record = self.record_mut(market_id)?;
+        if !Self::policy_mutable(record.lifecycle) {
+            return Err(MarketError::WrongLifecycleState);
+        }
+        let current = record
+            .policy
+            .as_ref()
+            .ok_or(ResolutionError::PolicyNotCommitted)?;
+        let rotated = current.rotate(committee, challenge_window, rules_hash, expiry);
+        record.policy = Some(rotated);
+        // A rotation opens a new round; discard any stale in-flight proposal so
+        // it cannot be finalized against the successor policy.
+        record.round_state = None;
+        Ok(())
+    }
+
+    /// States in which the committed policy may still be set or rotated: before
+    /// resolution is under way and never once a dispute is open or the market is
+    /// terminal.
+    fn policy_mutable(lifecycle: MarketLifecycle) -> bool {
+        matches!(
+            lifecycle,
+            MarketLifecycle::Draft
+                | MarketLifecycle::Staked
+                | MarketLifecycle::Bootstrapping
+                | MarketLifecycle::Open
+                | MarketLifecycle::Halted
+                | MarketLifecycle::Closed
+                | MarketLifecycle::PendingResolution
+        )
+    }
+
+    /// Propose a committee-certified outcome, opening the challenge window.
+    ///
+    /// The certificate is verified against the market's *committed* policy and
+    /// round via [`ResolutionCertificate::verify`]; no caller-supplied rule is
+    /// accepted. The committee-attested `challenge_deadline` must grant at least
+    /// the committed challenge window measured from `now`, and finalization is
+    /// impossible before it. The market stays `PendingResolution` while the
+    /// window is open.
+    ///
+    /// # Errors
+    /// [`MarketError::WrongLifecycleState`] if not `PendingResolution`, or
+    /// [`MarketError::Resolution`] for a missing/expired policy, a wrong phase, an
+    /// existing proposal, a too-short deadline, or a certificate that fails
+    /// verification.
+    pub fn propose_resolution(
         &mut self,
         market_id: MarketId,
         certificate: &ResolutionCertificate,
-        rule: &ResolutionRule,
+        now: SequenceNumber,
     ) -> Result<(), MarketError> {
         let record = self.record(market_id)?;
+        if record.lifecycle != MarketLifecycle::PendingResolution {
+            return Err(MarketError::WrongLifecycleState);
+        }
+        if record.round_state.is_some() {
+            return Err(MarketError::Resolution(ResolutionError::ProposalExists));
+        }
+        let policy = record
+            .policy
+            .as_ref()
+            .ok_or(ResolutionError::PolicyNotCommitted)?;
+        if now.get() >= policy.expiry().get() {
+            return Err(MarketError::Resolution(ResolutionError::PolicyExpired));
+        }
+        if certificate.phase != ResolutionPhase::Propose {
+            return Err(MarketError::Resolution(ResolutionError::PhaseMismatch));
+        }
+        let expected = record
+            .definition
+            .num_outcomes()
+            .ok_or(PayoutError::NonEnumerable)?;
+        certificate.verify(policy, market_id, expected)?;
+        // The committee must grant at least the committed window from now.
+        let earliest = now
+            .get()
+            .checked_add(policy.challenge_window())
+            .ok_or(ResolutionError::WindowTooShort)?;
+        if certificate.challenge_deadline.get() < earliest {
+            return Err(MarketError::Resolution(ResolutionError::WindowTooShort));
+        }
+        let round = policy.round();
+        let deadline = certificate.challenge_deadline;
+        let payout = certificate.payout.clone();
+        let evidence_hash = certificate.evidence_hash;
+        let record = self.record_mut(market_id)?;
+        record.round_state = Some(ResolutionRoundState {
+            round,
+            deadline,
+            payout,
+            evidence_hash,
+            challenges: ChallengeBook::new(MAX_CHALLENGES),
+            adjudicated: false,
+        });
+        Ok(())
+    }
+
+    /// Submit a staked challenge against the pending proposal, moving the market
+    /// to `Disputed`. Accepted only while the committee-attested challenge window
+    /// is open; an open challenge blocks finalization until deterministic
+    /// adjudication.
+    ///
+    /// # Errors
+    /// [`MarketError::WrongLifecycleState`]; or [`MarketError::Resolution`] with
+    /// [`ResolutionError::NoProposal`], [`ResolutionError::WindowClosed`], or
+    /// [`ResolutionError::ChallengeQueueFull`].
+    pub fn submit_challenge(
+        &mut self,
+        market_id: MarketId,
+        challenger: AccountId,
+        bond: Amount,
+        evidence_hash: Hash,
+        now: SequenceNumber,
+    ) -> Result<(), MarketError> {
+        let record = self.record_mut(market_id)?;
         if !matches!(
             record.lifecycle,
             MarketLifecycle::PendingResolution | MarketLifecycle::Disputed
         ) {
             return Err(MarketError::WrongLifecycleState);
         }
+        let round_state = record
+            .round_state
+            .as_mut()
+            .ok_or(ResolutionError::NoProposal)?;
+        if now.get() >= round_state.deadline.get() {
+            return Err(MarketError::Resolution(ResolutionError::WindowClosed));
+        }
+        round_state.challenges.submit(Challenge {
+            challenger,
+            bond,
+            evidence_hash,
+            submitted_at: now,
+        })?;
+        let was_pending = record.lifecycle == MarketLifecycle::PendingResolution;
+        if was_pending {
+            self.transition(market_id, MarketLifecycle::Disputed)?;
+        }
+        Ok(())
+    }
+
+    /// Deterministically adjudicate a disputed round with a committee
+    /// adjudication certificate, recording the final outcome and clearing the
+    /// challenge book. Permitted only after the challenge window closes and bound
+    /// to that exact window; the certificate is verified against the committed
+    /// policy just like a proposal.
+    ///
+    /// # Errors
+    /// [`MarketError::WrongLifecycleState`] if not `Disputed`; or
+    /// [`MarketError::Resolution`] for a missing policy/proposal, a still-open
+    /// window, a wrong phase/round, or a certificate that fails verification.
+    pub fn adjudicate_resolution(
+        &mut self,
+        market_id: MarketId,
+        certificate: &ResolutionCertificate,
+        now: SequenceNumber,
+    ) -> Result<(), MarketError> {
+        let record = self.record(market_id)?;
+        if record.lifecycle != MarketLifecycle::Disputed {
+            return Err(MarketError::WrongLifecycleState);
+        }
+        let policy = record
+            .policy
+            .as_ref()
+            .ok_or(ResolutionError::PolicyNotCommitted)?;
+        let round_state = record
+            .round_state
+            .as_ref()
+            .ok_or(ResolutionError::NoProposal)?;
+        if now.get() < round_state.deadline.get() {
+            return Err(MarketError::Resolution(ResolutionError::WindowOpen));
+        }
+        if certificate.phase != ResolutionPhase::Adjudicate {
+            return Err(MarketError::Resolution(ResolutionError::PhaseMismatch));
+        }
+        // Bind the adjudication certificate to this exact round's window.
+        if certificate.challenge_deadline != round_state.deadline {
+            return Err(MarketError::Resolution(ResolutionError::RoundMismatch));
+        }
         let expected = record
             .definition
             .num_outcomes()
             .ok_or(PayoutError::NonEnumerable)?;
-        certificate.verify(rule, market_id, expected)?;
-        let outcome = certificate.payout.clone();
+        certificate.verify(policy, market_id, expected)?;
+        let payout = certificate.payout.clone();
+        let record = self.record_mut(market_id)?;
+        let round_state = record
+            .round_state
+            .as_mut()
+            .ok_or(ResolutionError::NoProposal)?;
+        round_state.payout = payout;
+        round_state.adjudicated = true;
+        let _ = round_state.challenges.drain();
+        Ok(())
+    }
+
+    /// Finalize a resolution once its challenge window has closed, committing the
+    /// outcome bound into stored round state and advancing to `Resolved`.
+    ///
+    /// Takes no certificate or rule: the outcome is exactly the one the committee
+    /// certified (and, on a dispute, that adjudication settled). Finalization
+    /// before the committed deadline is impossible, and a disputed round cannot
+    /// finalize until it is adjudicated.
+    ///
+    /// # Errors
+    /// [`MarketError::WrongLifecycleState`]; or [`MarketError::Resolution`] with
+    /// [`ResolutionError::NoProposal`], [`ResolutionError::WindowOpen`], or
+    /// [`ResolutionError::UnresolvedChallenge`].
+    pub fn finalize_resolution(
+        &mut self,
+        market_id: MarketId,
+        now: SequenceNumber,
+    ) -> Result<(), MarketError> {
+        let record = self.record(market_id)?;
+        let round_state = record
+            .round_state
+            .as_ref()
+            .ok_or(ResolutionError::NoProposal)?;
+        if now.get() < round_state.deadline.get() {
+            return Err(MarketError::Resolution(ResolutionError::WindowOpen));
+        }
+        match record.lifecycle {
+            MarketLifecycle::PendingResolution => {}
+            MarketLifecycle::Disputed => {
+                if !round_state.adjudicated {
+                    return Err(MarketError::Resolution(
+                        ResolutionError::UnresolvedChallenge,
+                    ));
+                }
+            }
+            _ => return Err(MarketError::WrongLifecycleState),
+        }
+        let outcome = round_state.payout.clone();
         let record = self.record_mut(market_id)?;
         record.resolution = Some(outcome);
         self.transition(market_id, MarketLifecycle::Resolved)
@@ -718,14 +1010,6 @@ impl MarketRegistry {
         let record = self.record_mut(market_id)?;
         record.resolution = Some(refund);
         self.transition(market_id, MarketLifecycle::Invalid)
-    }
-
-    /// Open a staked challenge, moving `PendingResolution -> Disputed`.
-    ///
-    /// # Errors
-    /// [`MarketError::Lifecycle`] if not `PendingResolution`.
-    pub fn dispute_market(&mut self, market_id: MarketId) -> Result<(), MarketError> {
-        self.transition(market_id, MarketLifecycle::Disputed)
     }
 
     /// Settle a `Resolved`/`Invalid` market: drain the complete-set collateral
@@ -955,6 +1239,75 @@ mod tests {
         assert!(reg.reconciles());
     }
 
+    /// The standard 3-of-4 resolution committee used by the resolution tests.
+    fn resolution_committee() -> ThresholdSigners {
+        ThresholdSigners::from_seeds(&[[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]], 3)
+    }
+
+    /// A committed policy on deployment 7, round 0, with a 50-tick challenge
+    /// window and a far expiry.
+    fn test_policy(ts: &ThresholdSigners) -> ResolutionPolicy {
+        ResolutionPolicy::new(
+            1,
+            0,
+            7,
+            ts.validator_set(),
+            50,
+            Hash::ZERO,
+            SequenceNumber::new(1_000_000),
+        )
+    }
+
+    /// Build a committee certificate bound to `policy` for `phase`/`deadline`.
+    fn make_cert(
+        ts: &ThresholdSigners,
+        m: MarketId,
+        policy: &ResolutionPolicy,
+        deadline: SequenceNumber,
+        phase: ResolutionPhase,
+        payout: PayoutVector,
+        ev: Hash,
+    ) -> ResolutionCertificate {
+        let msg = resolution_message(
+            m,
+            policy.commitment(),
+            policy.round(),
+            deadline,
+            phase,
+            &payout,
+            ev,
+        );
+        let qc = ts.sign(msg, vec![0, 1, 2]);
+        ResolutionCertificate::new(
+            m,
+            policy.commitment(),
+            policy.round(),
+            deadline,
+            phase,
+            payout,
+            ev,
+            qc,
+        )
+    }
+
+    /// Drive a fresh market with `collateral` minted to `Closed -> PendingResolution`
+    /// and commit `policy`, ready for a proposal.
+    fn drive_to_pending(
+        reg: &mut MarketRegistry,
+        id: u32,
+        collateral: Amount,
+        policy: ResolutionPolicy,
+    ) -> MarketId {
+        let m = MarketId::new(id);
+        drive_to_open(reg, id);
+        reg.mint_complete_set(m, acct(TREASURY), collateral)
+            .unwrap();
+        reg.close_market(m, 1_000).unwrap();
+        reg.begin_resolution(m).unwrap();
+        reg.commit_resolution_policy(m, policy).unwrap();
+        m
+    }
+
     #[test]
     fn create_enforces_uniqueness_and_queries() {
         let mut reg = MarketRegistry::new();
@@ -1069,22 +1422,38 @@ mod tests {
     fn resolve_and_settle_conserve_and_are_idempotent() {
         let mut reg = MarketRegistry::new();
         reg.create_market(definition(1)).unwrap();
-        let m = MarketId::new(1);
-        drive_to_open(&mut reg, 1);
-        reg.mint_complete_set(m, acct(TREASURY), Amount::from_raw(3_000_000))
-            .unwrap();
-        reg.close_market(m, 1_000).unwrap();
-        reg.begin_resolution(m).unwrap();
+        let ts = resolution_committee();
+        let policy = test_policy(&ts);
+        let m = drive_to_pending(&mut reg, 1, Amount::from_raw(3_000_000), policy.clone());
 
-        // Build a committee certificate for outcome 0 (pays 1.0).
-        let ts = ThresholdSigners::from_seeds(&[[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]], 3);
-        let rule = ResolutionRule::new(ts.validator_set(), 50, Hash::ZERO);
+        // Propose a committee-certified outcome (outcome 0 pays 1.0) under the
+        // committed policy, opening the challenge window.
         let payout = winner_takes_all(2, 0).unwrap();
         let ev = Hash::from_bytes([7u8; 32]);
-        let msg = resolution_message(m, &payout, ev);
-        let qc = ts.sign(msg, vec![0, 1, 2]);
-        let cert = ResolutionCertificate::new(m, payout, ev, qc);
-        reg.resolve_market(m, &cert, &rule).unwrap();
+        let now = SequenceNumber::new(100);
+        let deadline = SequenceNumber::new(150);
+        let cert = make_cert(
+            &ts,
+            m,
+            &policy,
+            deadline,
+            ResolutionPhase::Propose,
+            payout,
+            ev,
+        );
+        reg.propose_resolution(m, &cert, now).unwrap();
+        // The market stays pending until the committee-attested window closes.
+        assert_eq!(
+            reg.get_market_status(m),
+            Some(MarketLifecycle::PendingResolution)
+        );
+        // Finalizing before the committed deadline is impossible.
+        assert_eq!(
+            reg.finalize_resolution(m, SequenceNumber::new(149))
+                .unwrap_err(),
+            MarketError::Resolution(ResolutionError::WindowOpen)
+        );
+        reg.finalize_resolution(m, deadline).unwrap();
         assert_eq!(reg.get_market_status(m), Some(MarketLifecycle::Resolved));
 
         // Escrow before settlement holds exactly the minted collateral.
@@ -1121,6 +1490,319 @@ mod tests {
             reg.settle_market(m),
             Err(MarketError::WrongLifecycleState)
         ));
+    }
+
+    #[test]
+    fn propose_binds_stored_committee_market_and_window() {
+        // Criteria: a certificate under a noncommitted committee/market is
+        // rejected, and a caller cannot substitute a rule — verification always
+        // uses the market's stored policy.
+        let mut reg = MarketRegistry::new();
+        reg.create_market(definition(1)).unwrap();
+        let ts = resolution_committee();
+        let policy = test_policy(&ts);
+        let m = drive_to_pending(&mut reg, 1, Amount::from_raw(3_000_000), policy.clone());
+        let payout = winner_takes_all(2, 0).unwrap();
+        let ev = Hash::from_bytes([7u8; 32]);
+        let now = SequenceNumber::new(100);
+        let deadline = SequenceNumber::new(150);
+
+        // A certificate the market's committee never signed (a different, caller
+        // "supplied" committee) names the correct policy commitment but fails the
+        // stored committee's quorum check.
+        let impostor =
+            ThresholdSigners::from_seeds(&[[9u8; 32], [8u8; 32], [7u8; 32], [6u8; 32]], 3);
+        let forged = make_cert(
+            &impostor,
+            m,
+            &policy,
+            deadline,
+            ResolutionPhase::Propose,
+            payout.clone(),
+            ev,
+        );
+        assert!(matches!(
+            reg.propose_resolution(m, &forged, now),
+            Err(MarketError::Resolution(ResolutionError::Quorum(_)))
+        ));
+
+        // A certificate naming a different market is rejected.
+        let wrong_market = make_cert(
+            &ts,
+            MarketId::new(999),
+            &policy,
+            deadline,
+            ResolutionPhase::Propose,
+            payout.clone(),
+            ev,
+        );
+        assert_eq!(
+            reg.propose_resolution(m, &wrong_market, now).unwrap_err(),
+            MarketError::Resolution(ResolutionError::MarketIdMismatch)
+        );
+
+        // A deadline shorter than the committed 50-tick window is rejected.
+        let short = make_cert(
+            &ts,
+            m,
+            &policy,
+            SequenceNumber::new(149),
+            ResolutionPhase::Propose,
+            payout.clone(),
+            ev,
+        );
+        assert_eq!(
+            reg.propose_resolution(m, &short, now).unwrap_err(),
+            MarketError::Resolution(ResolutionError::WindowTooShort)
+        );
+
+        // None of the rejected attempts recorded a proposal; a valid one still works.
+        let good = make_cert(
+            &ts,
+            m,
+            &policy,
+            deadline,
+            ResolutionPhase::Propose,
+            payout,
+            ev,
+        );
+        reg.propose_resolution(m, &good, now).unwrap();
+        assert_eq!(
+            reg.get_market_status(m),
+            Some(MarketLifecycle::PendingResolution)
+        );
+    }
+
+    #[test]
+    fn open_challenge_blocks_finalization_until_adjudication() {
+        // Criterion: an open challenge blocks finalization until deterministic
+        // adjudication.
+        let mut reg = MarketRegistry::new();
+        reg.create_market(definition(1)).unwrap();
+        let ts = resolution_committee();
+        let policy = test_policy(&ts);
+        let m = drive_to_pending(&mut reg, 1, Amount::from_raw(3_000_000), policy.clone());
+        let ev = Hash::from_bytes([7u8; 32]);
+        let now = SequenceNumber::new(100);
+        let deadline = SequenceNumber::new(150);
+
+        // Propose outcome 0.
+        let cert = make_cert(
+            &ts,
+            m,
+            &policy,
+            deadline,
+            ResolutionPhase::Propose,
+            winner_takes_all(2, 0).unwrap(),
+            ev,
+        );
+        reg.propose_resolution(m, &cert, now).unwrap();
+
+        // A challenge inside the window moves the market to Disputed.
+        reg.submit_challenge(
+            m,
+            acct(500),
+            Amount::from_raw(1_000_000),
+            Hash::from_bytes([2u8; 32]),
+            SequenceNumber::new(120),
+        )
+        .unwrap();
+        assert_eq!(reg.get_market_status(m), Some(MarketLifecycle::Disputed));
+
+        // Challenges after the window closes are rejected.
+        assert_eq!(
+            reg.submit_challenge(
+                m,
+                acct(501),
+                Amount::from_raw(1),
+                Hash::ZERO,
+                SequenceNumber::new(151),
+            )
+            .unwrap_err(),
+            MarketError::Resolution(ResolutionError::WindowClosed)
+        );
+
+        // Finalization is blocked while the challenge is unresolved.
+        assert_eq!(
+            reg.finalize_resolution(m, deadline).unwrap_err(),
+            MarketError::Resolution(ResolutionError::UnresolvedChallenge)
+        );
+
+        // Adjudication before the window closes is refused.
+        let adj = make_cert(
+            &ts,
+            m,
+            &policy,
+            deadline,
+            ResolutionPhase::Adjudicate,
+            winner_takes_all(2, 1).unwrap(),
+            Hash::from_bytes([3u8; 32]),
+        );
+        assert_eq!(
+            reg.adjudicate_resolution(m, &adj, SequenceNumber::new(149))
+                .unwrap_err(),
+            MarketError::Resolution(ResolutionError::WindowOpen)
+        );
+
+        // Deterministic adjudication flips the outcome to 1 and clears the book.
+        reg.adjudicate_resolution(m, &adj, deadline).unwrap();
+        reg.finalize_resolution(m, deadline).unwrap();
+        assert_eq!(reg.get_market_status(m), Some(MarketLifecycle::Resolved));
+
+        // Settlement pays the adjudicated outcome; value is conserved.
+        let s = reg.settle_market(m).unwrap();
+        assert_eq!(s.total_credited, Amount::from_raw(3_000_000));
+        assert!(reg.reconciles());
+    }
+
+    #[test]
+    fn rotation_advances_round_and_rejects_stale_certificate() {
+        // Criterion: rotation requires an explicit version transition and cannot
+        // rewrite past rounds; certificates for the pre-rotation round are
+        // rejected.
+        let mut reg = MarketRegistry::new();
+        reg.create_market(definition(1)).unwrap();
+        let m = MarketId::new(1);
+        let ts = resolution_committee();
+        let policy = test_policy(&ts);
+        drive_to_open(&mut reg, 1);
+        reg.commit_resolution_policy(m, policy.clone()).unwrap();
+
+        // A proposal certificate bound to the ORIGINAL policy (version 1, round 0).
+        let payout = winner_takes_all(2, 0).unwrap();
+        let ev = Hash::from_bytes([7u8; 32]);
+        let deadline = SequenceNumber::new(200);
+        let stale = make_cert(
+            &ts,
+            m,
+            &policy,
+            deadline,
+            ResolutionPhase::Propose,
+            payout.clone(),
+            ev,
+        );
+
+        // Rotate to a new committee: version and round both strictly advance.
+        let ts2 =
+            ThresholdSigners::from_seeds(&[[10u8; 32], [11u8; 32], [12u8; 32], [13u8; 32]], 3);
+        let expiry = SequenceNumber::new(1_000_000);
+        reg.rotate_resolution_policy(
+            m,
+            ts2.validator_set(),
+            50,
+            Hash::from_bytes([1u8; 32]),
+            expiry,
+        )
+        .unwrap();
+        let rotated = policy.rotate(ts2.validator_set(), 50, Hash::from_bytes([1u8; 32]), expiry);
+        assert_eq!(rotated.version(), 2);
+        assert_eq!(rotated.round(), 1);
+
+        // Move to pending and try the stale certificate: rejected (old commitment).
+        reg.mint_complete_set(m, acct(TREASURY), Amount::from_raw(3_000_000))
+            .unwrap();
+        reg.close_market(m, 1_000).unwrap();
+        reg.begin_resolution(m).unwrap();
+        assert_eq!(
+            reg.propose_resolution(m, &stale, SequenceNumber::new(100))
+                .unwrap_err(),
+            MarketError::Resolution(ResolutionError::PolicyMismatch)
+        );
+
+        // A certificate under the rotated policy (round 1, new committee) works.
+        let good = make_cert(
+            &ts2,
+            m,
+            &rotated,
+            deadline,
+            ResolutionPhase::Propose,
+            payout,
+            ev,
+        );
+        reg.propose_resolution(m, &good, SequenceNumber::new(100))
+            .unwrap();
+        reg.finalize_resolution(m, deadline).unwrap();
+        assert_eq!(reg.get_market_status(m), Some(MarketLifecycle::Resolved));
+    }
+
+    #[test]
+    fn resolution_policy_lifecycle_guards() {
+        let mut reg = MarketRegistry::new();
+        reg.create_market(definition(1)).unwrap();
+        let m = MarketId::new(1);
+        let ts = resolution_committee();
+        let policy = test_policy(&ts);
+
+        // Commit is once-only.
+        reg.commit_resolution_policy(m, policy.clone()).unwrap();
+        assert_eq!(
+            reg.commit_resolution_policy(m, policy.clone()).unwrap_err(),
+            MarketError::Resolution(ResolutionError::PolicyAlreadyCommitted)
+        );
+
+        // Rotating a market with no committed policy is refused.
+        reg.create_market(definition(2)).unwrap();
+        assert_eq!(
+            reg.rotate_resolution_policy(
+                MarketId::new(2),
+                ts.validator_set(),
+                50,
+                Hash::ZERO,
+                SequenceNumber::new(10),
+            )
+            .unwrap_err(),
+            MarketError::Resolution(ResolutionError::PolicyNotCommitted)
+        );
+
+        // Proposing with no committed policy is refused.
+        let m3 = MarketId::new(3);
+        reg.create_market(definition(3)).unwrap();
+        drive_to_open(&mut reg, 3);
+        reg.mint_complete_set(m3, acct(TREASURY), Amount::from_raw(1_000_000))
+            .unwrap();
+        reg.close_market(m3, 1_000).unwrap();
+        reg.begin_resolution(m3).unwrap();
+        let cert = make_cert(
+            &ts,
+            m3,
+            &policy,
+            SequenceNumber::new(150),
+            ResolutionPhase::Propose,
+            winner_takes_all(2, 0).unwrap(),
+            Hash::ZERO,
+        );
+        assert_eq!(
+            reg.propose_resolution(m3, &cert, SequenceNumber::new(100))
+                .unwrap_err(),
+            MarketError::Resolution(ResolutionError::PolicyNotCommitted)
+        );
+
+        // An expired policy cannot open a resolution.
+        let expired = ResolutionPolicy::new(
+            1,
+            0,
+            7,
+            ts.validator_set(),
+            50,
+            Hash::ZERO,
+            SequenceNumber::new(100),
+        );
+        reg.create_market(definition(4)).unwrap();
+        let m4 = drive_to_pending(&mut reg, 4, Amount::from_raw(1_000_000), expired.clone());
+        let cert4 = make_cert(
+            &ts,
+            m4,
+            &expired,
+            SequenceNumber::new(300),
+            ResolutionPhase::Propose,
+            winner_takes_all(2, 0).unwrap(),
+            Hash::ZERO,
+        );
+        assert_eq!(
+            reg.propose_resolution(m4, &cert4, SequenceNumber::new(200))
+                .unwrap_err(),
+            MarketError::Resolution(ResolutionError::PolicyExpired)
+        );
     }
 
     #[test]

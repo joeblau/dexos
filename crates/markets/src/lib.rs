@@ -51,7 +51,8 @@ pub use perpetual::{
 pub use registry::{LifecycleEvent, MarketCommand, MarketDefinition, MarketRegistry};
 pub use resolution::{
     resolution_message, Challenge, ChallengeBook, ChallengeWindow, ResolutionAdapter,
-    ResolutionCertificate, ResolutionRule, RESOLUTION_DOMAIN,
+    ResolutionCertificate, ResolutionPhase, ResolutionPolicy, MAX_CHALLENGES, RESOLUTION_DOMAIN,
+    RESOLUTION_POLICY_DOMAIN,
 };
 pub use sponsor::{SlashableFault, SponsorSet, SponsorShare};
 
@@ -109,6 +110,10 @@ mod tests {
         assert_eq!(mark, types::Price::from_raw(1_000_000));
         let msg = super::resolution_message(
             types::MarketId::new(1),
+            types::Hash::ZERO,
+            0,
+            types::SequenceNumber::new(1),
+            super::ResolutionPhase::Propose,
             &types::PayoutVector::new(vec![types::Amount::ONE]).unwrap(),
             types::Hash::ZERO,
         );
