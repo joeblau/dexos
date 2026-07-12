@@ -872,7 +872,7 @@ dependencies = [
  "benchmarks",
  "clap",
  "crypto",
- "getrandom 0.2.17",
+ "getrandom 0.4.3",
  "node",
  "storage",
 ]
@@ -924,7 +924,7 @@ dependencies = [
  "chacha20poly1305",
  "codec",
  "crypto",
- "getrandom 0.2.17",
+ "getrandom 0.4.3",
  "hkdf",
  "quinn",
  "rcgen",

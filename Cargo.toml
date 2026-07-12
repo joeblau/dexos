@@ -49,7 +49,7 @@ k256 = { version = "0.13", features = ["ecdsa"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 chacha20poly1305 = "0.10"
 hkdf = "0.12"
-getrandom = "0.2"
+getrandom = "0.4"
 hex = "0.4"
 clap = { version = "4.5", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net", "io-util"] }
