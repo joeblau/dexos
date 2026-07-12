@@ -299,6 +299,86 @@ mod tests {
         }
     }
 
+    /// Structure-aware companion to `decode_never_panics_on_arbitrary_bytes`.
+    ///
+    /// The random fuzz above almost never passes the magic check (2^-16 per
+    /// buffer), so it exercises only the `BadMagic` arm. This test starts from
+    /// a valid `Frame::encode()` output and patches specific header bytes so
+    /// every later decode check is reached and returns its exact typed error.
+    #[test]
+    fn structured_header_mutations_yield_exact_typed_errors() {
+        let msg = Msg {
+            a: 7,
+            b: vec![1, 2, 3],
+            c: "payload".into(),
+        };
+        let frame = Frame {
+            class: TrafficClass::RiskReducing,
+            msg_type: 42,
+            sequence: 9,
+            payload: encode(&msg).unwrap(),
+        };
+        let bytes = frame.encode().unwrap();
+        assert!(Frame::decode(&bytes).is_ok(), "baseline frame must decode");
+
+        // Version word (bytes[2..4]): any value other than FRAME_VERSION is
+        // rejected with the exact offending version.
+        for version in [0u16, 2, 0xFFFF] {
+            let mut mutated = bytes.clone();
+            mutated[2..4].copy_from_slice(&version.to_le_bytes());
+            assert_eq!(
+                Frame::decode(&mutated),
+                Err(CodecError::UnsupportedVersion(version))
+            );
+        }
+
+        // Traffic-class byte (bytes[4]): 9 is the first unassigned priority.
+        for class in [9u8, 0xFF] {
+            let mut mutated = bytes.clone();
+            mutated[4] = class;
+            assert_eq!(
+                Frame::decode(&mutated),
+                Err(CodecError::UnknownClass(class))
+            );
+        }
+
+        // Declared payload length (bytes[15..19]) above MAX_FRAME_PAYLOAD.
+        let mut oversized = bytes.clone();
+        let over_cap = u32::try_from(MAX_FRAME_PAYLOAD + 1).unwrap();
+        oversized[15..19].copy_from_slice(&over_cap.to_le_bytes());
+        assert_eq!(Frame::decode(&oversized), Err(CodecError::LengthOutOfRange));
+
+        // Declared payload length within the cap but past the buffer end.
+        let mut overdeclared = bytes.clone();
+        let one_past = u32::try_from(frame.payload.len() + 1).unwrap();
+        overdeclared[15..19].copy_from_slice(&one_past.to_le_bytes());
+        assert_eq!(Frame::decode(&overdeclared), Err(CodecError::Truncated));
+
+        // Buffer shorter than the fixed header.
+        assert_eq!(
+            Frame::decode(&bytes[..FRAME_HEADER_LEN - 1]),
+            Err(CodecError::Truncated)
+        );
+
+        // Magic corruption (bytes[0..2]).
+        let mut bad_magic = bytes.clone();
+        bad_magic[0..2].copy_from_slice(&0u16.to_le_bytes());
+        assert_eq!(Frame::decode(&bad_magic), Err(CodecError::BadMagic));
+
+        // Payload corruption: the header stays intact so the frame itself
+        // decodes, but the truncated postcard body fails typed deserialization.
+        let mut msg_bytes = encode(&msg).unwrap();
+        msg_bytes.pop();
+        let framed = Frame {
+            payload: msg_bytes,
+            ..frame
+        }
+        .encode()
+        .unwrap();
+        let (back, _) = Frame::decode(&framed).unwrap();
+        assert_eq!(decode::<Msg>(&back.payload), Err(CodecError::Deserialize));
+    }
+
     #[test]
     fn rejects_bad_magic_and_truncation() {
         let f = Frame {
