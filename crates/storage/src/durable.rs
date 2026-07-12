@@ -64,7 +64,8 @@ use crate::limits::{
 };
 use crate::log::DEFAULT_SEGMENT_BYTES;
 use crate::record::{
-    decode_ref_bounded, peek_declared_len, Record, RecordError, FRAME_OVERHEAD, PROTOCOL_VERSION,
+    decode_ref_bounded, peek_declared_len, Record, RecordError, RecordRef, FRAME_OVERHEAD,
+    PROTOCOL_VERSION,
 };
 
 /// Sync / durability policy for acknowledged appends.
@@ -490,15 +491,17 @@ impl DurableLog {
             }));
         }
 
-        let record = Record {
+        // Borrow the caller's payload directly: no owned Record, no payload
+        // copy on the durability hot path (the only copy is into `framed`).
+        let record_ref = RecordRef {
             protocol_version: PROTOCOL_VERSION,
             sequence,
             timestamp,
             command_type,
-            payload: payload.to_vec(),
+            payload,
         };
         let mut framed = Vec::with_capacity(framed_len);
-        record.encode_into(&mut framed)?;
+        record_ref.encode_into(&mut framed)?;
 
         self.ensure_active_segment(sequence, framed.len())?;
 
@@ -1335,6 +1338,32 @@ mod tests {
         let mut seqs = Vec::new();
         log.replay(Some(5), |r| seqs.push(r.sequence)).unwrap();
         assert_eq!(seqs, vec![6, 7, 8, 9, 10]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn borrowed_append_round_trips_payload_sequence_timestamp() {
+        // Appends go through the borrowed RecordRef encode path; after a
+        // reopen the decoded records must carry the same payload, sequence,
+        // and timestamp as before, including an empty payload.
+        let dir = temp_dir("borrowed-append");
+        {
+            let mut log = DurableLog::open(cfg(&dir)).unwrap();
+            log.append(1, 111, 7, b"").unwrap();
+            log.append(2, 222, 9, b"borrowed-hot-path").unwrap();
+        }
+        let log = DurableLog::open(cfg(&dir)).unwrap();
+        log.verify().unwrap();
+        let recs: Vec<Record> = log.iter().map(|r| r.unwrap()).collect();
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[0].sequence, 1);
+        assert_eq!(recs[0].timestamp, 111);
+        assert_eq!(recs[0].command_type, 7);
+        assert!(recs[0].payload.is_empty());
+        assert_eq!(recs[1].sequence, 2);
+        assert_eq!(recs[1].timestamp, 222);
+        assert_eq!(recs[1].command_type, 9);
+        assert_eq!(recs[1].payload, b"borrowed-hot-path");
         let _ = fs::remove_dir_all(&dir);
     }
 

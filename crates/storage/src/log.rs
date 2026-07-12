@@ -15,7 +15,7 @@
 //! [`crate::DurableLog`].
 
 use crate::limits::{DEFAULT_INDEX_STRIDE, DEFAULT_MAX_RECORD_BYTES};
-use crate::record::{decode_ref_bounded, Record, RecordError, FRAME_OVERHEAD};
+use crate::record::{decode_ref_bounded, Record, RecordError, RecordRef, FRAME_OVERHEAD};
 
 /// Default per-segment byte budget: 64 MiB.
 pub const DEFAULT_SEGMENT_BYTES: usize = 64 * 1024 * 1024;
@@ -215,15 +215,17 @@ impl SegmentedLog {
             }));
         }
 
-        let record = Record {
+        // Borrow the caller's payload directly: no owned Record, no payload
+        // copy beyond the single copy into `framed`.
+        let record_ref = RecordRef {
             protocol_version: crate::record::PROTOCOL_VERSION,
             sequence,
             timestamp,
             command_type,
-            payload: payload.to_vec(),
+            payload,
         };
         let mut framed = Vec::with_capacity(framed_len);
-        record.encode_into(&mut framed)?;
+        record_ref.encode_into(&mut framed)?;
 
         let need_new_segment = match self.segments.last() {
             None => true,
@@ -546,6 +548,27 @@ mod tests {
             assert_eq!(rec.sequence, expected_seq);
             assert_eq!(rec.payload, format!("cmd-{expected_seq}").into_bytes());
         }
+        log.verify().unwrap();
+    }
+
+    #[test]
+    fn borrowed_append_round_trips_payload_sequence_timestamp() {
+        // Appends go through the borrowed RecordRef encode path; decoded
+        // records must carry the same payload/sequence/timestamp as before,
+        // including an empty payload.
+        let mut log = SegmentedLog::default();
+        log.append(1, 111, 7, b"").unwrap();
+        log.append(2, 222, 9, b"borrowed-hot-path").unwrap();
+        let recs = drain(&log);
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[0].sequence, 1);
+        assert_eq!(recs[0].timestamp, 111);
+        assert_eq!(recs[0].command_type, 7);
+        assert!(recs[0].payload.is_empty());
+        assert_eq!(recs[1].sequence, 2);
+        assert_eq!(recs[1].timestamp, 222);
+        assert_eq!(recs[1].command_type, 9);
+        assert_eq!(recs[1].payload, b"borrowed-hot-path");
         log.verify().unwrap();
     }
 
