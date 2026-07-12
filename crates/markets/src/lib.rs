@@ -55,7 +55,12 @@ pub use resolution::{
     ResolutionCertificate, ResolutionPhase, ResolutionPolicy, MAX_CHALLENGES, RESOLUTION_DOMAIN,
     RESOLUTION_POLICY_DOMAIN,
 };
-pub use sponsor::{SlashableFault, SponsorSet, SponsorShare};
+pub use sponsor::{
+    config_payload_hash, epoch_payload_hash, messages_conflict, oracle_payload_hash,
+    quote_window_payload_hash, resolution_payload_hash, sponsor_msg_kind, AppliedSlash,
+    SignedSponsorMessage, SlashEvidence, SlashVerifyContext, SlashableFault, SponsorSet,
+    SponsorShare, SPONSOR_MESSAGE_DOMAIN, SPONSOR_SLASH_DOMAIN, SPONSOR_SLASH_PROTOCOL_VERSION,
+};
 
 /// Crate identity, used by the node composition root for a startup manifest.
 pub const CRATE_NAME: &str = "markets";
