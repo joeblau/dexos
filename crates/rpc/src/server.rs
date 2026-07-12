@@ -33,7 +33,8 @@ use std::time::{Duration, Instant};
 use codec::{FRAME_HEADER_LEN, MAX_RPC_FRAME_PAYLOAD};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{watch, Semaphore};
+use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 
 use crate::backend::{dispatch, RpcBackend};
@@ -121,6 +122,11 @@ pub struct ServerConfig {
     /// that has already been durably committed by the backend — it only bounds
     /// how long this connection waits for a reply.
     pub dispatch_timeout: Duration,
+    /// Maximum time [`serve_with_shutdown`] waits, after the stop signal fires
+    /// (or the listener errors), for in-flight connections to observe shutdown
+    /// and finish their current request. Connections still live at the deadline
+    /// are aborted so shutdown is always bounded.
+    pub drain_timeout: Duration,
 }
 
 impl Default for ServerConfig {
@@ -140,6 +146,7 @@ impl Default for ServerConfig {
             tls: TlsMode::Disabled,
             work: WorkBudgetConfig::default(),
             dispatch_timeout: Duration::from_secs(5),
+            drain_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -168,6 +175,7 @@ impl ServerConfig {
                 max_in_flight_bytes_per_conn: MAX_RPC_FRAME_PAYLOAD,
             },
             dispatch_timeout: Duration::from_secs(2),
+            drain_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -268,11 +276,43 @@ where
 /// **before** dispatch: a rejected request gets [`RpcError::Backpressure`] and
 /// is never committed.
 pub async fn handle_connection_with<S>(
+    stream: S,
+    backend: Arc<dyn RpcBackend>,
+    mode: RpcMode,
+    config: &ServerConfig,
+    work_budget: Option<Arc<WorkBudget>>,
+) -> Result<(), ServerError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    // The sender guard lives across the await below, so the stop flag can never
+    // fire for callers of the non-shutdown-aware API.
+    let (_stop_tx, stop_rx) = watch::channel(false);
+    handle_connection_stoppable(stream, backend, mode, config, work_budget, stop_rx).await
+}
+
+/// Resolves once the stop flag reads `true`.
+///
+/// A dropped sender also resolves: with no sender left the flag could never
+/// fire again, and an un-stoppable server is exactly the failure mode this
+/// signal exists to prevent. `wait_for` inspects the current value before
+/// awaiting changes, so a stop signalled before this call resolves immediately.
+async fn stop_requested(stop: &mut watch::Receiver<bool>) {
+    let _ = stop.wait_for(|stopped| *stopped).await;
+}
+
+/// [`handle_connection_with`], plus a shutdown signal: between requests the
+/// loop also watches `stop`, and once the flag fires the connection is closed
+/// (clean FIN) after its current request instead of reading another. A request
+/// whose frame has not yet fully arrived is abandoned — nothing has been
+/// dispatched, so no committed work is lost.
+async fn handle_connection_stoppable<S>(
     mut stream: S,
     backend: Arc<dyn RpcBackend>,
     mode: RpcMode,
     config: &ServerConfig,
     work_budget: Option<Arc<WorkBudget>>,
+    mut stop: watch::Receiver<bool>,
 ) -> Result<(), ServerError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -282,14 +322,19 @@ where
     let max_payload = config.max_payload.clamp(1, codec::MAX_FRAME_PAYLOAD);
 
     loop {
-        let bytes = match read_frame_timed(
-            &mut stream,
-            config.idle_timeout,
-            config.read_timeout,
-            max_payload,
-        )
-        .await
-        {
+        let read = tokio::select! {
+            biased;
+            // Shutdown between requests: close instead of reading another. The
+            // previous request (if any) has already been fully replied to.
+            _ = stop_requested(&mut stop) => return Ok(()),
+            read = read_frame_timed(
+                &mut stream,
+                config.idle_timeout,
+                config.read_timeout,
+                max_payload,
+            ) => read,
+        };
+        let bytes = match read {
             Ok(bytes) => bytes,
             // A clean EOF/reset or a stalled-client timeout ends the session
             // without a hard error.
@@ -412,12 +457,57 @@ pub async fn serve(
 /// ClientHello exhaust the admission budget. When TLS is required by
 /// a production config but the acceptor is missing, the function returns
 /// immediately with [`ServerError::TlsRequired`].
+///
+/// This is [`serve_with_shutdown`] with a stop signal that never fires; use
+/// that variant when the caller needs to stop accepting and drain in-flight
+/// connections.
 pub async fn serve_with_config(
     listener: TcpListener,
     backend: Arc<dyn RpcBackend>,
     mode: RpcMode,
     config: ServerConfig,
 ) -> Result<(), ServerError> {
+    // The sender guard lives across the await below, so the stop flag can never
+    // fire for callers of the non-shutdown-aware API.
+    let (_stop_tx, stop_rx) = watch::channel(false);
+    serve_with_shutdown(listener, backend, mode, config, stop_rx)
+        .await
+        .map(|_served| ())
+}
+
+/// [`serve_with_config`], plus a shutdown path (#407): accept connections until
+/// the `stop` flag fires, then drain and return how many connections were
+/// admitted and served over the server's lifetime.
+///
+/// # Shutdown protocol
+/// Send `true` on the paired [`watch::Sender`] (dropping the sender is treated
+/// the same — with no sender left the flag could never fire, and an
+/// un-stoppable server is the failure mode this signal exists to prevent).
+/// The server then:
+/// 1. breaks out of the accept loop and **drops the listener immediately**, so
+///    the accept socket is closed and no new connection is admitted;
+/// 2. lets in-flight connections — which each hold a clone of `stop` — observe
+///    the flag and close after their current request (clean FIN);
+/// 3. bounds that drain by [`ServerConfig::drain_timeout`], **aborting** any
+///    connection task still live at the deadline; and
+/// 4. returns the count of connections served.
+///
+/// Connection tasks are tracked in a [`JoinSet`] (reaped opportunistically each
+/// accept so bookkeeping stays bounded over long uptimes), so — unlike a plain
+/// detached spawn — they can be enumerated, joined, and on the drain deadline
+/// aborted. Dropping this future likewise aborts all tracked connection tasks
+/// instead of leaking them.
+///
+/// A listener error takes the same bounded drain path before returning the
+/// error, so already-admitted connections get a chance to finish their current
+/// request even on an accept failure.
+pub async fn serve_with_shutdown(
+    listener: TcpListener,
+    backend: Arc<dyn RpcBackend>,
+    mode: RpcMode,
+    config: ServerConfig,
+    mut stop: watch::Receiver<bool>,
+) -> Result<u64, ServerError> {
     let config = Arc::new(config);
     let global = Arc::new(Semaphore::new(config.max_connections));
     let limiter = Arc::new(ConnectionLimiter::new(
@@ -428,9 +518,25 @@ pub async fn serve_with_config(
     let work_budget = WorkBudget::new(&config.work);
     let write_timeout = config.write_timeout;
     let tls = config.tls.clone();
+    // Every spawned task — served connections and bounded rejection notices —
+    // is tracked here so shutdown can join or abort all of them.
+    let mut tasks: JoinSet<()> = JoinSet::new();
+    let mut served: u64 = 0;
 
-    loop {
-        let (stream, peer) = listener.accept().await?;
+    let outcome = loop {
+        // Opportunistic reap: discard entries for tasks that already finished
+        // so the JoinSet's bookkeeping stays bounded over long uptimes.
+        while tasks.try_join_next().is_some() {}
+
+        let accepted = tokio::select! {
+            biased;
+            _ = stop_requested(&mut stop) => break Ok(()),
+            accepted = listener.accept() => accepted,
+        };
+        let (stream, peer) = match accepted {
+            Ok(pair) => pair,
+            Err(e) => break Err(ServerError::Io(e)),
+        };
         // Disable Nagle's algorithm so small framed replies are not delayed.
         let _ = stream.set_nodelay(true);
 
@@ -438,7 +544,7 @@ pub async fn serve_with_config(
         let global_permit = match Arc::clone(&global).try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
-                tokio::spawn(send_rejection(stream, write_timeout));
+                tasks.spawn(send_rejection(stream, write_timeout));
                 continue;
             }
         };
@@ -450,25 +556,33 @@ pub async fn serve_with_config(
                 // Release the global permit before rejecting so it is not tied up
                 // for the connection we are refusing.
                 drop(global_permit);
-                tokio::spawn(send_rejection(stream, write_timeout));
+                tasks.spawn(send_rejection(stream, write_timeout));
                 continue;
             }
         };
 
+        served = served.saturating_add(1);
         let backend = Arc::clone(&backend);
         let config = Arc::clone(&config);
         let work_budget = Arc::clone(&work_budget);
         let tls = tls.clone();
-        tokio::spawn(async move {
+        let conn_stop = stop.clone();
+        tasks.spawn(async move {
             // The permits live for the connection's lifetime and are released on
             // task exit, freeing the global and per-IP slots.
             let _global_permit = global_permit;
             let _ip_permit = ip_permit;
             match tls {
                 TlsMode::Disabled => {
-                    let _ =
-                        handle_connection_with(stream, backend, mode, &config, Some(work_budget))
-                            .await;
+                    let _ = handle_connection_stoppable(
+                        stream,
+                        backend,
+                        mode,
+                        &config,
+                        Some(work_budget),
+                        conn_stop,
+                    )
+                    .await;
                 }
                 TlsMode::Required(acceptor) => {
                     // Bound the handshake by `read_timeout`: the permits above are
@@ -479,12 +593,13 @@ pub async fn serve_with_config(
                     // (clean close) and the task exits, releasing both permits.
                     match tokio::time::timeout(config.read_timeout, acceptor.accept(stream)).await {
                         Ok(Ok(tls_stream)) => {
-                            let _ = handle_connection_with(
+                            let _ = handle_connection_stoppable(
                                 tls_stream,
                                 backend,
                                 mode,
                                 &config,
                                 Some(work_budget),
+                                conn_stop,
                             )
                             .await;
                         }
@@ -498,7 +613,26 @@ pub async fn serve_with_config(
                 }
             }
         });
+    };
+
+    // Stop accepting immediately: dropping the listener closes the accept
+    // socket, so no new connection can be admitted from here on.
+    drop(listener);
+
+    // Bounded drain: in-flight connections hold a `stop` clone and close after
+    // their current request; anything still live at the deadline is aborted.
+    let drained = tokio::time::timeout(config.drain_timeout, async {
+        while tasks.join_next().await.is_some() {}
+    })
+    .await;
+    if drained.is_err() {
+        tasks.abort_all();
+        // Reap the aborted tasks; each next join resolves promptly with a
+        // cancelled `JoinError`, so this loop is bounded.
+        while tasks.join_next().await.is_some() {}
     }
+
+    outcome.map(|()| served)
 }
 
 /// Convenience: connect to a server, send one request over a fresh connection,

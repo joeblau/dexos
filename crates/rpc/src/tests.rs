@@ -1474,6 +1474,7 @@ fn budget_config(max_connections: usize) -> crate::server::ServerConfig {
         tls: crate::server::TlsMode::Disabled,
         work: crate::work::WorkBudgetConfig::default(),
         dispatch_timeout: std::time::Duration::from_secs(5),
+        drain_timeout: std::time::Duration::from_secs(5),
     }
 }
 
@@ -1545,6 +1546,7 @@ async fn tcp_server_evicts_slowloris_clients() {
         tls: crate::server::TlsMode::Disabled,
         work: crate::work::WorkBudgetConfig::default(),
         dispatch_timeout: Duration::from_secs(5),
+        drain_timeout: Duration::from_secs(5),
     };
     tokio::spawn(async move {
         let _ = crate::server::serve_with_config(listener, backend, RpcMode::Full, cfg).await;
@@ -1629,6 +1631,105 @@ async fn tcp_server_connection_budget_holds_under_flood() {
         assert_eq!(resp.request_id, 7);
         assert!(matches!(resp.result, Ok(RpcOk::NetworkStatus(_))));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Graceful shutdown (#407): serve_with_shutdown stops accepting, drains
+// in-flight connections, joins its tracked tasks, and returns.
+// ---------------------------------------------------------------------------
+
+/// Acceptance (#407): firing the stop signal makes `serve_with_shutdown`
+/// RETURN within a bounded time with the served-connection count, closes the
+/// accept socket so no new connection is served, and drains the in-flight
+/// connections (each observes a clean close instead of being left running).
+#[tokio::test]
+async fn serve_with_shutdown_stops_accepting_drains_and_returns() {
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::{TcpListener, TcpStream};
+
+    let backend: Arc<dyn RpcBackend> = Arc::new(populated_backend(RpcMode::Full));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut cfg = budget_config(16);
+    cfg.drain_timeout = Duration::from_secs(2);
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let server = tokio::spawn(async move {
+        crate::server::serve_with_shutdown(listener, backend, RpcMode::Full, cfg, stop_rx).await
+    });
+
+    // Two live connections, each confirmed with a full request/response
+    // round-trip, then parked idle so they are in flight when the stop fires.
+    let mut first = connect_and_confirm(addr).await;
+    let mut second = connect_and_confirm(addr).await;
+
+    stop_tx.send(true).unwrap();
+
+    // The serve future returns within a bounded time, reporting both served
+    // connections. Cancelling is no longer the only way to stop the server.
+    let served = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("serve_with_shutdown must return promptly after the stop signal")
+        .expect("serve task must not panic")
+        .expect("shutdown is not a listener error");
+    assert_eq!(served, 2);
+
+    // The in-flight connections were drained: each observes a clean close
+    // (EOF or reset), not an open socket left behind by a vanished server.
+    for stream in [&mut first, &mut second] {
+        let mut buf = [0u8; 1];
+        match tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => {}
+            Ok(Ok(n)) => panic!("drained connection unexpectedly received {n} bytes"),
+            Err(_) => panic!("in-flight connection was not closed by shutdown"),
+        }
+    }
+
+    // No new connection is accepted after stop: the listener is dropped, so a
+    // fresh connect is refused — or, if the OS raced the close, the socket
+    // yields EOF/reset without ever serving a request.
+    match tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(addr)).await {
+        Ok(Err(_)) => {} // connection refused: the accept socket is gone.
+        Ok(Ok(mut stream)) => {
+            let mut buf = [0u8; 1];
+            match tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => {}
+                other => panic!("connection after stop was served: {other:?}"),
+            }
+        }
+        Err(_) => panic!("connect after stop must fail fast, not hang"),
+    }
+}
+
+/// A stop signalled *before* the server starts is honored immediately —
+/// `watch::Receiver::wait_for` inspects the current value, not just changes —
+/// so a racing shutdown cannot be lost. Zero connections are served.
+#[tokio::test]
+async fn serve_with_shutdown_honors_stop_signalled_before_start() {
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::net::TcpListener;
+
+    let backend: Arc<dyn RpcBackend> = Arc::new(populated_backend(RpcMode::Full));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    stop_tx.send(true).unwrap();
+
+    let served = tokio::time::timeout(
+        Duration::from_secs(5),
+        crate::server::serve_with_shutdown(
+            listener,
+            backend,
+            RpcMode::Full,
+            budget_config(4),
+            stop_rx,
+        ),
+    )
+    .await
+    .expect("a pre-fired stop must return immediately")
+    .expect("shutdown is not a listener error");
+    assert_eq!(served, 0);
 }
 
 // ---------------------------------------------------------------------------
