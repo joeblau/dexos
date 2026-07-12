@@ -188,8 +188,14 @@ web builds:
 ```sh
 cargo install dioxus-cli --locked        # provides `dx` (match the pinned Dioxus 0.7.x)
 rustup target add wasm32-unknown-unknown  # for the web build
-dx --version                              # confirm `dx` resolves to the Dioxus CLI
+dx --version                              # must print "dioxus 0.7.x"
 ```
+
+> **`dx` name collision.** Deno also ships a `dx` (`deno x`). If `dx --version`
+> doesn't say `dioxus`, another `dx` shadows it on `PATH` — put `~/.cargo/bin`
+> first by adding `export PATH="$HOME/.cargo/bin:$PATH"` to your shell rc (after
+> any `brew shellenv` line) and opening a new shell, or invoke it directly as
+> `~/.cargo/bin/dx …`.
 
 **Web app** (`dexos-web`) — served as wasm via the Dioxus dev server:
 

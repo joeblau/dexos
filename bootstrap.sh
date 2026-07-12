@@ -28,6 +28,10 @@ cd "$(dirname "$0")"
 WANT_FRONTEND=1
 WANT_DEV=0
 SKIP_SYSTEM=0
+# Set by install_frontend_toolchain when a non-Dioxus `dx` shadows the CLI on
+# PATH; the completion hint then shows the direct-path invocation.
+DX_SHADOWED=0
+CARGO_DX="${CARGO_HOME:-$HOME/.cargo}/bin/dx"
 for arg in "$@"; do
     case "$arg" in
         --no-frontend) WANT_FRONTEND=0 ;;
@@ -200,17 +204,26 @@ install_frontend_toolchain() {
     info "adding wasm32-unknown-unknown target…"
     rustup target add wasm32-unknown-unknown >/dev/null
 
-    # Dioxus CLI (`dx`). Note: the binary name collides with Deno's `deno x`
-    # alias, also named `dx`. Detect a real Dioxus dx before deciding to install.
-    if have dx && dx --help 2>&1 | grep -qi dioxus; then
-        info "Dioxus CLI already installed ($(command -v dx))."
+    # Install the Dioxus CLI if the real one isn't already on disk. Detect it by
+    # the cargo-installed binary path, NOT `command -v dx`: the name collides with
+    # Deno's `dx` (its `deno x` alias), so a `dx` on PATH may be a different tool.
+    CARGO_DX="${CARGO_HOME:-$HOME/.cargo}/bin/dx"
+    if [ -x "$CARGO_DX" ] && "$CARGO_DX" --version 2>&1 | grep -qi dioxus; then
+        info "Dioxus CLI already installed ($CARGO_DX)."
     else
-        if have dx; then
-            warn "'dx' on PATH is not the Dioxus CLI (likely Deno's 'deno x')."
-            warn "installing dioxus-cli into ~/.cargo/bin; ensure it precedes the other 'dx' on PATH."
-        fi
         info "installing dioxus-cli (this compiles from source and is slow)…"
         cargo install dioxus-cli --locked
+    fi
+
+    # If a *different* `dx` shadows the Dioxus one on PATH, say exactly how to fix
+    # it — a bare `dx serve …` would otherwise run the wrong program.
+    if have dx && ! dx --version 2>&1 | grep -qi dioxus; then
+        DX_SHADOWED=1
+        warn "another 'dx' ($(command -v dx)) shadows the Dioxus CLI at $CARGO_DX."
+        warn "put ~/.cargo/bin ahead of it on PATH — add to your shell rc (after any"
+        warn "'brew shellenv' line), then open a new shell:"
+        warn '    export PATH="$HOME/.cargo/bin:$PATH"'
+        warn "or invoke the Dioxus CLI directly: $CARGO_DX serve --package dexos-web --platform web"
     fi
 }
 
@@ -271,7 +284,12 @@ step "Bootstrap complete"
 info "Verify the engine:      cargo build --locked"
 if [ "$WANT_FRONTEND" -eq 1 ]; then
     info "Verify the web app:     cargo build -p dexos-web --target wasm32-unknown-unknown --locked"
-    info "Run the web app:        dx serve --package dexos-web --platform web"
+    if [ "$DX_SHADOWED" -eq 1 ]; then
+        info "Run the web app:        $CARGO_DX serve --package dexos-web --platform web"
+        info "                        (a different 'dx' shadows it — see the PATH note above)"
+    else
+        info "Run the web app:        dx serve --package dexos-web --platform web"
+    fi
     info "Run the desktop app:    cargo run -p dexos-desktop"
 fi
 info "Run all PR gates:       ./scripts/preflight.sh"
