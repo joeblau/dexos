@@ -2,9 +2,10 @@
 //! account allocation and a global conservation invariant.
 //!
 //! Every account's stablecoin is partitioned into `available` (spendable),
-//! `reserved` (open orders / pending withdrawals), and `locked` (complete sets).
-//! `total_supply == sum(available + reserved + locked)` holds after every
-//! operation; it changes only on deposit (+) and finalized withdrawal (−).
+//! `reserved` (pending withdrawals), `locked` (complete sets), and `escrowed`
+//! (premium backing resting claim-market bids).
+//! `total_supply == sum(available + reserved + locked + escrowed)` holds after
+//! every operation; it changes only on deposit (+) and finalized withdrawal (−).
 
 use state_tree::LeafWriter;
 use types::{AccountId, Amount};
@@ -17,6 +18,10 @@ pub struct Ledger {
     available: Vec<Amount>,
     reserved: Vec<Amount>,
     locked: Vec<Amount>,
+    /// Premium escrowed by resting claim-market bids. A dedicated partition —
+    /// deliberately NOT `reserved`, which reconciles 1:1 against pending
+    /// withdrawals — so escrow-at-rest cannot break that invariant.
+    escrowed: Vec<Amount>,
     auth_epoch: Vec<u64>,
     total_supply: Amount,
 }
@@ -63,6 +68,7 @@ impl Ledger {
         self.available.push(initial);
         self.reserved.push(Amount::ZERO);
         self.locked.push(Amount::ZERO);
+        self.escrowed.push(Amount::ZERO);
         self.auth_epoch.push(0);
         self.total_supply = self.total_supply.checked_add(initial)?;
         Ok(id)
@@ -81,6 +87,11 @@ impl Ledger {
     /// Locked (in complete sets) balance.
     pub fn locked(&self, account: AccountId) -> Result<Amount, ExecutionError> {
         Ok(self.locked[self.idx(account)?])
+    }
+
+    /// Escrowed (resting claim-bid premium) balance.
+    pub fn escrowed(&self, account: AccountId) -> Result<Amount, ExecutionError> {
+        Ok(self.escrowed[self.idx(account)?])
     }
 
     /// Total stablecoin supply held by the ledger.
@@ -148,6 +159,63 @@ impl Ledger {
         }
         self.locked[i] = self.locked[i].checked_sub(amount)?;
         self.available[i] = self.available[i].checked_add(amount)?;
+        Ok(())
+    }
+
+    /// Move `amount` from available into escrow (premium backing a resting
+    /// claim-market bid). Fails closed when available cannot cover it.
+    pub fn escrow(&mut self, account: AccountId, amount: Amount) -> Result<(), ExecutionError> {
+        non_negative(amount)?;
+        let i = self.idx(account)?;
+        if self.available[i] < amount {
+            return Err(ExecutionError::InsufficientAvailable {
+                required: amount.raw(),
+                available: self.available[i].raw(),
+            });
+        }
+        self.available[i] = self.available[i].checked_sub(amount)?;
+        self.escrowed[i] = self.escrowed[i].checked_add(amount)?;
+        Ok(())
+    }
+
+    /// Move `amount` from escrow back to available (cancel / expiry / residual
+    /// release of a resting claim-market bid).
+    pub fn release_escrow(
+        &mut self,
+        account: AccountId,
+        amount: Amount,
+    ) -> Result<(), ExecutionError> {
+        non_negative(amount)?;
+        let i = self.idx(account)?;
+        if self.escrowed[i] < amount {
+            return Err(ExecutionError::InsufficientReserved);
+        }
+        self.escrowed[i] = self.escrowed[i].checked_sub(amount)?;
+        self.available[i] = self.available[i].checked_add(amount)?;
+        Ok(())
+    }
+
+    /// Settle `amount` of `from`'s escrowed premium into `to`'s available
+    /// balance (a fill against a resting claim-market bid). Because the premium
+    /// was moved out of `available` when the bid rested, this path cannot fail
+    /// on the resting maker's funding.
+    pub fn settle_escrow(
+        &mut self,
+        from: AccountId,
+        to: AccountId,
+        amount: Amount,
+    ) -> Result<(), ExecutionError> {
+        non_negative(amount)?;
+        if amount.raw() == 0 {
+            return Ok(());
+        }
+        let i = self.idx(from)?;
+        let j = self.idx(to)?;
+        if self.escrowed[i] < amount {
+            return Err(ExecutionError::InsufficientReserved);
+        }
+        self.escrowed[i] = self.escrowed[i].checked_sub(amount)?;
+        self.available[j] = self.available[j].checked_add(amount)?;
         Ok(())
     }
 
@@ -267,6 +335,7 @@ impl Ledger {
                 .checked_add(self.available[i])
                 .and_then(|s| s.checked_add(self.reserved[i]))
                 .and_then(|s| s.checked_add(self.locked[i]))
+                .and_then(|s| s.checked_add(self.escrowed[i]))
             {
                 Ok(v) => v,
                 Err(_) => return false,

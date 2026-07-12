@@ -5,7 +5,7 @@
 //! command and returns a receipt carrying the post-command state root. Identical
 //! command streams produce identical state roots (deterministic replay).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use orderbook::{BookConfig, NewOrder, OrderBook, OrderOutcome};
 use risk::{RiskConfig, RiskEngine};
@@ -99,6 +99,75 @@ struct Withdrawal {
     finalized: bool,
 }
 
+/// Book-order coordinates: `(market, instrument, order_id)`.
+type OrderKey = (u32, u16, u64);
+
+/// Add `amount` into a committed escrow column entry (creating it if absent).
+fn column_add<K: Ord>(
+    column: &mut BTreeMap<K, Amount>,
+    key: K,
+    amount: Amount,
+) -> Result<(), ExecutionError> {
+    if amount.raw() < 0 {
+        return Err(ExecutionError::NegativeAmount);
+    }
+    if amount.raw() == 0 {
+        return Ok(());
+    }
+    let entry = column.entry(key).or_insert(Amount::ZERO);
+    *entry = entry.checked_add(amount)?;
+    Ok(())
+}
+
+/// Subtract `amount` from a committed escrow column entry, removing the entry
+/// when it reaches zero so leaves stay canonical. A shortfall or missing entry
+/// is an escrow accounting inconsistency (typed, never a panic).
+fn column_sub<K: Ord + Copy>(
+    column: &mut BTreeMap<K, Amount>,
+    key: K,
+    amount: Amount,
+) -> Result<(), ExecutionError> {
+    if amount.raw() < 0 {
+        return Err(ExecutionError::NegativeAmount);
+    }
+    if amount.raw() == 0 {
+        return Ok(());
+    }
+    let current = column
+        .get(&key)
+        .copied()
+        .ok_or(ExecutionError::EscrowInconsistency)?;
+    if current < amount {
+        return Err(ExecutionError::EscrowInconsistency);
+    }
+    let next = current.checked_sub(amount)?;
+    if next.raw() == 0 {
+        column.remove(&key);
+    } else {
+        column.insert(key, next);
+    }
+    Ok(())
+}
+
+/// Escrow backing one resting claim-market order.
+///
+/// A resting bid moves its promised premium out of the ledger's `available`
+/// partition (and out of risk collateral) when it rests; a resting ask moves
+/// the offered claims out of the live claim balance. Fills draw down this
+/// record, so a resting maker can never be left unbacked, and every cancel /
+/// expiry / replace / liquidation / resolve path releases the exact remainder.
+#[derive(Debug, Clone, Copy)]
+struct ClaimOrderEscrow {
+    /// Owning account.
+    account: AccountId,
+    /// Side of the resting order (bid escrows premium; ask escrows claims).
+    side: Side,
+    /// Remaining escrowed premium (bids; zero for asks).
+    premium: Amount,
+    /// Remaining escrowed claim quantity (asks; zero for bids).
+    claims: Amount,
+}
+
 /// A persisted external-wallet binding for an account.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalletBinding {
@@ -125,8 +194,21 @@ pub struct Engine {
     markets: HashMap<u32, MarketMeta>,
     /// Resting-order notional reserved: (market, instrument, order_id) -> notional.
     order_reserves: HashMap<(u32, u16, u64), (AccountId, Amount)>,
-    /// Outcome claims: (account, market) -> per-outcome balances.
+    /// Outcome claims: (account, market) -> per-outcome balances. Live
+    /// (spendable) claims only; claims backing resting asks are moved into
+    /// `ask_claims_escrow` while the order rests.
     claims: HashMap<(u32, u32), Vec<Amount>>,
+    /// Committed reserved-premium column for resting claim-market bids, keyed
+    /// `(account, market)`. The cash itself sits in the ledger's `escrowed`
+    /// partition; this column is the per-market breakdown folded into the
+    /// account leaf (deterministic: BTreeMap iterates in key order).
+    bid_premium_escrow: BTreeMap<(u32, u32), Amount>,
+    /// Committed reserved-claims column for resting claim-market asks, keyed
+    /// `(account, market, instrument)`; folded into the account leaf.
+    ask_claims_escrow: BTreeMap<(u32, u32, u16), Amount>,
+    /// Per-resting-order escrow records for exact release on fill drawdown,
+    /// cancel, cancel-all, replace, expiry, liquidation, and resolve.
+    claim_escrows: HashMap<OrderKey, ClaimOrderEscrow>,
     /// Locked complete-set collateral still attributed to a minter: (account, market).
     mint_locked: HashMap<(u32, u32), Amount>,
     deposits_seen: HashSet<(u32, Vec<u8>, u32)>,
@@ -150,6 +232,9 @@ impl Engine {
             markets: HashMap::new(),
             order_reserves: HashMap::new(),
             claims: HashMap::new(),
+            bid_premium_escrow: BTreeMap::new(),
+            ask_claims_escrow: BTreeMap::new(),
+            claim_escrows: HashMap::new(),
             mint_locked: HashMap::new(),
             deposits_seen: HashSet::new(),
             withdrawals: HashMap::new(),
@@ -195,11 +280,29 @@ impl Engine {
         Some(total)
     }
 
-    /// Outcome-claim balance for `account` in `market` at `instrument`, or zero.
+    /// Live (un-escrowed) outcome-claim balance for `account` in `market` at
+    /// `instrument`, or zero. Claims backing resting asks are excluded: they sit
+    /// in the committed reserved-claims column until the ask fills or releases.
     pub fn claim_balance(&self, account: AccountId, market: MarketId, instrument: u16) -> Amount {
         self.claims
             .get(&(account.get(), market.get()))
             .and_then(|v| v.get(usize::from(instrument)))
+            .copied()
+            .unwrap_or(Amount::ZERO)
+    }
+
+    /// Premium escrowed by `account`'s resting claim-market bids in `market`.
+    pub fn premium_escrowed(&self, account: AccountId, market: MarketId) -> Amount {
+        self.bid_premium_escrow
+            .get(&(account.get(), market.get()))
+            .copied()
+            .unwrap_or(Amount::ZERO)
+    }
+
+    /// Claims escrowed by `account`'s resting asks in `market` at `instrument`.
+    pub fn claims_escrowed(&self, account: AccountId, market: MarketId, instrument: u16) -> Amount {
+        self.ask_claims_escrow
+            .get(&(account.get(), market.get(), instrument))
             .copied()
             .unwrap_or(Amount::ZERO)
     }
@@ -277,6 +380,188 @@ impl Engine {
         Ok(())
     }
 
+    /// Escrow the resting residual of a claim-market order.
+    ///
+    /// Bids move the residual premium (`price * remaining`, floor — exactly what
+    /// maker-price fills will draw) out of ledger `available` and risk
+    /// collateral into the committed reserved-premium column. Asks move
+    /// `remaining` claims out of the live claim balance into the committed
+    /// reserved-claims column, so a second ask over the same claims fails closed
+    /// at placement and `RedeemCompleteSet` cannot strip a resting ask's
+    /// backing. Fails typed (rolling the whole command back) when the residual
+    /// is not fully fundable.
+    fn escrow_claim_resting(
+        &mut self,
+        key: OrderKey,
+        account: AccountId,
+        side: Side,
+        price: types::Price,
+        remaining: Quantity,
+    ) -> Result<(), ExecutionError> {
+        if remaining.raw() <= 0 {
+            return Ok(());
+        }
+        let (market, instrument, _) = key;
+        let mut record = ClaimOrderEscrow {
+            account,
+            side,
+            premium: Amount::ZERO,
+            claims: Amount::ZERO,
+        };
+        match side {
+            Side::Bid => {
+                let premium = price.notional(remaining)?;
+                if premium.raw() > 0 {
+                    // Fail-closed: both the settlement ledger and risk
+                    // collateral must fund the promised premium at rest.
+                    self.ledger.escrow(account, premium)?;
+                    self.risk.debit_collateral(account, premium)?;
+                    column_add(
+                        &mut self.bid_premium_escrow,
+                        (account.get(), market),
+                        premium,
+                    )?;
+                }
+                record.premium = premium;
+            }
+            Side::Ask => {
+                let need = Amount::from_raw(i128::from(remaining.raw()));
+                let entry = self
+                    .claims
+                    .get_mut(&(account.get(), market))
+                    .ok_or(ExecutionError::InsufficientClaims)?;
+                let inst = usize::from(instrument);
+                let held = entry.get(inst).copied().unwrap_or(Amount::ZERO);
+                if held < need {
+                    return Err(ExecutionError::InsufficientClaims);
+                }
+                entry[inst] = held.checked_sub(need)?;
+                column_add(
+                    &mut self.ask_claims_escrow,
+                    (account.get(), market, instrument),
+                    need,
+                )?;
+                record.claims = need;
+            }
+        }
+        self.claim_escrows.insert(key, record);
+        Ok(())
+    }
+
+    /// Release whatever escrow remains for one claim-market order back to its
+    /// owner: bid premium returns to ledger `available` + risk collateral;
+    /// ask claims return to the live claim balance. A missing record is a
+    /// no-op (perp orders, already-drained fills). Returns the owner released.
+    fn release_claim_escrow(
+        &mut self,
+        key: OrderKey,
+        expected_owner: Option<AccountId>,
+    ) -> Result<Option<AccountId>, ExecutionError> {
+        let Some(record) = self.claim_escrows.get(&key).copied() else {
+            return Ok(None);
+        };
+        if let Some(owner) = expected_owner {
+            if record.account != owner {
+                return Err(ExecutionError::OrderNotOwned);
+            }
+        }
+        let (market, instrument, _) = key;
+        match record.side {
+            Side::Bid => {
+                if record.premium.raw() > 0 {
+                    column_sub(
+                        &mut self.bid_premium_escrow,
+                        (record.account.get(), market),
+                        record.premium,
+                    )?;
+                    self.ledger.release_escrow(record.account, record.premium)?;
+                    self.risk
+                        .credit_collateral(record.account, record.premium)?;
+                }
+            }
+            Side::Ask => {
+                if record.claims.raw() > 0 {
+                    column_sub(
+                        &mut self.ask_claims_escrow,
+                        (record.account.get(), market, instrument),
+                        record.claims,
+                    )?;
+                    let meta = self
+                        .markets
+                        .get(&market)
+                        .ok_or(ExecutionError::UnknownMarket)?;
+                    let outcomes = usize::from(instrument_count(meta.market_type, meta.outcomes));
+                    let entry = self
+                        .claims
+                        .entry((record.account.get(), market))
+                        .or_insert_with(|| vec![Amount::ZERO; outcomes]);
+                    if entry.len() < outcomes {
+                        entry.resize(outcomes, Amount::ZERO);
+                    }
+                    let inst = usize::from(instrument);
+                    if inst >= entry.len() {
+                        return Err(ExecutionError::EscrowInconsistency);
+                    }
+                    entry[inst] = entry[inst].checked_add(record.claims)?;
+                }
+            }
+        }
+        self.claim_escrows.remove(&key);
+        Ok(Some(record.account))
+    }
+
+    /// Draw `premium` for a fill against a resting bid's escrow record and the
+    /// committed reserved-premium column. Backed by the escrow-at-rest bound
+    /// (per-fill floor notionals at the maker price never exceed the escrowed
+    /// floor notional), so a shortfall is an accounting inconsistency.
+    fn draw_bid_escrow(
+        &mut self,
+        key: OrderKey,
+        buyer: AccountId,
+        premium: Amount,
+    ) -> Result<(), ExecutionError> {
+        if premium.raw() == 0 {
+            return Ok(());
+        }
+        let record = self
+            .claim_escrows
+            .get_mut(&key)
+            .ok_or(ExecutionError::EscrowInconsistency)?;
+        if record.account != buyer || !matches!(record.side, Side::Bid) || record.premium < premium
+        {
+            return Err(ExecutionError::EscrowInconsistency);
+        }
+        record.premium = record.premium.checked_sub(premium)?;
+        column_sub(&mut self.bid_premium_escrow, (buyer.get(), key.0), premium)
+    }
+
+    /// Draw `qty` claims for a fill against a resting ask's escrow record and
+    /// the committed reserved-claims column. Claims escrow is exact-integer, so
+    /// a shortfall is an accounting inconsistency.
+    fn draw_ask_escrow(
+        &mut self,
+        key: OrderKey,
+        seller: AccountId,
+        qty: Amount,
+    ) -> Result<(), ExecutionError> {
+        if qty.raw() == 0 {
+            return Ok(());
+        }
+        let record = self
+            .claim_escrows
+            .get_mut(&key)
+            .ok_or(ExecutionError::EscrowInconsistency)?;
+        if record.account != seller || !matches!(record.side, Side::Ask) || record.claims < qty {
+            return Err(ExecutionError::EscrowInconsistency);
+        }
+        record.claims = record.claims.checked_sub(qty)?;
+        column_sub(
+            &mut self.ask_claims_escrow,
+            (seller.get(), key.0, key.1),
+            qty,
+        )
+    }
+
     fn validate_instrument(
         &self,
         market: MarketId,
@@ -294,13 +579,15 @@ impl Engine {
     }
 
     /// The full committed leaf for `account`: settlement ledger balances, auth
-    /// epoch, risk collateral and the derived margin columns, open positions, and
-    /// outcome claims — the complete economic state a light client verifies
-    /// against the shard root.
+    /// epoch, risk collateral and the derived margin columns, open positions,
+    /// outcome claims, and the resting-order escrow columns (reserved premium
+    /// per market, reserved claims per market/instrument) — the complete
+    /// economic state a light client verifies against the shard root.
     ///
-    /// Positions and claim sets are emitted in ascending market order, and flat
-    /// positions / fully-redeemed (all-zero) claim sets are omitted, so the leaf
-    /// is canonical over economic state: replaying an identical command stream
+    /// Positions, claim sets, and escrow entries are emitted in ascending
+    /// market (and instrument) order, and flat positions / fully-redeemed
+    /// (all-zero) claim sets / zero escrows are omitted, so the leaf is
+    /// canonical over economic state: replaying an identical command stream
     /// reproduces bit-identical leaves and roots regardless of map iteration
     /// order.
     pub fn account_leaf(&self, account: AccountId) -> Result<Vec<u8>, ExecutionError> {
@@ -344,6 +631,33 @@ impl Engine {
             for v in *amounts {
                 w.field_i128(v.raw());
             }
+        }
+        // Reserved-premium column (resting claim-market bids), ascending by
+        // market with zero entries omitted; then the reserved-claims column
+        // (resting asks), ascending by (market, instrument). Both are
+        // integer-only, fixed-order, sorted-key serializations (BTreeMap range
+        // iteration), so identical command streams commit bit-identical leaves
+        // on every architecture.
+        let a = account.get();
+        let premium: Vec<(u32, i128)> = self
+            .bid_premium_escrow
+            .range((a, u32::MIN)..=(a, u32::MAX))
+            .filter(|(_, v)| v.raw() != 0)
+            .map(|(&(_, m), v)| (m, v.raw()))
+            .collect();
+        w.field_u32(u32::try_from(premium.len()).unwrap_or(u32::MAX));
+        for (m, v) in &premium {
+            w.field_u32(*m).field_i128(*v);
+        }
+        let reserved_claims: Vec<(u32, u16, i128)> = self
+            .ask_claims_escrow
+            .range((a, u32::MIN, u16::MIN)..=(a, u32::MAX, u16::MAX))
+            .filter(|(_, v)| v.raw() != 0)
+            .map(|(&(_, m, i), v)| (m, i, v.raw()))
+            .collect();
+        w.field_u32(u32::try_from(reserved_claims.len()).unwrap_or(u32::MAX));
+        for (m, inst, v) in &reserved_claims {
+            w.field_u32(*m).field_u32(u32::from(*inst)).field_i128(*v);
         }
         // Idempotency watermarks: the highest order `client_id` and withdrawal
         // `nonce` this account has committed. Folding them into the leaf commits
@@ -483,6 +797,18 @@ impl Engine {
                     self.order_reserves.insert(key, (owner, next));
                 }
             }
+            // When this fill fully consumed the resting maker (it no longer
+            // rests on the already-updated book), release any residual claim
+            // escrow — floor-rounding premium dust for bids, exact zero for
+            // asks — back to the maker so nothing leaks.
+            let maker_consumed = self
+                .books
+                .get(&(market.get(), instrument))
+                .map(|b| !b.contains(fill.maker_order))
+                .unwrap_or(true);
+            if maker_consumed {
+                self.release_claim_escrow(key, None)?;
+            }
             // Maker/taker fees on actual fill notional (directed rounding).
             if taker_bps != 0 {
                 let fee = Self::markets_fill_fee(fill_notional, taker_bps)?;
@@ -514,8 +840,15 @@ impl Engine {
     /// Transfer outcome claims and premium cash for a non-perpetual fill.
     ///
     /// The ask side sells claims; the bid side buys them. Premium
-    /// (`price * quantity`) moves available stablecoin + risk collateral from
-    /// buyer to seller. Never opens a [`risk::PerpPosition`].
+    /// (`price * quantity`) moves stablecoin + risk collateral from buyer to
+    /// seller. Never opens a [`risk::PerpPosition`].
+    ///
+    /// The resting maker's side settles from its escrow taken at rest — a
+    /// maker ask's claims come out of the reserved-claims column and a maker
+    /// bid's premium out of the reserved-premium column — so a fill can never
+    /// fail on the maker and leave a poisoned, unbacked order resting. Only the
+    /// taker's own leg (live claims / available cash) can reject, which rolls
+    /// back only the taker's own command.
     fn apply_claim_fill(
         &mut self,
         market: MarketId,
@@ -531,16 +864,23 @@ impl Engine {
         if inst >= outcomes {
             return Err(ExecutionError::InvalidInstrument);
         }
+        let maker_is_seller = matches!(fill.taker_side, Side::Bid);
         let (seller, buyer) = match fill.taker_side {
             Side::Bid => (fill.maker_account, fill.taker_account),
             Side::Ask => (fill.taker_account, fill.maker_account),
         };
+        let maker_key: OrderKey = (market.get(), instrument, fill.maker_order.get());
         let qty = Amount::from_raw(i128::from(fill.quantity.raw()));
         if qty.raw() <= 0 {
             return Err(ExecutionError::NegativeAmount);
         }
-        // Debit seller claims; credit buyer claims.
-        {
+        // Debit seller claims: from the maker's escrow when the resting ask
+        // sells (escrowed at rest, so this cannot fail on the maker), from the
+        // live balance when the taker sells (checked at placement; a failure
+        // rejects only the taker's own command).
+        if maker_is_seller {
+            self.draw_ask_escrow(maker_key, seller, qty)?;
+        } else {
             let entry = self
                 .claims
                 .entry((seller.get(), market.get()))
@@ -553,6 +893,7 @@ impl Engine {
             }
             entry[inst] = entry[inst].checked_sub(qty)?;
         }
+        // Credit buyer claims (always live).
         {
             let entry = self
                 .claims
@@ -563,11 +904,19 @@ impl Engine {
             }
             entry[inst] = entry[inst].checked_add(qty)?;
         }
-        // Premium cash: buyer pays seller (zero-sum ledger + risk).
+        // Premium cash: buyer pays seller (zero-sum ledger + risk). A resting
+        // maker bid settles from its premium escrow — the cash left `available`
+        // and risk collateral when the bid rested — so the maker leg cannot
+        // fail; a taker bid pays from live available cash.
         let premium = fill.price.notional(fill.quantity)?;
         if premium.raw() > 0 {
-            self.ledger.transfer_available(buyer, seller, premium)?;
-            self.risk.debit_collateral(buyer, premium)?;
+            if maker_is_seller {
+                self.ledger.transfer_available(buyer, seller, premium)?;
+                self.risk.debit_collateral(buyer, premium)?;
+            } else {
+                self.draw_bid_escrow(maker_key, buyer, premium)?;
+                self.ledger.settle_escrow(buyer, seller, premium)?;
+            }
             self.risk.credit_collateral(seller, premium)?;
         }
         Ok(())
@@ -925,7 +1274,11 @@ impl Engine {
                             self.risk.check_order(c.account, notional, false)?;
                         }
                         Side::Ask => {
-                            // Seller must already hold the claims being offered.
+                            // Seller must already hold the claims being offered
+                            // in the LIVE (un-escrowed) pool: claims backing
+                            // already-resting asks were moved into the
+                            // reserved-claims column at rest, so a second ask
+                            // over the same claims fails closed here.
                             let held = self.claim_balance(c.account, c.market, c.instrument);
                             let need = Amount::from_raw(i128::from(c.quantity.raw()));
                             if held < need {
@@ -959,23 +1312,45 @@ impl Engine {
                     OrderOutcome::Resting { .. } | OrderOutcome::PartiallyFilledResting { .. }
                 );
                 let touched = self.apply_fills(c.market, c.instrument, &result)?;
-                // Reserve IM for any residual that rests on the book.
+                // Escrow (claims) or reserve IM (perps) for any residual that
+                // rests on the book.
                 if rested {
-                    let rest_notional = Self::residual_notional(&result, c.price, c.quantity)?;
-                    // Limit orders use their limit price; market residuals do not rest.
-                    let rest_notional =
-                        if !matches!(c.order_type, OrderType::Market) && c.price.raw() > 0 {
-                            rest_notional
-                        } else {
-                            Amount::ZERO
-                        };
-                    self.reserve_order(
-                        c.market,
-                        c.instrument,
-                        c.order_id,
-                        c.account,
-                        rest_notional,
-                    )?;
+                    let remaining = match result.outcome {
+                        OrderOutcome::Resting { remaining }
+                        | OrderOutcome::PartiallyFilledResting { remaining } => remaining,
+                        _ => Quantity::ZERO,
+                    };
+                    if is_claim_market(meta_type) {
+                        // Escrow-at-rest: physically move the promised premium
+                        // (bid) or claims (ask) out of the spendable pools so a
+                        // resting maker can never be crossed unbacked. A second
+                        // ask over the same claims — or a bid promising cash
+                        // `available` does not hold — fails closed right here.
+                        self.escrow_claim_resting(
+                            (c.market.get(), c.instrument, c.order_id.get()),
+                            c.account,
+                            c.side,
+                            c.price,
+                            remaining,
+                        )?;
+                    } else {
+                        let rest_notional = Self::residual_notional(&result, c.price, c.quantity)?;
+                        // Limit orders use their limit price; market residuals
+                        // do not rest.
+                        let rest_notional =
+                            if !matches!(c.order_type, OrderType::Market) && c.price.raw() > 0 {
+                                rest_notional
+                            } else {
+                                Amount::ZERO
+                            };
+                        self.reserve_order(
+                            c.market,
+                            c.instrument,
+                            c.order_id,
+                            c.account,
+                            rest_notional,
+                        )?;
+                    }
                 }
                 for a in touched {
                     self.commit_account(a)?;
@@ -1021,6 +1396,11 @@ impl Engine {
                     .ok_or(ExecutionError::UnknownMarket)?;
                 book.cancel(c.order_id)?;
                 self.release_order_reserve(c.market, instrument, c.order_id, c.account)?;
+                // Claim markets: restore the exact escrowed premium / claims.
+                self.release_claim_escrow(
+                    (c.market.get(), instrument, c.order_id.get()),
+                    Some(c.account),
+                )?;
                 self.commit_account(c.account)?;
                 self.commit_market(c.market)?;
                 Ok(self.receipt(seq, ReceiptKind::Cancelled(1)))
@@ -1050,6 +1430,18 @@ impl Engine {
                         self.risk.release_resting(owner, notional)?;
                     }
                 }
+                // Release every claim escrow this account holds in the market,
+                // in sorted key order for cross-architecture determinism.
+                let mut escrow_keys: Vec<OrderKey> = self
+                    .claim_escrows
+                    .iter()
+                    .filter(|(k, rec)| k.0 == c.market.get() && rec.account == c.account)
+                    .map(|(k, _)| *k)
+                    .collect();
+                escrow_keys.sort_unstable();
+                for key in escrow_keys {
+                    self.release_claim_escrow(key, Some(c.account))?;
+                }
                 self.commit_account(c.account)?;
                 self.commit_market(c.market)?;
                 Ok(self.receipt(seq, ReceiptKind::Cancelled(count)))
@@ -1061,6 +1453,7 @@ impl Engine {
                     .markets
                     .get(&c.market.get())
                     .ok_or(ExecutionError::UnknownMarket)?;
+                let meta_type = meta.market_type;
                 let n = instrument_count(meta.market_type, meta.outcomes);
                 let mut instrument = None;
                 for inst in 0..n {
@@ -1079,8 +1472,35 @@ impl Engine {
                 let notional = c.price.notional_ceil(c.quantity)?;
                 self.authorize(c.account, c.market, notional, &c.auth)?;
                 self.release_order_reserve(c.market, instrument, c.order_id, c.account)?;
-                self.risk
-                    .check_order_in_market(c.account, c.market, notional, false)?;
+                let order_key: OrderKey = (c.market.get(), instrument, c.order_id.get());
+                // Claim markets: release the old order's escrow first (a
+                // repriced order re-escrows at its new terms below), then apply
+                // the same admission checks as placement — bids need free
+                // collateral for the new notional, asks need the full new
+                // quantity held in the live claim pool.
+                let claim_side = if is_claim_market(meta_type) {
+                    let side = self
+                        .claim_escrows
+                        .get(&order_key)
+                        .map(|r| r.side)
+                        .ok_or(ExecutionError::EscrowInconsistency)?;
+                    self.release_claim_escrow(order_key, Some(c.account))?;
+                    match side {
+                        Side::Bid => self.risk.check_order(c.account, notional, false)?,
+                        Side::Ask => {
+                            let held = self.claim_balance(c.account, c.market, instrument);
+                            let need = Amount::from_raw(i128::from(c.quantity.raw()));
+                            if held < need {
+                                return Err(ExecutionError::InsufficientClaims);
+                            }
+                        }
+                    }
+                    Some(side)
+                } else {
+                    self.risk
+                        .check_order_in_market(c.account, c.market, notional, false)?;
+                    None
+                };
                 let book = self
                     .books
                     .get_mut(&(c.market.get(), instrument))
@@ -1093,8 +1513,23 @@ impl Engine {
                     OrderOutcome::Resting { .. } | OrderOutcome::PartiallyFilledResting { .. }
                 );
                 if rested {
-                    let rest_notional = Self::residual_notional(&result, c.price, c.quantity)?;
-                    self.reserve_order(c.market, instrument, c.order_id, c.account, rest_notional)?;
+                    let remaining = match result.outcome {
+                        OrderOutcome::Resting { remaining }
+                        | OrderOutcome::PartiallyFilledResting { remaining } => remaining,
+                        _ => Quantity::ZERO,
+                    };
+                    if let Some(side) = claim_side {
+                        self.escrow_claim_resting(order_key, c.account, side, c.price, remaining)?;
+                    } else {
+                        let rest_notional = Self::residual_notional(&result, c.price, c.quantity)?;
+                        self.reserve_order(
+                            c.market,
+                            instrument,
+                            c.order_id,
+                            c.account,
+                            rest_notional,
+                        )?;
+                    }
                 }
                 for a in touched {
                     self.commit_account(a)?;
@@ -1209,6 +1644,21 @@ impl Engine {
                     if let Some(book) = self.books.get_mut(key) {
                         book.cancel_all(c.account);
                     }
+                }
+                // Release the account's claim-market escrows for the orders
+                // just cancelled — BEFORE risk settlement closes the risk
+                // account, so the escrowed premium flows back into collateral
+                // and participates in the liquidation instead of leaking.
+                // Sorted key order keeps release deterministic.
+                let mut escrow_keys: Vec<OrderKey> = self
+                    .claim_escrows
+                    .iter()
+                    .filter(|(_, rec)| rec.account == c.account)
+                    .map(|(k, _)| *k)
+                    .collect();
+                escrow_keys.sort_unstable();
+                for key in escrow_keys {
+                    self.release_claim_escrow(key, Some(c.account))?;
                 }
                 // Phases 2-4: auto-deleverage, insurance draw, and socialization
                 // are settled by the risk engine.
@@ -1372,6 +1822,29 @@ impl Engine {
                             let _ = book.cancel(types::OrderId::new(key.2));
                         }
                     }
+                }
+                // Release every claim escrow in this market before settlement:
+                // escrowed claims return to live balances (so SettleMarket pays
+                // them) and escrowed premium returns to available. Sorted key
+                // order for determinism; owners re-commit below so the state
+                // root reflects the released balances.
+                let mut escrow_keys: Vec<OrderKey> = self
+                    .claim_escrows
+                    .keys()
+                    .copied()
+                    .filter(|(m, _, _)| *m == c.market.get())
+                    .collect();
+                escrow_keys.sort_unstable();
+                let mut released: Vec<AccountId> = Vec::new();
+                for key in escrow_keys {
+                    if let Some(owner) = self.release_claim_escrow(key, None)? {
+                        released.push(owner);
+                    }
+                }
+                released.sort_by_key(|a| a.get());
+                released.dedup();
+                for a in &released {
+                    self.commit_account(*a)?;
                 }
                 // Cancel any remaining orders on every instrument book.
                 for inst in 0..n {
@@ -1566,8 +2039,9 @@ mod tests {
 
     use super::*;
     use crate::command::{
-        CompleteSetOp, CreateAccount, CreateMarket, DepositCredit, FinalizeWithdrawal, PlaceOrder,
-        ReplaceOrder, RequestWithdrawal, SetMarkPrice,
+        CancelAll, CancelOrder, CompleteSetOp, CreateAccount, CreateMarket, DepositCredit,
+        FinalizeWithdrawal, Liquidate, PlaceOrder, ReplaceOrder, RequestWithdrawal, ResolveMarket,
+        SetMarkPrice, SettleMarket,
     };
     use state_tree::{verify_account, verify_market};
     use std::collections::HashMap;
@@ -1637,6 +2111,60 @@ mod tests {
         })
     }
 
+    /// A two-outcome prediction (claim) market.
+    fn create_claim(id: u32) -> Command {
+        Command::CreateMarket(CreateMarket {
+            market: MarketId::new(id),
+            market_type: MarketType::BinaryPrediction,
+            outcomes: 2,
+            mark_price: Price::from_raw(500_000),
+        })
+    }
+
+    fn mint(account: u32, market: u32, count: i128) -> Command {
+        Command::MintCompleteSet(CompleteSetOp {
+            account: AccountId::new(account),
+            market: MarketId::new(market),
+            count: Amount::from_raw(count),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn place_at(
+        account: u32,
+        market: u32,
+        order_id: u64,
+        side: Side,
+        price: i64,
+        qty: i64,
+        instrument: u16,
+        tif: TimeInForce,
+    ) -> Command {
+        Command::PlaceOrder(PlaceOrder {
+            account: AccountId::new(account),
+            market: MarketId::new(market),
+            order_id: OrderId::new(order_id),
+            side,
+            order_type: OrderType::Limit,
+            tif,
+            price: Price::from_raw(price),
+            quantity: Quantity::from_raw(qty),
+            client_id: order_id,
+            reduce_only: false,
+            instrument,
+            auth: Authorization::Master,
+        })
+    }
+
+    fn cancel(account: u32, market: u32, order_id: u64) -> Command {
+        Command::CancelOrder(CancelOrder {
+            market: MarketId::new(market),
+            account: AccountId::new(account),
+            order_id: OrderId::new(order_id),
+            auth: Authorization::Master,
+        })
+    }
+
     // A single deterministic function of the ENTIRE engine state — every
     // subsystem plus every non-committed in-memory map — used to prove that a
     // failed command leaves the engine byte-identical.
@@ -1652,8 +2180,53 @@ mod tests {
             w.field_i128(e.ledger.available(a).unwrap().raw());
             w.field_i128(e.ledger.reserved(a).unwrap().raw());
             w.field_i128(e.ledger.locked(a).unwrap().raw());
+            w.field_i128(e.ledger.escrowed(a).unwrap().raw());
             w.field_i128(e.risk.collateral(a).unwrap().raw());
             w.field_i128(e.risk.equity(a).unwrap().raw());
+        }
+        // Claim-market escrow state: committed columns + per-order records.
+        w.field_i128(i128::try_from(e.bid_premium_escrow.len()).unwrap());
+        for (&(a, m), v) in &e.bid_premium_escrow {
+            w.field_u32(a);
+            w.field_u32(m);
+            w.field_i128(v.raw());
+        }
+        w.field_i128(i128::try_from(e.ask_claims_escrow.len()).unwrap());
+        for (&(a, m, inst), v) in &e.ask_claims_escrow {
+            w.field_u32(a);
+            w.field_u32(m);
+            w.field_u32(u32::from(inst));
+            w.field_i128(v.raw());
+        }
+        let mut escrow_records: Vec<(u32, u16, u64, u32, u32, i128, i128)> = e
+            .claim_escrows
+            .iter()
+            .map(|(&(m, inst, oid), rec)| {
+                let side_tag = match rec.side {
+                    Side::Bid => 0u32,
+                    Side::Ask => 1u32,
+                };
+                (
+                    m,
+                    inst,
+                    oid,
+                    rec.account.get(),
+                    side_tag,
+                    rec.premium.raw(),
+                    rec.claims.raw(),
+                )
+            })
+            .collect();
+        escrow_records.sort_unstable();
+        w.field_i128(i128::try_from(escrow_records.len()).unwrap());
+        for (m, inst, oid, a, side_tag, premium, claims) in escrow_records {
+            w.field_u32(m);
+            w.field_u32(u32::from(inst));
+            w.field_i64(i64::from_le_bytes(oid.to_le_bytes()));
+            w.field_u32(a);
+            w.field_u32(side_tag);
+            w.field_i128(premium);
+            w.field_i128(claims);
         }
         let mut positions: Vec<(u32, u32, i64)> = Vec::new();
         for i in 0..n {
@@ -1775,6 +2348,59 @@ mod tests {
                 "account {i} reserved {reserved} != pending withdrawals {expected}",
             );
         }
+
+        // Claim-order escrow reconciliation: the ledger's escrowed partition is
+        // exactly the sum of the committed per-market reserved-premium column,
+        // and each committed column entry is exactly the sum of its live
+        // per-order escrow records — so escrow can neither leak nor double-count
+        // without failing here.
+        let mut premium_by_account: HashMap<u32, i128> = HashMap::new();
+        for (&(a, _m), v) in &e.bid_premium_escrow {
+            *premium_by_account.entry(a).or_default() += v.raw();
+        }
+        for i in 0..n {
+            let a = AccountId::from_index(i).unwrap();
+            assert_eq!(
+                e.ledger.escrowed(a).unwrap().raw(),
+                premium_by_account.get(&a.get()).copied().unwrap_or(0),
+                "account {i} ledger escrow diverged from the committed premium column",
+            );
+        }
+        let mut premium_by_column: HashMap<(u32, u32), i128> = HashMap::new();
+        let mut claims_by_column: HashMap<(u32, u32, u16), i128> = HashMap::new();
+        for (&(m, inst, _oid), rec) in &e.claim_escrows {
+            match rec.side {
+                Side::Bid => {
+                    *premium_by_column.entry((rec.account.get(), m)).or_default() +=
+                        rec.premium.raw();
+                }
+                Side::Ask => {
+                    *claims_by_column
+                        .entry((rec.account.get(), m, inst))
+                        .or_default() += rec.claims.raw();
+                }
+            }
+        }
+        premium_by_column.retain(|_, v| *v != 0);
+        claims_by_column.retain(|_, v| *v != 0);
+        let committed_premium: HashMap<(u32, u32), i128> = e
+            .bid_premium_escrow
+            .iter()
+            .map(|(&k, v)| (k, v.raw()))
+            .collect();
+        let committed_claims: HashMap<(u32, u32, u16), i128> = e
+            .ask_claims_escrow
+            .iter()
+            .map(|(&k, v)| (k, v.raw()))
+            .collect();
+        assert_eq!(
+            committed_premium, premium_by_column,
+            "committed premium column diverged from per-order escrow records",
+        );
+        assert_eq!(
+            committed_claims, claims_by_column,
+            "committed claims column diverged from per-order escrow records",
+        );
 
         // Committed market leaves (type, outcomes, mark, book root) reconcile too.
         for &m in e.markets.keys() {
@@ -2623,5 +3249,495 @@ mod tests {
                 );
             }
         }
+    }
+
+    // --- Claim-market escrow-at-rest (issue #398) ----------------------------
+    //
+    // A resting claim order must be BACKED: a bid escrows its promised premium
+    // out of `available`, an ask escrows the offered claims out of the live
+    // claim pool, both into committed columns that fold into the state root.
+    // Every release path (fill drawdown, cancel, cancel-all, replace, TIF
+    // expiry, liquidation, resolve) restores the exact reserved amount.
+
+    // Reproduction 1: a seller holding 100 claims rests a 100-claim ask; the
+    // escrow physically removes the claims, so a second 100-claim ask is
+    // REJECTED at placement (fail-closed) and a taker crossing the first ask
+    // can never fail on the maker.
+    #[test]
+    fn overcommitted_second_ask_rejected_and_resting_ask_always_fillable() {
+        let mut e = engine_with_caps(8, 4);
+        e.execute(seq(1), create_account(1_000_000_000)).unwrap(); // seller 0
+        e.execute(seq(2), create_account(1_000_000_000)).unwrap(); // buyer 1
+        e.execute(seq(3), create_claim(0)).unwrap();
+        e.execute(seq(4), mint(0, 0, 100_000_000)).unwrap(); // 100.0 sets
+        let (seller, buyer) = (AccountId::new(0), AccountId::new(1));
+        let m = MarketId::new(0);
+
+        // First 100-claim ask at best price rests; claims move into escrow.
+        e.execute(seq(5), place(0, 0, 1, Side::Ask, 400_000, 100_000_000))
+            .unwrap();
+        assert_eq!(e.claim_balance(seller, m, 0), Amount::ZERO);
+        assert_eq!(
+            e.claims_escrowed(seller, m, 0),
+            Amount::from_raw(100_000_000)
+        );
+        check_invariants(&e);
+
+        // Second identical ask has no un-escrowed claims backing it: rejected
+        // at placement, leaving nothing behind.
+        let before = fingerprint(&e);
+        assert_eq!(
+            e.execute(seq(6), place(0, 0, 2, Side::Ask, 400_000, 100_000_000)),
+            Err(ExecutionError::InsufficientClaims),
+        );
+        assert_eq!(fingerprint(&e), before, "rejected ask mutated state");
+        assert_eq!(e.market_resting_len(m), Some(1));
+
+        // The resting ask is drawn from escrow at fill: the taker command
+        // succeeds even though the seller's LIVE balance is zero — the
+        // poisoned-ask scenario is impossible.
+        e.execute(seq(7), place(1, 0, 3, Side::Bid, 400_000, 100_000_000))
+            .unwrap();
+        assert_eq!(e.claim_balance(buyer, m, 0), Amount::from_raw(100_000_000));
+        assert_eq!(e.claims_escrowed(seller, m, 0), Amount::ZERO);
+        assert!(
+            e.claim_escrows.is_empty(),
+            "escrow record leaked after fill"
+        );
+        // Premium 0.4 * 100 = 40.0 paid to the seller.
+        assert_eq!(
+            e.ledger.available(seller).unwrap(),
+            Amount::from_raw(1_000_000_000 - 100_000_000 + 40_000_000),
+        );
+        check_invariants(&e);
+    }
+
+    // Reproduction 2: a bid cannot rest promising premium `available` does not
+    // hold — it is rejected at rest (fail-closed) — and a funded bid escrows
+    // its premium into the committed column, from which fills settle without
+    // touching `available` again.
+    #[test]
+    fn underfunded_bid_rejected_and_funded_bid_escrows_premium() {
+        let mut e = engine_with_caps(8, 4);
+        e.execute(seq(1), create_account(10_000_000)).unwrap(); // buyer 0: 10.0
+        e.execute(seq(2), create_account(1_000_000_000)).unwrap(); // seller 1
+        e.execute(seq(3), create_claim(0)).unwrap();
+        let buyer = AccountId::new(0);
+        let m = MarketId::new(0);
+
+        // 30 @ 0.5 promises premium 15.0 > 10.0 available: rejected at rest.
+        let before = fingerprint(&e);
+        assert!(matches!(
+            e.execute(seq(4), place(0, 0, 1, Side::Bid, 500_000, 30_000_000)),
+            Err(ExecutionError::InsufficientAvailable { .. })
+        ));
+        assert_eq!(e.market_resting_len(m), Some(0), "unbacked bid rested");
+        assert_eq!(fingerprint(&e), before);
+
+        // A funded bid rests: premium 8.0 moves available -> escrow column.
+        e.execute(seq(5), place(0, 0, 2, Side::Bid, 500_000, 16_000_000))
+            .unwrap();
+        assert_eq!(e.premium_escrowed(buyer, m), Amount::from_raw(8_000_000));
+        assert_eq!(
+            e.ledger.escrowed(buyer).unwrap(),
+            Amount::from_raw(8_000_000)
+        );
+        assert_eq!(
+            e.ledger.available(buyer).unwrap(),
+            Amount::from_raw(2_000_000)
+        );
+        check_invariants(&e);
+
+        // A further bid the remaining 2.0 cannot back is rejected fail-closed:
+        // the point-in-time race of the original bug is gone because the first
+        // bid's premium has physically left `available`.
+        let before = fingerprint(&e);
+        assert!(matches!(
+            e.execute(seq(6), place(0, 0, 3, Side::Bid, 500_000, 10_000_000)),
+            Err(ExecutionError::InsufficientAvailable { .. })
+        ));
+        assert_eq!(fingerprint(&e), before);
+
+        // A seller crossing the resting bid settles from escrow: the maker leg
+        // cannot fail and the buyer's available cash is untouched at fill.
+        e.execute(seq(7), mint(1, 0, 16_000_000)).unwrap();
+        e.execute(seq(8), place(1, 0, 4, Side::Ask, 500_000, 16_000_000))
+            .unwrap();
+        assert_eq!(e.premium_escrowed(buyer, m), Amount::ZERO);
+        assert_eq!(e.ledger.escrowed(buyer).unwrap(), Amount::ZERO);
+        assert_eq!(
+            e.ledger.available(buyer).unwrap(),
+            Amount::from_raw(2_000_000)
+        );
+        assert_eq!(e.claim_balance(buyer, m, 0), Amount::from_raw(16_000_000));
+        assert!(e.claim_escrows.is_empty());
+        check_invariants(&e);
+    }
+
+    // Release coverage: CancelOrder restores the reserved columns to zero and
+    // the live claim balance / available cash exactly.
+    #[test]
+    fn cancel_restores_escrowed_claims_and_premium_exactly() {
+        let mut e = engine_with_caps(8, 4);
+        e.execute(seq(1), create_account(1_000_000_000)).unwrap(); // seller 0
+        e.execute(seq(2), create_account(1_000_000_000)).unwrap(); // buyer 1
+        e.execute(seq(3), create_claim(0)).unwrap();
+        e.execute(seq(4), mint(0, 0, 50_000_000)).unwrap();
+        let (seller, buyer) = (AccountId::new(0), AccountId::new(1));
+        let m = MarketId::new(0);
+
+        e.execute(seq(5), place(0, 0, 1, Side::Ask, 400_000, 50_000_000))
+            .unwrap();
+        e.execute(seq(6), place(1, 0, 2, Side::Bid, 300_000, 20_000_000))
+            .unwrap(); // premium 6.0, no cross
+        assert_eq!(
+            e.claims_escrowed(seller, m, 0),
+            Amount::from_raw(50_000_000)
+        );
+        assert_eq!(e.premium_escrowed(buyer, m), Amount::from_raw(6_000_000));
+        check_invariants(&e);
+
+        e.execute(seq(7), cancel(0, 0, 1)).unwrap();
+        assert_eq!(e.claims_escrowed(seller, m, 0), Amount::ZERO);
+        assert_eq!(e.claim_balance(seller, m, 0), Amount::from_raw(50_000_000));
+        check_invariants(&e);
+
+        e.execute(seq(8), cancel(1, 0, 2)).unwrap();
+        assert_eq!(e.premium_escrowed(buyer, m), Amount::ZERO);
+        assert_eq!(e.ledger.escrowed(buyer).unwrap(), Amount::ZERO);
+        assert_eq!(
+            e.ledger.available(buyer).unwrap(),
+            Amount::from_raw(1_000_000_000),
+        );
+        assert_eq!(
+            e.risk.collateral(buyer).unwrap(),
+            Amount::from_raw(1_000_000_000),
+        );
+        assert!(e.claim_escrows.is_empty());
+        check_invariants(&e);
+    }
+
+    // Release coverage: CancelAll releases every escrow the account holds in
+    // the market — both instruments' claims and the bid premium — exactly.
+    #[test]
+    fn cancel_all_restores_escrows_exactly() {
+        let mut e = engine_with_caps(8, 4);
+        e.execute(seq(1), create_account(1_000_000_000)).unwrap();
+        e.execute(seq(2), create_claim(0)).unwrap();
+        e.execute(seq(3), mint(0, 0, 50_000_000)).unwrap();
+        let a = AccountId::new(0);
+        let m = MarketId::new(0);
+
+        e.execute(
+            seq(4),
+            place_at(0, 0, 1, Side::Ask, 400_000, 30_000_000, 0, TimeInForce::Gtc),
+        )
+        .unwrap();
+        e.execute(
+            seq(5),
+            place_at(0, 0, 2, Side::Ask, 400_000, 20_000_000, 1, TimeInForce::Gtc),
+        )
+        .unwrap();
+        e.execute(
+            seq(6),
+            place_at(0, 0, 3, Side::Bid, 300_000, 10_000_000, 0, TimeInForce::Gtc),
+        )
+        .unwrap(); // premium 3.0
+        assert_eq!(e.claims_escrowed(a, m, 0), Amount::from_raw(30_000_000));
+        assert_eq!(e.claims_escrowed(a, m, 1), Amount::from_raw(20_000_000));
+        assert_eq!(e.premium_escrowed(a, m), Amount::from_raw(3_000_000));
+        check_invariants(&e);
+
+        let r = e
+            .execute(
+                seq(7),
+                Command::CancelAll(CancelAll {
+                    market: m,
+                    account: a,
+                    auth: Authorization::Master,
+                }),
+            )
+            .unwrap();
+        assert!(matches!(r.kind, ReceiptKind::Cancelled(3)));
+        assert_eq!(e.claims_escrowed(a, m, 0), Amount::ZERO);
+        assert_eq!(e.claims_escrowed(a, m, 1), Amount::ZERO);
+        assert_eq!(e.premium_escrowed(a, m), Amount::ZERO);
+        assert_eq!(e.claim_balance(a, m, 0), Amount::from_raw(50_000_000));
+        assert_eq!(e.claim_balance(a, m, 1), Amount::from_raw(50_000_000));
+        assert_eq!(e.ledger.escrowed(a).unwrap(), Amount::ZERO);
+        assert_eq!(
+            e.ledger.available(a).unwrap(),
+            Amount::from_raw(950_000_000), // 1000 - 50 locked by the mint
+        );
+        assert!(e.claim_escrows.is_empty());
+        check_invariants(&e);
+    }
+
+    // Release coverage: ReplaceOrder releases the old escrow and re-escrows the
+    // new residual exactly; growth the live pool cannot back is rejected
+    // atomically (the original order and its escrow survive).
+    #[test]
+    fn replace_reescrows_exactly_and_rejects_unbacked_growth() {
+        let mut e = engine_with_caps(8, 4);
+        e.execute(seq(1), create_account(1_000_000_000)).unwrap(); // seller 0
+        e.execute(seq(2), create_account(1_000_000_000)).unwrap(); // buyer 1
+        e.execute(seq(3), create_claim(0)).unwrap();
+        e.execute(seq(4), mint(0, 0, 100_000_000)).unwrap();
+        let (seller, buyer) = (AccountId::new(0), AccountId::new(1));
+        let m = MarketId::new(0);
+
+        // Ask 100 @ 0.4 rests; replace down to 60 @ 0.5: exactly 60 stays
+        // escrowed and 40 returns to the live pool.
+        e.execute(seq(5), place(0, 0, 1, Side::Ask, 400_000, 100_000_000))
+            .unwrap();
+        e.execute(
+            seq(6),
+            Command::ReplaceOrder(ReplaceOrder {
+                market: m,
+                account: seller,
+                order_id: OrderId::new(1),
+                price: Price::from_raw(500_000),
+                quantity: Quantity::from_raw(60_000_000),
+                auth: Authorization::Master,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            e.claims_escrowed(seller, m, 0),
+            Amount::from_raw(60_000_000)
+        );
+        assert_eq!(e.claim_balance(seller, m, 0), Amount::from_raw(40_000_000));
+        check_invariants(&e);
+
+        // Growing beyond the total holding (100) is rejected atomically.
+        let before = fingerprint(&e);
+        assert_eq!(
+            e.execute(
+                seq(7),
+                Command::ReplaceOrder(ReplaceOrder {
+                    market: m,
+                    account: seller,
+                    order_id: OrderId::new(1),
+                    price: Price::from_raw(500_000),
+                    quantity: Quantity::from_raw(150_000_000),
+                    auth: Authorization::Master,
+                }),
+            ),
+            Err(ExecutionError::InsufficientClaims),
+        );
+        assert_eq!(fingerprint(&e), before, "failed replace mutated escrow");
+        assert_eq!(
+            e.claims_escrowed(seller, m, 0),
+            Amount::from_raw(60_000_000)
+        );
+
+        // Bid 20 @ 0.3 (premium 6.0) replaced to 30 @ 0.35 (premium 10.5):
+        // the committed column tracks the new residual exactly.
+        e.execute(seq(8), place(1, 0, 2, Side::Bid, 300_000, 20_000_000))
+            .unwrap();
+        assert_eq!(e.premium_escrowed(buyer, m), Amount::from_raw(6_000_000));
+        e.execute(
+            seq(9),
+            Command::ReplaceOrder(ReplaceOrder {
+                market: m,
+                account: buyer,
+                order_id: OrderId::new(2),
+                price: Price::from_raw(350_000),
+                quantity: Quantity::from_raw(30_000_000),
+                auth: Authorization::Master,
+            }),
+        )
+        .unwrap();
+        assert_eq!(e.premium_escrowed(buyer, m), Amount::from_raw(10_500_000));
+        assert_eq!(
+            e.ledger.escrowed(buyer).unwrap(),
+            Amount::from_raw(10_500_000)
+        );
+        assert_eq!(
+            e.ledger.available(buyer).unwrap(),
+            Amount::from_raw(1_000_000_000 - 10_500_000),
+        );
+        check_invariants(&e);
+    }
+
+    // Release coverage (TIF expiry): an IOC residual expires instead of
+    // resting, so no escrow is ever taken for it, and a partially-filled
+    // resting maker's escrow is drawn down exactly and fully released the
+    // moment the order is consumed.
+    #[test]
+    fn ioc_residual_expiry_leaves_no_escrow() {
+        let mut e = engine_with_caps(8, 4);
+        e.execute(seq(1), create_account(1_000_000_000)).unwrap(); // seller 0
+        e.execute(seq(2), create_account(1_000_000_000)).unwrap(); // buyer 1
+        e.execute(seq(3), create_claim(0)).unwrap();
+        e.execute(seq(4), mint(0, 0, 50_000_000)).unwrap();
+        let (seller, buyer) = (AccountId::new(0), AccountId::new(1));
+        let m = MarketId::new(0);
+
+        // Resting ask 50 @ 0.4; buyer sends IOC bid 80 @ 0.4: 50 fills, the
+        // 30 residual expires. No premium escrow may remain for the buyer.
+        e.execute(seq(5), place(0, 0, 1, Side::Ask, 400_000, 50_000_000))
+            .unwrap();
+        e.execute(
+            seq(6),
+            place_at(1, 0, 2, Side::Bid, 400_000, 80_000_000, 0, TimeInForce::Ioc),
+        )
+        .unwrap();
+        assert_eq!(e.premium_escrowed(buyer, m), Amount::ZERO);
+        assert_eq!(e.ledger.escrowed(buyer).unwrap(), Amount::ZERO);
+        assert_eq!(
+            e.ledger.available(buyer).unwrap(),
+            Amount::from_raw(1_000_000_000 - 20_000_000), // only the fill premium
+        );
+        assert_eq!(e.claim_balance(buyer, m, 0), Amount::from_raw(50_000_000));
+        assert_eq!(e.claims_escrowed(seller, m, 0), Amount::ZERO);
+        assert_eq!(e.market_resting_len(m), Some(0));
+        assert!(e.claim_escrows.is_empty());
+        check_invariants(&e);
+
+        // Symmetric: a resting bid partially filled by an IOC ask. The maker
+        // bid's escrow is drawn exactly; the taker ask's expired residual
+        // escrows nothing and its claims stay live.
+        e.execute(seq(7), mint(0, 0, 50_000_000)).unwrap();
+        e.execute(
+            seq(8),
+            place_at(1, 0, 3, Side::Bid, 500_000, 20_000_000, 0, TimeInForce::Gtc),
+        )
+        .unwrap(); // premium 10.0 escrowed
+        assert_eq!(e.premium_escrowed(buyer, m), Amount::from_raw(10_000_000));
+        let buyer_available = e.ledger.available(buyer).unwrap();
+        e.execute(
+            seq(9),
+            place_at(0, 0, 4, Side::Ask, 500_000, 50_000_000, 0, TimeInForce::Ioc),
+        )
+        .unwrap(); // fills 20, residual 30 expires
+        assert_eq!(e.premium_escrowed(buyer, m), Amount::ZERO);
+        assert_eq!(e.ledger.escrowed(buyer).unwrap(), Amount::ZERO);
+        // The maker paid from escrow, not from available.
+        assert_eq!(e.ledger.available(buyer).unwrap(), buyer_available);
+        assert_eq!(e.claims_escrowed(seller, m, 0), Amount::ZERO);
+        assert_eq!(e.claim_balance(seller, m, 0), Amount::from_raw(30_000_000));
+        assert_eq!(e.claim_balance(buyer, m, 0), Amount::from_raw(70_000_000));
+        assert!(e.claim_escrows.is_empty());
+        check_invariants(&e);
+    }
+
+    // Release coverage: liquidation cancels the account's resting claim orders
+    // and releases their escrows back (premium into collateral BEFORE risk
+    // settlement, claims into the live pool) so nothing leaks when the risk
+    // account closes.
+    #[test]
+    fn liquidation_releases_claim_escrows() {
+        let mut e = engine_with_caps(8, 4);
+        e.execute(seq(1), create_account(100_000_000)).unwrap(); // victim 0: 100.0
+        e.execute(seq(2), create_account(10_000_000_000)).unwrap(); // cpty 1
+        e.execute(seq(3), create_perp(0, 1_000_000)).unwrap();
+        e.execute(seq(4), create_claim(1)).unwrap();
+        let victim = AccountId::new(0);
+        let m1 = MarketId::new(1);
+
+        // Victim escrows claims (ask) and premium (bid) on the claim market.
+        e.execute(seq(5), mint(0, 1, 50_000_000)).unwrap();
+        e.execute(
+            seq(6),
+            place_at(0, 1, 1, Side::Ask, 500_000, 50_000_000, 0, TimeInForce::Gtc),
+        )
+        .unwrap();
+        e.execute(
+            seq(7),
+            place_at(0, 1, 2, Side::Bid, 500_000, 10_000_000, 1, TimeInForce::Gtc),
+        )
+        .unwrap(); // premium 5.0
+        assert_eq!(
+            e.claims_escrowed(victim, m1, 0),
+            Amount::from_raw(50_000_000)
+        );
+        assert_eq!(e.premium_escrowed(victim, m1), Amount::from_raw(5_000_000));
+        check_invariants(&e);
+
+        // Victim opens a 400.0 long at 1.0; the mark drops to 0.9 so equity
+        // (45 - 40 = 5) falls below maintenance margin (18).
+        e.execute(seq(8), place(1, 0, 3, Side::Ask, 1_000_000, 400_000_000))
+            .unwrap();
+        e.execute(seq(9), place(0, 0, 4, Side::Bid, 1_000_000, 400_000_000))
+            .unwrap();
+        e.execute(
+            seq(10),
+            Command::SetMarkPrice(SetMarkPrice {
+                market: MarketId::new(0),
+                price: Price::from_raw(900_000),
+            }),
+        )
+        .unwrap();
+        check_invariants(&e);
+
+        e.execute(seq(11), Command::Liquidate(Liquidate { account: victim }))
+            .unwrap();
+        assert!(e.bid_premium_escrow.is_empty(), "premium escrow leaked");
+        assert!(e.ask_claims_escrow.is_empty(), "claims escrow leaked");
+        assert!(e.claim_escrows.is_empty(), "escrow records leaked");
+        assert_eq!(e.ledger.escrowed(victim).unwrap(), Amount::ZERO);
+        // Premium (5.0) returned to available; claims returned to the live pool.
+        assert_eq!(
+            e.ledger.available(victim).unwrap(),
+            Amount::from_raw(50_000_000)
+        );
+        assert_eq!(e.claim_balance(victim, m1, 0), Amount::from_raw(50_000_000));
+        assert_eq!(e.claim_balance(victim, m1, 1), Amount::from_raw(50_000_000));
+        check_invariants(&e);
+    }
+
+    // Release coverage: resolving a market releases every escrow in it —
+    // escrowed claims return to live balances so SettleMarket's complete-set
+    // pool reconciles exactly, and escrowed premium returns to available.
+    #[test]
+    fn resolve_releases_claim_escrows_before_settlement() {
+        let mut e = engine_with_caps(8, 4);
+        e.execute(seq(1), create_account(1_000_000_000)).unwrap(); // seller 0
+        e.execute(seq(2), create_account(1_000_000_000)).unwrap(); // buyer 1
+        e.execute(seq(3), create_claim(0)).unwrap();
+        e.execute(seq(4), mint(0, 0, 100_000_000)).unwrap();
+        let (seller, buyer) = (AccountId::new(0), AccountId::new(1));
+        let m = MarketId::new(0);
+
+        e.execute(seq(5), place(0, 0, 1, Side::Ask, 400_000, 60_000_000))
+            .unwrap();
+        e.execute(seq(6), place(1, 0, 2, Side::Bid, 300_000, 30_000_000))
+            .unwrap(); // premium 9.0, no cross
+        assert_eq!(
+            e.claims_escrowed(seller, m, 0),
+            Amount::from_raw(60_000_000)
+        );
+        assert_eq!(e.premium_escrowed(buyer, m), Amount::from_raw(9_000_000));
+        check_invariants(&e);
+
+        e.execute(
+            seq(7),
+            Command::ResolveMarket(ResolveMarket {
+                market: m,
+                winning_outcome: 0,
+            }),
+        )
+        .unwrap();
+        assert!(e.claim_escrows.is_empty());
+        assert_eq!(e.claims_escrowed(seller, m, 0), Amount::ZERO);
+        assert_eq!(e.premium_escrowed(buyer, m), Amount::ZERO);
+        assert_eq!(e.claim_balance(seller, m, 0), Amount::from_raw(100_000_000));
+        assert_eq!(
+            e.ledger.available(buyer).unwrap(),
+            Amount::from_raw(1_000_000_000),
+        );
+        check_invariants(&e);
+
+        // Settlement pays the full winning holding from the mint-locked pool —
+        // impossible if the resolve had left 60 claims stranded in escrow.
+        e.execute(seq(8), Command::SettleMarket(SettleMarket { market: m }))
+            .unwrap();
+        assert_eq!(
+            e.ledger.available(seller).unwrap(),
+            Amount::from_raw(1_000_000_000),
+        );
+        assert_eq!(e.ledger.locked(seller).unwrap(), Amount::ZERO);
+        check_invariants(&e);
     }
 }
