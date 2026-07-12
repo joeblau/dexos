@@ -231,8 +231,10 @@ pub enum StreamError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Recovery {
     /// The missing events were still within the retained window; apply these
-    /// deltas in order to catch up.
-    Deltas(Vec<StreamEvent>),
+    /// deltas in order to catch up. Each element is a shared handle
+    /// ([`SharedEvent`]) to the retained event, so backfill never clones
+    /// event bodies.
+    Deltas(Vec<SharedEvent>),
     /// The gap is beyond the retained window; the consumer must fetch a fresh
     /// snapshot and reset its baseline.
     SnapshotRequired,
@@ -510,11 +512,14 @@ impl StreamHub {
         let earliest = front.sequence.get();
         // We can backfill iff the next needed sequence is still retained.
         if earliest <= from_seq.saturating_add(1) {
-            let deltas: Vec<StreamEvent> = entry
+            // History stores `Arc<StreamEvent>`; hand out shared handles so
+            // the shard lock is held only for O(n) pointer copies, never for
+            // deep clones of event bodies (book snapshots, receipt fills, ...).
+            let deltas: Vec<SharedEvent> = entry
                 .history
                 .iter()
                 .filter(|(_, e)| e.sequence.get() > from_seq)
-                .map(|(_, e)| (**e).clone())
+                .map(|(_, e)| Arc::clone(e))
                 .collect();
             Recovery::Deltas(deltas)
         } else {

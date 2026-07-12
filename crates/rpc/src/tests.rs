@@ -1115,9 +1115,10 @@ fn snapshot_plus_deltas_reconstructs_canonical_state() {
     };
     let mut rebuilt: BTreeMap<i64, i64> = BTreeMap::new();
     for ev in events {
-        match ev.payload {
+        // Recovered events are shared handles; read the payload through them.
+        match &ev.payload {
             StreamPayload::Book(book) => {
-                for lvl in book.bids {
+                for lvl in &book.bids {
                     rebuilt.insert(lvl.price.raw(), lvl.quantity.raw());
                 }
             }
@@ -1159,6 +1160,37 @@ fn recovery_window_backfills_or_requires_snapshot() {
     }
     // Gap beyond window requires a fresh snapshot.
     assert_eq!(hub.recover(topic, 0), Recovery::SnapshotRequired);
+}
+
+#[test]
+fn recovery_deltas_share_history_events_without_cloning() {
+    // recover() must hand back Arc handles to the very events retained in
+    // history — pointer copies, not deep clones of event bodies.
+    let hub = StreamHub::new(8);
+    let topic = Topic::Book(m(1));
+    let published: Vec<SharedEvent> = (1..=4i64)
+        .map(|i| {
+            hub.publish_delta(
+                topic,
+                StreamPayload::BookDelta(BookDelta {
+                    market_id: m(1),
+                    side: Side::Bid,
+                    price: Price::from_raw(i),
+                    quantity: Quantity::ONE,
+                }),
+            )
+        })
+        .collect();
+    let deltas = match hub.recover(topic, 0) {
+        Recovery::Deltas(d) => d,
+        Recovery::SnapshotRequired => panic!("expected in-window recovery"),
+    };
+    assert_eq!(deltas.len(), published.len());
+    for (recovered, original) in deltas.iter().zip(&published) {
+        // Same allocation as the stored/published SharedEvent, not a copy.
+        assert!(Arc::ptr_eq(recovered, original));
+        assert_eq!(recovered.sequence, original.sequence);
+    }
 }
 
 #[test]
