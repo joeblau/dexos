@@ -43,7 +43,7 @@ jobs:
         run: >-
           cargo clippy --workspace --all-targets --locked
           --exclude dexos-ui --exclude dexos-web
-          --exclude dexos-desktop --exclude dexos-mobile
+          --exclude dexos-desktop --exclude dexos-mobile --exclude dexos-sdk-wasm --exclude dexos-sdk-py
           -- -D warnings
 
   test:
@@ -60,7 +60,7 @@ jobs:
         run: >-
           cargo test --workspace --locked
           --exclude dexos-ui --exclude dexos-web
-          --exclude dexos-desktop --exclude dexos-mobile
+          --exclude dexos-desktop --exclude dexos-mobile --exclude dexos-sdk-wasm --exclude dexos-sdk-py
 
   docs:
     name: cargo doc
@@ -78,7 +78,7 @@ jobs:
         run: >-
           cargo doc --workspace --no-deps --locked
           --exclude dexos-ui --exclude dexos-web
-          --exclude dexos-desktop --exclude dexos-mobile
+          --exclude dexos-desktop --exclude dexos-mobile --exclude dexos-sdk-wasm --exclude dexos-sdk-py
 
   # Dedicated gate for the Dioxus `ui/*` frontends, kept out of the engine
   # `--workspace` jobs above: the web app is a wasm32 target and the native
@@ -155,7 +155,7 @@ jobs:
           cargo llvm-cov --workspace --locked --lcov --output-path lcov.info \
             --ignore-filename-regex '(tests?/|target/)' \
             --exclude dexos-ui --exclude dexos-web \
-            --exclude dexos-desktop --exclude dexos-mobile
+            --exclude dexos-desktop --exclude dexos-mobile --exclude dexos-sdk-wasm --exclude dexos-sdk-py
           test -s lcov.info
           # Floor: report must mention real crates (not empty).
           grep -q 'SF:.*crates/' lcov.info
@@ -393,7 +393,7 @@ jobs:
         run: >-
           cargo build --release --workspace --locked
           --exclude dexos-ui --exclude dexos-web
-          --exclude dexos-desktop --exclude dexos-mobile
+          --exclude dexos-desktop --exclude dexos-mobile --exclude dexos-sdk-wasm --exclude dexos-sdk-py
       - name: release profile is panic=abort
         run: |
           grep -q 'panic = "abort"' Cargo.toml
@@ -444,7 +444,7 @@ jobs:
         run: >-
           cargo test --workspace --locked
           --exclude dexos-ui --exclude dexos-web
-          --exclude dexos-desktop --exclude dexos-mobile
+          --exclude dexos-desktop --exclude dexos-mobile --exclude dexos-sdk-wasm --exclude dexos-sdk-py
       - name: safety gates
         run: |
           ./scripts/check-no-float.sh

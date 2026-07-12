@@ -1,0 +1,30 @@
+[package]
+name = "dexos-sdk-core"
+version = "0.1.0"                 # decoupled from workspace 0.0.1
+edition.workspace = true
+license.workspace = true
+rust-version = "1.82"            # decoupled floor: wider public reach than engine's 1.92
+repository.workspace = true
+publish = false                  # Phase 4: flip true AFTER the dexos-* rename
+
+[lints]
+workspace = true                 # pure Rust, no FFI -> full clippy/unsafe gate applies
+
+[dependencies]
+types  = { path = "../types" }
+codec  = { path = "../codec" }
+crypto = { path = "../crypto" }
+proto  = { path = "../proto" }
+serde.workspace = true
+thiserror.workspace = true
+# INTENTIONALLY absent: tokio, rustls, any I/O. Proven wasm superset of ui/web.
+
+# `proto` reaches `getrandom` 0.2 transitively (via k256 in `crypto`). On wasm32
+# that crate needs its `js` backend feature enabled by the linking crate, exactly
+# as `ui/web` does. getrandom 0.3+/0.4 is handled by the `getrandom_backend`
+# rustflag in `.cargo/config.toml`. Native targets never take this dependency.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { workspace = true, features = ["js"] }
+
+[dev-dependencies]
+hex = { workspace = true }

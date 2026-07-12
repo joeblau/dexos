@@ -1,12 +1,16 @@
 [workspace]
 resolver = "2"
-members = ["crates/*", "bin/*", "ui/*"]
+members = ["crates/*", "bin/*", "ui/*", "bindings/*"]
 # Bare `cargo build`/`test`/`run` (no `-p`/`--workspace`) operate on the engine
 # only, so day-to-day engine work never compiles the heavy Dioxus `ui/*` tree.
 # CI builds the apps in a dedicated `apps` job (wasm web + native desktop/mobile);
 # the engine's `--workspace` gates pass `--exclude dexos-{ui,web,desktop,mobile}`
 # so they never pull in the Dioxus tree. See `.github/workflows/ci.yml`.
 default-members = ["bin/marketd", "bin/dexos", "bin/market-loadgen", "crates/types"]
+# `bindings/*` globs in the two Rust FFI crates (bindings/{wasm,py}). `bindings/ts`
+# is a TypeScript/npm package, not a cargo crate — a glob-matched directory with
+# no Cargo.toml is a hard error, so it is excluded from the workspace explicitly.
+exclude = ["bindings/ts"]
 
 [workspace.package]
 version = "0.0.1"
@@ -67,6 +71,23 @@ anyhow = "1.0"
 # the deterministic engine never does. Each app selects its renderer via the
 # per-crate `dioxus` features (web/desktop/mobile/server + fullstack).
 dioxus = { version = "0.7" }
+
+# --- Client SDK (Phases 0-3): wasm(npm) + python(pip) + native rust bindings. ---
+# Only the `crates/{sdk-core,sdk,xtask}` and `bindings/*` crates use these; the
+# deterministic engine never does. `wasm-bindgen` MUST equal the wasm-pack CLI's
+# bundled bindgen (Cargo.lock pins 0.2.126). `tokio-rustls`/`rustls` reuse the
+# exact versions/features `rpc` already links, so no new version enters the graph.
+wasm-bindgen = "=0.2.126"
+serde-wasm-bindgen = "0.6"
+js-sys = "0.3"
+pyo3 = { version = "0.23", default-features = false }
+pyo3-stub-gen = "0.6"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+rustls-native-certs = "0.8"
+axum = "0.7"
+tower-http = { version = "0.6", features = ["cors", "limit"] }
+serde_json = "1"
 
 # Thin release profile suitable for latency benchmarking later phases will tune.
 # Exchange kernels abort on panic so a single task panic cannot unwind across

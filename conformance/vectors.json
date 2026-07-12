@@ -1,0 +1,47 @@
+{
+  "amount_pin": {
+    "decimal": "1.000000",
+    "postcard_hex": "80897a",
+    "raw": "1000000"
+  },
+  "ed25519_sign": {
+    "input": {
+      "msg_utf8": "dexos",
+      "seed_hex": "0707070707070707070707070707070707070707070707070707070707070707"
+    },
+    "sig_hex": "897597d83419e723364fa63c060e7081f59758bbb3922c5b0e3f268caa021409047b39948a0327d1689b053d85e806ba0be0547ec92fe29a29ae87c33879c00d"
+  },
+  "encode_get_market_request": {
+    "frame_hex": "05de010007010001000000000000000300000001032a",
+    "input": {
+      "market_id": 42,
+      "request_id": 1
+    }
+  },
+  "schema": 2,
+  "seed_hex": "0707070707070707070707070707070707070707070707070707070707070707",
+  "signed_submit_order": {
+    "command_hash_hex": "33e15df613d095e38c2379121a5542a7efcd9b9bec1d0e3128fccb154663c5fb",
+    "framed_request_hex": "05de01000301000700000000000000760000000712010100ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c40c1aa14e61b4869ed06c534328ff0c52b585b73e3fe6582526f19ef2637f73b815b74566bea6443caa0cf2a80475f0eebe8d08237cd5fe31a8cea8a8dff52c40d012a0000c096b10280a4e8030080897a",
+    "input": {
+      "client_id": 1,
+      "nonce": 1
+    },
+    "preimage_hex": "6465786f732e7270632e636f6e74726f6c2e763101010000012a0000c096b10280a4e8030080897a",
+    "signature_hex": "c1aa14e61b4869ed06c534328ff0c52b585b73e3fe6582526f19ef2637f73b815b74566bea6443caa0cf2a80475f0eebe8d08237cd5fe31a8cea8a8dff52c40d"
+  },
+  "wire_structs": {
+    "CancelAllParams": {
+      "hex": "01012a"
+    },
+    "Command_PlaceOrder": {
+      "hex": "00012a0000c096b10280a4e8030080897a"
+    },
+    "PageParams_default": {
+      "hex": "0064"
+    },
+    "SubmitOrderParams": {
+      "hex": "012a0000c096b10280a4e8030080897a"
+    }
+  }
+}

@@ -13,7 +13,7 @@
 # ships in the node — and the wasm-safe `dexos-web` / `dexos-ui` frontends — stays
 # fully audited. Adding a real supply-chain dependency to the node still requires
 # an explicit, reviewed policy change here.
-exclude = ["dexos-desktop", "dexos-mobile"]
+exclude = ["dexos-desktop", "dexos-mobile", "dexos-sdk-wasm", "dexos-sdk-py"]
 
 [advisories]
 version = 2

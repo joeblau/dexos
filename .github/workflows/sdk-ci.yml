@@ -1,0 +1,175 @@
+name: sdk-ci
+
+# Conformance-driven CI for the multi-language client SDK. ONE pure Rust core
+# (dexos-sdk-core) is the single source of truth; every language binding is a
+# thin shim. This workflow regenerates the golden conformance corpus from Rust,
+# diff-gates it, then feeds the SAME committed bytes to the wasm/npm, Python, and
+# TypeScript surfaces and asserts bit-identity. Runs independently of the engine
+# `ci.yml` gates (which `--exclude` the FFI cdylibs).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Fork pull requests receive a read-only token. Every job repeats the
+# declaration so future edits cannot inherit broader repository defaults.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: sdk-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # The gate everything else depends on: the Rust core's ABI-freeze tests pass,
+  # AND regenerating the conformance corpus from Rust produces byte-identical
+  # committed artifacts (vectors.json + the abi_freeze golden .hex files).
+  # ---------------------------------------------------------------------------
+  conformance:
+    name: rust conformance (source of truth)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+      - name: core unit + ABI-freeze tests
+        # abi_freeze pins enum variant ORDER (RpcMethod/RpcError/RpcOk/…) and
+        # per-wire-struct golden bytes; poc pins the signing preimage, signature,
+        # command_hash and framed request.
+        run: cargo test -p dexos-sdk-core --locked
+      - name: regenerate the conformance corpus from Rust
+        run: cargo run -p dexos-xtask --locked -- gen-vectors
+      - name: vectors + golden .hex must match Rust (no drift)
+        run: git diff --exit-code conformance/
+
+  # ---------------------------------------------------------------------------
+  # The public crates advertise rust-version = "1.82" (wider consumer reach than
+  # the engine's 1.92). Prove the floor holds. RUSTUP_TOOLCHAIN overrides the
+  # repo's rust-toolchain.toml (1.92) so the build really runs on 1.82.0.
+  # ---------------------------------------------------------------------------
+  msrv:
+    name: msrv 1.82 (public crates)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      RUSTUP_TOOLCHAIN: "1.82.0"
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          toolchain: "1.82.0"
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+      - name: build the two public Rust crates on the MSRV floor
+        run: cargo build -p dexos-sdk-core -p dexos-sdk --locked
+
+  # ---------------------------------------------------------------------------
+  # wasm/npm surface. RUSTFLAGS must carry BOTH `-D warnings` AND the getrandom
+  # backend cfg: an explicit RUSTFLAGS env replaces (does not merge with) the
+  # per-target rustflags in .cargo/config.toml, so we restate the cfg here.
+  # ---------------------------------------------------------------------------
+  wasm:
+    name: wasm conformance (node PoC + browser)
+    needs: conformance
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      # Applied to every cargo/wasm-pack invocation in this job.
+      RUSTFLAGS: '-D warnings --cfg getrandom_backend="wasm_js"'
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          target: wasm32-unknown-unknown
+          rustflags: '-D warnings --cfg getrandom_backend="wasm_js"'
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+      - uses: taiki-e/install-action@2ca9b94c269419b7b0c711c09d0b21c4e1d51145 # v2
+        with:
+          tool: wasm-pack@0.13.1
+      - name: assert getrandom 0.1 is absent from the wasm cdylib graph
+        # 0.1.x exists elsewhere in the lock but must NOT reach this cdylib.
+        run: |
+          if cargo tree -p dexos-sdk-wasm --target wasm32-unknown-unknown -i getrandom@0.1 2>/dev/null | grep -q getrandom; then
+            echo "getrandom 0.1 leaked into the wasm cdylib graph" >&2
+            exit 1
+          fi
+      - name: build wasm (nodejs target) + node conformance PoC
+        run: |
+          wasm-pack build bindings/wasm --target nodejs --release --out-dir pkg/nodejs
+          node bindings/wasm/tests/poc.test.mjs
+      - name: headless browser conformance
+        run: wasm-pack test --headless --firefox bindings/wasm
+
+  # ---------------------------------------------------------------------------
+  # Python surface. Regenerate + diff-gate the committed type stub, then build
+  # the wheel with maturin (extension-module feature) and run pytest.
+  # PYO3_USE_ABI3_FORWARD_COMPATIBILITY lets pyo3 0.23 build against newer CPython.
+  # ---------------------------------------------------------------------------
+  python:
+    name: python conformance (stub diff + pytest)
+    needs: conformance
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+      - name: regenerate + diff-gate the .pyi (built WITHOUT extension-module)
+        # stub_gen links libpython on the host; the wheel enables extension-module.
+        run: |
+          cargo run -p dexos-sdk-py --bin stub_gen --locked
+          git diff --exit-code bindings/py/python/dexos/_core.pyi
+      - name: build the wheel + run pytest against it
+        run: |
+          python3 -m venv .venv
+          . .venv/bin/activate
+          pip install --upgrade pip
+          pip install 'maturin>=1.7,<2.0' pytest
+          maturin develop -m bindings/py/Cargo.toml
+          pytest bindings/py/python/dexos/tests
+
+  # ---------------------------------------------------------------------------
+  # TypeScript surface. Build the three wasm targets, compile, lint (bans JS
+  # `number` for money), and run vitest (frame bit-identity + wire deepEqual vs
+  # vectors.json). Depends on `wasm` so a broken core fails fast upstream.
+  # ---------------------------------------------------------------------------
+  ts:
+    name: typescript conformance (build + lint + vitest)
+    needs: [conformance, wasm]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      RUSTFLAGS: '-D warnings --cfg getrandom_backend="wasm_js"'
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          target: wasm32-unknown-unknown
+          rustflags: '-D warnings --cfg getrandom_backend="wasm_js"'
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+      - uses: taiki-e/install-action@2ca9b94c269419b7b0c711c09d0b21c4e1d51145 # v2
+        with:
+          tool: wasm-pack@0.13.1
+      - name: install deps
+        run: npm --prefix bindings/ts ci
+      - name: build the three wasm targets (web/nodejs/bundler)
+        run: npm --prefix bindings/ts run codegen:wasm
+      - name: tsc build
+        run: npm --prefix bindings/ts run build
+      - name: lint (bans JS number for money)
+        run: npm --prefix bindings/ts run lint
+      - name: vitest (frame bit-identity + wire deepEqual vs vectors.json)
+        run: npm --prefix bindings/ts test
