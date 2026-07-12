@@ -14,7 +14,7 @@ default = []
 # Real QUIC transport (independent streams + native datagrams) via quinn/rustls.
 # When disabled, `network::quic_supported()` is false and node config must keep
 # enable_quic / enable_datagrams off (fail-closed).
-quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:rustls-pki-types", "dep:bytes"]
+quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:rustls-pki-types", "dep:bytes", "dep:tracing"]
 
 [dependencies]
 types = { path = "../types" }
@@ -35,3 +35,4 @@ rustls = { version = "0.23", optional = true, default-features = false, features
 rcgen = { version = "0.13", optional = true }
 rustls-pki-types = { version = "1", optional = true }
 bytes = { version = "1", optional = true }
+tracing = { workspace = true, optional = true }

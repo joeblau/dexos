@@ -991,6 +991,7 @@ dependencies = [
  "socket2",
  "thiserror",
  "tokio",
+ "tracing",
  "types",
  "x25519-dalek",
 ]

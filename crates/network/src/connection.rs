@@ -200,7 +200,10 @@ pub struct TransportConfig {
     pub max_peer_bytes: usize,
     /// Node-wide (process) reliable-byte ceiling across every peer.
     pub max_node_bytes: usize,
-    /// Maximum accepted datagram payload.
+    /// Maximum accepted datagram payload. On QUIC this is additionally clamped
+    /// per connection to the path's negotiated max datagram frame size (minus
+    /// the frame header), so [`Connection::send_datagram`] fails typed for
+    /// anything the wire cannot carry; `0` disables datagram sends entirely.
     pub datagram_max_bytes: usize,
     /// Per-class semantic payload ceilings, indexed by
     /// [`TrafficClass::priority`]. Oversized semantic messages are rejected
@@ -562,6 +565,12 @@ impl Connection {
     /// Returns [`TransportError::Backpressure`] if the bounded datagram channel
     /// is full (the datagram is shed, not buffered) — lossy delivery never
     /// touches the reliable priority queues.
+    ///
+    /// Returns [`TransportError::MessageTooLarge`] if the payload exceeds the
+    /// datagram ceiling. On QUIC that ceiling is clamped per connection to the
+    /// path's negotiated max datagram frame size, so a payload the wire cannot
+    /// carry is rejected here, synchronously — never accepted and then
+    /// silently shed by the datagram writer.
     pub fn send_datagram(&self, message: &[u8]) -> Result<(), TransportError> {
         // Reject before the payload-sized copy. The datagram cap is far below
         // `max_payload`, so the best-effort path's memory is bounded by
@@ -986,6 +995,33 @@ mod tests {
         ));
         // At the cap it is accepted.
         conn.send_datagram(&[0u8; 16]).unwrap();
+    }
+
+    #[test]
+    fn zero_datagram_cap_fails_every_datagram_send_typed() {
+        // The QUIC transport clamps `datagram_max_bytes` per connection to the
+        // path's max datagram size, and to 0 when the peer does not support
+        // datagrams at all — in which case every send must fail typed rather
+        // than be accepted and silently shed on the wire (#415).
+        let cfg = cfg_with(|c| c.datagram_max_bytes = 0);
+        let out = Arc::new(AsyncPriorityChannel::new(16));
+        let (out_dtx, _out_drx) = mpsc::channel(4);
+        let (_in_dtx, in_drx) = mpsc::channel(4);
+        let conn = Connection::new(
+            PeerId::from([7u8; 32]),
+            out,
+            Arc::new(AsyncPriorityChannel::new(16)),
+            out_dtx,
+            in_drx,
+            &cfg,
+            Vec::new(),
+        );
+        assert!(matches!(
+            conn.send_datagram(&[0u8; 1]),
+            Err(TransportError::MessageTooLarge)
+        ));
+        // Only the empty payload fits a zero ceiling.
+        conn.send_datagram(&[]).unwrap();
     }
 
     #[test]
