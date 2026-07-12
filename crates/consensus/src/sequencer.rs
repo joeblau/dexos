@@ -8,6 +8,14 @@
 //! Each command carries a [`CommandStatus`] that advances monotonically through
 //! `Accepted -> Executed -> Certified -> Finalized`. Transitions never move
 //! backwards; an attempt to do so is a typed error rather than a silent no-op.
+//!
+//! Storage is bounded by a caller-driven watermark: finalized history below the
+//! watermark can be reclaimed via [`Sequencer::prune_below`], and accessing a
+//! reclaimed sequence surfaces as [`SequencerError::Pruned`] — distinct from
+//! [`SequencerError::UnknownSequence`], which is reserved for never-assigned
+//! sequences.
+
+use std::collections::VecDeque;
 
 use serde::{Deserialize, Serialize};
 
@@ -60,6 +68,13 @@ pub enum SequencerError {
     /// A referenced sequence number is not present in the log.
     #[error("unknown sequence {0}")]
     UnknownSequence(u64),
+    /// A referenced sequence number was assigned but its record has been
+    /// reclaimed by [`Sequencer::prune_below`].
+    #[error("sequence pruned: history reclaimed through {through}")]
+    Pruned {
+        /// The highest sequence number that has been pruned (inclusive).
+        through: u64,
+    },
     /// A status transition did not strictly advance the lifecycle.
     #[error("invalid status transition for sequence {sequence}: {from:?} -> {to:?}")]
     InvalidTransition {
@@ -93,12 +108,19 @@ pub struct CommandRecord {
 
 /// A per-shard continuous sequencer.
 ///
-/// Records are stored densely so that index == sequence number; the log is
-/// therefore gap-free by construction.
+/// Records are stored densely so that `sequence == base_sequence + index`; the
+/// log is therefore gap-free by construction. Finalized history strictly below
+/// a caller-supplied watermark can be reclaimed with
+/// [`Sequencer::prune_below`], which pops from the front and advances
+/// `base_sequence` — mirroring `BftEngine::prune_finalized` — so memory stays
+/// proportional to the live (unpruned) suffix rather than the whole history.
 #[derive(Debug, Clone)]
 pub struct Sequencer {
     shard_id: ShardId,
-    records: Vec<CommandRecord>,
+    /// Sequence number of the record at the front of `records`. Everything
+    /// below it has been pruned.
+    base_sequence: u64,
+    records: VecDeque<CommandRecord>,
 }
 
 impl Sequencer {
@@ -107,7 +129,8 @@ impl Sequencer {
     pub fn new(shard_id: ShardId) -> Self {
         Self {
             shard_id,
-            records: Vec::new(),
+            base_sequence: 0,
+            records: VecDeque::new(),
         }
     }
 
@@ -117,25 +140,53 @@ impl Sequencer {
         self.shard_id
     }
 
-    /// Number of sequenced commands.
+    /// Number of records currently retained (assigned and not yet pruned).
     #[must_use]
     pub fn len(&self) -> usize {
         self.records.len()
     }
 
-    /// Whether the log is empty.
+    /// Whether no records are currently retained.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
+    }
+
+    /// The lowest sequence number still retained; every sequence below it has
+    /// been reclaimed by [`Sequencer::prune_below`]. Zero when nothing has
+    /// been pruned.
+    #[must_use]
+    pub fn base_sequence(&self) -> SequenceNumber {
+        SequenceNumber::new(self.base_sequence)
     }
 
     /// The next sequence number that will be assigned.
     ///
     /// Returns [`SequencerError::Exhausted`] if the space is full.
     pub fn next_sequence(&self) -> Result<SequenceNumber, SequencerError> {
-        u64::try_from(self.records.len())
+        let retained = u64::try_from(self.records.len()).map_err(|_| SequencerError::Exhausted)?;
+        self.base_sequence
+            .checked_add(retained)
             .map(SequenceNumber::new)
-            .map_err(|_| SequencerError::Exhausted)
+            .ok_or(SequencerError::Exhausted)
+    }
+
+    /// Index of `sequence` within the retained window.
+    ///
+    /// Returns [`SequencerError::Pruned`] if `sequence` falls below the prune
+    /// watermark and [`SequencerError::UnknownSequence`] if it was never
+    /// assigned.
+    fn index_of(&self, sequence: u64) -> Result<usize, SequencerError> {
+        let offset = sequence.checked_sub(self.base_sequence).ok_or({
+            SequencerError::Pruned {
+                through: self.base_sequence.saturating_sub(1),
+            }
+        })?;
+        let idx = usize::try_from(offset).map_err(|_| SequencerError::UnknownSequence(sequence))?;
+        if idx >= self.records.len() {
+            return Err(SequencerError::UnknownSequence(sequence));
+        }
+        Ok(idx)
     }
 
     /// Assign the next sequence number to `command_hash` and admit it as
@@ -143,7 +194,7 @@ impl Sequencer {
     /// sequences produce identical numbering.
     pub fn accept(&mut self, command_hash: Hash) -> Result<SequenceNumber, SequencerError> {
         let seq = self.next_sequence()?;
-        self.records.push(CommandRecord {
+        self.records.push_back(CommandRecord {
             sequence: seq,
             command_hash,
             status: CommandStatus::Accepted,
@@ -168,7 +219,7 @@ impl Sequencer {
                 got: sequence.get(),
             });
         }
-        self.records.push(CommandRecord {
+        self.records.push_back(CommandRecord {
             sequence,
             command_hash,
             status: CommandStatus::Accepted,
@@ -176,16 +227,22 @@ impl Sequencer {
         Ok(())
     }
 
-    /// The record for `sequence`, if present.
-    #[must_use]
-    pub fn record(&self, sequence: SequenceNumber) -> Option<&CommandRecord> {
-        let idx = usize::try_from(sequence.get()).ok()?;
-        self.records.get(idx)
+    /// The record for `sequence`.
+    ///
+    /// Returns [`SequencerError::Pruned`] if the record was reclaimed and
+    /// [`SequencerError::UnknownSequence`] if it was never assigned.
+    pub fn record(&self, sequence: SequenceNumber) -> Result<&CommandRecord, SequencerError> {
+        let idx = self.index_of(sequence.get())?;
+        self.records
+            .get(idx)
+            .ok_or(SequencerError::UnknownSequence(sequence.get()))
     }
 
-    /// The status of `sequence`, if present.
-    #[must_use]
-    pub fn status(&self, sequence: SequenceNumber) -> Option<CommandStatus> {
+    /// The status of `sequence`.
+    ///
+    /// Returns [`SequencerError::Pruned`] if the record was reclaimed and
+    /// [`SequencerError::UnknownSequence`] if it was never assigned.
+    pub fn status(&self, sequence: SequenceNumber) -> Result<CommandStatus, SequencerError> {
         self.record(sequence).map(|r| r.status)
     }
 
@@ -195,8 +252,7 @@ impl Sequencer {
         sequence: SequenceNumber,
         to: CommandStatus,
     ) -> Result<(), SequencerError> {
-        let idx = usize::try_from(sequence.get())
-            .map_err(|_| SequencerError::UnknownSequence(sequence.get()))?;
+        let idx = self.index_of(sequence.get())?;
         let record = self
             .records
             .get_mut(idx)
@@ -243,7 +299,7 @@ impl Sequencer {
         let mut leaves: Vec<Hash> = Vec::new();
         let mut cur = first.get();
         loop {
-            let idx = usize::try_from(cur).map_err(|_| SequencerError::UnknownSequence(cur))?;
+            let idx = self.index_of(cur)?;
             let record = self
                 .records
                 .get(idx)
@@ -257,6 +313,28 @@ impl Sequencer {
                 .ok_or(SequencerError::UnknownSequence(cur))?;
         }
         Ok(merkle_root(&leaves))
+    }
+
+    /// Reclaim finalized records with sequence strictly below `watermark`,
+    /// popping from the front and advancing the base sequence.
+    ///
+    /// Conservative by construction: pruning stops at the first record that is
+    /// not yet [`CommandStatus::Finalized`], so live history is never dropped
+    /// even if the caller passes a watermark that is too high, and it can
+    /// never advance past the highest-assigned sequence. Callers pass their
+    /// finalized (checkpoint) watermark once it is durable.
+    ///
+    /// Sequence assignment is unaffected: [`Sequencer::next_sequence`] keeps
+    /// counting from where it left off, and [`Sequencer::command_root`] over
+    /// surviving ranges is byte-identical to its pre-prune value.
+    pub fn prune_below(&mut self, watermark: SequenceNumber) {
+        while let Some(front) = self.records.front() {
+            if front.sequence.get() >= watermark.get() || front.status != CommandStatus::Finalized {
+                break;
+            }
+            self.records.pop_front();
+            self.base_sequence = self.base_sequence.saturating_add(1);
+        }
     }
 }
 

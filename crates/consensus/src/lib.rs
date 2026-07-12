@@ -315,11 +315,11 @@ mod tests {
     fn status_transitions_are_forward_only() {
         let mut seq = Sequencer::new(ShardId::new(0));
         let s = seq.accept(Hash::ZERO).unwrap();
-        assert_eq!(seq.status(s), Some(CommandStatus::Accepted));
+        assert_eq!(seq.status(s), Ok(CommandStatus::Accepted));
         seq.mark_executed(s).unwrap();
         seq.mark_certified(s).unwrap();
         seq.mark_finalized(s).unwrap();
-        assert_eq!(seq.status(s), Some(CommandStatus::Finalized));
+        assert_eq!(seq.status(s), Ok(CommandStatus::Finalized));
         // Backwards is rejected.
         assert!(matches!(
             seq.mark_executed(s),
@@ -351,6 +351,109 @@ mod tests {
             seq.command_root(SequenceNumber::new(5), SequenceNumber::new(2)),
             Err(SequencerError::RangeOutOfOrder { .. })
         ));
+    }
+
+    #[test]
+    fn prune_below_reclaims_finalized_history_and_preserves_roots() {
+        let mut seq = Sequencer::new(ShardId::new(0));
+        for i in 0..10u64 {
+            seq.accept(Hash::from_bytes([u8::try_from(i).unwrap(); 32]))
+                .unwrap();
+        }
+        // Finalize the prefix [0, 6) so it becomes reclaimable.
+        for i in 0..6u64 {
+            seq.mark_finalized(SequenceNumber::new(i)).unwrap();
+        }
+        let pre_prune_root = seq
+            .command_root(SequenceNumber::new(6), SequenceNumber::new(9))
+            .unwrap();
+
+        seq.prune_below(SequenceNumber::new(6));
+
+        // Memory: only the live suffix is retained.
+        assert_eq!(seq.len(), 4);
+        assert_eq!(seq.base_sequence(), SequenceNumber::new(6));
+        // Below the watermark: pruned, not unknown.
+        assert_eq!(
+            seq.record(SequenceNumber::new(0)),
+            Err(SequencerError::Pruned { through: 5 })
+        );
+        assert_eq!(
+            seq.status(SequenceNumber::new(5)),
+            Err(SequencerError::Pruned { through: 5 })
+        );
+        assert!(matches!(
+            seq.command_root(SequenceNumber::new(2), SequenceNumber::new(9)),
+            Err(SequencerError::Pruned { through: 5 })
+        ));
+        assert_eq!(
+            seq.mark_executed(SequenceNumber::new(3)),
+            Err(SequencerError::Pruned { through: 5 })
+        );
+        // At/above the watermark: still fully addressable and byte-identical.
+        assert_eq!(
+            seq.record(SequenceNumber::new(6)).unwrap().command_hash,
+            Hash::from_bytes([6u8; 32])
+        );
+        assert_eq!(
+            seq.status(SequenceNumber::new(9)),
+            Ok(CommandStatus::Accepted)
+        );
+        assert_eq!(
+            seq.command_root(SequenceNumber::new(6), SequenceNumber::new(9))
+                .unwrap(),
+            pre_prune_root
+        );
+        // Sequence assignment is unchanged: numbering continues monotonically.
+        assert_eq!(seq.next_sequence().unwrap(), SequenceNumber::new(10));
+        assert_eq!(seq.accept(Hash::ZERO).unwrap(), SequenceNumber::new(10));
+    }
+
+    #[test]
+    fn pruned_sequences_are_distinct_from_unknown() {
+        let mut seq = Sequencer::new(ShardId::new(0));
+        for _ in 0..4u64 {
+            seq.accept(Hash::ZERO).unwrap();
+        }
+        for i in 0..2u64 {
+            seq.mark_finalized(SequenceNumber::new(i)).unwrap();
+        }
+        seq.prune_below(SequenceNumber::new(2));
+        // Reclaimed history is Pruned...
+        assert_eq!(
+            seq.record(SequenceNumber::new(1)),
+            Err(SequencerError::Pruned { through: 1 })
+        );
+        // ...while a never-assigned sequence is still UnknownSequence.
+        assert_eq!(
+            seq.record(SequenceNumber::new(999)),
+            Err(SequencerError::UnknownSequence(999))
+        );
+        assert_eq!(
+            seq.mark_executed(SequenceNumber::new(999)),
+            Err(SequencerError::UnknownSequence(999))
+        );
+    }
+
+    #[test]
+    fn prune_below_stops_at_first_unfinalized_record() {
+        let mut seq = Sequencer::new(ShardId::new(0));
+        for _ in 0..5u64 {
+            seq.accept(Hash::ZERO).unwrap();
+        }
+        // Only [0, 2) is finalized; a too-high watermark must not drop live
+        // records (and can never pass the highest-assigned sequence).
+        for i in 0..2u64 {
+            seq.mark_finalized(SequenceNumber::new(i)).unwrap();
+        }
+        seq.prune_below(SequenceNumber::new(999));
+        assert_eq!(seq.len(), 3);
+        assert_eq!(seq.base_sequence(), SequenceNumber::new(2));
+        assert_eq!(
+            seq.status(SequenceNumber::new(2)),
+            Ok(CommandStatus::Accepted)
+        );
+        assert_eq!(seq.next_sequence().unwrap(), SequenceNumber::new(5));
     }
 
     // ---- leader selection -------------------------------------------------
