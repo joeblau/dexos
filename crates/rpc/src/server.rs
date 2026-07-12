@@ -455,7 +455,7 @@ pub async fn serve(
 /// the admission control in `config`. Runs until the listener fails with a
 /// **fatal** error: transient per-connection accept failures and resource
 /// exhaustion are absorbed by the loop instead of terminating the server (see
-/// [`accept_action`]).
+/// `accept_action`).
 ///
 /// When `config.tls` is [`TlsMode::Required`], each accepted socket performs a
 /// TLS 1.3 handshake before entering the RPC session. The handshake is bounded
@@ -561,10 +561,10 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 ///
 /// # Accept-error resilience (#406)
 /// An accept failure does **not** blindly terminate the server. Errors are
-/// classified by [`accept_action`]: per-connection failures
+/// classified by `accept_action`: per-connection failures
 /// (`ECONNABORTED`/`ECONNRESET`/`EINTR`) are logged and skipped; resource
 /// exhaustion (`EMFILE`/`ENFILE`/`ENOBUFS`/`ENOMEM`) pauses accepting for
-/// [`ACCEPT_BACKOFF`] — still racing the stop signal — so in-flight
+/// `ACCEPT_BACKOFF` — still racing the stop signal — so in-flight
 /// connections can close and free descriptors; only unclassified errors are
 /// fatal. A **fatal** listener error takes the same bounded drain path before
 /// returning the error, so already-admitted connections get a chance to finish
