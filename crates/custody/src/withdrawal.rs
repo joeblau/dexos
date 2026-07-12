@@ -204,9 +204,9 @@ impl WithdrawalCertificate {
         w.var_bytes(&self.request.encode())?;
         w.raw(self.withdrawal_id.as_bytes());
         w.raw(self.checkpoint.as_bytes());
-        // quorum
+        // quorum (the u16 bitmap keeps its legacy 8-byte wire slot)
         w.raw(self.quorum.message.as_bytes());
-        w.u64(self.quorum.signer_bitmap);
+        w.u64(u64::from(self.quorum.signer_bitmap));
         let n = u32::try_from(self.quorum.signatures.len()).map_err(|_| CustodyError::Decode)?;
         w.u32(n);
         for sig in &self.quorum.signatures {
@@ -233,7 +233,8 @@ impl WithdrawalCertificate {
         let withdrawal_id = WithdrawalId::from_bytes(r.array::<32>()?);
         let checkpoint = Hash::from_bytes(r.array::<32>()?);
         let message = Hash::from_bytes(r.array::<32>()?);
-        let signer_bitmap = r.u64()?;
+        // Reject bitmaps naming signers beyond the 16-signer cap.
+        let signer_bitmap = u16::try_from(r.u64()?).map_err(|_| CustodyError::Decode)?;
         let count = usize::try_from(r.u32()?).map_err(|_| CustodyError::Decode)?;
         // Guard against a length field that would demand a huge allocation:
         // each signature is 64 bytes, so the buffer must have room for them.

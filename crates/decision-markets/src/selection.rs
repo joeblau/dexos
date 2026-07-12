@@ -446,7 +446,8 @@ mod tests {
             }
             let quorum = QuorumCertificate {
                 message: payload.digest(),
-                signer_bitmap: r.next(),
+                signer_bitmap: u16::try_from(r.next() & u64::from(u16::MAX))
+                    .expect("masked to 16 bits"),
                 signatures: vec![sig],
             };
             let c = DecisionConfirmation { payload, quorum };

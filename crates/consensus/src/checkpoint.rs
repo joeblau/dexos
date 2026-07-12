@@ -595,11 +595,12 @@ impl WitnessCollector {
             .receipts
             .get(&digest)
             .ok_or(CheckpointError::BelowThreshold)?;
-        let mut bitmap: u64 = 0;
+        let mut bitmap: u16 = 0;
         let mut signatures: Vec<[u8; 64]> = Vec::with_capacity(per_digest.len());
         let mut weight: u64 = 0;
         for (&index, signature) in per_digest {
-            bitmap |= 1u64 << index;
+            // index < MAX_VALIDATORS (16) is guaranteed at admission time.
+            bitmap |= 1u16 << index;
             signatures.push(*signature);
             weight = weight.saturating_add(
                 committee

@@ -129,7 +129,8 @@ mod tests {
         let signatures = (0..count).map(|_| array64(lcg)).collect();
         crypto::QuorumCertificate {
             message: Hash::from_bytes(array32(lcg)),
-            signer_bitmap: lcg.next_u64(),
+            signer_bitmap: u16::try_from(lcg.next_u64() & u64::from(u16::MAX))
+                .expect("masked to 16 bits"),
             signatures,
         }
     }

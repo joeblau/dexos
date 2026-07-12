@@ -4,8 +4,8 @@ use crate::codec::{Codec, CodecError, Reader, Writer};
 use crypto::QuorumCertificate;
 use types::{AccountId, Amount, Hash};
 
-/// A `u64` bitmap has at most 64 set bits, so a quorum never carries more.
-pub const MAX_QUORUM_SIGNATURES: usize = 64;
+/// A `u16` bitmap has at most 16 set bits, so a quorum never carries more.
+pub const MAX_QUORUM_SIGNATURES: usize = 16;
 
 impl Codec for Hash {
     fn write(&self, w: &mut Writer) {
@@ -37,7 +37,7 @@ impl Codec for AccountId {
 impl Codec for QuorumCertificate {
     fn write(&self, w: &mut Writer) {
         self.message.write(w);
-        w.u64(self.signer_bitmap);
+        w.u16(self.signer_bitmap);
         w.len(self.signatures.len());
         for sig in &self.signatures {
             w.array64(sig);
@@ -45,7 +45,7 @@ impl Codec for QuorumCertificate {
     }
     fn read(r: &mut Reader<'_>) -> Result<Self, CodecError> {
         let message = Hash::read(r)?;
-        let signer_bitmap = r.u64()?;
+        let signer_bitmap = r.u16()?;
         let count = r.len()?;
         if count > MAX_QUORUM_SIGNATURES {
             return Err(CodecError::LengthOutOfRange);
@@ -89,7 +89,7 @@ mod tests {
     fn oversized_signature_vec_rejected() {
         let mut w = Writer::new();
         Hash::ZERO.write(&mut w);
-        w.u64(0);
+        w.u16(0);
         w.len(MAX_QUORUM_SIGNATURES + 1);
         // No signatures follow; length guard trips first.
         assert!(matches!(

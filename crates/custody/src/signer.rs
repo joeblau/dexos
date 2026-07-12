@@ -217,8 +217,8 @@ impl KeyRef {
     }
 }
 
-/// Largest supported signer set (bounded by the 64-bit quorum bitmap).
-pub const MAX_SIGNERS: usize = 64;
+/// Largest supported signer set (bounded by the 16-bit quorum bitmap).
+pub const MAX_SIGNERS: usize = 16;
 
 /// A `t`-of-`n` threshold signer set at a given rotation epoch.
 ///
@@ -303,10 +303,10 @@ impl<S: Signer> SignerSet<S> {
         idx.sort_unstable();
         idx.dedup();
 
-        let mut signer_bitmap = 0u64;
+        let mut signer_bitmap = 0u16;
         let mut signatures = Vec::with_capacity(idx.len());
         for &i in &idx {
-            signer_bitmap |= 1u64 << i;
+            signer_bitmap |= 1u16 << i;
             signatures.push(self.signers[i].sign(&message)?);
         }
         Ok(QuorumCertificate {
