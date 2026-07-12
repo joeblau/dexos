@@ -57,8 +57,8 @@ pub use limits::RateLimit;
 pub use request::{RpcMethod, RpcRequest};
 pub use response::{RpcOk, RpcResponse, RpcResult};
 pub use server::{
-    handle_connection, handle_connection_with, serve, serve_with_config, ServerConfig, ServerError,
-    TlsMode,
+    handle_connection, handle_connection_with, serve, serve_with_config, serve_with_shutdown,
+    ServerConfig, ServerError, TlsMode,
 };
 pub use session::{
     authorize_private_topic, session_may_read, Session, SessionBinding, SessionLookup,
