@@ -15,9 +15,52 @@
 //!                       Archived                       Resolved/Invalid ─▶ Settled ─▶ Archived
 //! ```
 
+use serde::{Deserialize, Serialize};
 use types::MarketLifecycle;
 
 use crate::error::LifecycleError;
+
+/// Typed reason a market entered [`MarketLifecycle::Halted`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HaltReason {
+    /// Operator / admin halt.
+    Admin,
+    /// Price oracle is Stale or Halted.
+    OracleUnhealthy,
+    /// Risk / circuit-breaker halt.
+    Risk,
+    /// Bootstrap liquidity or stake path failed.
+    BootstrapFailed,
+    /// External dependency failure.
+    External,
+}
+
+/// Recovery predicate that must hold before a halt may be cleared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HaltState {
+    /// Why the market halted.
+    pub reason: HaltReason,
+    /// Lifecycle state immediately prior to the halt.
+    pub prior: MarketLifecycle,
+}
+
+impl HaltState {
+    /// Construct a halt record.
+    #[must_use]
+    pub fn new(reason: HaltReason, prior: MarketLifecycle) -> Self {
+        Self { reason, prior }
+    }
+
+    /// The only legal resume target for this halt (never skips bootstrapping).
+    #[must_use]
+    pub fn resume_target(self) -> Option<MarketLifecycle> {
+        match self.prior {
+            MarketLifecycle::Open | MarketLifecycle::Bootstrapping => Some(self.prior),
+            _ => None,
+        }
+    }
+}
 
 /// Every lifecycle state, in canonical order. Used by exhaustive tests and by
 /// reachability analysis.
@@ -54,7 +97,9 @@ pub fn is_legal_transition(from: MarketLifecycle, to: MarketLifecycle) -> bool {
             | (Bootstrapping, Halted)
             | (Open, Halted)
             | (Open, Closed)
+            // Resume returns to the prior phase only — never Bootstrapping -> Halted -> Open.
             | (Halted, Open)
+            | (Halted, Bootstrapping)
             | (Halted, Closed)
             | (Halted, Archived)
             | (Closed, PendingResolution)
@@ -111,6 +156,7 @@ mod tests {
         (MarketLifecycle::Open, MarketLifecycle::Halted),
         (MarketLifecycle::Open, MarketLifecycle::Closed),
         (MarketLifecycle::Halted, MarketLifecycle::Open),
+        (MarketLifecycle::Halted, MarketLifecycle::Bootstrapping),
         (MarketLifecycle::Halted, MarketLifecycle::Closed),
         (MarketLifecycle::Halted, MarketLifecycle::Archived),
         (MarketLifecycle::Closed, MarketLifecycle::PendingResolution),
@@ -222,5 +268,35 @@ mod tests {
         assert!(accepts_orders(MarketLifecycle::Open));
         assert!(!accepts_orders(MarketLifecycle::Halted));
         assert!(!accepts_orders(MarketLifecycle::Closed));
+    }
+
+    #[test]
+    fn halt_resume_target_never_skips_bootstrap() {
+        let h = HaltState::new(HaltReason::OracleUnhealthy, MarketLifecycle::Bootstrapping);
+        assert_eq!(h.resume_target(), Some(MarketLifecycle::Bootstrapping));
+        assert!(is_legal_transition(
+            MarketLifecycle::Halted,
+            MarketLifecycle::Bootstrapping
+        ));
+        let h = HaltState::new(HaltReason::Admin, MarketLifecycle::Open);
+        assert_eq!(h.resume_target(), Some(MarketLifecycle::Open));
+        // Prior Draft cannot resume to Open through halt.
+        let h = HaltState::new(HaltReason::Admin, MarketLifecycle::Draft);
+        assert_eq!(h.resume_target(), None);
+    }
+
+    #[test]
+    fn every_halt_reason_has_recovery_predicate() {
+        for reason in [
+            HaltReason::Admin,
+            HaltReason::OracleUnhealthy,
+            HaltReason::Risk,
+            HaltReason::BootstrapFailed,
+            HaltReason::External,
+        ] {
+            let h = HaltState::new(reason, MarketLifecycle::Open);
+            assert_eq!(h.reason, reason);
+            assert_eq!(h.resume_target(), Some(MarketLifecycle::Open));
+        }
     }
 }

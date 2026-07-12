@@ -13,10 +13,10 @@ pub mod ledger;
 pub mod session;
 
 pub use command::{
-    Authorization, AuthorizeSession, BindWallet, CancelAll, CancelOrder, Command, CompleteSetOp,
-    CreateAccount, CreateMarket, DepositCredit, DeterministicEngine, ExecutionReceipt,
+    ApplyFundingEpoch, Authorization, AuthorizeSession, BindWallet, CancelAll, CancelOrder, Command,
+    CompleteSetOp, CreateAccount, CreateMarket, DepositCredit, DeterministicEngine, ExecutionReceipt,
     FinalizeWithdrawal, Liquidate, PlaceOrder, ProtocolUpgrade, ReceiptKind, ReplaceOrder,
-    RequestWithdrawal, RevokeSession, SetMarkPrice, Timestamp,
+    RequestWithdrawal, RevokeSession, SetMarkPrice, SetMarketLifecycle, SetOracleHealth, Timestamp,
 };
 pub use engine::{Engine, EngineConfig, WalletBinding};
 pub use error::ExecutionError;
@@ -1261,6 +1261,417 @@ mod tests {
                 }),
             ),
             Err(ExecutionError::UnknownAccount)
+        );
+    }
+
+    // -------- #292 trading gates, resting IM, replace risk, reduce-only --------
+
+    #[test]
+    fn closed_or_halted_markets_reject_new_risk() {
+        use types::{MarketLifecycle, OracleHealth};
+        let mut e = engine();
+        e.execute(
+            seq(1),
+            Command::CreateAccount(CreateAccount {
+                initial_collateral: amt(100_000_000),
+            }),
+        )
+        .unwrap();
+        e.execute(
+            seq(2),
+            Command::CreateMarket(CreateMarket {
+                market: MarketId::new(0),
+                market_type: MarketType::Perpetual,
+                outcomes: 1,
+                mark_price: Price::from_raw(1_000_000),
+            }),
+        )
+        .unwrap();
+        e.execute(
+            seq(3),
+            Command::SetMarketLifecycle(SetMarketLifecycle {
+                market: MarketId::new(0),
+                lifecycle: MarketLifecycle::Halted,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            e.execute(seq(4), place_bid(0, 1, 1_000_000, Authorization::Master)),
+            Err(ExecutionError::MarketNotOpen)
+        );
+        e.execute(
+            seq(5),
+            Command::SetMarketLifecycle(SetMarketLifecycle {
+                market: MarketId::new(0),
+                lifecycle: MarketLifecycle::Open,
+            }),
+        )
+        .unwrap();
+        e.execute(
+            seq(6),
+            Command::SetOracleHealth(SetOracleHealth {
+                market: MarketId::new(0),
+                health: OracleHealth::Stale,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            e.execute(seq(7), place_bid(0, 2, 1_000_000, Authorization::Master)),
+            Err(ExecutionError::OracleRiskFrozen)
+        );
+    }
+
+    #[test]
+    fn resting_notional_consumes_free_collateral() {
+        let mut e = engine();
+        // Small collateral so a large rest exhausts free collateral.
+        e.execute(
+            seq(1),
+            Command::CreateAccount(CreateAccount {
+                initial_collateral: amt(10_000_000), // 10.0
+            }),
+        )
+        .unwrap();
+        e.execute(
+            seq(2),
+            Command::CreateMarket(CreateMarket {
+                market: MarketId::new(0),
+                market_type: MarketType::Perpetual,
+                outcomes: 1,
+                mark_price: Price::from_raw(1_000_000),
+            }),
+        )
+        .unwrap();
+        // Rest 50 qty @ 1.0 => notional 50, IM 10% = 5.0; free becomes 5.0.
+        e.execute(
+            seq(3),
+            Command::PlaceOrder(PlaceOrder {
+                account: AccountId::new(0),
+                market: MarketId::new(0),
+                order_id: OrderId::new(1),
+                side: Side::Bid,
+                order_type: OrderType::Limit,
+                tif: TimeInForce::Gtc,
+                price: Price::from_raw(1_000_000),
+                quantity: Quantity::from_raw(50_000_000),
+                client_id: 1,
+                reduce_only: false,
+                auth: Authorization::Master,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            e.risk().reserved_resting(AccountId::new(0)).unwrap(),
+            amt(50_000_000)
+        );
+        // Another 51 notional would push projected exposure to 101 -> IM 10.1 > 10.
+        assert!(matches!(
+            e.execute(
+                seq(4),
+                Command::PlaceOrder(PlaceOrder {
+                    account: AccountId::new(0),
+                    market: MarketId::new(0),
+                    order_id: OrderId::new(2),
+                    side: Side::Bid,
+                    order_type: OrderType::Limit,
+                    tif: TimeInForce::Gtc,
+                    price: Price::from_raw(1_000_000),
+                    quantity: Quantity::from_raw(51_000_000),
+                    client_id: 2,
+                    reduce_only: false,
+                    auth: Authorization::Master,
+                }),
+            ),
+            Err(ExecutionError::Risk(_))
+        ));
+        // Cancel releases the reservation.
+        e.execute(
+            seq(5),
+            Command::CancelOrder(CancelOrder {
+                market: MarketId::new(0),
+                account: AccountId::new(0),
+                order_id: OrderId::new(1),
+                auth: Authorization::Master,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            e.risk().reserved_resting(AccountId::new(0)).unwrap(),
+            amt(0)
+        );
+    }
+
+    #[test]
+    fn replace_revalidates_risk_atomically() {
+        let mut e = engine();
+        e.execute(
+            seq(1),
+            Command::CreateAccount(CreateAccount {
+                initial_collateral: amt(10_000_000),
+            }),
+        )
+        .unwrap();
+        e.execute(
+            seq(2),
+            Command::CreateMarket(CreateMarket {
+                market: MarketId::new(0),
+                market_type: MarketType::Perpetual,
+                outcomes: 1,
+                mark_price: Price::from_raw(1_000_000),
+            }),
+        )
+        .unwrap();
+        // Rest small order.
+        e.execute(
+            seq(3),
+            Command::PlaceOrder(PlaceOrder {
+                account: AccountId::new(0),
+                market: MarketId::new(0),
+                order_id: OrderId::new(1),
+                side: Side::Bid,
+                order_type: OrderType::Limit,
+                tif: TimeInForce::Gtc,
+                price: Price::from_raw(900_000),
+                quantity: Quantity::from_raw(1_000_000),
+                client_id: 1,
+                reduce_only: false,
+                auth: Authorization::Master,
+            }),
+        )
+        .unwrap();
+        let free_before = e.risk().free_collateral(AccountId::new(0)).unwrap();
+        // Replace with huge notional that fails risk; original must remain.
+        assert!(matches!(
+            e.execute(
+                seq(4),
+                Command::ReplaceOrder(ReplaceOrder {
+                    market: MarketId::new(0),
+                    account: AccountId::new(0),
+                    order_id: OrderId::new(1),
+                    price: Price::from_raw(1_000_000),
+                    quantity: Quantity::from_raw(1_000_000_000),
+                    auth: Authorization::Master,
+                }),
+            ),
+            Err(ExecutionError::Risk(_))
+        ));
+        assert_eq!(e.market_resting_len(MarketId::new(0)), Some(1));
+        assert_eq!(
+            e.risk().free_collateral(AccountId::new(0)).unwrap(),
+            free_before
+        );
+    }
+
+    #[test]
+    fn reduce_only_clamps_to_risk_position() {
+        let mut e = engine();
+        e.execute(
+            seq(1),
+            Command::CreateAccount(CreateAccount {
+                initial_collateral: amt(100_000_000),
+            }),
+        )
+        .unwrap();
+        e.execute(
+            seq(2),
+            Command::CreateAccount(CreateAccount {
+                initial_collateral: amt(100_000_000),
+            }),
+        )
+        .unwrap();
+        e.execute(
+            seq(3),
+            Command::CreateMarket(CreateMarket {
+                market: MarketId::new(0),
+                market_type: MarketType::Perpetual,
+                outcomes: 1,
+                mark_price: Price::from_raw(1_000_000),
+            }),
+        )
+        .unwrap();
+        // Maker long 2, taker short 2.
+        e.execute(
+            seq(4),
+            Command::PlaceOrder(PlaceOrder {
+                account: AccountId::new(0),
+                market: MarketId::new(0),
+                order_id: OrderId::new(1),
+                side: Side::Bid,
+                order_type: OrderType::Limit,
+                tif: TimeInForce::Gtc,
+                price: Price::from_raw(1_000_000),
+                quantity: Quantity::from_raw(2_000_000),
+                client_id: 1,
+                reduce_only: false,
+                auth: Authorization::Master,
+            }),
+        )
+        .unwrap();
+        e.execute(
+            seq(5),
+            Command::PlaceOrder(PlaceOrder {
+                account: AccountId::new(1),
+                market: MarketId::new(0),
+                order_id: OrderId::new(2),
+                side: Side::Ask,
+                order_type: OrderType::Limit,
+                tif: TimeInForce::Gtc,
+                price: Price::from_raw(1_000_000),
+                quantity: Quantity::from_raw(2_000_000),
+                client_id: 2,
+                reduce_only: false,
+                auth: Authorization::Master,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            e.risk()
+                .position(AccountId::new(0), MarketId::new(0))
+                .unwrap(),
+            Quantity::from_raw(2_000_000)
+        );
+        // Reduce-only sell 5 should clamp to position 2.
+        // Rest a bid for the counterparty to take.
+        e.execute(
+            seq(6),
+            Command::PlaceOrder(PlaceOrder {
+                account: AccountId::new(1),
+                market: MarketId::new(0),
+                order_id: OrderId::new(3),
+                side: Side::Bid,
+                order_type: OrderType::Limit,
+                tif: TimeInForce::Gtc,
+                price: Price::from_raw(1_000_000),
+                quantity: Quantity::from_raw(5_000_000),
+                client_id: 3,
+                reduce_only: false,
+                auth: Authorization::Master,
+            }),
+        )
+        .unwrap();
+        let r = e
+            .execute(
+                seq(7),
+                Command::PlaceOrder(PlaceOrder {
+                    account: AccountId::new(0),
+                    market: MarketId::new(0),
+                    order_id: OrderId::new(4),
+                    side: Side::Ask,
+                    order_type: OrderType::Limit,
+                    tif: TimeInForce::Gtc,
+                    price: Price::from_raw(1_000_000),
+                    quantity: Quantity::from_raw(5_000_000),
+                    client_id: 4,
+                    reduce_only: true,
+                    auth: Authorization::Master,
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            r.kind,
+            ReceiptKind::OrderApplied {
+                filled: Quantity::from_raw(2_000_000),
+                rested: false
+            }
+        );
+        assert_eq!(
+            e.risk()
+                .position(AccountId::new(0), MarketId::new(0))
+                .unwrap(),
+            Quantity::ZERO
+        );
+    }
+
+    #[test]
+    fn funding_epoch_applies_once_across_replay() {
+        let mut e = engine();
+        e.execute(
+            seq(1),
+            Command::CreateAccount(CreateAccount {
+                initial_collateral: amt(100_000_000),
+            }),
+        )
+        .unwrap();
+        e.execute(
+            seq(2),
+            Command::CreateAccount(CreateAccount {
+                initial_collateral: amt(100_000_000),
+            }),
+        )
+        .unwrap();
+        e.execute(
+            seq(3),
+            Command::CreateMarket(CreateMarket {
+                market: MarketId::new(0),
+                market_type: MarketType::Perpetual,
+                outcomes: 1,
+                mark_price: Price::from_raw(1_000_000),
+            }),
+        )
+        .unwrap();
+        e.execute(
+            seq(4),
+            Command::PlaceOrder(PlaceOrder {
+                account: AccountId::new(0),
+                market: MarketId::new(0),
+                order_id: OrderId::new(1),
+                side: Side::Bid,
+                order_type: OrderType::Limit,
+                tif: TimeInForce::Gtc,
+                price: Price::from_raw(1_000_000),
+                quantity: Quantity::from_raw(2_000_000),
+                client_id: 1,
+                reduce_only: false,
+                auth: Authorization::Master,
+            }),
+        )
+        .unwrap();
+        e.execute(
+            seq(5),
+            Command::PlaceOrder(PlaceOrder {
+                account: AccountId::new(1),
+                market: MarketId::new(0),
+                order_id: OrderId::new(2),
+                side: Side::Ask,
+                order_type: OrderType::Limit,
+                tif: TimeInForce::Gtc,
+                price: Price::from_raw(1_000_000),
+                quantity: Quantity::from_raw(2_000_000),
+                client_id: 2,
+                reduce_only: false,
+                auth: Authorization::Master,
+            }),
+        )
+        .unwrap();
+        let rate = types::Ratio::from_bps(100).unwrap(); // 1%
+        e.execute(
+            seq(6),
+            Command::ApplyFundingEpoch(ApplyFundingEpoch {
+                market: MarketId::new(0),
+                epoch: 1,
+                rate,
+            }),
+        )
+        .unwrap();
+        // Long pays 2 * 1% = 0.02; short receives.
+        assert_eq!(
+            e.risk().collateral(AccountId::new(0)).unwrap(),
+            amt(99_980_000)
+        );
+        assert_eq!(
+            e.risk().collateral(AccountId::new(1)).unwrap(),
+            amt(100_020_000)
+        );
+        assert_eq!(
+            e.execute(
+                seq(7),
+                Command::ApplyFundingEpoch(ApplyFundingEpoch {
+                    market: MarketId::new(0),
+                    epoch: 1,
+                    rate,
+                }),
+            ),
+            Err(ExecutionError::FundingEpochConflict)
         );
     }
 }

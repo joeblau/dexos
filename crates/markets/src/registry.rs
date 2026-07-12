@@ -20,7 +20,7 @@ use types::{
 use crate::config::{FeeSchedule, LifecycleConfig, OracleConfig, ResolverConfig, MAX_BPS};
 use crate::error::{EscrowError, MarketError, PayoutError, ResolutionError};
 use crate::escrow::EscrowLedger;
-use crate::lifecycle;
+use crate::lifecycle::{self, HaltReason, HaltState};
 use crate::payout::{invalid_refund, CompleteSetPool, PayoutRule, Settlement};
 use crate::perpetual::PerpMarketState;
 use crate::resolution::{
@@ -114,6 +114,14 @@ struct MarketRecord {
     policy: Option<ResolutionPolicy>,
     /// Progress of the current resolution round, once a proposal is made.
     round_state: Option<ResolutionRoundState>,
+    /// Active halt metadata (reason + prior state), present only while Halted.
+    halt: Option<HaltState>,
+    /// Latest observed price-oracle health for resume gates.
+    oracle_health: OracleHealth,
+    /// Resting order count reported by the execution layer (liability for archive).
+    open_orders: u64,
+    /// Outstanding withdrawal claims / locked user collateral units.
+    locked_user_collateral: Amount,
 }
 
 /// A replayable market command over the lifecycle-management subset. Resolution
@@ -156,9 +164,14 @@ pub enum MarketCommand {
         /// Liquidity added.
         amount: Amount,
     },
-    /// Halt an `Open`/`Bootstrapping` market.
-    HaltMarket(MarketId),
-    /// Resume a `Halted` market to `Open`.
+    /// Halt an `Open`/`Bootstrapping` market with a typed reason.
+    HaltMarket {
+        /// Target market.
+        market_id: MarketId,
+        /// Why the market is halted.
+        reason: HaltReason,
+    },
+    /// Resume a `Halted` market to its prior phase after prerequisite checks.
     ResumeMarket(MarketId),
     /// Close trading at sequence `now` (`Open -> Closed`).
     CloseMarket {
@@ -393,6 +406,10 @@ impl MarketRegistry {
             settled: false,
             policy: None,
             round_state: None,
+            halt: None,
+            oracle_health: OracleHealth::Halted,
+            open_orders: 0,
+            locked_user_collateral: Amount::ZERO,
         };
         self.markets.insert(record.definition.market_id, record);
         Ok(())
@@ -559,20 +576,146 @@ impl MarketRegistry {
         Ok(())
     }
 
-    /// Halt an `Open` or `Bootstrapping` market.
+    /// Halt an `Open` or `Bootstrapping` market with a typed reason. Persists
+    /// the prior lifecycle so resume cannot skip bootstrapping.
     ///
     /// # Errors
     /// [`MarketError::Lifecycle`] if not haltable.
-    pub fn halt_market(&mut self, market_id: MarketId) -> Result<(), MarketError> {
-        self.transition(market_id, MarketLifecycle::Halted)
+    pub fn halt_market(
+        &mut self,
+        market_id: MarketId,
+        reason: HaltReason,
+    ) -> Result<(), MarketError> {
+        let record = self.record(market_id)?;
+        let prior = record.lifecycle;
+        if !matches!(
+            prior,
+            MarketLifecycle::Open | MarketLifecycle::Bootstrapping
+        ) {
+            return Err(MarketError::Lifecycle(crate::LifecycleError::IllegalTransition {
+                from: prior,
+                to: MarketLifecycle::Halted,
+            }));
+        }
+        self.transition(market_id, MarketLifecycle::Halted)?;
+        let record = self.record_mut(market_id)?;
+        record.halt = Some(HaltState::new(reason, prior));
+        Ok(())
     }
 
-    /// Resume a `Halted` market to `Open`.
+    /// Resume a `Halted` market to its prior phase after revalidating stake,
+    /// bootstrap liquidity, and oracle health. Never opens a market that was
+    /// halted during bootstrapping.
     ///
     /// # Errors
-    /// [`MarketError::Lifecycle`] if not resumable.
+    /// [`MarketError::ResumePrerequisites`], [`MarketError::OracleUnhealthy`],
+    /// or [`MarketError::Lifecycle`].
     pub fn resume_market(&mut self, market_id: MarketId) -> Result<(), MarketError> {
-        self.transition(market_id, MarketLifecycle::Open)
+        let record = self.record(market_id)?;
+        if record.lifecycle != MarketLifecycle::Halted {
+            return Err(MarketError::Lifecycle(crate::LifecycleError::IllegalTransition {
+                from: record.lifecycle,
+                to: MarketLifecycle::Open,
+            }));
+        }
+        let halt = record.halt.ok_or(MarketError::ResumePrerequisites)?;
+        let target = halt.resume_target().ok_or(MarketError::ResumePrerequisites)?;
+
+        // Stake must still meet the requirement.
+        let stake_ok = record.definition.sponsor_set.total_stake().raw()
+            >= record.definition.stake_requirement.raw();
+        if !stake_ok {
+            return Err(MarketError::ResumePrerequisites);
+        }
+        // Resuming to Open requires bootstrap threshold and a usable oracle.
+        if target == MarketLifecycle::Open {
+            let boot_ok = record.bootstrapped.raw()
+                >= record
+                    .definition
+                    .lifecycle_config
+                    .bootstrap_liquidity_threshold
+                    .raw();
+            if !boot_ok {
+                return Err(MarketError::ResumePrerequisites);
+            }
+            if matches!(
+                record.oracle_health,
+                OracleHealth::Halted | OracleHealth::Stale
+            ) {
+                return Err(MarketError::OracleUnhealthy);
+            }
+            // Oracle-unhealthy halt cannot clear while still unhealthy.
+            if halt.reason == HaltReason::OracleUnhealthy
+                && record.oracle_health != OracleHealth::Normal
+                && record.oracle_health != OracleHealth::Degraded
+            {
+                return Err(MarketError::OracleUnhealthy);
+            }
+        }
+        self.transition(market_id, target)?;
+        let record = self.record_mut(market_id)?;
+        record.halt = None;
+        Ok(())
+    }
+
+    /// Update the observed price-oracle health for resume / trading gates.
+    pub fn set_oracle_health(
+        &mut self,
+        market_id: MarketId,
+        health: OracleHealth,
+    ) -> Result<(), MarketError> {
+        let record = self.record_mut(market_id)?;
+        record.oracle_health = health;
+        Ok(())
+    }
+
+    /// Report resting order count (from the execution book) for archive gates.
+    pub fn set_open_orders(
+        &mut self,
+        market_id: MarketId,
+        open_orders: u64,
+    ) -> Result<(), MarketError> {
+        let record = self.record_mut(market_id)?;
+        record.open_orders = open_orders;
+        Ok(())
+    }
+
+    /// Report locked user collateral outstanding against this market.
+    pub fn set_locked_user_collateral(
+        &mut self,
+        market_id: MarketId,
+        amount: Amount,
+    ) -> Result<(), MarketError> {
+        if amount.is_negative() {
+            return Err(MarketError::ParameterOutOfRange);
+        }
+        let record = self.record_mut(market_id)?;
+        record.locked_user_collateral = amount;
+        Ok(())
+    }
+
+    /// Apply a sequenced perpetual funding epoch exactly once.
+    pub fn apply_funding_epoch(
+        &mut self,
+        market_id: MarketId,
+        epoch: u64,
+        rate: types::Ratio,
+        mark: Price,
+    ) -> Result<crate::FundingEpochReceipt, MarketError> {
+        let record = self.record_mut(market_id)?;
+        Ok(record.perp.apply_funding_epoch(epoch, rate, mark)?)
+    }
+
+    /// The halt state of a market, if currently halted.
+    #[must_use]
+    pub fn halt_state(&self, market_id: MarketId) -> Option<HaltState> {
+        self.markets.get(&market_id).and_then(|r| r.halt)
+    }
+
+    /// Observed oracle health for a market.
+    #[must_use]
+    pub fn oracle_health(&self, market_id: MarketId) -> Option<OracleHealth> {
+        self.markets.get(&market_id).map(|r| r.oracle_health)
     }
 
     /// Close trading (`Open -> Closed`) once `now` reaches the configured close
@@ -597,12 +740,44 @@ impl MarketRegistry {
         self.transition(market_id, MarketLifecycle::PendingResolution)
     }
 
-    /// Archive a `Settled` (or abandoned `Halted`) market.
+    /// Archive a `Settled` (or abandoned `Halted`) market only when liabilities
+    /// are zero: no open orders, no complete-set claims, no locked user
+    /// collateral, no open disputes, and escrow is fully released (or the
+    /// market completed a forced invalid/refund settlement).
     ///
     /// # Errors
-    /// [`MarketError::Lifecycle`] if not archivable.
+    /// [`MarketError::ArchiveLiabilities`] or [`MarketError::Lifecycle`].
     pub fn archive_market(&mut self, market_id: MarketId) -> Result<(), MarketError> {
-        self.transition(market_id, MarketLifecycle::Archived)
+        let record = self.record(market_id)?;
+        if record.open_orders != 0 {
+            return Err(MarketError::ArchiveLiabilities);
+        }
+        if record.locked_user_collateral.raw() != 0 {
+            return Err(MarketError::ArchiveLiabilities);
+        }
+        if let Some(pool) = &record.pool {
+            if pool.outstanding().iter().any(|a| a.raw() != 0) {
+                return Err(MarketError::ArchiveLiabilities);
+            }
+        }
+        // Open dispute / unresolved challenge blocks archive.
+        if let Some(rs) = &record.round_state {
+            if !rs.challenges.is_empty() && !rs.adjudicated {
+                return Err(MarketError::ArchiveLiabilities);
+            }
+        }
+        if record.lifecycle == MarketLifecycle::Halted {
+            // Abandoned halt: require no sponsor stake still locked and no
+            // bootstrap escrow (forced clear). Settled path uses Settled state.
+            let stake = record.definition.sponsor_set.total_stake();
+            if stake.raw() != 0 || record.bootstrapped.raw() != 0 {
+                return Err(MarketError::ArchiveLiabilities);
+            }
+        }
+        self.transition(market_id, MarketLifecycle::Archived)?;
+        let record = self.record_mut(market_id)?;
+        record.halt = None;
+        Ok(())
     }
 
     /// Update mutable parameters (fee schedule, metadata) while in `Draft` or
@@ -1143,7 +1318,9 @@ impl MarketRegistry {
                 funding_account,
                 amount,
             } => self.add_bootstrap_liquidity(market_id, funding_account, amount),
-            MarketCommand::HaltMarket(id) => self.halt_market(id),
+            MarketCommand::HaltMarket { market_id, reason } => {
+                self.halt_market(market_id, reason)
+            }
             MarketCommand::ResumeMarket(id) => self.resume_market(id),
             MarketCommand::CloseMarket { market_id, now } => self.close_market(market_id, now),
             MarketCommand::BeginResolution(id) => self.begin_resolution(id),
@@ -1945,7 +2122,10 @@ mod tests {
                         funding_account: account,
                         amount: Amount::from_raw(i128::from(r.next_u64() % 6_000_000)),
                     },
-                    4 => MarketCommand::HaltMarket(m),
+                    4 => MarketCommand::HaltMarket {
+                        market_id: m,
+                        reason: crate::HaltReason::Admin,
+                    },
                     5 => MarketCommand::ResumeMarket(m),
                     6 => MarketCommand::MintCompleteSet {
                         market_id: m,
@@ -2284,5 +2464,89 @@ mod tests {
             let decoded: MarketDefinition = postcard::from_bytes(&bytes).unwrap();
             assert_eq!(def, decoded);
         }
+    }
+
+    #[test]
+    fn halt_resume_cannot_bypass_bootstrapping() {
+        let mut reg = MarketRegistry::new();
+        reg.create_market(definition(1)).unwrap();
+        let m = MarketId::new(1);
+        let t = acct(TREASURY);
+        reg.deposit(t, Amount::from_raw(10_000_000)).unwrap();
+        reg.stake_market(m, SponsorId::new(1), t, Amount::from_raw(1_000_000))
+            .unwrap();
+        reg.activate_market(m).unwrap();
+        // Still bootstrapping.
+        reg.halt_market(m, crate::HaltReason::BootstrapFailed).unwrap();
+        assert_eq!(reg.get_market_status(m), Some(MarketLifecycle::Halted));
+        assert_eq!(
+            reg.halt_state(m).unwrap().prior,
+            MarketLifecycle::Bootstrapping
+        );
+        // Resume returns to Bootstrapping, not Open.
+        reg.resume_market(m).unwrap();
+        assert_eq!(
+            reg.get_market_status(m),
+            Some(MarketLifecycle::Bootstrapping)
+        );
+        // Open still requires bootstrap threshold.
+        assert_eq!(
+            reg.mint_complete_set(m, t, Amount::from_raw(1_000_000))
+                .unwrap_err(),
+            MarketError::WrongLifecycleState
+        );
+    }
+
+    #[test]
+    fn resume_rejects_unhealthy_oracle_and_understake() {
+        let mut reg = MarketRegistry::new();
+        reg.create_market(definition(1)).unwrap();
+        drive_to_open(&mut reg, 1);
+        let m = MarketId::new(1);
+        reg.set_oracle_health(m, OracleHealth::Normal).unwrap();
+        reg.halt_market(m, crate::HaltReason::OracleUnhealthy).unwrap();
+        // Oracle still stale -> cannot resume new risk.
+        reg.set_oracle_health(m, OracleHealth::Stale).unwrap();
+        assert_eq!(
+            reg.resume_market(m).unwrap_err(),
+            MarketError::OracleUnhealthy
+        );
+        reg.set_oracle_health(m, OracleHealth::Normal).unwrap();
+        reg.resume_market(m).unwrap();
+        assert_eq!(reg.get_market_status(m), Some(MarketLifecycle::Open));
+    }
+
+    #[test]
+    fn archive_rejects_outstanding_liabilities() {
+        let mut reg = MarketRegistry::new();
+        reg.create_market(definition(1)).unwrap();
+        drive_to_open(&mut reg, 1);
+        let m = MarketId::new(1);
+        reg.halt_market(m, crate::HaltReason::Admin).unwrap();
+        // Stake / bootstrap still locked.
+        assert_eq!(
+            reg.archive_market(m).unwrap_err(),
+            MarketError::ArchiveLiabilities
+        );
+        reg.set_open_orders(m, 3).unwrap();
+        // Even with orders reported, still blocked.
+        assert_eq!(
+            reg.archive_market(m).unwrap_err(),
+            MarketError::ArchiveLiabilities
+        );
+    }
+
+    #[test]
+    fn funding_epoch_once_via_registry() {
+        let mut reg = MarketRegistry::new();
+        reg.create_market(definition(1)).unwrap();
+        let m = MarketId::new(1);
+        let rate = types::Ratio::from_bps(5).unwrap();
+        let mark = Price::from_raw(1_000_000);
+        reg.apply_funding_epoch(m, 1, rate, mark).unwrap();
+        assert_eq!(
+            reg.apply_funding_epoch(m, 1, rate, mark).unwrap_err(),
+            MarketError::Perp(crate::PerpError::DuplicateEpoch { last: 1, got: 1 })
+        );
     }
 }

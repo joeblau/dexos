@@ -32,9 +32,9 @@ mod slab;
 
 pub use book::OrderBook;
 pub use conditional::{
-    decode_conditional, ConditionalConfig, ConditionalEngine, ConditionalId, DecodedConditional,
-    OcoLeg, OrderIntent, PlaceTemplate, TrailDirection, Trailing, TriggerKind,
-    ENCODED_CONDITIONAL_LEN,
+    decode_conditional, ConditionalConfig, ConditionalEngine, ConditionalId, ConditionalStatus,
+    DecodedConditional, ExecutionAck, OcoLeg, OrderIntent, PlaceTemplate, TrailDirection, Trailing,
+    TriggerKind, ENCODED_CONDITIONAL_LEN,
 };
 pub use error::{ConditionalError, OrderError, SlabError};
 pub use order::{BookConfig, Fill, MatchResult, NewOrder, OrderOutcome, StpPolicy};
