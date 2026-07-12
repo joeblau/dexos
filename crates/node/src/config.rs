@@ -11,6 +11,7 @@
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -178,6 +179,13 @@ impl Default for StorageSection {
 }
 
 /// `[rpc]` section.
+///
+/// Beyond the listen address and read-only switch, the transport keys map
+/// one-to-one onto [`rpc::ServerConfig`] / [`rpc::WorkBudgetConfig`] so the
+/// production TLS and DoS-hardening posture is fully expressible from the
+/// operator config. Every transport key defaults to the corresponding
+/// [`rpc::ServerConfig::default`] value (asserted by test), so configs that
+/// omit them behave exactly as before.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RpcSection {
@@ -185,6 +193,100 @@ pub struct RpcSection {
     pub listen: String,
     /// Whether the RPC surface is read-only.
     pub read_only: bool,
+    /// PEM-encoded TLS 1.3 certificate chain. Must be set together with
+    /// `tls_key_path` (both-or-neither); when both are set the composition
+    /// root serves [`rpc::TlsMode::Required`] built via
+    /// [`rpc::acceptor_from_pem`]. Relative paths resolve against the config
+    /// file's directory.
+    #[serde(default)]
+    pub tls_cert_path: Option<PathBuf>,
+    /// PEM-encoded PKCS#8 private key paired with `tls_cert_path`
+    /// (both-or-neither).
+    #[serde(default)]
+    pub tls_key_path: Option<PathBuf>,
+    /// Optional PEM-encoded client-certificate roots enabling mTLS client
+    /// verification. Requires `tls_cert_path` and `tls_key_path`.
+    #[serde(default)]
+    pub tls_client_ca_path: Option<PathBuf>,
+    /// Process-wide ceiling on concurrently served RPC connections.
+    #[serde(default = "default_rpc_max_connections")]
+    pub max_connections: usize,
+    /// Maximum concurrent connections admitted from a single source IP.
+    #[serde(default = "default_rpc_max_connections_per_ip")]
+    pub max_connections_per_ip: u32,
+    /// Sustained per-IP connection admissions per second. `0` together with
+    /// `rate_burst = 0` disables per-IP rate limiting (both-or-neither).
+    #[serde(default = "default_rpc_rate_per_ip_per_sec")]
+    pub rate_per_ip_per_sec: u64,
+    /// Per-IP connection burst (token-bucket capacity). `0` together with
+    /// `rate_per_ip_per_sec = 0` disables per-IP rate limiting.
+    #[serde(default = "default_rpc_rate_burst")]
+    pub rate_burst: u64,
+    /// Maximum idle time (ms) waiting for the next request frame header.
+    #[serde(default = "default_rpc_idle_timeout_ms")]
+    pub idle_timeout_ms: u64,
+    /// Maximum time (ms) to receive a frame payload once its header arrived.
+    #[serde(default = "default_rpc_read_timeout_ms")]
+    pub read_timeout_ms: u64,
+    /// Maximum time (ms) to flush a response to a stalled reader.
+    #[serde(default = "default_rpc_write_timeout_ms")]
+    pub write_timeout_ms: u64,
+    /// Maximum time (ms) a single backend dispatch may run before the
+    /// connection is failed closed.
+    #[serde(default = "default_rpc_dispatch_timeout_ms")]
+    pub dispatch_timeout_ms: u64,
+    /// Process-wide maximum concurrent dispatches (blocking-pool tasks).
+    #[serde(default = "default_rpc_max_in_flight_requests")]
+    pub max_in_flight_requests: usize,
+    /// Process-wide maximum bytes retained by in-flight request frames.
+    #[serde(default = "default_rpc_max_in_flight_bytes")]
+    pub max_in_flight_bytes: usize,
+    /// Per-connection concurrent-dispatch ceiling.
+    #[serde(default = "default_rpc_max_in_flight_requests_per_conn")]
+    pub max_in_flight_requests_per_conn: usize,
+    /// Per-connection in-flight request-frame byte ceiling.
+    #[serde(default = "default_rpc_max_in_flight_bytes_per_conn")]
+    pub max_in_flight_bytes_per_conn: usize,
+}
+
+// Serde field defaults for `[rpc]`. Literals mirror `rpc::ServerConfig::default()`
+// / `rpc::WorkBudgetConfig::default()`; the `rpc_defaults_mirror_server_config`
+// test asserts the mirror so drift fails CI rather than silently diverging.
+fn default_rpc_max_connections() -> usize {
+    4_096
+}
+fn default_rpc_max_connections_per_ip() -> u32 {
+    64
+}
+fn default_rpc_rate_per_ip_per_sec() -> u64 {
+    32
+}
+fn default_rpc_rate_burst() -> u64 {
+    64
+}
+fn default_rpc_idle_timeout_ms() -> u64 {
+    30_000
+}
+fn default_rpc_read_timeout_ms() -> u64 {
+    10_000
+}
+fn default_rpc_write_timeout_ms() -> u64 {
+    10_000
+}
+fn default_rpc_dispatch_timeout_ms() -> u64 {
+    5_000
+}
+fn default_rpc_max_in_flight_requests() -> usize {
+    1_024
+}
+fn default_rpc_max_in_flight_bytes() -> usize {
+    64 * 1024 * 1024
+}
+fn default_rpc_max_in_flight_requests_per_conn() -> usize {
+    1
+}
+fn default_rpc_max_in_flight_bytes_per_conn() -> usize {
+    1024 * 1024
 }
 
 impl Default for RpcSection {
@@ -192,6 +294,78 @@ impl Default for RpcSection {
         Self {
             listen: "0.0.0.0:8080".to_string(),
             read_only: false,
+            tls_cert_path: None,
+            tls_key_path: None,
+            tls_client_ca_path: None,
+            max_connections: default_rpc_max_connections(),
+            max_connections_per_ip: default_rpc_max_connections_per_ip(),
+            rate_per_ip_per_sec: default_rpc_rate_per_ip_per_sec(),
+            rate_burst: default_rpc_rate_burst(),
+            idle_timeout_ms: default_rpc_idle_timeout_ms(),
+            read_timeout_ms: default_rpc_read_timeout_ms(),
+            write_timeout_ms: default_rpc_write_timeout_ms(),
+            dispatch_timeout_ms: default_rpc_dispatch_timeout_ms(),
+            max_in_flight_requests: default_rpc_max_in_flight_requests(),
+            max_in_flight_bytes: default_rpc_max_in_flight_bytes(),
+            max_in_flight_requests_per_conn: default_rpc_max_in_flight_requests_per_conn(),
+            max_in_flight_bytes_per_conn: default_rpc_max_in_flight_bytes_per_conn(),
+        }
+    }
+}
+
+impl RpcSection {
+    /// True when this section requests TLS: both `tls_cert_path` and
+    /// `tls_key_path` are set. [`NodeConfig::validate`] rejects a half-set pair,
+    /// so post-validate this is equivalent to "any TLS key present".
+    pub fn tls_configured(&self) -> bool {
+        self.tls_cert_path.is_some() && self.tls_key_path.is_some()
+    }
+
+    /// The per-IP connection rate limit expressed by this section, or `None`
+    /// when rate limiting is disabled (`rate_per_ip_per_sec = 0` and
+    /// `rate_burst = 0`).
+    pub fn per_ip_rate(&self) -> Option<rpc::RateLimit> {
+        (self.rate_per_ip_per_sec > 0 || self.rate_burst > 0).then_some(rpc::RateLimit {
+            per_sec: self.rate_per_ip_per_sec,
+            burst: self.rate_burst,
+        })
+    }
+
+    /// The in-flight work budget expressed by this section.
+    pub fn work_budget(&self) -> rpc::WorkBudgetConfig {
+        rpc::WorkBudgetConfig {
+            max_in_flight_requests: self.max_in_flight_requests,
+            max_in_flight_bytes: self.max_in_flight_bytes,
+            max_in_flight_requests_per_conn: self.max_in_flight_requests_per_conn,
+            max_in_flight_bytes_per_conn: self.max_in_flight_bytes_per_conn,
+        }
+    }
+
+    /// Build the transport [`rpc::ServerConfig`] expressed by this section,
+    /// constructing [`Duration`]s from the `_ms` keys here in the composition
+    /// layer. Fields the schema does not expose (`max_tracked_ips`,
+    /// `max_payload`, `drain_timeout`) keep their [`rpc::ServerConfig::default`]
+    /// values.
+    ///
+    /// `tls` is injected by the caller because building
+    /// [`rpc::TlsMode::Required`] reads the PEM files named by
+    /// `tls_cert_path` / `tls_key_path` / `tls_client_ca_path` from disk via
+    /// [`rpc::acceptor_from_pem`] — this method performs no I/O. TODO(#418):
+    /// when the RPC listener is wired into the node runtime, the composition
+    /// root must load those PEMs and pass `TlsMode::Required(acceptor)`
+    /// whenever [`Self::tls_configured`] is true.
+    pub fn server_config(&self, tls: rpc::TlsMode) -> rpc::ServerConfig {
+        rpc::ServerConfig {
+            max_connections: self.max_connections,
+            max_connections_per_ip: self.max_connections_per_ip,
+            per_ip_rate: self.per_ip_rate(),
+            idle_timeout: Duration::from_millis(self.idle_timeout_ms),
+            read_timeout: Duration::from_millis(self.read_timeout_ms),
+            write_timeout: Duration::from_millis(self.write_timeout_ms),
+            tls,
+            work: self.work_budget(),
+            dispatch_timeout: Duration::from_millis(self.dispatch_timeout_ms),
+            ..rpc::ServerConfig::default()
         }
     }
 }
@@ -360,6 +534,16 @@ impl NodeConfig {
         self.consensus.validator_set_path =
             resolve_against(base, &self.consensus.validator_set_path);
         self.storage.data_dir = resolve_against(base, &self.storage.data_dir);
+        for path in [
+            &mut self.rpc.tls_cert_path,
+            &mut self.rpc.tls_key_path,
+            &mut self.rpc.tls_client_ca_path,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            *path = resolve_path_against(base, path);
+        }
     }
 
     /// Apply CLI overrides on top of file values, then re-validate.
@@ -412,6 +596,7 @@ impl NodeConfig {
 
         self.validate_storage()?;
         self.validate_listen_addresses()?;
+        self.validate_rpc()?;
         self.reject_unsupported_features()?;
 
         if self.node.light {
@@ -457,6 +642,22 @@ impl NodeConfig {
                 "storage.data_dir '{}' exists and is not a directory",
                 self.storage.data_dir
             )));
+        }
+        // TLS PEM inputs must exist at load so a mistyped path fails at startup,
+        // not when the acceptor is (later) constructed.
+        for (field, path) in [
+            ("rpc.tls_cert_path", &self.rpc.tls_cert_path),
+            ("rpc.tls_key_path", &self.rpc.tls_key_path),
+            ("rpc.tls_client_ca_path", &self.rpc.tls_client_ca_path),
+        ] {
+            if let Some(p) = path {
+                if !p.is_file() {
+                    return Err(ConfigError::Validation(format!(
+                        "{field} '{}' does not exist or is not a file",
+                        p.display()
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -538,6 +739,100 @@ impl NodeConfig {
                 min: 0,
                 max: DRAIN_TIMEOUT_MAX_MS,
             });
+        }
+        Ok(())
+    }
+
+    /// Validate the `[rpc]` transport posture so an inexpressible combination
+    /// fails closed at load rather than surfacing at bind time (or worse,
+    /// silently serving cleartext where the operator intended TLS).
+    fn validate_rpc(&self) -> Result<(), ConfigError> {
+        let rpc = &self.rpc;
+
+        // TLS identity is both-or-neither: a certificate chain without its
+        // private key (or vice versa) cannot build any `rpc::TlsMode` and is
+        // therefore an unsupported posture, not a silently-cleartext one.
+        match (&rpc.tls_cert_path, &rpc.tls_key_path) {
+            (Some(_), None) => {
+                return Err(ConfigError::Unsupported {
+                    field: "rpc.tls_cert_path",
+                    detail: "tls_cert_path is set without rpc.tls_key_path; TLS 1.3 needs the \
+                             certificate chain and its PKCS#8 private key together — set both \
+                             (TLS required) or neither (cleartext, tests/loopback only)",
+                });
+            }
+            (None, Some(_)) => {
+                return Err(ConfigError::Unsupported {
+                    field: "rpc.tls_key_path",
+                    detail: "tls_key_path is set without rpc.tls_cert_path; TLS 1.3 needs the \
+                             certificate chain and its PKCS#8 private key together — set both \
+                             (TLS required) or neither (cleartext, tests/loopback only)",
+                });
+            }
+            _ => {}
+        }
+        if rpc.tls_client_ca_path.is_some() && !rpc.tls_configured() {
+            return Err(ConfigError::Unsupported {
+                field: "rpc.tls_client_ca_path",
+                detail: "mTLS client verification requires rpc.tls_cert_path and \
+                         rpc.tls_key_path; set the server certificate pair or remove \
+                         tls_client_ca_path",
+            });
+        }
+        for (field, path) in [
+            ("rpc.tls_cert_path", &rpc.tls_cert_path),
+            ("rpc.tls_key_path", &rpc.tls_key_path),
+            ("rpc.tls_client_ca_path", &rpc.tls_client_ca_path),
+        ] {
+            if let Some(p) = path {
+                if p.as_os_str().is_empty() {
+                    return Err(ConfigError::Validation(format!(
+                        "{field} must not be empty when set"
+                    )));
+                }
+            }
+        }
+
+        // Per-IP rate limiting is both-or-neither: a positive rate with a zero
+        // burst admits nothing, and a positive burst with a zero rate never
+        // refills. Both are almost certainly operator mistakes.
+        if (rpc.rate_per_ip_per_sec == 0) != (rpc.rate_burst == 0) {
+            return Err(ConfigError::Validation(format!(
+                "rpc.rate_per_ip_per_sec = {} and rpc.rate_burst = {} are contradictory; \
+                 set both positive (rate limiting on) or both zero (rate limiting off)",
+                rpc.rate_per_ip_per_sec, rpc.rate_burst
+            )));
+        }
+
+        for (field, is_zero) in [
+            ("rpc.max_connections", rpc.max_connections == 0),
+            (
+                "rpc.max_connections_per_ip",
+                rpc.max_connections_per_ip == 0,
+            ),
+            ("rpc.idle_timeout_ms", rpc.idle_timeout_ms == 0),
+            ("rpc.read_timeout_ms", rpc.read_timeout_ms == 0),
+            ("rpc.write_timeout_ms", rpc.write_timeout_ms == 0),
+            ("rpc.dispatch_timeout_ms", rpc.dispatch_timeout_ms == 0),
+            (
+                "rpc.max_in_flight_requests",
+                rpc.max_in_flight_requests == 0,
+            ),
+            ("rpc.max_in_flight_bytes", rpc.max_in_flight_bytes == 0),
+            (
+                "rpc.max_in_flight_requests_per_conn",
+                rpc.max_in_flight_requests_per_conn == 0,
+            ),
+            (
+                "rpc.max_in_flight_bytes_per_conn",
+                rpc.max_in_flight_bytes_per_conn == 0,
+            ),
+        ] {
+            if is_zero {
+                return Err(ConfigError::Validation(format!(
+                    "{field} must be greater than zero"
+                )));
+            }
         }
         Ok(())
     }
@@ -630,6 +925,14 @@ fn resolve_against(base: &Path, value: &str) -> String {
     }
 }
 
+fn resolve_path_against(base: &Path, value: &Path) -> PathBuf {
+    if value.is_absolute() || value.as_os_str().is_empty() {
+        value.to_path_buf()
+    } else {
+        base.join(value).components().collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -661,6 +964,21 @@ segment_size_mb = 1024
 [rpc]
 listen = "0.0.0.0:8080"
 read_only = false
+tls_cert_path = "certs/rpc-chain.pem"
+tls_key_path = "certs/rpc-key.pem"
+tls_client_ca_path = "certs/client-roots.pem"
+max_connections = 2048
+max_connections_per_ip = 16
+rate_per_ip_per_sec = 8
+rate_burst = 24
+idle_timeout_ms = 20000
+read_timeout_ms = 4000
+write_timeout_ms = 3000
+dispatch_timeout_ms = 1500
+max_in_flight_requests = 256
+max_in_flight_bytes = 8388608
+max_in_flight_requests_per_conn = 2
+max_in_flight_bytes_per_conn = 262144
 
 [performance]
 pin_threads = false
@@ -685,6 +1003,8 @@ metrics_listen = "127.0.0.1:9100"
         assert_eq!(cfg.consensus.epoch_length, 100_000);
         assert_eq!(cfg.storage.segment_size_mb, 1024);
         assert!(!cfg.rpc.read_only);
+        assert!(cfg.rpc.tls_configured());
+        assert_eq!(cfg.rpc.max_connections, 2048);
         assert_eq!(cfg.observability.log_format, LogFormat::Json);
         assert_eq!(cfg.observability.metrics_listen, "127.0.0.1:9100");
         assert_eq!(cfg.performance.drain_timeout_ms, 15_000);
@@ -703,6 +1023,198 @@ metrics_listen = "127.0.0.1:9100"
         let cfg = NodeConfig::from_toml_str("").unwrap();
         assert_eq!(cfg, NodeConfig::default());
         assert_eq!(cfg.consensus.checkpoint_interval_ms, 100);
+    }
+
+    #[test]
+    fn default_config_round_trips_through_toml() {
+        let cfg = NodeConfig::default();
+        let serialized = toml::to_string(&cfg).unwrap();
+        let reparsed = NodeConfig::from_toml_str(&serialized).unwrap();
+        assert_eq!(cfg, reparsed);
+    }
+
+    #[test]
+    fn rpc_transport_toml_maps_to_server_config() {
+        let cfg = NodeConfig::from_toml_str(full_toml()).expect("valid config");
+        assert_eq!(
+            cfg.rpc.tls_cert_path.as_deref(),
+            Some(Path::new("certs/rpc-chain.pem"))
+        );
+        assert_eq!(
+            cfg.rpc.tls_key_path.as_deref(),
+            Some(Path::new("certs/rpc-key.pem"))
+        );
+        assert_eq!(
+            cfg.rpc.tls_client_ca_path.as_deref(),
+            Some(Path::new("certs/client-roots.pem"))
+        );
+        assert!(cfg.rpc.tls_configured());
+
+        let sc = cfg.rpc.server_config(rpc::TlsMode::Disabled);
+        assert_eq!(sc.max_connections, 2048);
+        assert_eq!(sc.max_connections_per_ip, 16);
+        assert_eq!(
+            sc.per_ip_rate,
+            Some(rpc::RateLimit {
+                per_sec: 8,
+                burst: 24
+            })
+        );
+        assert_eq!(sc.idle_timeout, Duration::from_millis(20_000));
+        assert_eq!(sc.read_timeout, Duration::from_millis(4_000));
+        assert_eq!(sc.write_timeout, Duration::from_millis(3_000));
+        assert_eq!(sc.dispatch_timeout, Duration::from_millis(1_500));
+        assert_eq!(sc.work.max_in_flight_requests, 256);
+        assert_eq!(sc.work.max_in_flight_bytes, 8 * 1024 * 1024);
+        assert_eq!(sc.work.max_in_flight_requests_per_conn, 2);
+        assert_eq!(sc.work.max_in_flight_bytes_per_conn, 256 * 1024);
+        assert!(matches!(sc.tls, rpc::TlsMode::Disabled));
+
+        // Unexposed knobs keep their rpc defaults.
+        let d = rpc::ServerConfig::default();
+        assert_eq!(sc.max_tracked_ips, d.max_tracked_ips);
+        assert_eq!(sc.max_payload, d.max_payload);
+        assert_eq!(sc.drain_timeout, d.drain_timeout);
+    }
+
+    #[test]
+    fn rpc_defaults_mirror_server_config_defaults() {
+        // A config that omits every transport key — including a pre-#418
+        // `[rpc]` section with only listen/read_only — must map exactly onto
+        // `rpc::ServerConfig::default()`.
+        let expected = rpc::ServerConfig::default();
+        for toml_src in ["", "[rpc]\nlisten = \"127.0.0.1:8080\"\nread_only = true"] {
+            let cfg = NodeConfig::from_toml_str(toml_src).expect("valid config");
+            assert!(cfg.rpc.tls_cert_path.is_none());
+            assert!(cfg.rpc.tls_key_path.is_none());
+            assert!(cfg.rpc.tls_client_ca_path.is_none());
+            assert!(!cfg.rpc.tls_configured());
+
+            let sc = cfg.rpc.server_config(rpc::TlsMode::Disabled);
+            assert_eq!(sc.max_connections, expected.max_connections);
+            assert_eq!(sc.max_connections_per_ip, expected.max_connections_per_ip);
+            assert_eq!(sc.per_ip_rate, expected.per_ip_rate);
+            assert_eq!(sc.idle_timeout, expected.idle_timeout);
+            assert_eq!(sc.read_timeout, expected.read_timeout);
+            assert_eq!(sc.write_timeout, expected.write_timeout);
+            assert_eq!(sc.dispatch_timeout, expected.dispatch_timeout);
+            assert_eq!(sc.max_tracked_ips, expected.max_tracked_ips);
+            assert_eq!(sc.max_payload, expected.max_payload);
+            assert_eq!(sc.drain_timeout, expected.drain_timeout);
+            assert_eq!(
+                sc.work.max_in_flight_requests,
+                expected.work.max_in_flight_requests
+            );
+            assert_eq!(
+                sc.work.max_in_flight_bytes,
+                expected.work.max_in_flight_bytes
+            );
+            assert_eq!(
+                sc.work.max_in_flight_requests_per_conn,
+                expected.work.max_in_flight_requests_per_conn
+            );
+            assert_eq!(
+                sc.work.max_in_flight_bytes_per_conn,
+                expected.work.max_in_flight_bytes_per_conn
+            );
+            assert!(matches!(sc.tls, rpc::TlsMode::Disabled));
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_rpc_field() {
+        // Typo'd key (`tls_cert` instead of `tls_cert_path`) must fail parse,
+        // never silently serve cleartext.
+        let toml = "[rpc]\nlisten = \"127.0.0.1:8080\"\nread_only = false\ntls_cert = \"x.pem\"";
+        assert!(matches!(
+            NodeConfig::from_toml_str(toml),
+            Err(ConfigError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_tls_cert_without_key() {
+        let toml =
+            "[rpc]\nlisten = \"127.0.0.1:8080\"\nread_only = false\ntls_cert_path = \"x.pem\"";
+        let err = NodeConfig::from_toml_str(toml).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::Unsupported {
+                    field: "rpc.tls_cert_path",
+                    ..
+                }
+            ),
+            "expected unsupported half-TLS posture, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_tls_key_without_cert() {
+        let mut cfg = NodeConfig::default();
+        cfg.rpc.tls_key_path = Some(PathBuf::from("x.key"));
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::Unsupported {
+                field: "rpc.tls_key_path",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_client_ca_without_server_cert_pair() {
+        let mut cfg = NodeConfig::default();
+        cfg.rpc.tls_client_ca_path = Some(PathBuf::from("roots.pem"));
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::Unsupported {
+                field: "rpc.tls_client_ca_path",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_contradictory_rpc_rate_pair() {
+        // Positive rate with zero burst admits nothing; zero rate with positive
+        // burst never refills. Both are rejected; both-zero disables limiting.
+        let mut cfg = NodeConfig::default();
+        cfg.rpc.rate_burst = 0;
+        assert!(matches!(cfg.validate(), Err(ConfigError::Validation(_))));
+
+        let mut cfg = NodeConfig::default();
+        cfg.rpc.rate_per_ip_per_sec = 0;
+        assert!(matches!(cfg.validate(), Err(ConfigError::Validation(_))));
+
+        let mut cfg = NodeConfig::default();
+        cfg.rpc.rate_per_ip_per_sec = 0;
+        cfg.rpc.rate_burst = 0;
+        cfg.validate().expect("both-zero disables rate limiting");
+        assert_eq!(cfg.rpc.per_ip_rate(), None);
+    }
+
+    #[test]
+    fn rejects_zero_rpc_limits_and_timeouts() {
+        for mutate in [
+            (|c: &mut NodeConfig| c.rpc.max_connections = 0) as fn(&mut NodeConfig),
+            |c| c.rpc.max_connections_per_ip = 0,
+            |c| c.rpc.idle_timeout_ms = 0,
+            |c| c.rpc.read_timeout_ms = 0,
+            |c| c.rpc.write_timeout_ms = 0,
+            |c| c.rpc.dispatch_timeout_ms = 0,
+            |c| c.rpc.max_in_flight_requests = 0,
+            |c| c.rpc.max_in_flight_bytes = 0,
+            |c| c.rpc.max_in_flight_requests_per_conn = 0,
+            |c| c.rpc.max_in_flight_bytes_per_conn = 0,
+        ] {
+            let mut cfg = NodeConfig::default();
+            mutate(&mut cfg);
+            assert!(
+                matches!(cfg.validate(), Err(ConfigError::Validation(_))),
+                "zeroed rpc limit must be rejected"
+            );
+        }
     }
 
     #[test]
@@ -998,6 +1510,47 @@ read_only = false
         fs::write(&validators, "validators = []\n").unwrap();
         let cfg = NodeConfig::load(&cfg_path).expect("with validators file");
         assert!(Path::new(&cfg.consensus.validator_set_path).is_file());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_resolves_and_requires_tls_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "dexos-cfg-tls-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let cfg_path = dir.join("node.toml");
+        fs::write(
+            &cfg_path,
+            r#"
+[rpc]
+listen = "127.0.0.1:18080"
+read_only = false
+tls_cert_path = "rpc.pem"
+tls_key_path = "rpc.key"
+"#,
+        )
+        .unwrap();
+
+        // Missing PEM files → fail closed at load.
+        let err = NodeConfig::load(&cfg_path).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation(ref m) if m.contains("rpc.tls_cert_path")),
+            "{err}"
+        );
+
+        fs::write(dir.join("rpc.pem"), "cert\n").unwrap();
+        fs::write(dir.join("rpc.key"), "key\n").unwrap();
+        let cfg = NodeConfig::load(&cfg_path).expect("with pem files present");
+        // Relative paths resolve against the config file's directory.
+        let cert = cfg.rpc.tls_cert_path.as_deref().unwrap();
+        assert!(cert.is_absolute() && cert.is_file(), "{}", cert.display());
+        assert!(cfg.rpc.tls_configured());
         let _ = fs::remove_dir_all(&dir);
     }
 
