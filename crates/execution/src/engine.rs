@@ -1456,6 +1456,30 @@ impl DeterministicEngine for Engine {
         // monotonic-sequence gate above cannot catch it; this guard does.
         let binding = command_binding(&command);
 
+        // Idempotency classification is non-mutating (`classify` takes `&self`),
+        // so decide it *before* the transaction clone. The replay, conflict, and
+        // expired outcomes touch no subsystem state, and cloning the whole engine
+        // only to drop it (or, for a replay, only to advance `last_seq`) is pure
+        // overhead — a multi-megabyte deep copy on the hot exactly-once path. This
+        // is byte-identical to the previous clone-then-classify boundary: a Replay
+        // advanced only `last_seq`; Conflict/Expired left `self` untouched.
+        if let Some(binding) = binding.as_ref() {
+            match self.replay.classify(binding) {
+                GuardDecision::Replay(receipt) => {
+                    // Exactly-once: a byte-identical retry returns the original
+                    // receipt without re-applying any delta. The only state that
+                    // advances is the consumed sequence; ledger, positions, risk,
+                    // book, withdrawals, and the root are left byte-identical, so
+                    // advance `last_seq` in place rather than cloning the engine.
+                    self.last_seq = Some(seq);
+                    return Ok(receipt);
+                }
+                GuardDecision::Conflict => return Err(ExecutionError::IdempotencyConflict),
+                GuardDecision::Expired => return Err(ExecutionError::ReplayExpired),
+                GuardDecision::Fresh => {}
+            }
+        }
+
         // Transaction boundary. Apply the command to a working copy of the whole
         // engine. If any fallible step — fixed-point arithmetic, capacity, the
         // ledger, the risk engine, an order book, or a state-tree write — returns
@@ -1469,23 +1493,9 @@ impl DeterministicEngine for Engine {
         txn.last_seq = Some(seq);
 
         if let Some(binding) = binding.as_ref() {
-            match txn.replay.classify(binding) {
-                GuardDecision::Replay(receipt) => {
-                    // Exactly-once: a byte-identical retry returns the original
-                    // receipt without re-applying any delta. The only state that
-                    // advances is the consumed sequence; ledger, positions, risk,
-                    // book, withdrawals, and the root are left byte-identical.
-                    *self = txn;
-                    return Ok(receipt);
-                }
-                GuardDecision::Conflict => return Err(ExecutionError::IdempotencyConflict),
-                GuardDecision::Expired => return Err(ExecutionError::ReplayExpired),
-                GuardDecision::Fresh => {
-                    // Commit the watermark into the working copy up front so the
-                    // command's own commits fold it into the same state root.
-                    txn.replay.reserve(binding);
-                }
-            }
+            // Commit the watermark into the working copy up front so the command's
+            // own commits fold it into the same state root.
+            txn.replay.reserve(binding);
         }
 
         let receipt = txn.apply(seq, command)?;
