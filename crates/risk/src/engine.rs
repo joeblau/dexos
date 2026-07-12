@@ -50,6 +50,10 @@ pub struct RiskEngine {
     // Cached, recomputed incrementally on every mutation.
     cached_equity: Vec<Amount>,
     cached_exposure: Vec<Amount>,
+    // Worst-case scenario collateral demanded by the payout-vector book: the
+    // net liability across every multi-outcome position if each settles at its
+    // least favorable outcome. Folded into both `cached_im` and `cached_mm`.
+    cached_scenario: Vec<Amount>,
     cached_im: Vec<Amount>,
     cached_mm: Vec<Amount>,
 
@@ -79,6 +83,7 @@ impl RiskEngine {
             payout: Vec::new(),
             cached_equity: Vec::new(),
             cached_exposure: Vec::new(),
+            cached_scenario: Vec::new(),
             cached_im: Vec::new(),
             cached_mm: Vec::new(),
             marks: Vec::new(),
@@ -245,6 +250,13 @@ impl RiskEngine {
     }
 
     /// Add a payout-vector (multi-outcome) position to an account.
+    ///
+    /// The position is admitted only if, once its worst-case scenario liability
+    /// is folded into the account's requirement, the account still meets initial
+    /// margin. A short multi-outcome claim posted without collateral to cover its
+    /// worst outcome is rejected with [`RiskError::InsufficientMargin`] and no
+    /// position is recorded. Every payout mutation recomputes the cached columns
+    /// so equity, IM, MM, and the liquidation scan reflect the new book.
     pub fn open_payout_position(
         &mut self,
         account: AccountId,
@@ -253,6 +265,19 @@ impl RiskEngine {
     ) -> Result<(), RiskError> {
         let i = self.active_index(account)?;
         self.payout[i].push(PayoutPosition::new(payout, signed_qty));
+        self.recompute(i)?;
+        let required = self.cached_im[i];
+        let available = self.cached_equity[i];
+        if available.raw() < required.raw() {
+            // Roll the book back to its pre-trade state; the account cannot
+            // collateralize this position's worst-case liability.
+            self.payout[i].pop();
+            self.recompute(i)?;
+            return Err(RiskError::InsufficientMargin {
+                required,
+                available,
+            });
+        }
         Ok(())
     }
 
@@ -262,10 +287,11 @@ impl RiskEngine {
     ///
     /// A reduce-only order is admitted iff the account currently has exposure to
     /// reduce. An exposure-increasing order is admitted iff, after adding
-    /// `notional`, the account still meets initial margin, stays within
-    /// `max_leverage`, and respects the portfolio cap. The account is never
-    /// admitted below maintenance margin as a consequence, since initial margin
-    /// dominates maintenance margin.
+    /// `notional`, the account still meets initial margin — which includes the
+    /// worst-case scenario collateral its payout-vector book demands — stays
+    /// within `max_leverage`, and respects the portfolio cap. The account is
+    /// never admitted below maintenance margin as a consequence, since initial
+    /// margin dominates maintenance margin.
     pub fn check_order(
         &self,
         account: AccountId,
@@ -288,7 +314,11 @@ impl RiskEngine {
                 return Err(RiskError::PortfolioLimitExceeded);
             }
         }
-        let required = projected.mul_ratio(self.config.initial_margin)?;
+        // Initial margin on the projected perp notional plus the worst-case
+        // scenario collateral the existing payout-vector book already reserves.
+        let required = projected
+            .mul_ratio(self.config.initial_margin)?
+            .checked_add(self.cached_scenario[i])?;
         let available = self.cached_equity[i];
         if available.raw() < required.raw() {
             return Err(RiskError::InsufficientMargin {
@@ -359,6 +389,12 @@ impl RiskEngine {
     /// Cached absolute notional exposure.
     pub fn exposure(&self, account: AccountId) -> Result<Amount, RiskError> {
         Ok(self.cached_exposure[self.read_index(account)?])
+    }
+
+    /// Cached worst-case scenario collateral demanded by the payout-vector book.
+    /// Included in both the initial- and maintenance-margin requirements.
+    pub fn scenario_margin(&self, account: AccountId) -> Result<Amount, RiskError> {
+        Ok(self.cached_scenario[self.read_index(account)?])
     }
 
     /// The maintenance-margin liquidation threshold for an account.
@@ -538,15 +574,30 @@ impl RiskEngine {
     // --------------------------------------------------------------- internals
 
     fn recompute(&mut self, i: usize) -> Result<(), RiskError> {
-        let (equity, exposure) = self.compute(i)?;
+        let (equity, exposure, scenario) = self.compute(i)?;
         self.cached_equity[i] = equity;
         self.cached_exposure[i] = exposure;
-        self.cached_im[i] = exposure.mul_ratio(self.config.initial_margin)?;
-        self.cached_mm[i] = exposure.mul_ratio(self.config.maintenance_margin)?;
+        self.cached_scenario[i] = scenario;
+        // Perp margin is a fraction of notional; payout margin is the full
+        // worst-case scenario liability (settlement is certain to realize some
+        // outcome, so no volatility haircut applies). Both requirements add.
+        self.cached_im[i] = exposure
+            .mul_ratio(self.config.initial_margin)?
+            .checked_add(scenario)?;
+        self.cached_mm[i] = exposure
+            .mul_ratio(self.config.maintenance_margin)?
+            .checked_add(scenario)?;
         Ok(())
     }
 
-    fn compute(&self, i: usize) -> Result<(Amount, Amount), RiskError> {
+    /// Compute `(equity, perp_exposure, scenario_collateral)` for one account.
+    ///
+    /// `scenario_collateral` is `max(0, -Σ worst_case_pnl)` over the payout-vector
+    /// book: the collateral floor at which the book stays solvent if every
+    /// multi-outcome position settles at its least favorable outcome. Summing the
+    /// per-position worst cases is the exact portfolio worst case for independent
+    /// markets and conservative otherwise.
+    fn compute(&self, i: usize) -> Result<(Amount, Amount, Amount), RiskError> {
         let mut equity = self.collateral[i];
         for pos in &self.perp[i] {
             let mark = self.mark_for(pos.market).unwrap_or(pos.avg_entry);
@@ -563,7 +614,16 @@ impl RiskEngine {
             }
             MarginMode::Cross => self.cross_exposure(i)?,
         };
-        Ok((equity, exposure))
+        let mut payout_worst = Amount::ZERO;
+        for pp in &self.payout[i] {
+            payout_worst = payout_worst.checked_add(pp.worst_case_pnl()?)?;
+        }
+        let scenario = if payout_worst.is_negative() {
+            neg_amount(payout_worst)?
+        } else {
+            Amount::ZERO
+        };
+        Ok((equity, exposure, scenario))
     }
 
     /// Cross exposure: sum over risk groups of the absolute *net* signed
@@ -654,6 +714,7 @@ impl RiskEngine {
             self.payout.resize(n, Vec::new());
             self.cached_equity.resize(n, Amount::ZERO);
             self.cached_exposure.resize(n, Amount::ZERO);
+            self.cached_scenario.resize(n, Amount::ZERO);
             self.cached_im.resize(n, Amount::ZERO);
             self.cached_mm.resize(n, Amount::ZERO);
         }
@@ -716,6 +777,10 @@ mod tests {
     }
     fn mkt(n: u32) -> MarketId {
         MarketId::new(n)
+    }
+    /// A payout vector from raw `Amount` units (already at the 6-dp scale).
+    fn pv(raw: &[i128]) -> PayoutVector {
+        PayoutVector::new(raw.iter().map(|&x| Amount::from_raw(x)).collect()).unwrap()
     }
 
     #[test]
@@ -1048,5 +1113,166 @@ mod tests {
             let _ = e.liquidation_candidates();
             let _ = e.worst_case_equity(acct(1));
         }
+    }
+
+    // ----------------------------------------------------- payout-vector margin
+
+    #[test]
+    fn opening_short_payout_without_collateral_fails() {
+        let mut e = engine();
+        e.open_account(acct(1), amt(0)).unwrap();
+        // Short one binary claim paying [1.0, 0.0]: worst case is a 1.0
+        // liability, but the account posts no collateral.
+        let market = pv(&[A, 0]);
+        assert!(matches!(
+            e.open_payout_position(acct(1), market.clone(), qty(-1)),
+            Err(RiskError::InsufficientMargin { .. })
+        ));
+        // The rejected position left no trace: no scenario liability recorded.
+        assert_eq!(e.scenario_margin(acct(1)).unwrap(), Amount::ZERO);
+        assert_eq!(e.initial_margin(acct(1)).unwrap(), Amount::ZERO);
+        assert_eq!(e.worst_case_equity(acct(1)).unwrap(), amt(0));
+        // Once collateral covers the worst case, the same order is admitted.
+        e.credit_collateral(acct(1), amt(1)).unwrap();
+        assert!(e.open_payout_position(acct(1), market, qty(-1)).is_ok());
+        assert_eq!(e.scenario_margin(acct(1)).unwrap(), amt(1));
+        assert_eq!(e.initial_margin(acct(1)).unwrap(), amt(1));
+        assert_eq!(e.maintenance_margin(acct(1)).unwrap(), amt(1));
+    }
+
+    #[test]
+    fn opening_long_payout_needs_no_collateral() {
+        let mut e = engine();
+        e.open_account(acct(1), amt(0)).unwrap();
+        // A long binary claim can never owe: worst case is 0, so it is admitted
+        // with no collateral and demands no scenario margin.
+        let market = pv(&[A, 0]);
+        assert!(e.open_payout_position(acct(1), market, qty(1)).is_ok());
+        assert_eq!(e.scenario_margin(acct(1)).unwrap(), Amount::ZERO);
+        assert_eq!(e.initial_margin(acct(1)).unwrap(), Amount::ZERO);
+    }
+
+    #[test]
+    fn liquidation_candidates_include_underwater_payout() {
+        let mut e = engine();
+        e.open_account(acct(1), amt(2)).unwrap();
+        // Short one binary claim: scenario liability 1.0, margin 1.0.
+        let market = pv(&[A, 0]);
+        e.open_payout_position(acct(1), market, qty(-1)).unwrap();
+        assert_eq!(e.maintenance_margin(acct(1)).unwrap(), amt(1));
+        // Equity 2 > MM 1: healthy, not a candidate.
+        assert!(e.liquidation_candidates().is_empty());
+        // A fee eats collateral down to 0.5, below the payout book's 1.0 floor.
+        e.apply_fee(acct(1), Amount::from_raw(3 * A / 2)).unwrap();
+        assert_eq!(e.equity(acct(1)).unwrap(), Amount::from_raw(A / 2));
+        // Worst-case equity is now negative: the payout book is underwater.
+        assert_eq!(
+            e.worst_case_equity(acct(1)).unwrap(),
+            Amount::from_raw(-A / 2)
+        );
+        assert_eq!(e.liquidation_candidates(), vec![acct(1)]);
+        assert_eq!(e.enqueue_liquidations(), 1);
+    }
+
+    #[test]
+    fn golden_margin_binary_multi_scalar() {
+        // Golden vectors: for a pure payout book the margin equals the worst-case
+        // scenario liability (no perp exposure, so no volatility haircut).
+
+        // Binary short [1.0, 0.0], qty -1 -> worst -1.0.
+        let mut e = engine();
+        e.open_account(acct(1), amt(10)).unwrap();
+        e.open_payout_position(acct(1), pv(&[A, 0]), qty(-1))
+            .unwrap();
+        assert_eq!(e.scenario_margin(acct(1)).unwrap(), amt(1));
+        assert_eq!(e.initial_margin(acct(1)).unwrap(), amt(1));
+        assert_eq!(e.maintenance_margin(acct(1)).unwrap(), amt(1));
+
+        // Multi-outcome short [0.2, 0.5, 1.0], qty -2 -> worst -2.0.
+        let mut e = engine();
+        e.open_account(acct(1), amt(10)).unwrap();
+        e.open_payout_position(acct(1), pv(&[A / 5, A / 2, A]), qty(-2))
+            .unwrap();
+        assert_eq!(e.scenario_margin(acct(1)).unwrap(), amt(2));
+        assert_eq!(e.initial_margin(acct(1)).unwrap(), amt(2));
+        assert_eq!(e.maintenance_margin(acct(1)).unwrap(), amt(2));
+
+        // Scalar/range short [0.25, 0.5, 0.75], qty -1 -> worst -0.75.
+        let mut e = engine();
+        e.open_account(acct(1), amt(10)).unwrap();
+        e.open_payout_position(acct(1), pv(&[A / 4, A / 2, 3 * A / 4]), qty(-1))
+            .unwrap();
+        assert_eq!(
+            e.scenario_margin(acct(1)).unwrap(),
+            Amount::from_raw(3 * A / 4)
+        );
+        assert_eq!(
+            e.initial_margin(acct(1)).unwrap(),
+            Amount::from_raw(3 * A / 4)
+        );
+        assert_eq!(
+            e.maintenance_margin(acct(1)).unwrap(),
+            Amount::from_raw(3 * A / 4)
+        );
+
+        // Scalar long [0.25, 0.5, 0.75], qty 1 -> worst +0.25: no margin.
+        let mut e = engine();
+        e.open_account(acct(1), amt(10)).unwrap();
+        e.open_payout_position(acct(1), pv(&[A / 4, A / 2, 3 * A / 4]), qty(1))
+            .unwrap();
+        assert_eq!(e.scenario_margin(acct(1)).unwrap(), Amount::ZERO);
+        assert_eq!(e.initial_margin(acct(1)).unwrap(), Amount::ZERO);
+    }
+
+    #[test]
+    fn mixed_perp_and_payout_margin_adds() {
+        // Perp margin (fraction of notional) and payout margin (worst-case
+        // liability) sum into the same requirement.
+        let mut e = engine();
+        e.open_account(acct(1), amt(1_000)).unwrap();
+        e.set_mark_price(mkt(1), price(100)).unwrap();
+        e.apply_fill(acct(1), mkt(1), qty(5), price(100)).unwrap(); // exposure 500
+        e.open_payout_position(acct(1), pv(&[A, 0]), qty(-1))
+            .unwrap(); // scenario 1
+        assert_eq!(e.exposure(acct(1)).unwrap(), amt(500));
+        assert_eq!(e.scenario_margin(acct(1)).unwrap(), amt(1));
+        // IM = 10% * 500 + 1 = 51; MM = 5% * 500 + 1 = 26.
+        assert_eq!(e.initial_margin(acct(1)).unwrap(), amt(51));
+        assert_eq!(e.maintenance_margin(acct(1)).unwrap(), amt(26));
+    }
+
+    #[test]
+    fn check_order_enforces_scenario_collateral() {
+        // With a payout book reserving collateral, a new perp order must clear
+        // perp initial margin *plus* the reserved scenario collateral.
+        let mut e = engine();
+        e.open_account(acct(1), amt(100)).unwrap();
+        e.set_mark_price(mkt(1), price(100)).unwrap();
+        // Short 50 binary claims: scenario liability 50, admitted (100 >= 50).
+        e.open_payout_position(acct(1), pv(&[A, 0]), qty(-50))
+            .unwrap();
+        assert_eq!(e.scenario_margin(acct(1)).unwrap(), amt(50));
+        // Notional 500 -> perp IM 50 + scenario 50 = 100 == equity 100: OK.
+        assert!(e.check_order(acct(1), amt(500), false).is_ok());
+        // Notional 501 -> 50.1 + 50 = 100.1 > 100: rejected on scenario reserve.
+        assert!(matches!(
+            e.check_order(acct(1), amt(501), false),
+            Err(RiskError::InsufficientMargin { .. })
+        ));
+    }
+
+    #[test]
+    fn payout_mutation_recomputes_incrementally() {
+        // Every payout mutation refreshes the cached columns: the incremental
+        // path matches a from-scratch batch recompute.
+        let mut e = engine();
+        e.open_account(acct(1), amt(100)).unwrap();
+        e.set_mark_price(mkt(1), price(100)).unwrap();
+        e.apply_fill(acct(1), mkt(1), qty(3), price(100)).unwrap();
+        e.open_payout_position(acct(1), pv(&[A / 5, A / 2, A]), qty(-2))
+            .unwrap();
+        let incremental = e.state_root();
+        e.recompute_all().unwrap();
+        assert_eq!(e.state_root(), incremental);
     }
 }
