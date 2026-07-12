@@ -344,6 +344,28 @@ impl ConnSlot {
     pub(crate) fn new(peer: PeerId, counts: Arc<Mutex<HashMap<PeerId, usize>>>) -> Self {
         Self { peer, counts }
     }
+
+    /// Reserve one connection slot for `peer` against the per-peer `budget`.
+    ///
+    /// Returns a guard that releases the reservation when dropped, so the
+    /// budget tracks live connections rather than lifetime totals. A refused
+    /// reservation never inserts an entry, keeping the map bounded.
+    pub(crate) fn reserve(
+        counts: &Arc<Mutex<HashMap<PeerId, usize>>>,
+        budget: usize,
+        peer: PeerId,
+    ) -> Result<Self, TransportError> {
+        let mut guard = counts.lock().unwrap_or_else(PoisonError::into_inner);
+        let count = guard.get(&peer).copied().unwrap_or(0);
+        if count >= budget {
+            return Err(TransportError::Backpressure {
+                class: TrafficClass::Sync,
+            });
+        }
+        guard.insert(peer, count + 1);
+        drop(guard);
+        Ok(Self::new(peer, counts.clone()))
+    }
 }
 
 impl Drop for ConnSlot {
