@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use orderbook::{BookConfig, MatchPlan, NewOrder, OrderBook, OrderOutcome};
+use orderbook::{BookConfig, NewOrder, OrderBook, OrderOutcome};
 use risk::{RiskConfig, RiskEngine};
 use state_tree::{LeafWriter, StateTree};
 use types::{
@@ -584,14 +584,25 @@ impl Engine {
         market: MarketId,
         instrument: u16,
         order: &NewOrder,
-        reduce_only: bool,
-    ) -> Result<(Amount, MatchPlan), ExecutionError> {
-        let meta = self.validate_instrument(market, instrument)?;
+        _reduce_only: bool,
+    ) -> Result<Amount, ExecutionError> {
+        self.validate_instrument(market, instrument)?;
         let book = self
             .books
             .get(&(market.get(), instrument))
             .ok_or(ExecutionError::UnknownMarket)?;
-        let plan = book.plan_match(order)?;
+
+        // `plan_match` is a full dry-run of matching against current depth. Its
+        // result is only needed to margin market orders from executable depth, so
+        // a resting limit — the most common command — no longer pays that O(levels)
+        // walk and allocation for a value it would discard. The quantity/price
+        // rejections `plan_match` performed *before* `authorize` are replicated
+        // here so the pre-authorize ordering and the exact typed errors are
+        // preserved.
+        if order.quantity.raw() <= 0 {
+            return Err(orderbook::OrderError::NonPositiveQuantity.into());
+        }
+
         if matches!(order.order_type, OrderType::Market) {
             if order.price.raw() <= 0 {
                 return Err(ExecutionError::MarketOrderCollarRequired);
@@ -600,6 +611,7 @@ impl Engine {
             // collar price * requested qty) so a sparse book cannot under-margin
             // a market order that later rests nothing (markets are IOC) but still
             // cannot be gamed by a 1-micro placeholder.
+            let plan = book.plan_match(order)?;
             let collar_cap = order.price.notional_ceil(order.quantity)?;
             let from_depth = if plan.filled_quantity.raw() > 0 {
                 plan.notional_ceil
@@ -619,18 +631,19 @@ impl Engine {
                 // times filled qty (already in plan.notional_ceil).
                 from_depth
             };
-            // Also ensure a pure placeholder (price=1) against deep expensive book
-            // is impossible: plan honors collar so fills empty if book above collar.
-            let _ = reduce_only;
-            let _ = meta;
-            return Ok((notional, plan));
+            return Ok(notional);
         }
-        let notional = if order.price.raw() > 0 {
-            order.price.notional_ceil(order.quantity)?
-        } else {
-            meta.mark_price.notional_ceil(order.quantity)?
-        };
-        Ok((notional, plan))
+
+        // Limit orders margin at their limit price, which must be positive — the
+        // same fail-closed check `plan_match` applied to non-market orders. The
+        // former mark-price fallback was dead under that gate and is intentionally
+        // gone: reaching it would silently loosen validation for a `price <= 0`
+        // limit.
+        if order.price.raw() <= 0 {
+            return Err(orderbook::OrderError::NonPositivePrice.into());
+        }
+        let notional = order.price.notional_ceil(order.quantity)?;
+        Ok(notional)
     }
 
     fn markets_fill_fee(notional: Amount, bps: i32) -> Result<Amount, ExecutionError> {
@@ -864,8 +877,9 @@ impl Engine {
                     client_id: c.client_id,
                     reduce_only: c.reduce_only,
                 };
-                // Market orders: collar required; notional from executable depth.
-                let (notional, _plan) =
+                // Market orders margin from executable depth; limit orders use
+                // their limit price. See `pretrade_notional`.
+                let notional =
                     self.pretrade_notional(c.market, c.instrument, &new_order, c.reduce_only)?;
                 // Authenticate before any business logic so a rejected order
                 // leaves no state behind.
