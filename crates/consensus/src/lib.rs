@@ -21,6 +21,10 @@
 //!   detection.
 //! - [`checkpoint`]: canonical checkpoint construction, hashing, quorum + root +
 //!   ancestry verification, and threshold witness receipts.
+//! - [`minimmit`]: the Minimmit successor engine (migration in progress,
+//!   additive beside HotStuff): the dual-threshold `M = 2B + 1` advance /
+//!   `L = W − B` finalize committee and the certificate seam. See
+//!   `docs/CONSENSUS_MINIMMIT.md`.
 //!
 //! # Determinism
 //!
@@ -30,6 +34,7 @@
 
 pub mod bft;
 pub mod checkpoint;
+pub mod minimmit;
 pub mod sequencer;
 pub mod vote;
 
@@ -46,6 +51,7 @@ pub use checkpoint::{
     DEFAULT_WITNESS_MAX_ENTRIES, DEFAULT_WITNESS_SEQUENCE_HORIZON, DOMAIN_CHECKPOINT,
     DOMAIN_WITNESS,
 };
+pub use minimmit::{Certificate, MinimmitCommittee, ThresholdKind};
 pub use sequencer::{detect_gap, CommandRecord, CommandStatus, Sequencer, SequencerError};
 pub use vote::{
     timeout_digest, vote_digest, CollectorWindow, Committee, Equivocation, NoopSlashHook,
@@ -201,10 +207,10 @@ mod tests {
         let mut idxs = indices.to_vec();
         idxs.sort_unstable();
         idxs.dedup();
-        let mut signer_bitmap = 0u64;
+        let mut signer_bitmap = 0u16;
         let mut signatures = Vec::new();
         for &i in &idxs {
-            signer_bitmap |= 1u64 << i;
+            signer_bitmap |= 1u16 << i;
             signatures.push(kps[usize::try_from(i).unwrap()].sign(message.as_bytes()));
         }
         QuorumCertificate {

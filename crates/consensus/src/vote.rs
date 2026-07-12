@@ -25,18 +25,26 @@ pub const DOMAIN_VOTE: &[u8] = b"dexos:consensus:vote:v1";
 /// Domain tag for timeout (view-change) digests.
 pub const DOMAIN_TIMEOUT: &[u8] = b"dexos:consensus:timeout:v1";
 
-/// Maximum committee size — bounded by the 64-bit signer bitmap of a
+/// Maximum committee size — bounded by the 16-bit signer bitmap of a
 /// [`QuorumCertificate`] (bit `i` names validator index `i`).
 ///
-/// This is the operational ceiling for HotStuff committees and must stay in
+/// This is the operational ceiling for consensus committees and must stay in
 /// lockstep with [`crypto::MAX_VALIDATORS`]: a larger set cannot be encoded in
-/// the QC bitmap and is rejected at committee construction.
-pub const MAX_VALIDATORS: usize = 64;
+/// the QC bitmap and is rejected at committee construction. Under Minimmit
+/// `n >= 5f + 1` sizing, 16 validators tolerate `f = 3` (`M = 7`, `L = 13`).
+pub const MAX_VALIDATORS: usize = 16;
+
+// Compile-time lockstep with the crypto-side cap: a committee that passes
+// this crate's bound must always be encodable in the QC signer bitmap.
+const _: () = assert!(
+    MAX_VALIDATORS == crypto::MAX_VALIDATORS,
+    "consensus::MAX_VALIDATORS must equal crypto::MAX_VALIDATORS"
+);
 
 /// Default how far ahead of the collector watermark a height may be.
 ///
-/// Sized to realistic HotStuff pipelining depth — two full leader rotations of
-/// the maximum committee (`2 * MAX_VALIDATORS`) — not to worst-case soak
+/// Sized to realistic HotStuff pipelining depth — several full leader
+/// rotations of even the maximum committee — not to worst-case soak
 /// length. Engines call [`VoteCollector::prune_finalized`] /
 /// [`VoteCollector::set_window`] on finalization, so the live window stays
 /// tight around the watermark. A small horizon bounds what one Byzantine
@@ -46,10 +54,10 @@ pub const MAX_VALIDATORS: usize = 64;
 pub const DEFAULT_HEIGHT_HORIZON: u64 = 128;
 /// Default how far ahead of the current view a vote may target.
 ///
-/// One full leader rotation of the maximum committee ([`MAX_VALIDATORS`]):
-/// before every leader has had a turn, either a proposal lands and
-/// finalization re-tightens the window, or the node is already in a liveness
-/// failure that a larger vote window cannot fix.
+/// Several full leader rotations of the maximum committee
+/// ([`MAX_VALIDATORS`]): before every leader has had that many turns, either
+/// a proposal lands and finalization re-tightens the window, or the node is
+/// already in a liveness failure that a larger vote window cannot fix.
 pub const DEFAULT_VIEW_HORIZON: u64 = 64;
 /// Default bound on retained slash / equivocation evidence entries.
 pub const DEFAULT_EVIDENCE_LIMIT: usize = 256;
@@ -237,13 +245,28 @@ pub enum VoteError {
     /// The committee is empty.
     #[error("empty committee")]
     EmptyCommittee,
-    /// The committee exceeds the 64-signer bitmap capacity.
-    #[error("committee exceeds 64 validators")]
+    /// The committee exceeds the 16-signer bitmap capacity.
+    #[error("committee exceeds 16 validators")]
     TooManyValidators,
     /// The committee membership is not canonical: duplicate public keys,
-    /// zero-weight members, or a weight sum that overflows `u64`.
+    /// zero-weight members, unparseable keys, or a weight sum that overflows
+    /// `u64`.
     #[error("invalid validator set membership")]
     InvalidValidatorSet,
+    /// The committee violates the Minimmit fault-model sizing: total voting
+    /// weight `W` must satisfy `W >= 5B + 1` for the Byzantine weight bound
+    /// `B`, with strict `M < L` separation between the advance and finalize
+    /// thresholds (see [`crypto::quorum::require_minimmit_sizing`]).
+    #[error(
+        "committee weight {total_weight} cannot tolerate byzantine weight \
+         {byzantine_weight}: minimmit requires W >= 5B + 1 with M < L"
+    )]
+    InsufficientSizing {
+        /// Total committee voting weight `W`.
+        total_weight: u64,
+        /// Byzantine weight bound `B` the committee was sized against.
+        byzantine_weight: u64,
+    },
     /// A timeout certificate's aggregate does not sign the expected
     /// `(epoch, view)` digest.
     #[error("timeout certificate digest mismatch")]
@@ -838,15 +861,15 @@ impl VoteCollector {
     #[must_use]
     pub fn try_form_qc(&self, committee: &Committee, digest: Hash) -> Option<QuorumCertificate> {
         let per_digest = self.votes.get(&digest)?;
-        let mut bitmap: u64 = 0;
+        let mut bitmap: u16 = 0;
         let mut signatures: Vec<[u8; 64]> = Vec::with_capacity(per_digest.len());
         let mut weight: u64 = 0;
         for (&index, signature) in per_digest {
             if self.halted.contains(&index) {
                 continue;
             }
-            // index < MAX_VALIDATORS (64) is guaranteed at insertion time.
-            bitmap |= 1u64 << index;
+            // index < MAX_VALIDATORS (16) is guaranteed at insertion time.
+            bitmap |= 1u16 << index;
             signatures.push(*signature);
             weight = weight.saturating_add(committee.weight(index)?);
         }
@@ -942,11 +965,12 @@ impl TimeoutCollector {
         view: u64,
     ) -> Option<TimeoutCertificate> {
         let per_view = self.timeouts.get(&(epoch, view))?;
-        let mut bitmap: u64 = 0;
+        let mut bitmap: u16 = 0;
         let mut signatures: Vec<[u8; 64]> = Vec::with_capacity(per_view.len());
         let mut weight: u64 = 0;
         for (&index, signature) in per_view {
-            bitmap |= 1u64 << index;
+            // index < MAX_VALIDATORS (16) is guaranteed at admission time.
+            bitmap |= 1u16 << index;
             signatures.push(*signature);
             weight = weight.saturating_add(committee.weight(index)?);
         }

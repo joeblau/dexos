@@ -299,7 +299,7 @@ impl WithdrawalCertificate {
                 need: policy.min_confirmations(),
             });
         }
-        if self.observer_bitmap != self.quorum_signature.signer_bitmap {
+        if self.observer_bitmap != u64::from(self.quorum_signature.signer_bitmap) {
             return Err(AdapterError::QuorumNotMet);
         }
         if self.quorum_signature.message != self.message_hash() {
@@ -387,7 +387,7 @@ pub fn certify_withdrawal(
         asset,
         amount,
         finality_proof,
-        observer_bitmap: qc.signer_bitmap,
+        observer_bitmap: u64::from(qc.signer_bitmap),
         quorum_signature: qc,
     }
 }
