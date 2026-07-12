@@ -50,8 +50,14 @@ pub trait RpcBackend: Send + Sync {
     fn get_latest_checkpoint(&self) -> Result<Checkpoint, RpcError>;
     /// An account's state.
     fn get_account(&self, account: AccountId) -> Result<Account, RpcError>;
-    /// A Merkle proof for an account. The response's `verification_status` must
-    /// be populated.
+    /// A Merkle proof for an account.
+    ///
+    /// The response carries no verification status: any server-supplied
+    /// status would be an unverifiable trust assertion by a potentially
+    /// malicious serving node. Clients MUST NOT trust any server-supplied
+    /// status; obtain the state root from a quorum-certified [`Checkpoint`]
+    /// at the proof's `checkpoint_height` and call
+    /// [`AccountProof::verify_against`] locally.
     fn get_account_proof(&self, account: AccountId) -> Result<AccountProof, RpcError>;
     /// A position by account and market.
     fn get_position(&self, account: AccountId, market: MarketId) -> Result<Position, RpcError>;

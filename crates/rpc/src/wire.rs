@@ -266,6 +266,12 @@ pub struct Account {
 }
 
 /// A Merkle inclusion proof for an account leaf against a checkpoint state root.
+///
+/// Deliberately carries **no** server-asserted verification status: every
+/// field here is supplied by the serving node, so any embedded status would be
+/// an unverifiable trust claim, not evidence. Clients derive the status
+/// locally by obtaining the state root from a quorum-certified [`Checkpoint`]
+/// at `checkpoint_height` and calling [`AccountProof::verify_against`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountProof {
     /// Account the proof is for.
@@ -278,16 +284,17 @@ pub struct AccountProof {
     pub siblings: Vec<Hash>,
     /// Height of the checkpoint the proof is anchored to.
     pub checkpoint_height: u64,
-    /// State root the proof is anchored to.
+    /// State root the server claims the proof is anchored to. Informational:
+    /// clients verify against a quorum-certified root, never this field.
     pub state_root: StateRoot,
-    /// Result of verifying the proof against `state_root`.
-    pub verification_status: VerificationStatus,
 }
 
 impl AccountProof {
     /// Verify this proof against a checkpoint's state root, returning the
-    /// resulting [`VerificationStatus`]. Never panics: an out-of-range leaf
-    /// index simply yields `ProofInvalid`.
+    /// resulting [`VerificationStatus`]. This is the sole way to obtain a
+    /// status for an account proof; pass a root taken from a quorum-certified
+    /// [`Checkpoint`], not one supplied by the serving node. Never panics: an
+    /// out-of-range leaf index simply yields `ProofInvalid`.
     pub fn verify_against(&self, state_root: StateRoot) -> VerificationStatus {
         let Ok(index) = usize::try_from(self.leaf_index) else {
             return VerificationStatus::ProofInvalid;
@@ -460,4 +467,44 @@ pub struct MarketLifecycleEvent {
     pub market_id: MarketId,
     /// New lifecycle state.
     pub lifecycle: MarketLifecycle,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The wire form of [`AccountProof`] round-trips through the codec and
+    /// carries no verification status: validity is established solely by the
+    /// client calling [`AccountProof::verify_against`] with a trusted root.
+    #[test]
+    fn account_proof_round_trips_without_server_status() {
+        let proof = AccountProof {
+            account_id: AccountId::new(7),
+            leaf: Hash::from_bytes([7u8; 32]),
+            leaf_index: 3,
+            siblings: vec![Hash::from_bytes([1u8; 32]), Hash::from_bytes([2u8; 32])],
+            checkpoint_height: 42,
+            state_root: Hash::from_bytes([9u8; 32]),
+        };
+        let bytes = codec::encode(&proof).unwrap();
+        let back: AccountProof = codec::decode(&bytes).unwrap();
+        assert_eq!(proof, back);
+    }
+
+    /// An out-of-range leaf index yields `ProofInvalid` instead of panicking.
+    #[test]
+    fn verify_against_rejects_out_of_range_leaf_index() {
+        let proof = AccountProof {
+            account_id: AccountId::new(1),
+            leaf: Hash::from_bytes([1u8; 32]),
+            leaf_index: u64::MAX,
+            siblings: vec![],
+            checkpoint_height: 0,
+            state_root: Hash::ZERO,
+        };
+        assert_eq!(
+            proof.verify_against(Hash::ZERO),
+            VerificationStatus::ProofInvalid
+        );
+    }
 }

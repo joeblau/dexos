@@ -271,7 +271,6 @@ fn all_oks() -> Vec<RpcOk> {
             siblings: vec![Hash::ZERO],
             checkpoint_height: 5,
             state_root: Hash::ZERO,
-            verification_status: VerificationStatus::ProofValid,
         }),
         RpcOk::Position(fixture_position(1, 1, Quantity::ONE)),
         RpcOk::Orders(vec![Order {
@@ -477,7 +476,6 @@ fn read_only_and_light_reject_every_control_method() {
 fn account_proof_verifies_and_tamper_is_rejected() {
     let b = populated_backend(RpcMode::Full);
     let proof = b.get_account_proof(a(1)).unwrap();
-    assert_eq!(proof.verification_status, VerificationStatus::ProofValid);
     // Valid proof accepts against the committed root.
     assert_eq!(
         proof.verify_against(b.state_root()),
