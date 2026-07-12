@@ -21,6 +21,7 @@
 //! sequence means a frame vanished and is surfaced as
 //! [`TransportError::ReliableGap`] with the link torn down — never hidden.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -318,17 +319,55 @@ pub struct Connection {
     semantic_max: [usize; NUM_CLASSES],
     /// Maximum datagram payload accepted on send.
     datagram_max: usize,
+    /// Reserved per-peer connection slot; owning it here ties the slot's
+    /// release (its `Drop`) to this connection's lifetime.
+    _conn_slot: Option<ConnSlot>,
     tasks: Vec<JoinHandle<()>>,
 }
 
+/// RAII guard over one reserved per-peer connection slot.
+///
+/// A transport's `reserve_conn_slot` hands one out after a successful
+/// handshake, and the resulting [`Connection`] owns it, so the per-peer
+/// connection budget counts *live* connections rather than lifetime totals.
+/// Dropping the guard decrements (saturating) the peer's entry in the shared
+/// count map and removes the entry once it reaches zero, keeping the map
+/// bounded by the number of peers with live connections.
+#[derive(Debug)]
+pub(crate) struct ConnSlot {
+    peer: PeerId,
+    counts: Arc<Mutex<HashMap<PeerId, usize>>>,
+}
+
+impl ConnSlot {
+    /// Wrap an already-incremented count for `peer` in a releasing guard.
+    pub(crate) fn new(peer: PeerId, counts: Arc<Mutex<HashMap<PeerId, usize>>>) -> Self {
+        Self { peer, counts }
+    }
+}
+
+impl Drop for ConnSlot {
+    fn drop(&mut self) {
+        let mut counts = self.counts.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(count) = counts.get_mut(&self.peer) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&self.peer);
+            }
+        }
+    }
+}
+
 /// Options that transports pass when assembling a [`Connection`].
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct ConnectionOpts {
     pub epoch: u64,
     pub role: PeerRole,
     pub wire_version: u16,
     pub capabilities: u64,
     pub peer_dedup: Option<Arc<Mutex<PeerDedup>>>,
+    /// Reserved per-peer connection slot, released when the connection drops.
+    pub conn_slot: Option<ConnSlot>,
 }
 
 impl Default for ConnectionOpts {
@@ -339,6 +378,7 @@ impl Default for ConnectionOpts {
             wire_version: DEFAULT_MAX_WIRE_VERSION,
             capabilities: DEFAULT_CAPABILITIES,
             peer_dedup: None,
+            conn_slot: None,
         }
     }
 }
@@ -400,6 +440,7 @@ impl Connection {
             max_payload: cfg.max_payload.min(MAX_FRAME_PAYLOAD),
             semantic_max: cfg.semantic_max,
             datagram_max: cfg.datagram_max_bytes,
+            _conn_slot: opts.conn_slot,
             tasks,
         }
     }
@@ -682,6 +723,43 @@ mod tests {
             sequence,
             payload: sequence.to_le_bytes().to_vec(),
         }
+    }
+
+    #[test]
+    fn conn_slot_drop_releases_count_and_removes_zero_entries() {
+        let peer = PeerId::from([7u8; 32]);
+        let counts: Arc<Mutex<HashMap<PeerId, usize>>> = Arc::new(Mutex::new(HashMap::new()));
+        counts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(peer, 2);
+
+        // Dropping one guard decrements the live count by exactly one.
+        drop(ConnSlot::new(peer, counts.clone()));
+        assert_eq!(
+            counts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&peer)
+                .copied(),
+            Some(1)
+        );
+
+        // The entry is removed (not left at 0) when the last slot releases,
+        // so the map stays bounded by peers with live connections.
+        drop(ConnSlot::new(peer, counts.clone()));
+        assert!(counts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty());
+
+        // Releasing with no entry present saturates: no panic, no underflow,
+        // and no phantom entry is created.
+        drop(ConnSlot::new(peer, counts.clone()));
+        assert!(counts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty());
     }
 
     #[test]
