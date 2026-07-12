@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 use types::{AccountId, Amount, Hash};
 
 /// Domain separator for deposit-certificate message hashing.
-pub const DOMAIN_DEPOSIT: &[u8] = b"dexos.custody.deposit";
+///
+/// Canonical value from [`crypto::DOMAIN_DEPOSIT`].
+pub const DOMAIN_DEPOSIT: &[u8] = crypto::DOMAIN_DEPOSIT;
 
 /// Uniqueness key for replay protection: one credit per `(chain, tx, event)`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]

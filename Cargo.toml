@@ -54,7 +54,7 @@ hex = "0.4"
 clap = { version = "4.5", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net", "io-util"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "json"] }
 thiserror = "2.0"
 anyhow = "1.0"
 

@@ -4,24 +4,13 @@ use sha2::{Digest, Sha256};
 use sha3::Keccak256;
 use types::Hash;
 
-/// Domain tag for a Merkle leaf.
-pub const DOMAIN_LEAF: &[u8] = b"dexos:leaf:v1";
-/// Domain tag for a Merkle internal node.
-pub const DOMAIN_NODE: &[u8] = b"dexos:node:v1";
-/// Domain tag for a per-account commitment.
-pub const DOMAIN_ACCOUNT: &[u8] = b"dexos:account:v1";
-/// Domain tag for a per-market commitment.
-pub const DOMAIN_MARKET: &[u8] = b"dexos:market:v1";
-/// Domain tag for a command.
-pub const DOMAIN_COMMAND: &[u8] = b"dexos:command:v1";
-/// Domain tag for an execution receipt.
-pub const DOMAIN_EXECUTION: &[u8] = b"dexos:execution:v1";
-/// Domain tag for an oracle observation.
-pub const DOMAIN_ORACLE: &[u8] = b"dexos:oracle:v1";
-/// Domain tag for a canonical validator-set commitment.
-pub const DOMAIN_VALIDATOR_SET: &[u8] = b"dexos:validator-set:v1";
-/// Domain tag for a decision-market action/outcome confirmation.
-pub const DOMAIN_DECISION: &[u8] = b"dexos:decision:v1";
+// Domain tags live in [`crate::domain`] (single catalog). Re-export the ones
+// historically defined here so existing `use crypto::hash::DOMAIN_*` paths keep
+// compiling.
+pub use crate::domain::{
+    DOMAIN_ACCOUNT, DOMAIN_COMMAND, DOMAIN_DECISION, DOMAIN_EXECUTION, DOMAIN_LEAF, DOMAIN_MARKET,
+    DOMAIN_NODE, DOMAIN_ORACLE, DOMAIN_VALIDATOR_SET,
+};
 
 fn finalize(h: Sha256) -> Hash {
     let out = h.finalize();

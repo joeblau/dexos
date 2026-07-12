@@ -48,6 +48,26 @@ pub use withdrawal::{
 pub const CRATE_NAME: &str = "chain-adapter";
 
 #[cfg(test)]
+mod domain_alignment_tests {
+    //! Cross-crate guarantee: withdrawal/deposit domain tags are the crypto
+    //! registry values, never a parallel dotted/slash scheme.
+
+    use super::{DOMAIN_DEPOSIT, DOMAIN_WITHDRAWAL_CERT, DOMAIN_WITHDRAWAL_ID};
+
+    #[test]
+    fn withdrawal_domains_match_crypto_registry() {
+        assert_eq!(DOMAIN_WITHDRAWAL_ID, crypto::DOMAIN_WITHDRAWAL_ID);
+        assert_eq!(DOMAIN_WITHDRAWAL_CERT, crypto::DOMAIN_WITHDRAWAL_CERT);
+        assert_eq!(DOMAIN_DEPOSIT, crypto::DOMAIN_DEPOSIT);
+        // Auth digest lives in custody but uses the same registry entry.
+        assert_eq!(
+            crypto::DOMAIN_WITHDRAWAL_AUTH,
+            b"dexos:custody:withdrawal-auth:v1"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crypto::ThresholdSigners;

@@ -10,9 +10,12 @@ publish.workspace = true
 workspace = true
 
 [features]
-default = []
+default = ["metrics-http"]
 dev-tools = ["dep:loadgen"]
 mock-chains = ["chain-adapter-evm/mock", "chain-adapter-svm/mock"]
+# Prometheus /livez scrape server (always available; bound only when
+# observability.metrics_listen is set). Kept as a feature so production
+# binaries can strip it if desired.
 metrics-http = []
 simd = []
 
@@ -38,6 +41,7 @@ network = { path = "../network" }
 discovery = { path = "../discovery" }
 rpc = { path = "../rpc" }
 light-client = { path = "../light-client" }
+observability = { path = "../observability" }
 loadgen = { path = "../loadgen", optional = true }
 serde.workspace = true
 toml.workspace = true

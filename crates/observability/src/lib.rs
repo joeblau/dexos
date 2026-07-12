@@ -50,6 +50,7 @@ pub use histogram::{Histogram, Quantiles, Stage, StageHistograms, BUCKET_COUNT};
 pub use registry::{MetricKind, MetricsRegistry, RegistrationError};
 pub use snapshot::{
     parse_metric_lines, CounterSnapshot, GaugeSnapshot, HistogramSnapshot, Snapshot,
+    PROMETHEUS_CONTENT_TYPE,
 };
 pub use trace::{SpanId, TraceContext, TraceGen, TraceId, TraceParseError};
 

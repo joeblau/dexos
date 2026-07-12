@@ -55,6 +55,22 @@ pub use withdrawal::{
 pub const CRATE_NAME: &str = "custody";
 
 #[cfg(test)]
+mod domain_alignment_tests {
+    use super::{WITHDRAWAL_AUTH_DOMAIN, WITHDRAWAL_DOMAIN};
+
+    #[test]
+    fn withdrawal_domains_match_crypto_registry() {
+        assert_eq!(WITHDRAWAL_DOMAIN, crypto::DOMAIN_WITHDRAWAL_ID);
+        assert_eq!(WITHDRAWAL_AUTH_DOMAIN, crypto::DOMAIN_WITHDRAWAL_AUTH);
+        // Same family as chain-adapter settlement certs.
+        assert_eq!(
+            crypto::DOMAIN_WITHDRAWAL_CERT,
+            b"dexos:custody:withdrawal-cert:v1"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn crate_name_is_stable() {

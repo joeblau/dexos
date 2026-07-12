@@ -31,3 +31,9 @@ read_only = false
 # Core pinning and busy-polled ingress are not implemented yet (fail closed).
 pin_threads = false
 busy_poll = false
+
+[observability]
+# Use `json` in production log pipelines; `text` is easier for local dev.
+log_format = "text"
+# Empty disables the scrape server. Example: "127.0.0.1:9100"
+metrics_listen = ""

@@ -16,3 +16,4 @@ crypto = { path = "../crypto" }
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tracing.workspace = true

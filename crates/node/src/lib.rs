@@ -10,18 +10,21 @@
 
 pub mod config;
 pub mod error;
+pub mod metrics;
 pub mod threading;
 
 use std::future::Future;
+use std::sync::Arc;
 
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 pub use config::{
-    ConfigError, ConfigOverrides, ConsensusSection, NetworkSection, NodeConfig, NodeSection,
-    PerformanceSection, Role, RpcSection, StorageSection,
+    ConfigError, ConfigOverrides, ConsensusSection, LogFormat, NetworkSection, NodeConfig,
+    NodeSection, ObservabilitySection, PerformanceSection, Role, RpcSection, StorageSection,
 };
 pub use error::NodeError;
+pub use observability::{MetricsRegistry, TraceGen, TraceId};
 
 /// Capacity of each subsystem ingress queue. Bounded by construction.
 pub const INGRESS_CAPACITY: usize = 1024;
@@ -51,6 +54,7 @@ pub const SUBSYSTEMS: &[&str] = &[
     discovery::CRATE_NAME,
     rpc::CRATE_NAME,
     light_client::CRATE_NAME,
+    observability::CRATE_NAME,
     #[cfg(feature = "dev-tools")]
     loadgen::CRATE_NAME,
 ];
@@ -161,16 +165,44 @@ impl Node {
     where
         F: Future<Output = ()>,
     {
-        init_tracing();
+        let identity = NodeIdentity {
+            name: self.config.node.name.clone(),
+            region: self.config.node.region.clone(),
+            version: env!("CARGO_PKG_VERSION"),
+        };
+        init_tracing(self.config.observability.log_format, &identity);
+
+        // Process-wide metrics registry + optional Prometheus scrape listener.
+        let metrics = Arc::new(MetricsRegistry::new());
+        metrics.counter("node_starts_total").inc();
+        let metrics_task = metrics::spawn_if_configured(
+            &self.config.observability.metrics_listen,
+            Arc::clone(&metrics),
+        )
+        .await?;
+
+        // Root span carries node identity + a process-level TraceId so every
+        // nested event on the hot path can correlate without custom scrapers.
+        let mut trace_gen = TraceGen::from_seed(0x0de05_0001);
+        let process_trace = trace_gen.new_trace();
+        let root = tracing::info_span!(
+            "node.run",
+            node_name = %identity.name,
+            node_region = %identity.region,
+            node_version = identity.version,
+            trace_id = %process_trace.to_hex(),
+        );
+        let _enter = root.enter();
         tracing::info!(target: "node", "{}", self.startup_summary());
 
         let receivers = std::mem::take(&mut self.receivers);
         let mut handles: Vec<(String, JoinHandle<u64>)> = Vec::with_capacity(receivers.len());
         for (role, rx) in receivers {
             let stop = self.shutdown_tx.subscribe();
+            let role_name = role.as_str().to_string();
             handles.push((
-                role.as_str().to_string(),
-                tokio::spawn(run_handler(rx, stop)),
+                role_name.clone(),
+                tokio::spawn(run_handler(rx, stop, role_name, process_trace)),
             ));
         }
 
@@ -186,6 +218,9 @@ impl Node {
                 .await
                 .map_err(|source| NodeError::Join { role, source })?;
             processed += count;
+        }
+        if let Some(task) = metrics_task {
+            task.abort();
         }
         tracing::info!(target: "node", "drained {} queued command(s) across {} subsystem(s)", processed, handler_count);
         Ok(ShutdownReport {
@@ -214,9 +249,25 @@ impl Node {
     }
 }
 
+/// Process identity fields attached to every structured log record.
+#[derive(Debug, Clone)]
+struct NodeIdentity {
+    name: String,
+    region: String,
+    version: &'static str,
+}
+
 /// One role handler: process ingress envelopes until the stop signal, then drain
 /// whatever remains in the bounded queue. Returns the number processed.
-async fn run_handler(mut rx: mpsc::Receiver<Envelope>, mut stop: watch::Receiver<bool>) -> u64 {
+///
+/// Each envelope is handled under a child span that carries the process
+/// `trace_id` and the role name so RPC/network-adjacent work can correlate.
+async fn run_handler(
+    mut rx: mpsc::Receiver<Envelope>,
+    mut stop: watch::Receiver<bool>,
+    role: String,
+    process_trace: TraceId,
+) -> u64 {
     let mut processed: u64 = 0;
     loop {
         tokio::select! {
@@ -229,7 +280,17 @@ async fn run_handler(mut rx: mpsc::Receiver<Envelope>, mut stop: watch::Receiver
             }
             maybe = rx.recv() => {
                 match maybe {
-                    Some(_envelope) => processed += 1,
+                    Some(envelope) => {
+                        let span = tracing::info_span!(
+                            "node.handler",
+                            role = %role,
+                            trace_id = %process_trace.to_hex(),
+                            envelope.seq = envelope.seq,
+                        );
+                        let _g = span.enter();
+                        tracing::trace!(target: "node", "envelope processed");
+                        processed += 1;
+                    }
                     None => break,
                 }
             }
@@ -239,16 +300,42 @@ async fn run_handler(mut rx: mpsc::Receiver<Envelope>, mut stop: watch::Receiver
 }
 
 /// Initialize structured logging exactly once, outside any hot path.
-fn init_tracing() {
+///
+/// - [`LogFormat::Text`]: human `fmt` (default for local dev).
+/// - [`LogFormat::Json`]: production JSON lines with `node.name` / `node.region`
+///   / `node.version` injected as subscriber fields.
+fn init_tracing(format: LogFormat, identity: &NodeIdentity) {
     use std::sync::Once;
     static INIT: Once = Once::new();
     INIT.call_once(|| {
         use tracing_subscriber::EnvFilter;
         let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_target(false)
-            .try_init();
+        match format {
+            LogFormat::Json => {
+                let _ = tracing_subscriber::fmt()
+                    .json()
+                    .with_env_filter(filter)
+                    .with_current_span(true)
+                    .with_span_list(true)
+                    .try_init();
+                // Identity is also on the root span; emit once so early lines
+                // before any span still carry process fields via a record.
+                tracing::info!(
+                    target: "node",
+                    node_name = %identity.name,
+                    node_region = %identity.region,
+                    node_version = identity.version,
+                    log_format = "json",
+                    "structured logging initialized"
+                );
+            }
+            LogFormat::Text => {
+                let _ = tracing_subscriber::fmt()
+                    .with_env_filter(filter)
+                    .with_target(false)
+                    .try_init();
+            }
+        }
     });
 }
 
