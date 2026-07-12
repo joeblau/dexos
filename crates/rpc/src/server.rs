@@ -20,7 +20,11 @@
 //!   ([`crate::work::WorkBudget`]) so large frames and slow handlers cannot
 //!   exhaust RSS independently of connection count;
 //! - idle, read, and write [timeouts](ServerConfig) that evict slowloris-style
-//!   stalled clients; and
+//!   stalled clients;
+//! - classified `accept()` error handling (#406): transient per-connection
+//!   failures and FD/buffer exhaustion never terminate the accept loop —
+//!   exhaustion backs off briefly so in-flight connections can free
+//!   descriptors, and only unclassified errors are fatal; and
 //! - `TCP_NODELAY` on every accepted socket.
 //!
 //! # TLS
@@ -448,7 +452,10 @@ pub async fn serve(
 }
 
 /// Accept connections on `listener` and serve each on its own task, enforcing
-/// the admission control in `config`. Runs until the listener errors.
+/// the admission control in `config`. Runs until the listener fails with a
+/// **fatal** error: transient per-connection accept failures and resource
+/// exhaustion are absorbed by the loop instead of terminating the server (see
+/// `accept_action`).
 ///
 /// When `config.tls` is [`TlsMode::Required`], each accepted socket performs a
 /// TLS 1.3 handshake before entering the RPC session. The handshake is bounded
@@ -475,6 +482,60 @@ pub async fn serve_with_config(
         .map(|_served| ())
 }
 
+/// How the accept loop should respond to a `listener.accept()` error (#406).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AcceptAction {
+    /// Per-connection failure (e.g. the peer aborted before we accepted): the
+    /// dead socket was consumed and the listener is healthy — accept the next
+    /// connection immediately.
+    Continue,
+    /// Resource exhaustion (out of file descriptors / buffers / memory): the
+    /// listener is healthy but the process cannot admit a socket *right now*.
+    /// Pause briefly so in-flight connections can close and free resources,
+    /// then resume accepting.
+    Backoff,
+    /// Anything else is unclassified and treated as fatal: terminate the
+    /// server (with the bounded drain) rather than spin on a broken listener.
+    Fatal,
+}
+
+/// Classify a `listener.accept()` error (#406). Without this, *any* accept
+/// error — including transient `ECONNABORTED` from a peer racing its own
+/// close, or `EMFILE`/`ENFILE` during exactly the FD-exhaustion flood the
+/// admission control above exists to survive — would permanently terminate
+/// the whole RPC server while established connections kept running detached.
+///
+/// Rust 1.92 has no stable [`io::ErrorKind`](std::io::ErrorKind) for FD/buffer
+/// exhaustion (`EMFILE`/`ENFILE`/`ENOBUFS` decode to `Uncategorized`), so the
+/// exhaustion arm matches [`std::io::Error::raw_os_error`] against the errno
+/// constants instead of the kind.
+pub(crate) fn accept_action(err: &std::io::Error) -> AcceptAction {
+    match err.kind() {
+        // The pending connection died between the kernel queuing it and us
+        // accepting it (or the syscall was interrupted). Nothing is wrong
+        // with the listener; the very next accept can succeed.
+        std::io::ErrorKind::ConnectionAborted
+        | std::io::ErrorKind::ConnectionReset
+        | std::io::ErrorKind::Interrupted => AcceptAction::Continue,
+        _ => match err.raw_os_error() {
+            Some(code)
+                if code == libc::EMFILE
+                    || code == libc::ENFILE
+                    || code == libc::ENOBUFS
+                    || code == libc::ENOMEM =>
+            {
+                AcceptAction::Backoff
+            }
+            _ => AcceptAction::Fatal,
+        },
+    }
+}
+
+/// How long the accept loop pauses after a resource-exhaustion accept failure
+/// before retrying, giving in-flight connections a chance to close and free
+/// file descriptors.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+
 /// [`serve_with_config`], plus a shutdown path (#407): accept connections until
 /// the `stop` flag fires, then drain and return how many connections were
 /// admitted and served over the server's lifetime.
@@ -498,9 +559,16 @@ pub async fn serve_with_config(
 /// aborted. Dropping this future likewise aborts all tracked connection tasks
 /// instead of leaking them.
 ///
-/// A listener error takes the same bounded drain path before returning the
-/// error, so already-admitted connections get a chance to finish their current
-/// request even on an accept failure.
+/// # Accept-error resilience (#406)
+/// An accept failure does **not** blindly terminate the server. Errors are
+/// classified by `accept_action`: per-connection failures
+/// (`ECONNABORTED`/`ECONNRESET`/`EINTR`) are logged and skipped; resource
+/// exhaustion (`EMFILE`/`ENFILE`/`ENOBUFS`/`ENOMEM`) pauses accepting for
+/// `ACCEPT_BACKOFF` — still racing the stop signal — so in-flight
+/// connections can close and free descriptors; only unclassified errors are
+/// fatal. A **fatal** listener error takes the same bounded drain path before
+/// returning the error, so already-admitted connections get a chance to finish
+/// their current request even on an accept failure.
 pub async fn serve_with_shutdown(
     listener: TcpListener,
     backend: Arc<dyn RpcBackend>,
@@ -535,7 +603,30 @@ pub async fn serve_with_shutdown(
         };
         let (stream, peer) = match accepted {
             Ok(pair) => pair,
-            Err(e) => break Err(ServerError::Io(e)),
+            // Classified accept-error handling (#406): only unclassified
+            // errors terminate the server; transient and exhaustion errors
+            // keep the accept loop alive.
+            Err(err) => match accept_action(&err) {
+                AcceptAction::Continue => {
+                    tracing::debug!(error = %err, "transient accept error; continuing");
+                    continue;
+                }
+                AcceptAction::Backoff => {
+                    tracing::warn!(
+                        error = %err,
+                        "accept failed on resource exhaustion; backing off"
+                    );
+                    // Race the pause against shutdown so a stop signalled
+                    // mid-backoff is still honored promptly.
+                    tokio::select! {
+                        biased;
+                        _ = stop_requested(&mut stop) => break Ok(()),
+                        () = tokio::time::sleep(ACCEPT_BACKOFF) => {}
+                    }
+                    continue;
+                }
+                AcceptAction::Fatal => break Err(ServerError::Io(err)),
+            },
         };
         // Disable Nagle's algorithm so small framed replies are not delayed.
         let _ = stream.set_nodelay(true);
