@@ -45,11 +45,11 @@ jobs:
         run: |
           BIN=$(ls dist-${{ matrix.target }}/marketd-* | head -1)
           "${BIN}" --help
-          (cd dist-${{ matrix.target }} && shasum -a 256 -c SHA256SUMS)
-          test -s dist-${{ matrix.target }}/sbom.cdx.json
-          test -s dist-${{ matrix.target }}/ROLLBACK.md
-          test -s dist-${{ matrix.target }}/build-metadata.json
-          python3 -c "import json; m=json.load(open('dist-${{ matrix.target }}/build-metadata.json')); assert m['panic_strategy']=='abort', m"
+          (cd dist-${{ matrix.target }} && shasum -a 256 -c SHA256SUMS-${{ matrix.target }})
+          test -s dist-${{ matrix.target }}/sbom-${{ matrix.target }}.cdx.json
+          test -s dist-${{ matrix.target }}/ROLLBACK-${{ matrix.target }}.md
+          test -s dist-${{ matrix.target }}/build-metadata-${{ matrix.target }}.json
+          python3 -c "import json; m=json.load(open('dist-${{ matrix.target }}/build-metadata-${{ matrix.target }}.json')); assert m['panic_strategy']=='abort', m"
       - name: install cosign
         uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da # v3.7.0
       - name: sign artifacts (keyless OIDC)
@@ -58,14 +58,15 @@ jobs:
         run: |
           set -euo pipefail
           DIR="dist-${{ matrix.target }}"
+          SUMS="${DIR}/SHA256SUMS-${{ matrix.target }}"
           BIN=$(ls "${DIR}"/marketd-* | head -1)
-          # Sign the binary and the checksums file. Keyless uses GitHub OIDC.
+          # Sign the binary and the per-target checksums file. Keyless uses GitHub OIDC.
           cosign sign-blob --yes \
             --bundle "${BIN}.cosign.bundle" \
             "${BIN}"
           cosign sign-blob --yes \
-            --bundle "${DIR}/SHA256SUMS.cosign.bundle" \
-            "${DIR}/SHA256SUMS"
+            --bundle "${SUMS}.cosign.bundle" \
+            "${SUMS}"
           # Prove verification works against the public Rekor log.
           cosign verify-blob \
             --bundle "${BIN}.cosign.bundle" \
@@ -73,7 +74,7 @@ jobs:
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
             "${BIN}"
           test -s "${BIN}.cosign.bundle"
-          test -s "${DIR}/SHA256SUMS.cosign.bundle"
+          test -s "${SUMS}.cosign.bundle"
           ls -la "${DIR}"
       - name: upload workflow artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -85,15 +86,10 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          files: |
-            dist-${{ matrix.target }}/marketd-*
-            dist-${{ matrix.target }}/SHA256SUMS
-            dist-${{ matrix.target }}/SHA256SUMS.cosign.bundle
-            dist-${{ matrix.target }}/sbom.cdx.json
-            dist-${{ matrix.target }}/build-metadata.json
-            dist-${{ matrix.target }}/ROLLBACK.md
-            dist-${{ matrix.target }}/marketd-*.cosign.bundle
-          fail_on_unmatched_files: false
+          # Every artifact name is target-suffixed, so both matrix legs can
+          # attach to the same release without overwriting each other.
+          files: dist-${{ matrix.target }}/*
+          fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -129,28 +125,61 @@ jobs:
           manifest = {"version": os.environ.get("GITHUB_REF_NAME", "dev"), "targets": {}}
           for name, d in [("x86_64-unknown-linux-gnu", "dist-x86_64"), ("aarch64-unknown-linux-gnu", "dist-aarch64")]:
               root = pathlib.Path(d)
-              bins = list(root.glob("marketd-*"))
+              bins = [p for p in root.glob("marketd-*") if not p.name.endswith(".cosign.bundle")]
               assert bins, f"missing binary under {d}"
               b = bins[0]
               manifest["targets"][name] = {
                   "binary": b.name,
                   "sha256": sha256(b),
-                  "sbom": "sbom.cdx.json",
-                  "checksums": "SHA256SUMS",
+                  "sbom": f"sbom-{name}.cdx.json",
+                  "checksums": f"SHA256SUMS-{name}",
                   "signature_bundle": b.name + ".cosign.bundle",
               }
           pathlib.Path("RELEASE_MANIFEST.json").write_text(json.dumps(manifest, indent=2) + "\n")
           print(json.dumps(manifest, indent=2))
           PY
+      - name: combine per-target checksums
+        # Single writer for the unsuffixed SHA256SUMS: only this job (which runs
+        # once, after both matrix legs) writes it, so there is no upload race.
+        # Operators can `shasum -a 256 -c SHA256SUMS` against either binary.
+        run: |
+          set -euo pipefail
+          cat dist-x86_64/SHA256SUMS-x86_64-unknown-linux-gnu \
+              dist-aarch64/SHA256SUMS-aarch64-unknown-linux-gnu > SHA256SUMS
+          cat SHA256SUMS
+      - name: install cosign
+        uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da # v3.7.0
+      - name: sign combined checksums (keyless OIDC)
+        env:
+          COSIGN_YES: "true"
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes \
+            --bundle SHA256SUMS.cosign.bundle \
+            SHA256SUMS
+          cosign verify-blob \
+            --bundle SHA256SUMS.cosign.bundle \
+            --certificate-identity-regexp "https://github.com/${{ github.repository }}/.*" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            SHA256SUMS
+          test -s SHA256SUMS.cosign.bundle
       - name: upload manifest
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-manifest
-          path: RELEASE_MANIFEST.json
+          path: |
+            RELEASE_MANIFEST.json
+            SHA256SUMS
+            SHA256SUMS.cosign.bundle
+          if-no-files-found: error
       - name: attach manifest to release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          files: RELEASE_MANIFEST.json
+          files: |
+            RELEASE_MANIFEST.json
+            SHA256SUMS
+            SHA256SUMS.cosign.bundle
+          fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

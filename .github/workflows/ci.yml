@@ -232,6 +232,8 @@ jobs:
         run: ./scripts/build-release-artifacts.sh
       - name: smoke-test artifact
         run: |
+          # Same default the build script uses when TARGET is unset.
+          TARGET="$(rustc -vV | awk '/^host:/{print $2}')"
           BIN=$(ls dist/marketd-* | head -1)
           "${BIN}" --help
           # Unwired ops must fail closed (nonzero) without --experimental.
@@ -239,13 +241,13 @@ jobs:
             echo "replay stub must exit nonzero" >&2
             exit 1
           fi
-          # Checksums verify.
-          (cd dist && shasum -a 256 -c SHA256SUMS)
-          test -f dist/sbom.cdx.json
-          test -f dist/build-metadata.json
-          test -f dist/ROLLBACK.md
-          python3 -c "import json; json.load(open('dist/sbom.cdx.json'))"
-          python3 -c "import json; m=json.load(open('dist/build-metadata.json')); assert m['panic_strategy']=='abort'"
+          # Checksums verify (artifact names are target-suffixed).
+          (cd dist && shasum -a 256 -c "SHA256SUMS-${TARGET}")
+          test -f "dist/sbom-${TARGET}.cdx.json"
+          test -f "dist/build-metadata-${TARGET}.json"
+          test -f "dist/ROLLBACK-${TARGET}.md"
+          python3 -c "import json; json.load(open('dist/sbom-${TARGET}.cdx.json'))"
+          python3 -c "import json; m=json.load(open('dist/build-metadata-${TARGET}.json')); assert m['panic_strategy']=='abort'"
 
   build-release:
     name: build (release)
