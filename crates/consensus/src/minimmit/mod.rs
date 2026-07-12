@@ -15,6 +15,17 @@
 //! removed before Phase 5 of the migration. Protocol authority:
 //! `docs/CONSENSUS_MINIMMIT.md`.
 
+pub mod block;
 pub mod committee;
+pub mod digest;
+pub mod wire;
 
+pub use block::{BlockHeader, DOMAIN_BLOCK};
 pub use committee::{Certificate, MinimmitCommittee, ThresholdKind};
+pub use digest::{
+    notarize_digest, nullify_digest, propose_auth, DOMAIN_NOTARIZE, DOMAIN_NULLIFY, DOMAIN_PROPOSE,
+};
+pub use wire::{
+    msg_type, CertError, ConsensusMessage, ExecAttest, Notarization, Notarize, Nullification,
+    Nullify, ParentRef, Proof, Propose, WireError, BOTTOM_VIEW,
+};

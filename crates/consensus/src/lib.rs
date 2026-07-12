@@ -51,7 +51,10 @@ pub use checkpoint::{
     DEFAULT_WITNESS_MAX_ENTRIES, DEFAULT_WITNESS_SEQUENCE_HORIZON, DOMAIN_CHECKPOINT,
     DOMAIN_WITNESS,
 };
-pub use minimmit::{Certificate, MinimmitCommittee, ThresholdKind};
+pub use minimmit::{
+    notarize_digest, nullify_digest, propose_auth, Certificate, MinimmitCommittee, ThresholdKind,
+    DOMAIN_NOTARIZE, DOMAIN_NULLIFY, DOMAIN_PROPOSE,
+};
 pub use sequencer::{detect_gap, CommandRecord, CommandStatus, Sequencer, SequencerError};
 pub use vote::{
     timeout_digest, vote_digest, CollectorWindow, Committee, Equivocation, NoopSlashHook,
@@ -1147,6 +1150,20 @@ mod tests {
             let _ = codec::decode::<WitnessReceipt>(&bytes);
             let _ = codec::decode::<ValidatorSetUpdate>(&bytes);
             let _ = codec::decode::<CommandRecord>(&bytes);
+            // Minimmit wire types (#517) share the same totality guarantee.
+            let _ = codec::decode::<minimmit::ParentRef>(&bytes);
+            let _ = codec::decode::<minimmit::Propose>(&bytes);
+            let _ = codec::decode::<minimmit::Notarize>(&bytes);
+            let _ = codec::decode::<minimmit::Nullify>(&bytes);
+            let _ = codec::decode::<minimmit::Notarization>(&bytes);
+            let _ = codec::decode::<minimmit::Nullification>(&bytes);
+            let _ = codec::decode::<minimmit::ExecAttest>(&bytes);
+            let _ = codec::decode::<minimmit::Proof>(&bytes);
+            // The tag-dispatch entry point (#518) is total across registry
+            // (0x0001–0x0006 after #520) and arbitrary tags alike.
+            for tag in 0x0000..=0x0008u16 {
+                let _ = minimmit::ConsensusMessage::decode(tag, &bytes);
+            }
         }
     }
 

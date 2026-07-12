@@ -302,7 +302,10 @@ impl MinimmitCommittee {
     /// Routes to the [`Self::advance_set`] (`M`) or [`Self::finalize_set`]
     /// (`L`) and re-verifies every signature plus the signed-weight threshold.
     /// The caller owns the digest-equality check (`cert.message` must equal
-    /// the recomputed notarize / nullify digest — a Phase 1 concern).
+    /// the recomputed notarize / nullify digest —
+    /// [`Notarization::verify`](super::Notarization::verify) /
+    /// [`Nullification::verify`](super::Nullification::verify) layer it on
+    /// top, #519).
     ///
     /// # Errors
     ///
