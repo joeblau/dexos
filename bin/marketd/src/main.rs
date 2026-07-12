@@ -351,18 +351,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_all_eight_modes() {
-        let cases: &[&[&str]] = &[
+    fn parses_all_enabled_modes() {
+        let cases: Vec<&[&str]> = vec![
             &["marketd", "run"],
             &["marketd", "run", "--light"],
-            &[
-                "marketd",
-                "benchmark",
-                "--suite",
-                "all",
-                "--output",
-                "results.json",
-            ],
             &[
                 "marketd",
                 "replay",
@@ -377,8 +369,22 @@ mod tests {
             &["marketd", "snapshot"],
         ];
         for args in cases {
-            assert!(Cli::try_parse_from(*args).is_ok(), "should parse: {args:?}");
+            assert!(Cli::try_parse_from(args).is_ok(), "should parse: {args:?}");
         }
+    }
+
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn benchmark_mode_parses_with_dev_tools() {
+        assert!(Cli::try_parse_from([
+            "marketd",
+            "benchmark",
+            "--suite",
+            "all",
+            "--output",
+            "results.json",
+        ])
+        .is_ok());
     }
 
     #[test]
