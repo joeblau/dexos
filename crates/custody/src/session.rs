@@ -255,7 +255,7 @@ mod tests {
             *signature = sig;
         }
         let mut reg = WalletRegistry::new(4);
-        reg.bind(&cmd, SequenceNumber::new(1)).unwrap();
+        reg.establish_master(&cmd, SequenceNumber::new(1)).unwrap();
         (reg, kp)
     }
 

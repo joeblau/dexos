@@ -34,7 +34,11 @@ pub mod withdrawal;
 
 pub use error::CustodyError;
 
-pub use binding::{BindWallet, WalletBinding, WalletKey, WalletProof, WalletRegistry, BIND_DOMAIN};
+pub use binding::{
+    bind_authorization_message, revoke_authorization_message, rotate_master_authorization_message,
+    set_privileges_authorization_message, BindWallet, WalletBinding, WalletKey, WalletProof,
+    WalletRegistry, BIND_AUTH_DOMAIN, BIND_DOMAIN,
+};
 pub use chain::{evm_address_from_pubkey, ChainId, ChainKind, WalletAddress};
 pub use controller::{ControlCommand, CustodyController, SignedWithdrawal};
 pub use policy::ChainPolicy;

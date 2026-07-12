@@ -34,6 +34,23 @@ pub enum CustodyError {
     /// The (account, address) pair is already actively bound.
     #[error("wallet already bound to this account")]
     DuplicateBinding,
+    /// The wallet address is already owned by (bound to) a different account.
+    /// A wallet address is permanently owned by the first account it binds to;
+    /// cross-account reuse is prohibited.
+    #[error("wallet address is already bound to a different account")]
+    CrossAccountReuse,
+    /// A genesis master could not be established because the account already has
+    /// a binding (its master, and possibly more). Later wallets attach through
+    /// [`WalletRegistry::bind`], which requires the current master's signature.
+    #[error("account already has an established master wallet")]
+    AccountAlreadyEstablished,
+    /// The genesis (first) binding for an account must designate its master.
+    #[error("the first binding must designate a master wallet")]
+    MasterRequired,
+    /// The active master wallet cannot be revoked directly; the master must be
+    /// rotated to another wallet first (so the account is never master-less).
+    #[error("the active master cannot be revoked; rotate the master first")]
+    MasterNotRevocable,
     /// The (account, nonce) binding was already consumed (replay).
     #[error("binding nonce already consumed")]
     ReplayedBinding,
