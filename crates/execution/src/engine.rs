@@ -1838,16 +1838,72 @@ impl Engine {
                 // while the work scales with the market's holders instead of
                 // accounts x positions (#430).
                 let accounts: Vec<AccountId> = self.risk.market_holders(c.market)?;
+                // Funding is a CLOSED transfer (#433). Per-account toward-zero
+                // rounding of `notional * rate` is only symmetric when longs
+                // and shorts mirror each other exactly; on a net-flat but
+                // asymmetric book the truncated debits and credits diverge and
+                // the difference leaks (or mints) collateral each epoch.
+                // Policy, in the fixed ascending dense-index holder order:
+                //   * payer   (truncated pay > 0): debit the obligation rounded
+                //     UP — `mul_ratio_ceil`, the fixed.rs policy for
+                //     non-negative obligations. The product `notional * rate`
+                //     is strictly positive for a payer, so the toward-positive
+                //     rounding is a ceiling on its magnitude.
+                //   * receiver (truncated pay < 0): credit the truncated
+                //     entitlement `|pay|` (the existing `mul_ratio` value).
+                //   * residual `collected - distributed` (>= 0 by
+                //     construction: payers round up, receivers round down) is
+                //     routed to the insurance fund, so total collateral —
+                //     accounts plus insurance — is conserved exactly.
+                // Everything is integer-only over committed state (mark,
+                // positions, rate) with checked accumulation, so identical
+                // streams commit byte-identical roots on every architecture.
+                let mut collected: i128 = 0;
+                let mut distributed: i128 = 0;
                 for a in &accounts {
                     let qty = self.risk.position(*a, c.market)?;
-                    // payment positive => account pays (long when rate > 0).
-                    let pay = mark.notional(qty)?.mul_ratio(rate)?;
-                    // apply_funding credits; so credit -pay.
-                    let credit = Amount::from_raw(
-                        pay.raw().checked_neg().ok_or(types::ArithError::Overflow)?,
-                    );
-                    self.risk.apply_funding(*a, credit)?;
+                    let notional = mark.notional(qty)?;
+                    // Truncated payment classifies the holder: positive pays
+                    // funding (long when rate > 0), negative receives it.
+                    let pay = notional.mul_ratio(rate)?;
+                    let delta = match pay.raw().cmp(&0) {
+                        std::cmp::Ordering::Greater => {
+                            let debit = notional.mul_ratio_ceil(rate)?;
+                            collected = collected
+                                .checked_add(debit.raw())
+                                .ok_or(types::ArithError::Overflow)?;
+                            Amount::from_raw(
+                                debit
+                                    .raw()
+                                    .checked_neg()
+                                    .ok_or(types::ArithError::Overflow)?,
+                            )
+                        }
+                        std::cmp::Ordering::Less => {
+                            let credit = Amount::from_raw(
+                                pay.raw().checked_neg().ok_or(types::ArithError::Overflow)?,
+                            );
+                            distributed = distributed
+                                .checked_add(credit.raw())
+                                .ok_or(types::ArithError::Overflow)?;
+                            credit
+                        }
+                        std::cmp::Ordering::Equal => Amount::ZERO,
+                    };
+                    self.risk.apply_funding(*a, delta)?;
                     self.commit_account(*a)?;
+                }
+                // Non-negative by construction; enforced fail-closed so a
+                // violated assumption rolls the epoch back instead of drawing
+                // the insurance fund down (fund_insurance rejects negatives).
+                let residual = collected
+                    .checked_sub(distributed)
+                    .ok_or(types::ArithError::Overflow)?;
+                if residual < 0 {
+                    return Err(ExecutionError::NegativeFundingResidual);
+                }
+                if residual > 0 {
+                    self.risk.fund_insurance(Amount::from_raw(residual))?;
                 }
                 self.commit_market(c.market)?;
                 Ok(self.receipt(
@@ -4204,9 +4260,110 @@ mod tests {
 
         // Golden root captured from the pre-#430 dense-scan implementation:
         // the reverse-index holder set must commit byte-identical state.
+        // Unchanged by the #433 closed-transfer rounding fix: every payment in
+        // this scenario is an exact micro-unit multiple (4.5/2.5/2.0 notional
+        // at 1% has no fractional micro-unit), so ceil-for-payers equals the
+        // old truncation, the residual is zero, and no insurance transfer
+        // occurs — the committed bytes are identical.
         assert_eq!(
             hex::encode(e.state_root().as_bytes()),
             "9d8cc0493262dfa45301dad8a340af19148e53b9ba63437dea98bb630af61699",
+        );
+    }
+
+    // #433 conservation: funding is a closed transfer. On a net-flat but
+    // ASYMMETRIC book, per-account toward-zero rounding leaks dust — here the
+    // old code debited the long trunc(2.25) = 2 while crediting the shorts
+    // trunc(0.75) + trunc(1.5) = 0 + 1 = 1, destroying 1 micro-unit of
+    // collateral per epoch. The fix debits payers with obligations rounded UP
+    // (ceil(2.25) = 3), credits receivers their truncated entitlements
+    // (0 + 1), and routes the non-negative residual (3 - 1 = 2) to the
+    // insurance fund, so total collateral (accounts + insurance) is conserved
+    // exactly. This test fails on the pre-#433 code (total drops by 1 and the
+    // insurance fund stays empty).
+    #[test]
+    fn funding_epoch_conserves_collateral_with_insurance_residual_433() {
+        // One long of 3 raw quantity units against shorts of 1 and 2, filled
+        // at the mark (1.0), so pre-funding collateral is untouched. At mark
+        // 1.0 the notionals are +3 / -1 / -2 micro-units; a 0.75 rate makes
+        // every payment fractional: +2.25 / -0.75 / -1.5.
+        let script: Vec<Command> = vec![
+            create_account(100_000_000), // 0: long 3 raw
+            create_account(100_000_000), // 1: short 1 raw
+            create_account(100_000_000), // 2: short 2 raw
+            create_perp(0, 1_000_000),
+            place(0, 0, 1, Side::Bid, 1_000_000, 3),
+            place(1, 0, 2, Side::Ask, 1_000_000, 1),
+            place(2, 0, 3, Side::Ask, 1_000_000, 2),
+        ];
+        let run = |cmds: &[Command]| -> Engine {
+            let mut e = engine_with_caps(8, 4);
+            for (i, c) in cmds.iter().enumerate() {
+                e.execute(seq(i as u64 + 1), c.clone()).unwrap();
+            }
+            e
+        };
+        let mut e = run(&script);
+        let total = |e: &Engine| -> i128 {
+            let mut sum = e.risk.insurance_fund().raw();
+            for i in 0..e.risk.account_count() {
+                let a = AccountId::from_index(i).unwrap();
+                sum += e.risk.collateral(a).unwrap().raw();
+            }
+            sum
+        };
+        let before = total(&e);
+        assert_eq!(before, 300_000_000);
+        assert_eq!(e.risk.insurance_fund(), Amount::ZERO);
+
+        let rate = types::Ratio::from_raw(750_000); // 0.75
+        let funding = Command::ApplyFundingEpoch(ApplyFundingEpoch {
+            market: MarketId::new(0),
+            epoch: 1,
+            rate,
+        });
+        e.execute(seq(script.len() as u64 + 1), funding.clone())
+            .unwrap();
+
+        // Payer: exact 2.25 rounds UP to 3 (collected). Receivers: truncated
+        // entitlements 0 and 1 (distributed). Residual 3 - 1 = 2 >= 0 goes to
+        // the insurance fund.
+        let collateral = |e: &Engine, a: u32| e.risk.collateral(AccountId::new(a)).unwrap().raw();
+        assert_eq!(collateral(&e, 0), 100_000_000 - 3);
+        assert_eq!(collateral(&e, 1), 100_000_000);
+        assert_eq!(collateral(&e, 2), 100_000_000 + 1);
+        let collected: i128 = 3;
+        let distributed: i128 = 1;
+        let residual = e.risk.insurance_fund().raw();
+        assert!(residual >= 0, "funding residual must be non-negative");
+        assert_eq!(
+            residual,
+            collected - distributed,
+            "insurance residual must be exactly collected - distributed",
+        );
+        // Exact conservation: accounts + insurance fund are unchanged in total.
+        assert_eq!(
+            total(&e),
+            before,
+            "funding must conserve total collateral (accounts + insurance)",
+        );
+        check_invariants(&e);
+
+        // Deterministic replay: an identical stream reproduces the root bit
+        // for bit.
+        let mut e2 = run(&script);
+        e2.execute(seq(script.len() as u64 + 1), funding).unwrap();
+        assert_eq!(e.state_root(), e2.state_root());
+
+        // Golden root pinned at #433 from the corrected closed-transfer
+        // implementation (payers ceil, receivers trunc, residual to
+        // insurance). This scenario's root DIFFERS from what the pre-#433
+        // toward-zero code committed (the long's debit changed 2 -> 3): that
+        // is the intended, documented bump. Any future drift in funding
+        // rounding, holder order, or leaf bytes moves it.
+        assert_eq!(
+            hex::encode(e.state_root().as_bytes()),
+            "bd242685452bf7f094658dd866e8a109354c5a118032ccafab65d2635489a6fc",
         );
     }
 }
