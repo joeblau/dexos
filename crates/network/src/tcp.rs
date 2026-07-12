@@ -40,7 +40,11 @@
 //!
 //! After the handshake the stream is encrypted (see [`crate::session`]), TCP
 //! keepalive is enabled, and an application-level idle timeout tears down
-//! silent peers. Reconnect helpers apply exponential backoff with full jitter.
+//! silent peers. Every frame read is additionally bounded by that same idle
+//! timeout at the reader (#435): the watchdog alone cannot preempt a reader
+//! parked inside `read_exact`, so a peer that stalls mid-frame is torn down
+//! by the reader itself rather than pinning the task and its buffer forever.
+//! Reconnect helpers apply exponential backoff with full jitter.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -461,10 +465,27 @@ fn spawn_connection(
     let reader_activity = last_activity.clone();
     let reader = tokio::spawn(async move {
         loop {
-            let frame = match read_encrypted_frame(&mut read_half, &mut opener, max_payload).await {
-                Ok(frame) => frame,
-                Err(error) => {
+            // Bound every frame read by the idle timeout (#435). The idle
+            // watchdog only closes the *outbound* channel and cannot preempt a
+            // reader parked inside `read_exact`, so without this bound a peer
+            // that completes the handshake and then stalls mid-frame (or goes
+            // silent) would pin the reader task and its buffer indefinitely —
+            // and outbound traffic refreshing `last_activity` would mask it.
+            // On expiry we break so the teardown below closes the inbound
+            // channel, waking blocked `recv()` callers fail-closed.
+            let frame = match timeout(
+                idle_timeout,
+                read_encrypted_frame(&mut read_half, &mut opener, max_payload),
+            )
+            .await
+            {
+                Ok(Ok(frame)) => frame,
+                Ok(Err(error)) => {
                     reader_disconnects.record(classify_disconnect(&error));
+                    break;
+                }
+                Err(_elapsed) => {
+                    reader_disconnects.record(DisconnectReason::RemoteClose);
                     break;
                 }
             };
@@ -1556,5 +1577,107 @@ mod tests {
         .expect("acceptance must recover after the half-open handshakes time out")
         .unwrap();
         assert_eq!(client_conn.peer_id(), server.id());
+    }
+
+    /// Regression for #435: a peer that completes the handshake and then goes
+    /// silent must be torn down within ~`idle_timeout`. The reader used to
+    /// park inside an unbounded `read_exact`; the idle watchdog only closes
+    /// the *outbound* channel, so `recv()` would hang forever.
+    #[tokio::test]
+    async fn silent_authenticated_peer_is_torn_down_within_idle_timeout() {
+        use tokio::time::timeout as to;
+
+        let mut server_cfg = cfg();
+        server_cfg.idle_timeout = Duration::from_millis(300);
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server = Arc::new(TcpTransport::bind(addr, kp(80), server_cfg).await.unwrap());
+        let client = Arc::new(TcpTransport::bind(addr, kp(81), cfg()).await.unwrap());
+        let server_addr = server.local_addr().unwrap();
+        let server_id = server.id();
+
+        let acceptor = {
+            let server = server.clone();
+            tokio::spawn(async move { server.accept().await })
+        };
+        let client_conn = client
+            .connect(&Peer::dial(server_id, server_addr))
+            .await
+            .unwrap();
+        let server_conn = acceptor.await.unwrap().unwrap();
+
+        // The client sends nothing after the handshake. The server's reader
+        // must exit on its own and close the inbound channel fail-closed —
+        // recv() returning at all proves the reader was not pinned.
+        let closed = to(Duration::from_secs(5), server_conn.recv())
+            .await
+            .expect("silent peer must be torn down within ~idle_timeout, not hang");
+        assert!(matches!(closed, Err(TransportError::ConnectionClosed)));
+        assert!(
+            server
+                .disconnect_metrics()
+                .get(DisconnectReason::RemoteClose)
+                >= 1,
+            "reader timeout must be recorded as a RemoteClose disconnect"
+        );
+        drop(client_conn);
+    }
+
+    /// Regression for #435 (mid-frame stall): a peer that completes the
+    /// handshake, sends the length prefix plus a *partial* ciphertext, and
+    /// then stalls used to pin the reader inside `read_exact` indefinitely —
+    /// `last_activity` only advances after a COMPLETE frame decodes, and the
+    /// watchdog cannot preempt a blocked read. With the per-frame read bound
+    /// the reader tears the connection down within ~`idle_timeout`.
+    #[tokio::test]
+    async fn mid_frame_stall_is_torn_down_within_idle_timeout() {
+        use tokio::time::timeout as to;
+
+        let mut server_cfg = cfg();
+        server_cfg.idle_timeout = Duration::from_millis(300);
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server = Arc::new(TcpTransport::bind(addr, kp(82), server_cfg).await.unwrap());
+        let server_addr = server.local_addr().unwrap();
+
+        let acceptor = {
+            let server = server.clone();
+            tokio::spawn(async move { server.accept().await })
+        };
+
+        // Raw client: real mutual handshake, then one partial encrypted record.
+        let mut stream = TcpStream::connect(server_addr).await.unwrap();
+        let client_kp = kp(83);
+        let (_hs, session) = mutual_handshake(&mut stream, &client_kp, None, true, &cfg(), 1)
+            .await
+            .unwrap();
+        let (mut sealer, _opener) = session.split();
+        let server_conn = acceptor.await.unwrap().unwrap();
+
+        let frame = Frame {
+            class: TrafficClass::Consensus,
+            msg_type: 1,
+            sequence: 0,
+            payload: b"stall-mid-frame".to_vec(),
+        };
+        let mut record = Vec::new();
+        append_encrypted_record(&mut record, &mut sealer, &frame).unwrap();
+        // Everything except the final ciphertext byte: the server's reader
+        // parks inside the ciphertext `read_exact` with no complete frame.
+        stream.write_all(&record[..record.len() - 1]).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let closed = to(Duration::from_secs(5), server_conn.recv())
+            .await
+            .expect("mid-frame stall must be torn down within ~idle_timeout, not hang");
+        assert!(matches!(closed, Err(TransportError::ConnectionClosed)));
+        assert!(
+            server
+                .disconnect_metrics()
+                .get(DisconnectReason::RemoteClose)
+                >= 1,
+            "reader timeout must be recorded as a RemoteClose disconnect"
+        );
+        // Keep the stalled socket open until after the assertion so teardown
+        // is attributable to the reader's timeout, not a remote close.
+        drop(stream);
     }
 }
