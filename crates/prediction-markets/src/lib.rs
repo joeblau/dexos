@@ -34,7 +34,11 @@ pub mod outcome;
 pub mod scalar;
 pub mod settlement;
 
-pub use committee::{Committee, CommitteeDecision, CommitteeError, ResolverId, ResolverVote};
+pub use committee::{
+    Committee, CommitteeDecision, CommitteeError, Equivocation, ResolutionClaim, ResolutionRound,
+    ResolverId, ResolverVote, TallyOutcome, DOMAIN_RESOLVER_COMMITTEE, DOMAIN_RESOLVER_VOTE,
+    MAX_RESOLVERS,
+};
 pub use completeset::{ClaimBook, CompleteSetError, Settlement};
 pub use definition::{
     evidence_hash, ChallengeWindow, PredictionMarketDefinition, ResolutionRules, DOMAIN_RESOLUTION,
@@ -184,7 +188,9 @@ mod tests {
             let n = usize::try_from(r.below(8) + 1).unwrap();
             let outcomes = OutcomeSet::sequential(n).unwrap();
             let committee = if r.below(2) == 0 {
-                Some(Committee::new(vec![ResolverId(1), ResolverId(2), ResolverId(3)], 2).unwrap())
+                Some(
+                    Committee::new(r.next_u64(), vec![[1u8; 32], [2u8; 32], [3u8; 32]], 2).unwrap(),
+                )
             } else {
                 None
             };
@@ -566,62 +572,59 @@ mod tests {
     // ---- Committee ----------------------------------------------------------
 
     #[test]
-    fn committee_accepts_at_threshold_and_rejects_below() {
-        let committee =
-            Committee::new(vec![ResolverId(1), ResolverId(2), ResolverId(3)], 2).unwrap();
-        let ev = evidence_hash(b"news report");
-        let win = OutcomeId(1);
-        // Two of three agree -> accepted.
+    fn committee_accepts_authenticated_quorum_and_rejects_below() {
+        use crypto::KeyPair;
+
+        let keys: Vec<KeyPair> = (0..3u8).map(|i| KeyPair::from_seed(&[i; 32])).collect();
+        let members: Vec<[u8; 32]> = keys.iter().map(KeyPair::public).collect();
+        let committee = Committee::new(0, members, 2).unwrap();
+
+        let round = ResolutionRound {
+            deployment: types::Hash::from_bytes([0xDE; 32]),
+            epoch: 0,
+            market_binding: types::Hash::from_bytes([0xAB; 32]),
+            round: 1,
+            expiry: 100,
+        };
+        let win = ResolutionClaim {
+            outcome: OutcomeId(1),
+            payout_digest: evidence_hash(b"winner-take-all outcome 1"),
+            evidence_hash: evidence_hash(b"news report"),
+        };
+        let lose = ResolutionClaim {
+            outcome: OutcomeId(0),
+            payout_digest: evidence_hash(b"winner-take-all outcome 0"),
+            evidence_hash: evidence_hash(b"news report"),
+        };
+
+        // Two of three sign the same claim -> accepted.
         let votes = [
-            ResolverVote {
-                resolver: ResolverId(1),
-                outcome: win,
-                evidence_hash: ev,
-            },
-            ResolverVote {
-                resolver: ResolverId(2),
-                outcome: win,
-                evidence_hash: ev,
-            },
-            ResolverVote {
-                resolver: ResolverId(3),
-                outcome: OutcomeId(0),
-                evidence_hash: ev,
-            },
+            ResolverVote::signed(round, win, ResolverId(0), &keys[0]),
+            ResolverVote::signed(round, win, ResolverId(1), &keys[1]),
+            ResolverVote::signed(round, lose, ResolverId(2), &keys[2]),
         ];
         assert_eq!(
-            committee.tally(&votes),
+            committee.tally(&round, 0, &votes).decision,
             CommitteeDecision::Accepted {
-                outcome: win,
+                claim: win,
                 votes: 2
             }
         );
-        // Non-members and double votes do not inflate the tally.
+
+        // Only one distinct signer for the leading claim -> insufficient.
         let votes2 = [
-            ResolverVote {
-                resolver: ResolverId(1),
-                outcome: win,
-                evidence_hash: ev,
-            },
-            ResolverVote {
-                resolver: ResolverId(1),
-                outcome: win,
-                evidence_hash: ev,
-            },
-            ResolverVote {
-                resolver: ResolverId(99),
-                outcome: win,
-                evidence_hash: ev,
-            },
+            ResolverVote::signed(round, win, ResolverId(0), &keys[0]),
+            ResolverVote::signed(round, lose, ResolverId(1), &keys[1]),
         ];
         assert_eq!(
-            committee.tally(&votes2),
+            committee.tally(&round, 0, &votes2).decision,
             CommitteeDecision::Insufficient { leader_votes: 1 }
         );
+
         // Bad construction.
-        assert_eq!(Committee::new(vec![], 1), Err(CommitteeError::Empty));
+        assert_eq!(Committee::new(0, vec![], 1), Err(CommitteeError::Empty));
         assert_eq!(
-            Committee::new(vec![ResolverId(1)], 2),
+            Committee::new(0, vec![[1u8; 32]], 2),
             Err(CommitteeError::BadThreshold)
         );
     }
