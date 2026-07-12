@@ -21,7 +21,7 @@ status=0
 for crate in "${CORE[@]}"; do
     # Fail closed: a broken `cargo tree` (missing target, resolver error, …)
     # must not be swallowed. Previously `|| true` hid toolchain/config failures.
-    if ! tree="$(cargo tree --quiet -e normal -p "$crate" --prefix none 2>&1)"; then
+    if ! tree="$(cargo tree --quiet -e normal --target all -p "$crate" --prefix none 2>&1)"; then
         echo "dep-direction gate FAILED: cargo tree -p $crate errored:" >&2
         printf '%s\n' "$tree" >&2
         status=1

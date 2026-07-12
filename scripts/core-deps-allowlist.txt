@@ -7,6 +7,7 @@ crypto
 crypto-bigint
 crypto-common
 curve25519-dalek
+curve25519-dalek-derive
 der
 digest
 ecdsa
@@ -15,6 +16,7 @@ ed25519-dalek
 elliptic-curve
 execution
 ff
+fiat-crypto
 generic-array
 getrandom
 group
@@ -47,4 +49,5 @@ thiserror-impl
 typenum
 types
 unicode-ident
+wasi
 zeroize
