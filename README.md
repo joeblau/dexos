@@ -79,6 +79,21 @@ are kept equal. There is no multi-MSRV CI matrix. See
 [docs/TOOLCHAIN.md](docs/TOOLCHAIN.md) for the full policy (including the
 optional macOS portability job).
 
+## Setup
+
+First-time setup on a fresh machine — installs the pinned toolchain and wasm
+target, the per-OS system libraries the desktop/mobile frontends need, the
+Dioxus CLI, and downloads the whole crate graph:
+
+```sh
+./bootstrap.sh                 # engine + frontends (Linux / macOS / Windows via Git Bash)
+./bootstrap.sh --no-frontend   # engine only (no wasm target, GUI libs, or dx)
+./bootstrap.sh --dev           # also install CI dev tools (cargo-deny, cargo-llvm-cov)
+```
+
+It is idempotent and detects the OS/distro (apt, dnf, pacman, zypper, or macOS
+Xcode CLT). See `./bootstrap.sh --help` for all flags.
+
 ## Build & test
 
 ```sh
