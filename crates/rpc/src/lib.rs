@@ -5,26 +5,30 @@
 //! wire types (compact binary via [`codec`], never JSON in the core path), a
 //! [`RpcBackend`] trait the node implements over its live engine, a pure
 //! [`dispatch`] router that enforces read-only / light mode, an async framed TCP
-//! [`server`], and a sequenced streaming subscription layer with gap detection
-//! and snapshot recovery.
+//! (TLS 1.3) [`server`], and a sequenced streaming subscription layer with gap
+//! detection and snapshot recovery.
 //!
 //! # Layout
 //! - [`error`] — the typed [`RpcError`].
 //! - [`wire`] — integer-only data types shared by requests, responses, streams.
 //! - [`command`] — control parameters and the canonical [`Command`] lowering.
-//! - [`session`] — session-scoped authorization.
+//! - [`session`] — session-scoped authorization and server-side bindings.
 //! - [`request`] / [`response`] — the correlated envelopes.
 //! - [`backend`] — the [`RpcBackend`] trait and [`dispatch`].
 //! - [`transport`] — framing into [`codec::Frame`]s.
-//! - [`server`] — the async TCP server.
+//! - [`server`] — the async TCP/TLS server with isolated blocking dispatch.
 //! - [`limits`] — connection admission control (per-IP caps and rate limits).
-//! - [`stream`] — the streaming subscription registry.
+//! - [`work`] — process/per-connection in-flight request and byte budgets.
+//! - [`idempotency`] — bounded TTL/LRU exactly-once store.
+//! - [`stream`] — sharded, byte-bounded streaming subscription registry.
+//! - [`tls`] — TLS 1.3 acceptor helpers.
 //! - [`stub`] — an in-memory backend for tests.
 #![forbid(unsafe_code)]
 
 pub mod backend;
 pub mod command;
 pub mod error;
+pub mod idempotency;
 pub mod limits;
 pub mod request;
 pub mod response;
@@ -32,13 +36,15 @@ pub mod server;
 pub mod session;
 pub mod stream;
 pub mod stub;
+pub mod tls;
 pub mod transport;
 pub mod wire;
+pub mod work;
 
 /// Crate identity, used by the node composition root for a startup manifest.
 pub const CRATE_NAME: &str = "rpc";
 
-pub use backend::{dispatch, RpcBackend};
+pub use backend::{dispatch, RpcBackend, MAX_BOOK_DEPTH};
 pub use command::{
     AuthorizeSessionParams, BasketParams, BindWalletParams, CancelAllParams, CancelOrderParams,
     Command, CommandAck, ControlMeta, CreateMarketParams, ReplaceOrderParams,
@@ -46,28 +52,36 @@ pub use command::{
     SubmitOrderParams,
 };
 pub use error::RpcError;
+pub use idempotency::{IdempotencyConfig, IdempotencyStore};
 pub use limits::RateLimit;
 pub use request::{RpcMethod, RpcRequest};
 pub use response::{RpcOk, RpcResponse, RpcResult};
 pub use server::{
     handle_connection, handle_connection_with, serve, serve_with_config, ServerConfig, ServerError,
+    TlsMode,
 };
-pub use session::Session;
+pub use session::{
+    authorize_private_topic, session_may_read, Session, SessionBinding, SessionLookup,
+    SessionRegistry,
+};
 pub use stream::{
-    EventKind, Gap, Progress, Recovery, Reliability, SequenceTracker, StreamError, StreamEvent,
-    StreamHub, StreamPayload, Subscription, Topic, DEFAULT_MAX_TOPICS,
+    EventKind, Gap, Progress, Recovery, Reliability, SequenceTracker, SharedEvent, StreamError,
+    StreamEvent, StreamHub, StreamPayload, StreamStats, Subscription, Topic, DEFAULT_MAX_TOPICS,
+    DEFAULT_TOPIC_BYTE_BUDGET,
 };
 pub use stub::StubBackend;
+pub use tls::{acceptor_from_pem, generate_self_signed_localhost, TlsError};
 pub use transport::{
     decode_request, decode_response, decode_stream_event, encode_request, encode_response,
     encode_stream_event,
 };
 pub use wire::{
-    Account, AccountProof, Book, BookDelta, BookLevel, BridgeStatus, Checkpoint, DepositStatus,
+    Account, AccountProof, Book, BookDelta, BridgeStatus, Checkpoint, DepositStatus,
     ExecutionReceipt, Fill, FinalityStatus, Funding, MarkPrice, MarketDetail, MarketLifecycleEvent,
     MarketStatus, MarketSummary, NetworkStatus, NodeInfo, OraclePrice, OracleStatus, Order,
     PageParams, PeerInfo, Position, RpcMode, Trade, VerificationStatus, WithdrawalStatus,
 };
+pub use work::{WorkBudget, WorkBudgetConfig};
 
 #[cfg(test)]
 mod tests;

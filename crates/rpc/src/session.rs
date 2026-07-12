@@ -1,8 +1,11 @@
 //! Session-scoped authorization checks applied to lowered [`Command`]s before
-//! they reach the engine.
+//! they reach the engine, plus a lookup trait for authenticated stream binding.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use serde::{Deserialize, Serialize};
-use types::Price;
+use types::{AccountId, Price};
 
 use crate::command::{Command, SessionScope};
 use crate::error::RpcError;
@@ -14,6 +17,77 @@ pub struct Session {
     pub session_pubkey: [u8; 32],
     /// Authorized scope.
     pub scope: SessionScope,
+}
+
+/// Server-side binding of a session key to exactly one account. Installed by
+/// `authorize_session` and consulted by private stream subscription so clients
+/// cannot spoof the account binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionBinding {
+    /// Account the session is bound to.
+    pub account: AccountId,
+    /// Session key and scope.
+    pub session: Session,
+}
+
+/// Lookup installed sessions by verified public key. Implemented by the live
+/// backend (and the test stub); the stream layer never trusts client-supplied
+/// account/expiry fields.
+pub trait SessionLookup: Send + Sync {
+    /// Resolve a session public key to its binding, or `None` if unknown/revoked.
+    fn lookup_session(&self, session_pubkey: &[u8; 32]) -> Option<SessionBinding>;
+}
+
+/// In-memory session registry shared by the stub backend and the stream hub.
+/// Cheap to clone via [`Arc`].
+#[derive(Debug, Default, Clone)]
+pub struct SessionRegistry {
+    inner: Arc<Mutex<HashMap<[u8; 32], SessionBinding>>>,
+}
+
+impl SessionRegistry {
+    /// Empty registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Install (or overwrite) a session binding.
+    pub fn insert(&self, account: AccountId, session: Session) {
+        let mut g = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        g.insert(
+            session.session_pubkey,
+            SessionBinding { account, session },
+        );
+    }
+
+    /// Revoke a session key. Returns whether one was present.
+    pub fn revoke(&self, session_pubkey: &[u8; 32]) -> bool {
+        let mut g = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        g.remove(session_pubkey).is_some()
+    }
+
+    /// Number of installed sessions (tests / metrics).
+    pub fn len(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    /// Whether the registry is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl SessionLookup for SessionRegistry {
+    fn lookup_session(&self, session_pubkey: &[u8; 32]) -> Option<SessionBinding> {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(session_pubkey)
+            .cloned()
+    }
 }
 
 impl Session {
@@ -126,11 +200,12 @@ impl Session {
 }
 
 /// Whether a session key may subscribe to `account`-scoped private streams.
-/// A session is bound to exactly one account at authorization time; the caller
-/// supplies that binding.
+///
+/// Prefer [`authorize_private_topic`], which resolves the binding from a
+/// server-side registry rather than trusting caller-supplied account/expiry.
 pub fn session_may_read(
-    bound_account: types::AccountId,
-    requested_account: types::AccountId,
+    bound_account: AccountId,
+    requested_account: AccountId,
     session_expiry: u64,
     now: u64,
 ) -> Result<(), RpcError> {
@@ -141,6 +216,27 @@ pub fn session_may_read(
         return Err(RpcError::Unauthorized);
     }
     Ok(())
+}
+
+/// Authorize a private stream subscription by looking up `session_pubkey` in
+/// `sessions` (server-installed) and checking the topic's owner against the
+/// verified binding. Client-supplied account/expiry claims are never consulted.
+pub fn authorize_private_topic(
+    sessions: &dyn SessionLookup,
+    session_pubkey: &[u8; 32],
+    topic_account: AccountId,
+    now: u64,
+) -> Result<SessionBinding, RpcError> {
+    let binding = sessions
+        .lookup_session(session_pubkey)
+        .ok_or(RpcError::Unauthorized)?;
+    session_may_read(
+        binding.account,
+        topic_account,
+        binding.session.scope.expiry,
+        now,
+    )?;
+    Ok(binding)
 }
 
 /// Convenience: notional of a price/quantity pair, saturating to `Amount::MAX`
