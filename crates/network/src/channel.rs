@@ -174,6 +174,21 @@ impl AsyncPriorityChannel {
         }
     }
 
+    /// Remove the highest-priority frame without waiting.
+    ///
+    /// Writer tasks use this after their first awaited receive to coalesce the
+    /// frames already queued into one socket write while preserving strict
+    /// priority ordering.
+    pub(crate) fn try_recv(&self) -> Option<Frame> {
+        let mut sched = self.inner.lock().expect("scheduler mutex poisoned");
+        let frame = sched.dequeue();
+        drop(sched);
+        if frame.is_some() {
+            self.space.notify_one();
+        }
+        frame
+    }
+
     /// Signal closure and wake any waiters (both receivers and blocked senders).
     /// Buffered frames remain drainable.
     pub(crate) fn close(&self) {

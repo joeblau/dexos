@@ -31,4 +31,3 @@ read_only = false
 # Core pinning and busy-polled ingress are not implemented yet (fail closed).
 pin_threads = false
 busy_poll = false
-simd = "auto"

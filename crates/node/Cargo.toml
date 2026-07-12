@@ -9,6 +9,13 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+dev-tools = ["dep:loadgen"]
+mock-chains = ["chain-adapter-evm/mock", "chain-adapter-svm/mock"]
+metrics-http = []
+simd = []
+
 [dependencies]
 types = { path = "../types" }
 crypto = { path = "../crypto" }
@@ -31,7 +38,7 @@ network = { path = "../network" }
 discovery = { path = "../discovery" }
 rpc = { path = "../rpc" }
 light-client = { path = "../light-client" }
-loadgen = { path = "../loadgen" }
+loadgen = { path = "../loadgen", optional = true }
 serde.workspace = true
 toml.workspace = true
 clap.workspace = true

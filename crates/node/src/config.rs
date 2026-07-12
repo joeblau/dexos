@@ -65,23 +65,6 @@ impl Role {
     }
 }
 
-/// SIMD dispatch policy for non-consensus paths.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SimdMode {
-    /// Detect the best kernel at runtime.
-    #[default]
-    Auto,
-    /// Force the scalar reference kernels.
-    Scalar,
-    /// Force AVX2 kernels.
-    Avx2,
-    /// Force AVX-512 kernels.
-    Avx512,
-    /// Force ARM NEON kernels.
-    Neon,
-}
-
 /// `[node]` section.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -199,28 +182,13 @@ impl Default for RpcSection {
 }
 
 /// `[performance]` section.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PerformanceSection {
     /// Pin subsystem threads to cores.
     pub pin_threads: bool,
     /// Busy-poll ingress queues.
     pub busy_poll: bool,
-    /// SIMD dispatch policy.
-    pub simd: SimdMode,
-}
-
-impl Default for PerformanceSection {
-    fn default() -> Self {
-        Self {
-            // Fail closed by default: core pinning is a portable no-op and ingress
-            // busy-polling is not implemented in this release, so the honest default
-            // is off. Requesting either explicitly is rejected by `validate`.
-            pin_threads: false,
-            busy_poll: false,
-            simd: SimdMode::Auto,
-        }
-    }
 }
 
 /// A fully-parsed, validated node configuration.
@@ -421,19 +389,6 @@ impl NodeConfig {
                          set performance.busy_poll = false",
             });
         }
-        match self.performance.simd {
-            // `auto` (runtime detection) and `scalar` (the deterministic reference
-            // kernels, always present) are honored. Forcing a specific vector ISA
-            // promises acceleration the node does not yet dispatch on.
-            SimdMode::Auto | SimdMode::Scalar => {}
-            SimdMode::Avx2 | SimdMode::Avx512 | SimdMode::Neon => {
-                return Err(ConfigError::Unsupported {
-                    field: "performance.simd",
-                    detail: "forcing a specific SIMD ISA is not implemented in this release; \
-                             set performance.simd = \"auto\" or \"scalar\"",
-                });
-            }
-        }
         Ok(())
     }
 
@@ -487,7 +442,6 @@ read_only = false
 [performance]
 pin_threads = false
 busy_poll = false
-simd = "auto"
 "#
     }
 
@@ -503,7 +457,6 @@ simd = "auto"
         assert_eq!(cfg.consensus.epoch_length, 100_000);
         assert_eq!(cfg.storage.segment_size_mb, 1024);
         assert!(!cfg.rpc.read_only);
-        assert_eq!(cfg.performance.simd, SimdMode::Auto);
     }
 
     #[test]
@@ -599,7 +552,6 @@ simd = "auto"
         assert!(!cfg.network.enable_datagrams);
         assert!(!cfg.performance.pin_threads);
         assert!(!cfg.performance.busy_poll);
-        assert_eq!(cfg.performance.simd, SimdMode::Auto);
         // And it validates cleanly.
         cfg.validate().expect("default config must be valid");
     }
@@ -651,30 +603,6 @@ simd = "auto"
                 ..
             })
         ));
-    }
-
-    #[test]
-    fn rejects_forced_simd_isa_but_accepts_auto_and_scalar() {
-        for forced in [SimdMode::Avx2, SimdMode::Avx512, SimdMode::Neon] {
-            let mut cfg = NodeConfig::default();
-            cfg.performance.simd = forced;
-            assert!(
-                matches!(
-                    cfg.validate(),
-                    Err(ConfigError::Unsupported {
-                        field: "performance.simd",
-                        ..
-                    })
-                ),
-                "forcing {forced:?} must fail closed"
-            );
-        }
-        for ok in [SimdMode::Auto, SimdMode::Scalar] {
-            let mut cfg = NodeConfig::default();
-            cfg.performance.simd = ok;
-            cfg.validate()
-                .unwrap_or_else(|e| panic!("{ok:?} must be supported: {e}"));
-        }
     }
 
     #[test]

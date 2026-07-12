@@ -10,6 +10,7 @@
 //! `Arc<Histogram>` handles the registry hands back — those never lock and
 //! never allocate. Register your handles once, then record freely.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use crate::counter::{Counter, Gauge};
@@ -21,9 +22,27 @@ use crate::snapshot::{CounterSnapshot, GaugeSnapshot, HistogramSnapshot, Snapsho
 /// stay `Clone`-free and obviously `Send + Sync`.
 #[derive(Default)]
 struct Inner {
+    descriptors: BTreeMap<String, MetricKind>,
     counters: Vec<(String, Arc<Counter>)>,
     gauges: Vec<(String, Arc<Gauge>)>,
     histograms: Vec<(String, Arc<Histogram>)>,
+}
+
+/// Prometheus metric family type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricKind {
+    Counter,
+    Gauge,
+    Histogram,
+}
+
+/// Registration failure caused by reusing one name for another metric type.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("metric '{name}' is already registered as {existing:?}, requested {requested:?}")]
+pub struct RegistrationError {
+    pub name: String,
+    pub existing: MetricKind,
+    pub requested: MetricKind,
 }
 
 /// Owns all metrics and produces snapshots. Share it behind an `Arc` across
@@ -45,39 +64,57 @@ impl MetricsRegistry {
     /// can look up shared counters without coordinating.
     #[must_use]
     pub fn counter(&self, name: &str) -> Arc<Counter> {
+        self.try_counter(name).expect("metric name type conflict")
+    }
+
+    /// Fallible counter registration that reports cross-family conflicts.
+    pub fn try_counter(&self, name: &str) -> Result<Arc<Counter>, RegistrationError> {
         let mut inner = lock(&self.inner);
+        register(&mut inner, name, MetricKind::Counter)?;
         if let Some((_, existing)) = inner.counters.iter().find(|(n, _)| n.as_str() == name) {
-            return Arc::clone(existing);
+            return Ok(Arc::clone(existing));
         }
         let handle = Arc::new(Counter::new());
         inner.counters.push((name.to_string(), Arc::clone(&handle)));
-        handle
+        Ok(handle)
     }
 
     /// Registers (or returns the existing) gauge named `name`. Idempotent.
     #[must_use]
     pub fn gauge(&self, name: &str) -> Arc<Gauge> {
+        self.try_gauge(name).expect("metric name type conflict")
+    }
+
+    /// Fallible gauge registration that reports cross-family conflicts.
+    pub fn try_gauge(&self, name: &str) -> Result<Arc<Gauge>, RegistrationError> {
         let mut inner = lock(&self.inner);
+        register(&mut inner, name, MetricKind::Gauge)?;
         if let Some((_, existing)) = inner.gauges.iter().find(|(n, _)| n.as_str() == name) {
-            return Arc::clone(existing);
+            return Ok(Arc::clone(existing));
         }
         let handle = Arc::new(Gauge::new());
         inner.gauges.push((name.to_string(), Arc::clone(&handle)));
-        handle
+        Ok(handle)
     }
 
     /// Registers (or returns the existing) histogram named `name`. Idempotent.
     #[must_use]
     pub fn histogram(&self, name: &str) -> Arc<Histogram> {
+        self.try_histogram(name).expect("metric name type conflict")
+    }
+
+    /// Fallible histogram registration that reports cross-family conflicts.
+    pub fn try_histogram(&self, name: &str) -> Result<Arc<Histogram>, RegistrationError> {
         let mut inner = lock(&self.inner);
+        register(&mut inner, name, MetricKind::Histogram)?;
         if let Some((_, existing)) = inner.histograms.iter().find(|(n, _)| n.as_str() == name) {
-            return Arc::clone(existing);
+            return Ok(Arc::clone(existing));
         }
         let handle = Arc::new(Histogram::new());
         inner
             .histograms
             .push((name.to_string(), Arc::clone(&handle)));
-        handle
+        Ok(handle)
     }
 
     /// Registers bounded-queue instrumentation: a `{name}_depth` gauge and a
@@ -142,6 +179,7 @@ impl MetricsRegistry {
                 count: h.count(),
                 sum: h.sum(),
                 max: h.max(),
+                buckets: h.bucket_counts(),
                 quantiles: h.quantiles(),
             })
             .collect();
@@ -158,6 +196,21 @@ impl MetricsRegistry {
     pub fn export_text(&self) -> String {
         self.snapshot().to_text()
     }
+}
+
+fn register(inner: &mut Inner, name: &str, requested: MetricKind) -> Result<(), RegistrationError> {
+    if let Some(&existing) = inner.descriptors.get(name) {
+        if existing != requested {
+            return Err(RegistrationError {
+                name: name.to_owned(),
+                existing,
+                requested,
+            });
+        }
+    } else {
+        inner.descriptors.insert(name.to_owned(), requested);
+    }
+    Ok(())
 }
 
 /// Recovers a poisoned lock rather than panicking: metric state is plain
@@ -179,6 +232,20 @@ mod tests {
         a.add(5);
         assert_eq!(b.get(), 5); // same underlying atomic
         assert_eq!(reg.snapshot().counters.len(), 1);
+    }
+
+    #[test]
+    fn cross_family_reuse_is_typed_error() {
+        let reg = MetricsRegistry::new();
+        reg.try_counter("same").unwrap();
+        assert_eq!(
+            reg.try_gauge("same").unwrap_err(),
+            RegistrationError {
+                name: "same".into(),
+                existing: MetricKind::Counter,
+                requested: MetricKind::Gauge
+            }
+        );
     }
 
     #[test]

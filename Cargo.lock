@@ -801,6 +801,7 @@ dependencies = [
  "crypto",
  "getrandom",
  "hkdf",
+ "serde",
  "sha2",
  "thiserror",
  "tokio",

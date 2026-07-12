@@ -269,6 +269,17 @@ fn cancel_all_removes_only_owner_orders_deterministically() {
     assert_eq!(b.cancel_all(AccountId::new(1)), 0);
 }
 
+
+#[test]
+fn level_aggregate_overflow_rejects_without_mutation() {
+    let mut b = OrderBook::new(cfg());
+    b.submit(limit(1, 1, Side::Bid, 100, i64::MAX)).unwrap();
+    let root = b.state_root();
+    assert_eq!(b.submit(limit(2, 2, Side::Bid, 100, 1)), Err(OrderError::Overflow));
+    assert_eq!(b.state_root(), root);
+    assert_eq!(b.level_quantity(Side::Bid, Price::from_raw(100)), Quantity::from_raw(i64::MAX));
+}
+
 #[test]
 fn atomic_replace_failure_leaves_book_bit_identical() {
     let mut b = OrderBook::new(cfg());

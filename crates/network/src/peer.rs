@@ -2,18 +2,36 @@
 
 use std::net::SocketAddr;
 
+use serde::{Deserialize, Serialize};
+
 /// A peer's stable network identity: its 32-byte ed25519 public key.
 ///
 /// Two connections that authenticate to the same `PeerId` are the *same logical
 /// peer*, even if they arrive over different addresses/paths — this is the key
 /// used for multipath de-duplication and connection migration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Serialize, Deserialize,
+)]
 pub struct PeerId([u8; 32]);
 
 impl PeerId {
     /// Construct a peer id from raw public-key bytes.
     pub const fn new(public_key: [u8; 32]) -> Self {
         Self(public_key)
+    }
+
+    /// Derive the canonical identity from an authenticated ed25519 public key.
+    ///
+    /// The identity deliberately retains the public-key bytes. Discovery and
+    /// transport can therefore compare the same value directly without a
+    /// second, hash-derived `NodeId` namespace or an ambiguous conversion.
+    pub const fn from_public_key(public_key: &[u8; 32]) -> Self {
+        Self(*public_key)
+    }
+
+    /// Construct an identity from its canonical wire bytes.
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
     }
 
     /// The raw public-key bytes.

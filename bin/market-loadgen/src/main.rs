@@ -1,4 +1,4 @@
-//! `market-loadgen` — the DexOS distributed load generator binary.
+//! `market-loadgen` — the DexOS deterministic offline load simulator.
 //!
 //! Parses a load plan — either from CLI flags or a full TOML scenario file — and hands
 //! off to the deterministic `loadgen` engine. Argument parsing is total; bad input
@@ -19,18 +19,12 @@ use loadgen::{
 #[command(
     name = "market-loadgen",
     version,
-    about = "DexOS distributed load generator"
+    about = "DexOS deterministic offline load simulator (does not contact a node)"
 )]
 struct Cli {
-    /// Target node address.
-    #[arg(long, value_name = "ADDR")]
-    target: String,
     /// Number of simulated users / persistent sessions (across all regions).
     #[arg(long, default_value_t = 1000)]
     users: u64,
-    /// Market symbol / count to trade against.
-    #[arg(long, default_value = "BTC-PERP")]
-    market: String,
     /// Number of distinct markets to spread load across.
     #[arg(long = "market-count", default_value_t = 1)]
     market_count: u32,
@@ -115,7 +109,7 @@ fn scenario_from_cli(cli: &Cli) -> LoadScenario {
 
     LoadScenario {
         seed: cli.seed,
-        target: cli.target.clone(),
+        target: "offline://simulation".to_string(),
         regions,
         market_count: cli.market_count.max(1),
         orders_per_second: cli.orders_per_second,
@@ -205,12 +199,8 @@ mod tests {
     fn parses_full_invocation() {
         let cli = Cli::try_parse_from([
             "market-loadgen",
-            "--target",
-            "127.0.0.1:9000",
             "--users",
             "100000",
-            "--market",
-            "BTC-PERP",
             "--orders-per-second",
             "1000000",
             "--cancel-ratio",
@@ -227,12 +217,8 @@ mod tests {
     fn parses_all_spec_knobs() {
         let cli = Cli::try_parse_from([
             "market-loadgen",
-            "--target",
-            "host:1",
             "--users",
             "500",
-            "--market",
-            "ETH-PERP",
             "--orders-per-second",
             "2000",
             "--cancel-ratio",
@@ -272,7 +258,7 @@ mod tests {
         let help = cmd.render_long_help().to_string();
         for knob in [
             "--users",
-            "--market",
+            "--market-count",
             "--orders-per-second",
             "--cancel-ratio",
             "--duration",
@@ -294,16 +280,15 @@ mod tests {
     }
 
     #[test]
-    fn missing_target_is_rejected() {
-        assert!(Cli::try_parse_from(["market-loadgen"]).is_err());
+    fn legacy_network_flags_are_rejected_instead_of_ignored() {
+        assert!(Cli::try_parse_from(["market-loadgen", "--target", "host:1"]).is_err());
+        assert!(Cli::try_parse_from(["market-loadgen", "--market", "BTC-PERP"]).is_err());
     }
 
     #[test]
     fn cli_scenario_runs() {
         let cli = Cli::try_parse_from([
             "market-loadgen",
-            "--target",
-            "host:1",
             "--users",
             "10",
             "--orders-per-second",

@@ -19,7 +19,7 @@ use tokio::task::JoinHandle;
 
 pub use config::{
     ConfigError, ConfigOverrides, ConsensusSection, NetworkSection, NodeConfig, NodeSection,
-    PerformanceSection, Role, RpcSection, SimdMode, StorageSection,
+    PerformanceSection, Role, RpcSection, StorageSection,
 };
 pub use error::NodeError;
 
@@ -51,6 +51,7 @@ pub const SUBSYSTEMS: &[&str] = &[
     discovery::CRATE_NAME,
     rpc::CRATE_NAME,
     light_client::CRATE_NAME,
+    #[cfg(feature = "dev-tools")]
     loadgen::CRATE_NAME,
 ];
 

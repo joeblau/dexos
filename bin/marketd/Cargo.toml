@@ -13,9 +13,17 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[features]
+default = []
+# Operator-only diagnostics. Never enable this feature in production artifacts.
+dev-tools = ["dep:benchmarks", "node/dev-tools"]
+mock-chains = ["node/mock-chains"]
+metrics-http = []
+simd = []
+
 [dependencies]
 node = { path = "../../crates/node" }
-benchmarks = { path = "../../crates/benchmarks" }
+benchmarks = { path = "../../crates/benchmarks", optional = true }
 crypto = { path = "../../crates/crypto" }
 clap.workspace = true
 anyhow.workspace = true

@@ -49,6 +49,7 @@ pub mod batch;
 mod budget;
 mod channel;
 mod connection;
+mod disconnect;
 mod error;
 mod framing;
 mod loopback;
@@ -73,6 +74,7 @@ pub use connection::{
     DEFAULT_MAX_CLASS_BYTES, DEFAULT_MAX_NODE_BYTES, DEFAULT_MAX_PEER_BYTES, DEFAULT_SEMANTIC_MAX,
     MSG_TYPE_DATAGRAM,
 };
+pub use disconnect::{classify_disconnect, DisconnectMetrics, DisconnectReason};
 pub use error::TransportError;
 pub use loopback::{LoopbackFabric, LoopbackTransport};
 pub use peer::{Peer, PeerId};

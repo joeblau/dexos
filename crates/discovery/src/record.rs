@@ -9,7 +9,8 @@
 //! return a typed [`RecordError`], never a panic.
 
 use codec::{decode, encode};
-use crypto::{keccak256, verify_ed25519, KeyPair};
+use crypto::{verify_ed25519, KeyPair};
+pub use network::PeerId as NodeId;
 use serde::{Deserialize, Serialize};
 use types::MarketId;
 
@@ -166,39 +167,10 @@ pub enum Region {
     Other,
 }
 
-/// A 32-byte node identity, defined as `keccak256(public_key)`.
-///
-/// Binding the id to the key lets [`PeerRecord::verify`] reject records whose
-/// advertised `node_id` does not match their signing key.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
-)]
-pub struct NodeId([u8; 32]);
-
-impl NodeId {
-    /// Derive the canonical node id for an ed25519 public key.
-    #[must_use]
-    pub fn from_public_key(public_key: &[u8; 32]) -> Self {
-        Self(keccak256(public_key))
-    }
-
-    /// Construct from raw bytes (e.g. decoding a wire record).
-    #[must_use]
-    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-
-    /// The underlying bytes.
-    #[must_use]
-    pub const fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-}
-
 /// A signed, self-describing peer advertisement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerRecord {
-    /// `keccak256(public_key)`; must match `public_key` to verify.
+    /// Canonical network peer identity; must match `public_key` to verify.
     pub node_id: NodeId,
     /// ed25519 public key that signed this record.
     pub public_key: [u8; 32],
@@ -242,7 +214,7 @@ pub enum RecordError {
     /// The record's `expires_at` is at or before the reference time.
     #[error("record expired")]
     Expired,
-    /// `node_id` is not `keccak256(public_key)`.
+    /// `node_id` is not the advertised public key identity.
     #[error("node id does not match public key")]
     NodeIdMismatch,
     /// The signature did not verify against the public key.
@@ -326,7 +298,7 @@ impl PeerRecord {
 
     /// Verify the record against reference time `now` (unix seconds).
     ///
-    /// Checks, in order: field bounds, `node_id == keccak256(public_key)`,
+    /// Checks, in order: field bounds, `node_id == public_key`,
     /// non-expiry, and the ed25519 signature. Returns the first failure.
     pub fn verify(&self, now: u64) -> Result<(), RecordError> {
         if !self.bounds_ok() {

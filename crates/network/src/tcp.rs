@@ -48,8 +48,9 @@ use tokio::sync::mpsc;
 use crate::budget::ByteBudget;
 use crate::channel::AsyncPriorityChannel;
 use crate::connection::{Connection, TransportConfig, MSG_TYPE_DATAGRAM};
+use crate::disconnect::{classify_disconnect, DisconnectMetrics, DisconnectReason};
 use crate::error::TransportError;
-use crate::framing::{read_encrypted_frame, write_encrypted_frame};
+use crate::framing::{append_encrypted_record, read_encrypted_frame};
 use crate::peer::{Peer, PeerId};
 use crate::session::{Ephemeral, Session, EPH_PUBLIC_LEN};
 use crate::transport::Transport;
@@ -174,6 +175,7 @@ fn spawn_connection(
     session: Session,
     cfg: &TransportConfig,
     node_budget: &Arc<ByteBudget>,
+    disconnects: Arc<DisconnectMetrics>,
 ) -> Connection {
     let (mut read_half, mut write_half) = stream.into_split();
     let (mut sealer, mut opener) = session.split();
@@ -201,35 +203,47 @@ fn spawn_connection(
     let (out_dtx, mut out_drx) = mpsc::channel::<Frame>(datagram_cap);
     let (in_dtx, in_drx) = mpsc::channel::<Frame>(datagram_cap);
 
-    // Writer: strict priority wins over datagrams (biased select).
+    // Writer: strict priority wins over datagrams (biased select). Once one
+    // frame wakes the task, drain a bounded burst and emit it with one socket
+    // write. This avoids a syscall and flush per frame under load without
+    // adding an artificial timer to the low-latency path.
     let writer_out = out_reliable.clone();
+    let writer_disconnects = disconnects.clone();
     let writer = tokio::spawn(async move {
+        const MAX_BATCH_FRAMES: usize = 64;
+        const MAX_BATCH_BYTES: usize = 256 * 1024;
         let mut dgram_open = true;
+        let mut output = Vec::with_capacity(16 * 1024);
         loop {
-            tokio::select! {
+            let first = tokio::select! {
                 biased;
-                reliable = writer_out.recv() => match reliable {
-                    Some(frame) => {
-                        if write_encrypted_frame(&mut write_half, &mut sealer, &frame)
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    None => break, // channel closed -> connection dropped
-                },
+                reliable = writer_out.recv() => reliable,
                 dgram = out_drx.recv(), if dgram_open => match dgram {
-                    Some(frame) => {
-                        if write_encrypted_frame(&mut write_half, &mut sealer, &frame)
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    None => dgram_open = false, // datagram sender gone
+                    Some(frame) => Some(frame),
+                    None => { dgram_open = false; continue; }
                 },
+            };
+            let Some(first) = first else { break };
+
+            output.clear();
+            if append_encrypted_record(&mut output, &mut sealer, &first).is_err() {
+                break;
+            }
+            for _ in 1..MAX_BATCH_FRAMES {
+                if output.len() >= MAX_BATCH_BYTES {
+                    break;
+                }
+                // Always drain reliable priority traffic first. Datagrams join
+                // the burst only when no reliable frame is immediately ready.
+                let next = writer_out.try_recv().or_else(|| out_drx.try_recv().ok());
+                let Some(frame) = next else { break };
+                if append_encrypted_record(&mut output, &mut sealer, &frame).is_err() {
+                    return;
+                }
+            }
+            if write_half.write_all(&output).await.is_err() || write_half.flush().await.is_err() {
+                writer_disconnects.record(DisconnectReason::Io);
+                break;
             }
         }
     });
@@ -239,10 +253,18 @@ fn spawn_connection(
     let max_payload = cfg.max_payload;
     let datagram_max = cfg.datagram_max_bytes;
     let semantic_max = cfg.semantic_max;
+    let reader_disconnects = disconnects;
     let reader = tokio::spawn(async move {
         // Loop ends when a record fails to read/open (EOF, malformed framing, or
         // AEAD authentication failure — any of which tears the link down).
-        while let Ok(frame) = read_encrypted_frame(&mut read_half, &mut opener, max_payload).await {
+        loop {
+            let frame = match read_encrypted_frame(&mut read_half, &mut opener, max_payload).await {
+                Ok(frame) => frame,
+                Err(error) => {
+                    reader_disconnects.record(classify_disconnect(&error));
+                    break;
+                }
+            };
             if frame.msg_type == MSG_TYPE_DATAGRAM {
                 // Best-effort: drop an over-cap datagram before it is enqueued,
                 // and shed on backpressure or a closed receiver.
@@ -291,6 +313,7 @@ pub struct TcpTransport {
     cfg: TransportConfig,
     /// Node-wide reliable-byte budget shared by every accepted/dialed peer.
     node_budget: Arc<ByteBudget>,
+    disconnects: Arc<DisconnectMetrics>,
 }
 
 impl TcpTransport {
@@ -309,6 +332,7 @@ impl TcpTransport {
             listener,
             cfg,
             node_budget: ByteBudget::root(cfg.max_node_bytes),
+            disconnects: Arc::new(DisconnectMetrics::default()),
         })
     }
 
@@ -336,6 +360,12 @@ impl TcpTransport {
     pub fn node_byte_limit(&self) -> usize {
         self.node_budget.limit()
     }
+
+    /// Shared cumulative disconnect counters for this transport.
+    #[must_use]
+    pub fn disconnect_metrics(&self) -> Arc<DisconnectMetrics> {
+        self.disconnects.clone()
+    }
 }
 
 impl Transport for TcpTransport {
@@ -351,6 +381,7 @@ impl Transport for TcpTransport {
             session,
             &self.cfg,
             &self.node_budget,
+            self.disconnects.clone(),
         ))
     }
 
@@ -364,6 +395,7 @@ impl Transport for TcpTransport {
             session,
             &self.cfg,
             &self.node_budget,
+            self.disconnects.clone(),
         ))
     }
 }
