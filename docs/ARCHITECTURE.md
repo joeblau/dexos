@@ -50,6 +50,12 @@ finalized checkpoint root — never trusting a proxy.
 
 ## Consensus & checkpoints
 
+> **Migration in progress:** the consensus engine is migrating from the HotStuff
+> design described below to **Minimmit** (`M = 2f+1` advance / `L = n−f` finalize,
+> `n ≥ 5f+1`). See the design doc: [`docs/CONSENSUS_MINIMMIT.md`](CONSENSUS_MINIMMIT.md).
+> This section still describes the current HotStuff engine and will be rewritten
+> when the migration completes.
+
 `consensus` is a pure synchronous state machine (no async): continuous sequencing
 with gap detection, deterministic round-robin leader selection, quorum-certificate
 formation, pipelined execution/finalization, epoch and validator-set transitions,
