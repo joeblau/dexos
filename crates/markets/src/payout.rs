@@ -14,7 +14,7 @@
 //! rounding dust that is reported explicitly ([`Settlement::dust`]).
 
 use serde::{Deserialize, Serialize};
-use types::{Amount, ArithError, Hash, PayoutVector, Quantity, AMOUNT_SCALE};
+use types::{Amount, ArithError, Hash, PayoutVector, Quantity, ScalarOutcome, AMOUNT_SCALE};
 
 use crate::error::PayoutError;
 
@@ -41,7 +41,8 @@ pub enum PayoutRule {
     /// A fixed per-outcome payout vector (binary, multi-outcome, dead-heat, …).
     Vector(PayoutVector),
     /// A scalar / range market resolving to a value in `[lower, upper]`. Two
-    /// outcomes: index 0 = short, index 1 = long.
+    /// outcomes in canonical [`types::ScalarOutcome`] order: index 0 = long,
+    /// index 1 = short.
     Scalar {
         /// Lower bound of the settlement range.
         lower: Amount,
@@ -77,7 +78,7 @@ pub fn winner_takes_all(n: usize, winner: usize) -> Result<PayoutVector, PayoutE
     }
     let mut v = vec![Amount::ZERO; n];
     v[winner] = Amount::ONE;
-    Ok(PayoutVector::new(v)?)
+    Ok(PayoutVector::new_conserving(v)?)
 }
 
 /// A dead-heat / tie vector splitting one unit equally across `winners`, with
@@ -86,6 +87,7 @@ pub fn winner_takes_all(n: usize, winner: usize) -> Result<PayoutVector, PayoutE
 ///
 /// # Errors
 /// [`PayoutError::OutcomeMismatch`] if `winners` is empty or any index `>= n`;
+/// [`PayoutError::DuplicateWinner`] if an index is named twice;
 /// [`PayoutError::Vector`] on bad `n`; [`PayoutError::Arith`] on overflow.
 pub fn dead_heat(n: usize, winners: &[usize]) -> Result<PayoutVector, PayoutError> {
     if winners.is_empty() {
@@ -99,6 +101,13 @@ pub fn dead_heat(n: usize, winners: &[usize]) -> Result<PayoutVector, PayoutErro
         if w >= n {
             return Err(PayoutError::OutcomeMismatch);
         }
+        // Reject duplicate winners: a repeated index would otherwise overwrite an
+        // entry while double-counting `allocated`, corrupting the dust adjustment
+        // (and could yield a non-conserving vector). `per > 0` since `k <= n <=
+        // MAX_OUTCOMES`, so a placed slot is always non-zero.
+        if v[w].raw() != 0 {
+            return Err(PayoutError::DuplicateWinner);
+        }
         v[w] = Amount::from_raw(per);
         allocated += per;
     }
@@ -106,7 +115,7 @@ pub fn dead_heat(n: usize, winners: &[usize]) -> Result<PayoutVector, PayoutErro
     let last = winners[winners.len() - 1];
     let dust = Amount::ONE.raw() - allocated;
     v[last] = Amount::from_raw(per + dust);
-    Ok(PayoutVector::new(v)?)
+    Ok(PayoutVector::new_conserving(v)?)
 }
 
 /// An INVALID-market pro-rata refund vector: every outcome shares the unit
@@ -119,15 +128,18 @@ pub fn invalid_refund(n: usize) -> Result<PayoutVector, PayoutError> {
     dead_heat(n, &all)
 }
 
-/// The two-outcome payout vector for a scalar market resolving to `value`.
+/// The two-outcome payout vector for a scalar market resolving to `value`, in
+/// canonical [`types::ScalarOutcome`] order.
 ///
-/// `value` is clamped into `[lower, upper]`. Index 0 (short) receives
-/// `(upper - value) / (upper - lower)`; index 1 (long) receives the complement,
-/// so the vector sums to exactly one unit.
+/// `value` is clamped into `[lower, upper]`. Index 0 ([`ScalarOutcome::Long`])
+/// receives `(value - lower) / (upper - lower)`; index 1
+/// ([`ScalarOutcome::Short`]) receives the complement, so the vector sums to
+/// exactly one unit. All width arithmetic is checked, so extreme bounds return a
+/// typed error instead of overflowing.
 ///
 /// # Errors
 /// [`PayoutError::OutcomeMismatch`] if `upper <= lower`; [`PayoutError::Arith`]
-/// on overflow.
+/// on overflow at extreme bounds.
 pub fn scalar_payout(
     lower: Amount,
     upper: Amount,
@@ -137,12 +149,23 @@ pub fn scalar_payout(
         return Err(PayoutError::OutcomeMismatch);
     }
     let clamped = value.raw().clamp(lower.raw(), upper.raw());
-    let range = upper.raw() - lower.raw();
-    // long = (value - lower) / range, expressed at Amount scale.
-    let long_raw = mul_div(clamped - lower.raw(), Amount::ONE.raw(), range)?;
+    // `upper - lower` and `clamped - lower` can overflow i128 at extreme bounds
+    // (e.g. `lower == Amount::MIN`), so never subtract unchecked.
+    let range = upper
+        .raw()
+        .checked_sub(lower.raw())
+        .ok_or(ArithError::Overflow)?;
+    let numer = clamped
+        .checked_sub(lower.raw())
+        .ok_or(ArithError::Overflow)?;
+    // long = (value - lower) / range, expressed at Amount scale (floor toward 0).
+    let long_raw = mul_div(numer, Amount::ONE.raw(), range)?;
     let long = Amount::from_raw(long_raw);
     let short = Amount::ONE.checked_sub(long)?;
-    Ok(PayoutVector::new(vec![short, long])?)
+    let mut v = vec![Amount::ZERO; 2];
+    v[ScalarOutcome::Long.index()] = long;
+    v[ScalarOutcome::Short.index()] = short;
+    Ok(PayoutVector::new_conserving(v)?)
 }
 
 /// The aggregate complete-set position of one market.
@@ -246,11 +269,16 @@ impl CompleteSetPool {
     ///
     /// # Errors
     /// [`PayoutError::OutcomeMismatch`] if `payout.len() != num_outcomes`;
-    /// [`PayoutError::Arith`] on overflow.
+    /// [`PayoutError::Vector`] if `payout` is not value-conserving (negative,
+    /// zero-sum, or over/under one unit); [`PayoutError::Arith`] on overflow.
     pub fn settle(&self, payout: &PayoutVector) -> Result<Settlement, PayoutError> {
         if payout.len() != self.num_outcomes {
             return Err(PayoutError::OutcomeMismatch);
         }
+        // Revalidate at the settlement boundary: a vector may have been
+        // deserialized (bypassing the constructors), so re-assert conservation
+        // before crediting. This keeps the reported dust bounded to rounding.
+        payout.validate_conserving()?;
         let mut per_outcome = Vec::with_capacity(self.num_outcomes);
         let mut total = Amount::ZERO;
         for (claims, pay) in self.outstanding.iter().zip(payout.values()) {
@@ -330,10 +358,12 @@ mod tests {
         // invalid / partial refund over 3 outcomes: 1/3 each with dust on last.
         let inv = invalid_refund(3).unwrap();
         assert_eq!(payout_sum(&inv).unwrap(), amt(ONE));
-        // scalar mid-point
+        // scalar mid-point, canonical [long, short] order
         let sc = scalar_payout(amt(0), amt(100 * ONE), amt(25 * ONE)).unwrap();
         // long = 25/100 = 0.25, short = 0.75
-        assert_eq!(sc.values(), &[amt(3 * ONE / 4), amt(ONE / 4)]);
+        assert_eq!(sc.values()[ScalarOutcome::Long.index()], amt(ONE / 4));
+        assert_eq!(sc.values()[ScalarOutcome::Short.index()], amt(3 * ONE / 4));
+        assert_eq!(sc.values(), &[amt(ONE / 4), amt(3 * ONE / 4)]);
     }
 
     #[test]
@@ -361,16 +391,115 @@ mod tests {
 
     #[test]
     fn scalar_clamps_outside_range() {
-        // value above upper clamps to full long.
+        // value above upper clamps to full long: [long=1, short=0].
         let sc = scalar_payout(amt(0), amt(ONE), amt(5 * ONE)).unwrap();
-        assert_eq!(sc.values(), &[amt(0), amt(ONE)]);
-        // value below lower clamps to full short.
+        assert_eq!(sc.values(), &[amt(ONE), amt(0)]);
+        // value below lower clamps to full short: [long=0, short=1].
         let sc2 = scalar_payout(amt(ONE), amt(2 * ONE), amt(0)).unwrap();
-        assert_eq!(sc2.values(), &[amt(ONE), amt(0)]);
+        assert_eq!(sc2.values(), &[amt(0), amt(ONE)]);
         assert_eq!(
             scalar_payout(amt(ONE), amt(ONE), amt(ONE)).unwrap_err(),
             PayoutError::OutcomeMismatch
         );
+    }
+
+    #[test]
+    fn dead_heat_rejects_duplicate_winners() {
+        assert_eq!(
+            dead_heat(3, &[0, 0]).unwrap_err(),
+            PayoutError::DuplicateWinner
+        );
+        assert_eq!(
+            dead_heat(4, &[1, 2, 1]).unwrap_err(),
+            PayoutError::DuplicateWinner
+        );
+        // Distinct winners still succeed and conserve exactly.
+        let dh = dead_heat(3, &[0, 2]).unwrap();
+        assert_eq!(payout_sum(&dh).unwrap(), amt(ONE));
+        assert!(dh.validate_conserving().is_ok());
+    }
+
+    #[test]
+    fn scalar_payout_matches_rational_reference_and_conserves() {
+        let mut r = Lcg(0x5CA1_A420);
+        for _ in 0..20_000 {
+            // Bounded so the reference division is exact and in range.
+            let lo = i128::from(r.next_u64() % 1_000_000) - 500_000;
+            let span = i128::from(r.next_u64() % 10_000_000) + 1; // >= 1 => lo < hi
+            let hi = lo + span;
+            let v = lo - 1_000_000 + i128::from(r.next_u64() % 12_000_000);
+            let pv = scalar_payout(amt(lo), amt(hi), amt(v)).unwrap();
+            let long = pv.values()[ScalarOutcome::Long.index()].raw();
+            let short = pv.values()[ScalarOutcome::Short.index()].raw();
+            // Value-conserving to exactly one unit.
+            assert_eq!(long + short, ONE);
+            assert!(pv.validate_conserving().is_ok());
+            // Rational reference (exact i128): long == floor((clamp(v)-lo)*ONE/span).
+            let clamped = v.clamp(lo, hi);
+            let expected_long = (clamped - lo) * ONE / span;
+            assert_eq!(long, expected_long);
+            assert!((0..=ONE).contains(&long));
+        }
+    }
+
+    #[test]
+    fn scalar_payout_rejects_extremes_without_panic() {
+        // Width overflow at extreme bounds -> typed Arith error, never a panic.
+        assert_eq!(
+            scalar_payout(Amount::MIN, Amount::MAX, Amount::ZERO).unwrap_err(),
+            PayoutError::Arith(ArithError::Overflow)
+        );
+        // numerator * ONE overflow at a huge span -> typed error.
+        assert_eq!(
+            scalar_payout(Amount::ZERO, Amount::MAX, Amount::MAX).unwrap_err(),
+            PayoutError::Arith(ArithError::Overflow)
+        );
+        // Degenerate range is still rejected.
+        assert_eq!(
+            scalar_payout(Amount::ONE, Amount::ONE, Amount::ONE).unwrap_err(),
+            PayoutError::OutcomeMismatch
+        );
+    }
+
+    #[test]
+    fn settle_rejects_non_conserving_payout() {
+        let mut pool = CompleteSetPool::new(2).unwrap();
+        pool.mint(amt(ONE)).unwrap();
+        // Over-allocated vector: settle rejects instead of over-crediting.
+        let over = PayoutVector::new(vec![amt(ONE), amt(ONE)]).unwrap();
+        assert_eq!(
+            pool.settle(&over).unwrap_err(),
+            PayoutError::Vector(types::PayoutVectorError::OverAllocated)
+        );
+        // Zero-sum vector rejected too.
+        let zero = PayoutVector::new(vec![amt(0), amt(0)]).unwrap();
+        assert_eq!(
+            pool.settle(&zero).unwrap_err(),
+            PayoutError::Vector(types::PayoutVectorError::ZeroSum)
+        );
+        // Negative entry rejected.
+        let neg = PayoutVector::new(vec![amt(-1), amt(ONE + 1)]).unwrap();
+        assert_eq!(
+            pool.settle(&neg).unwrap_err(),
+            PayoutError::Vector(types::PayoutVectorError::NegativeEntry)
+        );
+    }
+
+    #[test]
+    fn settlement_dust_is_bounded_and_conserves() {
+        // A non-divisible collateral over a three-way dead heat leaves sub-unit
+        // rounding dust; credited + dust equals the locked collateral exactly.
+        let mut pool = CompleteSetPool::new(3).unwrap();
+        pool.mint(amt(ONE + 1)).unwrap();
+        let payout = dead_heat(3, &[0, 1, 2]).unwrap();
+        let s = pool.settle(&payout).unwrap();
+        assert_eq!(
+            s.total_credited.checked_add(s.dust).unwrap(),
+            pool.locked_collateral()
+        );
+        // Dust never reaches one micro-unit per outcome.
+        assert!(!s.dust.is_negative());
+        assert!(s.dust.raw() < i128::try_from(pool.num_outcomes()).unwrap());
     }
 
     #[test]

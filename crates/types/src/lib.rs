@@ -14,7 +14,7 @@ pub mod ids;
 pub use decimal::{format_amount, parse_amount, DecimalError};
 pub use domain::{
     Hash, MarketLifecycle, MarketType, OracleHealth, OrderType, PayoutVector, PayoutVectorError,
-    Side, StateRoot, TimeInForce, MAX_OUTCOMES,
+    ScalarOutcome, Side, StateRoot, TimeInForce, MAX_OUTCOMES,
 };
 pub use fixed::{
     Amount, ArithError, Price, Quantity, Ratio, AMOUNT_SCALE, PRICE_SCALE, QTY_SCALE, RATIO_SCALE,

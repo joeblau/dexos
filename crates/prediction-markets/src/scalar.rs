@@ -75,9 +75,10 @@ impl ScalarRange {
         Ok(Ratio::from_raw(raw))
     }
 
-    /// The `[LONG, SHORT]` fraction pair for a resolved value. The pair always
-    /// sums to exactly `RATIO_SCALE` (1.0) — the SHORT side absorbs any floor
-    /// remainder, guaranteeing value conservation.
+    /// The fraction pair for a resolved value in canonical
+    /// [`types::ScalarOutcome`] order: `[LONG, SHORT]` (LONG at index 0, SHORT at
+    /// index 1). The pair always sums to exactly `RATIO_SCALE` (1.0) — the SHORT
+    /// side absorbs any floor remainder, guaranteeing value conservation.
     pub fn fractions(&self, value: Amount) -> Result<[Ratio; 2], ScalarError> {
         let long = self.long_fraction(value)?;
         let short = Ratio::from_raw(RATIO_SCALE - long.raw());

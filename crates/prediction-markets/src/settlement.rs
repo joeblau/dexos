@@ -217,7 +217,13 @@ impl Resolution {
                     return Err(SettlementError::NotScalarShaped);
                 }
                 let [long, short] = range.fractions(*value)?;
-                Ok(vec![long, short])
+                // Place by canonical `types::ScalarOutcome` index (LONG = 0,
+                // SHORT = 1) so this vector matches the `markets` crate's scalar
+                // payout by named outcome rather than an ad-hoc position.
+                let mut out = vec![Ratio::from_raw(0); 2];
+                out[types::ScalarOutcome::Long.index()] = long;
+                out[types::ScalarOutcome::Short.index()] = short;
+                Ok(out)
             }
             Resolution::Invalid => {
                 let all: Vec<usize> = (0..n).collect();

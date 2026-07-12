@@ -109,13 +109,15 @@ impl ResolutionCertificate {
     /// Verify this certificate against `rule` for `expected_market` with
     /// `expected_outcomes` outcomes.
     ///
-    /// Checks, in order: market id match, payout length match, the quorum's
-    /// message binds this outcome/evidence, and the committee quorum verifies to
-    /// threshold. Every failure is a typed [`ResolutionError`]; never panics.
+    /// Checks, in order: market id match, payout length match, payout value
+    /// conservation, the quorum's message binds this outcome/evidence, and the
+    /// committee quorum verifies to threshold. Every failure is a typed
+    /// [`ResolutionError`]; never panics.
     ///
     /// # Errors
     /// [`ResolutionError::MarketIdMismatch`],
     /// [`ResolutionError::PayoutLengthMismatch`],
+    /// [`ResolutionError::Vector`] (non-conserving payout),
     /// [`ResolutionError::ForgedMessage`], or [`ResolutionError::Quorum`].
     pub fn verify(
         &self,
@@ -129,6 +131,10 @@ impl ResolutionCertificate {
         if self.payout.len() != expected_outcomes {
             return Err(ResolutionError::PayoutLengthMismatch);
         }
+        // Revalidate at the certificate boundary: a decoded certificate bypasses
+        // the payout constructors, so re-assert non-negative, unit-sum values
+        // before a quorum can bind them into settlement.
+        self.payout.validate_conserving()?;
         let expected = resolution_message(self.market_id, &self.payout, self.evidence_hash);
         if self.quorum.message != expected {
             return Err(ResolutionError::ForgedMessage);
@@ -336,6 +342,33 @@ mod tests {
         assert_eq!(
             cert.verify(&rule, market, 2),
             Err(ResolutionError::ForgedMessage)
+        );
+    }
+
+    #[test]
+    fn rejects_non_conserving_certified_payout() {
+        let ts = committee(4, 3);
+        let rule = ResolutionRule::new(ts.validator_set(), 100, Hash::ZERO);
+        let market = MarketId::new(7);
+        let ev = Hash::from_bytes([9u8; 32]);
+
+        // Over-allocated payout (sums to 2.0) is rejected before the quorum check,
+        // even though the quorum genuinely signs this message.
+        let over = PayoutVector::new(vec![Amount::ONE, Amount::ONE]).unwrap();
+        let cert = make_cert(&ts, market, over, ev, vec![0, 1, 2]);
+        assert_eq!(
+            cert.verify(&rule, market, 2),
+            Err(ResolutionError::Vector(
+                types::PayoutVectorError::OverAllocated
+            ))
+        );
+
+        // Zero-sum payout likewise rejected.
+        let zero = PayoutVector::new(vec![Amount::ZERO, Amount::ZERO]).unwrap();
+        let cert_zero = make_cert(&ts, market, zero, ev, vec![0, 1, 2]);
+        assert_eq!(
+            cert_zero.verify(&rule, market, 2),
+            Err(ResolutionError::Vector(types::PayoutVectorError::ZeroSum))
         );
     }
 

@@ -64,6 +64,9 @@ pub enum PayoutError {
     /// A non-positive unit count was supplied to mint/redeem.
     #[error("unit count must be positive")]
     NonPositiveUnits,
+    /// A dead-heat winner list named the same outcome more than once.
+    #[error("duplicate winner in dead-heat set")]
+    DuplicateWinner,
     /// The rule cannot enumerate a fixed number of outcomes (e.g. custom).
     #[error("payout rule has no enumerable outcome vector")]
     NonEnumerable,

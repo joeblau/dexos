@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::fixed::Amount;
+use crate::fixed::{Amount, AMOUNT_SCALE};
 
 /// Maximum outcomes in a single market's payout vector. Bounds allocation and
 /// worst-case risk scans.
@@ -119,13 +119,39 @@ pub enum OracleHealth {
     Halted,
 }
 
+/// Canonical settlement-index convention for a two-outcome scalar (range) market.
+///
+/// Every crate that builds or consumes a scalar payout vector places the LONG
+/// outcome at index 0 and the SHORT outcome at index 1, so the vectors agree by
+/// *named* outcome across crate boundaries rather than by an ad-hoc positional
+/// convention. Indexing through [`Self::index`] keeps the ordering a single
+/// source of truth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ScalarOutcome {
+    /// The long side: pays `(value - lower) / (upper - lower)` of one unit.
+    Long,
+    /// The short side: pays the complement `1 - long`.
+    Short,
+}
+
+impl ScalarOutcome {
+    /// The canonical settlement index of this outcome (LONG = 0, SHORT = 1).
+    #[inline]
+    pub const fn index(self) -> usize {
+        match self {
+            ScalarOutcome::Long => 0,
+            ScalarOutcome::Short => 1,
+        }
+    }
+}
+
 /// A payout vector: the settlement value of one claim under each possible outcome.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PayoutVector {
     values: Vec<Amount>,
 }
 
-/// Payout-vector construction failure.
+/// Payout-vector construction / validation failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum PayoutVectorError {
     /// Zero outcomes supplied.
@@ -134,10 +160,30 @@ pub enum PayoutVectorError {
     /// More than [`MAX_OUTCOMES`] outcomes supplied.
     #[error("payout vector exceeds the maximum of {MAX_OUTCOMES} outcomes")]
     TooManyOutcomes,
+    /// A settlement entry was negative; payouts must be non-negative.
+    #[error("payout vector has a negative entry")]
+    NegativeEntry,
+    /// Every entry was zero, so no collateral would be distributed.
+    #[error("payout vector entries sum to zero")]
+    ZeroSum,
+    /// Entries summed to more than one unit (over-allocation of collateral).
+    #[error("payout vector entries sum to more than one unit")]
+    OverAllocated,
+    /// Entries summed to a positive value below one unit (collateral unassigned).
+    #[error("payout vector entries sum to less than one unit")]
+    Underfunded,
+    /// Summing the entries overflowed the accumulator.
+    #[error("payout vector sum overflowed")]
+    SumOverflow,
 }
 
 impl PayoutVector {
     /// Construct, rejecting empty or over-large vectors (no unbounded allocation).
+    ///
+    /// This does *not* enforce value conservation: risk-scenario code reuses this
+    /// type for arbitrary per-outcome marks (negative, > one unit). Settlement and
+    /// certificate paths must additionally call [`Self::validate_conserving`], or
+    /// construct through [`Self::new_conserving`].
     pub fn new(values: Vec<Amount>) -> Result<Self, PayoutVectorError> {
         if values.is_empty() {
             return Err(PayoutVectorError::Empty);
@@ -146,6 +192,51 @@ impl PayoutVector {
             return Err(PayoutVectorError::TooManyOutcomes);
         }
         Ok(Self { values })
+    }
+
+    /// Construct and require the canonical settlement invariant: non-negative
+    /// entries summing to exactly one unit. See [`Self::validate_conserving`].
+    ///
+    /// # Errors
+    /// Any [`PayoutVectorError`] from [`Self::new`] or [`Self::validate_conserving`].
+    pub fn new_conserving(values: Vec<Amount>) -> Result<Self, PayoutVectorError> {
+        let pv = Self::new(values)?;
+        pv.validate_conserving()?;
+        Ok(pv)
+    }
+
+    /// Validate the canonical settlement invariant: every entry is non-negative
+    /// and the entries sum to *exactly* one unit (`Amount::ONE`).
+    ///
+    /// Enforcing an exact unit sum bounds the per-claim rounding dust of
+    /// settlement to sub-unit magnitude and guarantees value conservation
+    /// (`credited + dust == locked collateral`). Callers re-validate deserialized
+    /// or externally-sourced vectors at every certificate and settlement
+    /// boundary; the mutation-free check reports a typed error and never panics.
+    ///
+    /// # Errors
+    /// [`PayoutVectorError::NegativeEntry`], [`PayoutVectorError::ZeroSum`],
+    /// [`PayoutVectorError::OverAllocated`], [`PayoutVectorError::Underfunded`], or
+    /// [`PayoutVectorError::SumOverflow`].
+    pub fn validate_conserving(&self) -> Result<(), PayoutVectorError> {
+        let mut total: i128 = 0;
+        for v in &self.values {
+            if v.raw() < 0 {
+                return Err(PayoutVectorError::NegativeEntry);
+            }
+            total = total
+                .checked_add(v.raw())
+                .ok_or(PayoutVectorError::SumOverflow)?;
+        }
+        if total == AMOUNT_SCALE {
+            Ok(())
+        } else if total == 0 {
+            Err(PayoutVectorError::ZeroSum)
+        } else if total > AMOUNT_SCALE {
+            Err(PayoutVectorError::OverAllocated)
+        } else {
+            Err(PayoutVectorError::Underfunded)
+        }
     }
 
     /// The number of outcomes.
@@ -219,6 +310,77 @@ mod tests {
         let ok = PayoutVector::new(vec![Amount::ONE, Amount::ZERO]).unwrap();
         assert_eq!(ok.len(), 2);
         assert_eq!(ok.values()[0], Amount::ONE);
+    }
+
+    #[test]
+    fn validate_conserving_accepts_unit_sum_and_rejects_the_rest() {
+        // Exactly one unit: conserving.
+        let ok =
+            PayoutVector::new(vec![Amount::from_raw(400_000), Amount::from_raw(600_000)]).unwrap();
+        assert_eq!(ok.validate_conserving(), Ok(()));
+        // Winner-takes-all is conserving.
+        assert_eq!(
+            PayoutVector::new(vec![Amount::ONE, Amount::ZERO])
+                .unwrap()
+                .validate_conserving(),
+            Ok(())
+        );
+        // Negative entry is rejected even when the total would still be one unit.
+        assert_eq!(
+            PayoutVector::new(vec![Amount::from_raw(-1), Amount::from_raw(1_000_001)])
+                .unwrap()
+                .validate_conserving(),
+            Err(PayoutVectorError::NegativeEntry)
+        );
+        // Zero-sum.
+        assert_eq!(
+            PayoutVector::new(vec![Amount::ZERO, Amount::ZERO])
+                .unwrap()
+                .validate_conserving(),
+            Err(PayoutVectorError::ZeroSum)
+        );
+        // Over-allocated (sum > one unit).
+        assert_eq!(
+            PayoutVector::new(vec![Amount::ONE, Amount::ONE])
+                .unwrap()
+                .validate_conserving(),
+            Err(PayoutVectorError::OverAllocated)
+        );
+        // Underfunded (0 < sum < one unit).
+        assert_eq!(
+            PayoutVector::new(vec![Amount::from_raw(100), Amount::ZERO])
+                .unwrap()
+                .validate_conserving(),
+            Err(PayoutVectorError::Underfunded)
+        );
+        // Summation overflow returns a typed error, never a panic.
+        assert_eq!(
+            PayoutVector::new(vec![Amount::MAX, Amount::MAX])
+                .unwrap()
+                .validate_conserving(),
+            Err(PayoutVectorError::SumOverflow)
+        );
+    }
+
+    #[test]
+    fn new_conserving_mirrors_validate_conserving() {
+        assert!(PayoutVector::new_conserving(vec![Amount::ONE, Amount::ZERO]).is_ok());
+        assert_eq!(
+            PayoutVector::new_conserving(vec![Amount::ONE, Amount::ONE]),
+            Err(PayoutVectorError::OverAllocated)
+        );
+        // Empty still fails at the length gate before any sum check.
+        assert_eq!(
+            PayoutVector::new_conserving(vec![]),
+            Err(PayoutVectorError::Empty)
+        );
+    }
+
+    #[test]
+    fn scalar_outcome_index_is_canonical() {
+        assert_eq!(ScalarOutcome::Long.index(), 0);
+        assert_eq!(ScalarOutcome::Short.index(), 1);
+        assert_ne!(ScalarOutcome::Long, ScalarOutcome::Short);
     }
 
     #[test]
