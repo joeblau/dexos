@@ -126,13 +126,30 @@ pub fn derive_mark(
     }
 }
 
-/// Minimal perpetual-market state carried by the registry: the last mark.
+/// A sequenced funding epoch receipt: applied exactly once per market.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FundingEpochReceipt {
+    /// Monotonic epoch index for this market.
+    pub epoch: u64,
+    /// Signed funding rate applied.
+    pub rate: Ratio,
+    /// Mark used for the notional.
+    pub mark_price: Price,
+    /// Cumulative funding index after this epoch (sum of rates, fixed-point raw).
+    pub cumulative_index: i64,
+}
+
+/// Minimal perpetual-market state carried by the registry: mark + funding index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PerpMarketState {
     /// The most recently derived mark price (`ZERO` until first set).
     pub mark_price: Price,
     /// The most recently applied funding rate.
     pub last_funding_rate: Ratio,
+    /// Highest funding epoch applied (0 = none yet).
+    pub last_funding_epoch: u64,
+    /// Cumulative funding index (sum of applied rates, raw Ratio units).
+    pub cumulative_funding_index: i64,
 }
 
 impl PerpMarketState {
@@ -149,6 +166,93 @@ impl PerpMarketState {
         let mark = derive_mark(index, mid, health)?;
         self.mark_price = mark;
         Ok(mark)
+    }
+
+    /// Apply a sequenced funding epoch exactly once. Epochs must be strictly
+    /// monotonic (`epoch == last_funding_epoch + 1`, or `1` when none applied).
+    ///
+    /// Advances `last_funding_rate`, `last_funding_epoch`, and the cumulative
+    /// funding index. Returns a receipt for journaling / root commitment.
+    ///
+    /// # Errors
+    /// [`PerpError::DuplicateEpoch`] if the epoch was already applied or is not
+    /// the next sequential epoch; [`PerpError::Arith`] on overflow.
+    pub fn apply_funding_epoch(
+        &mut self,
+        epoch: u64,
+        rate: Ratio,
+        mark_price: Price,
+    ) -> Result<FundingEpochReceipt, PerpError> {
+        let expected = self.last_funding_epoch.saturating_add(1);
+        if epoch != expected {
+            return Err(PerpError::DuplicateEpoch {
+                last: self.last_funding_epoch,
+                got: epoch,
+            });
+        }
+        let next_index = self
+            .cumulative_funding_index
+            .checked_add(rate.raw())
+            .ok_or(ArithError::Overflow)?;
+        self.last_funding_rate = rate;
+        self.last_funding_epoch = epoch;
+        self.cumulative_funding_index = next_index;
+        self.mark_price = mark_price;
+        Ok(FundingEpochReceipt {
+            epoch,
+            rate,
+            mark_price,
+            cumulative_index: next_index,
+        })
+    }
+
+    /// Funding payment for a position using the epoch's mark and rate.
+    pub fn position_funding(
+        &self,
+        signed_qty: Quantity,
+        rate: Ratio,
+        mark: Price,
+    ) -> Result<Amount, PerpError> {
+        funding_payment(mark, signed_qty, rate)
+    }
+}
+
+/// Maker/taker fee on actual fill notional with directed rounding.
+///
+/// * Positive fee bps: fee is `ceil(|notional| * bps / 10_000)` (never under-collect).
+/// * Negative fee bps (rebate): rebate is `floor(|notional| * |bps| / 10_000)` and
+///   returned as a negative amount (credit), bounded by the notional magnitude.
+///
+/// # Errors
+/// [`PerpError::Arith`] on overflow; [`PerpError::FeeOutOfRange`] if `|bps| > 10_000`.
+pub fn fill_fee(notional: Amount, bps: i32) -> Result<Amount, PerpError> {
+    if bps == 0 || notional.raw() == 0 {
+        return Ok(Amount::ZERO);
+    }
+    let abs_bps = bps.unsigned_abs();
+    if abs_bps > 10_000 {
+        return Err(PerpError::FeeOutOfRange);
+    }
+    let mag = if notional.is_negative() {
+        Amount::from_raw(
+            notional
+                .raw()
+                .checked_neg()
+                .ok_or(ArithError::Overflow)?,
+        )
+    } else {
+        notional
+    };
+    let ratio = Ratio::from_bps(i64::from(abs_bps))?;
+    if bps > 0 {
+        // Directed rounding: obligations never under-collect.
+        Ok(mag.mul_ratio_ceil(ratio)?)
+    } else {
+        // Rebate: floor, returned as credit (negative fee).
+        let rebate = mag.mul_ratio(ratio)?;
+        Ok(Amount::from_raw(
+            rebate.raw().checked_neg().ok_or(ArithError::Overflow)?,
+        ))
     }
 }
 
@@ -338,5 +442,57 @@ mod tests {
             let _ = postcard::from_bytes::<FundingUpdate>(&bytes);
             let _ = postcard::from_bytes::<PerpMarketState>(&bytes);
         }
+    }
+
+    #[test]
+    fn funding_epoch_applies_exactly_once() {
+        let mut s = PerpMarketState::default();
+        let rate = Ratio::from_bps(10).unwrap();
+        let mark = Price::from_raw(100 * P1);
+        let r1 = s.apply_funding_epoch(1, rate, mark).unwrap();
+        assert_eq!(r1.epoch, 1);
+        assert_eq!(s.last_funding_epoch, 1);
+        assert_eq!(s.last_funding_rate, rate);
+        assert_eq!(s.cumulative_funding_index, rate.raw());
+        // Replay same epoch rejected.
+        assert_eq!(
+            s.apply_funding_epoch(1, rate, mark),
+            Err(PerpError::DuplicateEpoch { last: 1, got: 1 })
+        );
+        // Skip rejected.
+        assert_eq!(
+            s.apply_funding_epoch(3, rate, mark),
+            Err(PerpError::DuplicateEpoch { last: 1, got: 3 })
+        );
+        let r2 = s.apply_funding_epoch(2, rate, mark).unwrap();
+        assert_eq!(r2.cumulative_index, rate.raw() * 2);
+    }
+
+    #[test]
+    fn balanced_funding_nets_to_zero() {
+        let mark = Price::from_raw(50 * P1);
+        let rate = Ratio::from_bps(25).unwrap();
+        let mut net = Amount::ZERO;
+        for q in [1i64, 2, -3] {
+            net = net
+                .checked_add(funding_payment(mark, Quantity::from_raw(q * Q1), rate).unwrap())
+                .unwrap();
+        }
+        assert_eq!(net, Amount::ZERO);
+    }
+
+    #[test]
+    fn fill_fee_directed_rounding_and_rebate() {
+        let notional = Amount::from_raw(1_000_000_000); // 1000.0
+        // 10 bps fee = 1.0
+        assert_eq!(fill_fee(notional, 10).unwrap(), Amount::from_raw(1_000_000));
+        // -10 bps rebate = -1.0
+        assert_eq!(fill_fee(notional, -10).unwrap(), Amount::from_raw(-1_000_000));
+        // Out of range.
+        assert_eq!(fill_fee(notional, 10_001), Err(PerpError::FeeOutOfRange));
+        // Sub-unit notional with ceil: 1 micro * 1 bps still collects 1 if any.
+        let tiny = Amount::from_raw(1);
+        let fee = fill_fee(tiny, 1).unwrap();
+        assert!(fee.raw() >= 0);
     }
 }

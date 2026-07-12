@@ -25,6 +25,8 @@
 //! is an order-independent-free FNV-1a fingerprint over the SoA columns; a
 //! replayed command stream reproduces a bit-identical root.
 
+use std::collections::BTreeSet;
+
 use types::{AccountId, Amount, MarketId, PayoutVector, Price, Quantity};
 
 use crate::config::{
@@ -70,6 +72,14 @@ pub struct RiskEngine {
     marks: Vec<Option<Price>>,
     risk_group: Vec<Option<u32>>,
     market_limit: Vec<Option<Amount>>,
+    /// Reverse index: market slab index -> accounts with a non-flat position in
+    /// that market. Mark updates recompute only these holders, not every account.
+    market_holders: Vec<BTreeSet<usize>>,
+
+    /// Resting-order notional reserved against free collateral, per account.
+    /// Counts toward projected exposure in pre-trade checks so resting IM cannot
+    /// be double-spent by a concurrent order.
+    reserved_resting: Vec<Amount>,
 
     // --- global risk state ---
     portfolio_limit: Option<Amount>,
@@ -106,6 +116,8 @@ impl RiskEngine {
             marks: Vec::new(),
             risk_group: Vec::new(),
             market_limit: Vec::new(),
+            market_holders: Vec::new(),
+            reserved_resting: Vec::new(),
             portfolio_limit: None,
             insurance: InsuranceFund::default(),
             liq_queue: LiquidationQueue::new(),
@@ -188,7 +200,7 @@ impl RiskEngine {
             return Err(RiskError::NegativeAmount);
         }
         let i = self.active_index(account)?;
-        let free = self.cached_equity[i].checked_sub(self.cached_im[i])?;
+        let free = self.free_collateral(account)?;
         if amount.raw() > free.raw() {
             return Err(RiskError::InsufficientCollateral);
         }
@@ -216,15 +228,17 @@ impl RiskEngine {
 
     // ------------------------------------------------------------------- market
 
-    /// Set (or update) a market's mark price and refresh every account.
+    /// Set (or update) a market's mark price and refresh only accounts that hold
+    /// a position in that market. Work scales with holders, not total accounts.
+    /// [`RiskEngine::recompute_all`] remains available as a differential oracle.
     pub fn set_mark_price(&mut self, market: MarketId, price: Price) -> Result<(), RiskError> {
         let mi = market.index()?;
         self.grow_market(mi)?;
         let prev = self.marks[mi];
         self.marks[mi] = Some(price);
-        if let Err(e) = self.recompute_all() {
-            // `recompute_all` is all-or-none, so on overflow no account column was
-            // written; restoring the prior mark leaves the engine byte-identical.
+        if let Err(e) = self.recompute_holders(mi) {
+            // All-or-none: on overflow no account column was written; restoring
+            // the prior mark leaves the engine byte-identical.
             self.marks[mi] = prev;
             return Err(e);
         }
@@ -326,12 +340,15 @@ impl RiskEngine {
         signed_qty: Quantity,
         price: Price,
     ) -> Result<(), RiskError> {
+        let market = self.perp[i][pos_idx].market;
         let realized = self.perp[i][pos_idx].apply_fill(signed_qty, price)?;
         self.collateral[i] = self.collateral[i].checked_add(realized)?;
         // Drop a flattened position to keep scans tight (only when at the end).
-        if self.perp[i][pos_idx].is_flat() && pos_idx + 1 == self.perp[i].len() {
+        let flat = self.perp[i][pos_idx].is_flat();
+        if flat && pos_idx + 1 == self.perp[i].len() {
             self.perp[i].pop();
         }
+        self.sync_market_holder(i, market, !flat)?;
         self.recompute(i)
     }
 
@@ -394,7 +411,11 @@ impl RiskEngine {
             }
             return Err(RiskError::NothingToReduce);
         }
-        let projected = self.cached_exposure[i].checked_add(notional)?;
+        // Projected notional includes already-reserved resting orders so two
+        // concurrent placements cannot double-spend free collateral.
+        let projected = self.cached_exposure[i]
+            .checked_add(self.reserved_resting[i])?
+            .checked_add(notional)?;
         if let Some(cap) = self.portfolio_limit {
             if projected.raw() > cap.raw() {
                 return Err(RiskError::PortfolioLimitExceeded);
@@ -488,12 +509,92 @@ impl RiskEngine {
         self.maintenance_margin(account)
     }
 
-    /// Free collateral withdrawable without breaching initial margin.
+    /// Free collateral withdrawable without breaching initial margin, after
+    /// deducting the initial-margin reserved by resting orders.
     pub fn free_collateral(&self, account: AccountId) -> Result<Amount, RiskError> {
         let i = self.read_index(account)?;
+        let reserved_im = self.reserved_resting[i].mul_ratio_ceil(self.config.initial_margin)?;
         self.cached_equity[i]
-            .checked_sub(self.cached_im[i])
+            .checked_sub(self.cached_im[i])?
+            .checked_sub(reserved_im)
             .map_err(RiskError::from)
+    }
+
+    /// Absolute notional currently reserved by resting orders for `account`.
+    pub fn reserved_resting(&self, account: AccountId) -> Result<Amount, RiskError> {
+        Ok(self.reserved_resting[self.read_index(account)?])
+    }
+
+    /// Reserve initial margin for a resting order of `notional`. The reservation
+    /// is admitted only if free collateral still covers it after the reserve.
+    pub fn reserve_resting(
+        &mut self,
+        account: AccountId,
+        notional: Amount,
+    ) -> Result<(), RiskError> {
+        if notional.is_negative() {
+            return Err(RiskError::NegativeAmount);
+        }
+        if notional.raw() == 0 {
+            return Ok(());
+        }
+        let i = self.active_index(account)?;
+        let next = self.reserved_resting[i].checked_add(notional)?;
+        let reserved_im = next.mul_ratio_ceil(self.config.initial_margin)?;
+        let free = self.cached_equity[i]
+            .checked_sub(self.cached_im[i])?
+            .checked_sub(reserved_im)?;
+        if free.is_negative() {
+            return Err(RiskError::InsufficientMargin {
+                required: self.cached_im[i].checked_add(reserved_im)?,
+                available: self.cached_equity[i],
+            });
+        }
+        // Also respect leverage / portfolio caps against exposure + reserved.
+        let projected = self.cached_exposure[i].checked_add(next)?;
+        if let Some(cap) = self.portfolio_limit {
+            if projected.raw() > cap.raw() {
+                return Err(RiskError::PortfolioLimitExceeded);
+            }
+        }
+        let max_notional = self.cached_equity[i].mul_ratio(self.config.max_leverage)?;
+        if projected.raw() > max_notional.raw() {
+            return Err(RiskError::LeverageExceeded);
+        }
+        self.reserved_resting[i] = next;
+        Ok(())
+    }
+
+    /// Release previously reserved resting notional (cancel / fill of residual).
+    pub fn release_resting(
+        &mut self,
+        account: AccountId,
+        notional: Amount,
+    ) -> Result<(), RiskError> {
+        if notional.is_negative() {
+            return Err(RiskError::NegativeAmount);
+        }
+        if notional.raw() == 0 {
+            return Ok(());
+        }
+        let i = self.active_index(account)?;
+        if notional.raw() > self.reserved_resting[i].raw() {
+            return Err(RiskError::InsufficientCollateral);
+        }
+        self.reserved_resting[i] = self.reserved_resting[i].checked_sub(notional)?;
+        Ok(())
+    }
+
+    /// Open perp positions for `account` (single source of truth for reduce-only).
+    pub fn perp_positions(&self, account: AccountId) -> Result<&[PerpPosition], RiskError> {
+        Ok(&self.perp[self.read_index(account)?])
+    }
+
+    /// Number of accounts that hold a non-flat position in `market` (for tests /
+    /// proportional-update diagnostics).
+    pub fn market_holder_count(&self, market: MarketId) -> Result<usize, RiskError> {
+        let mi = market.index()?;
+        Ok(self.market_holders.get(mi).map(|s| s.len()).unwrap_or(0))
     }
 
     /// Current collateral balance.
@@ -648,10 +749,15 @@ impl RiskEngine {
             returned_collateral = final_equity;
         }
 
-        // Close the account and clear its (already flattened) book.
+        // Close the account and clear its (already flattened) book. Defensively
+        // drop reverse-index entries for this account across every market.
+        for holders in &mut self.market_holders {
+            holders.remove(&i);
+        }
         self.perp[i].clear();
         self.payout[i].clear();
         self.collateral[i] = Amount::ZERO;
+        self.reserved_resting[i] = Amount::ZERO;
         self.open[i] = false;
         self.recompute(i)?;
         self.liq_queue.remove(account);
@@ -1113,6 +1219,7 @@ impl RiskEngine {
             self.cached_scenario.resize(n, Amount::ZERO);
             self.cached_im.resize(n, Amount::ZERO);
             self.cached_mm.resize(n, Amount::ZERO);
+            self.reserved_resting.resize(n, Amount::ZERO);
         }
         Ok(())
     }
@@ -1133,6 +1240,42 @@ impl RiskEngine {
             self.marks.resize(n, None);
             self.risk_group.resize(n, None);
             self.market_limit.resize(n, None);
+            self.market_holders.resize(n, BTreeSet::new());
+        }
+        Ok(())
+    }
+
+    /// Maintain the reverse market->account index after a position mutation.
+    fn sync_market_holder(
+        &mut self,
+        account_idx: usize,
+        market: MarketId,
+        holds: bool,
+    ) -> Result<(), RiskError> {
+        let mi = market.index()?;
+        self.grow_market(mi)?;
+        if holds {
+            self.market_holders[mi].insert(account_idx);
+        } else {
+            self.market_holders[mi].remove(&account_idx);
+        }
+        Ok(())
+    }
+
+    /// Recompute only the accounts that hold a position in market slab `mi`.
+    /// All-or-none: columns are computed first and committed only on success.
+    fn recompute_holders(&mut self, mi: usize) -> Result<(), RiskError> {
+        let holders: Vec<usize> = self
+            .market_holders
+            .get(mi)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default();
+        let mut computed: Vec<(usize, CachedColumns)> = Vec::with_capacity(holders.len());
+        for i in holders {
+            computed.push((i, self.compute_columns(i)?));
+        }
+        for (i, cols) in computed {
+            self.write_columns(i, &cols);
         }
         Ok(())
     }
@@ -2102,5 +2245,91 @@ mod tests {
         // Only in-range accounts were ever admitted, so the dense column never
         // grew past the configured capacity.
         assert!(e.account_count() <= CAP_A);
+    }
+
+    // -------- Proportional mark updates (#343) --------
+
+    #[test]
+    fn mark_update_touches_only_market_holders() {
+        let mut e = engine();
+        // 100 accounts, only 3 hold market 1.
+        for a in 1..=100u32 {
+            e.open_account(acct(a), amt(1_000)).unwrap();
+        }
+        e.set_mark_price(mkt(1), price(100)).unwrap();
+        e.set_mark_price(mkt(2), price(50)).unwrap();
+        for a in 1..=3u32 {
+            e.apply_fill(acct(a), mkt(1), qty(1), price(100)).unwrap();
+        }
+        // Unrelated account holds only market 2.
+        e.apply_fill(acct(50), mkt(2), qty(2), price(50)).unwrap();
+        assert_eq!(e.market_holder_count(mkt(1)).unwrap(), 3);
+        assert_eq!(e.market_holder_count(mkt(2)).unwrap(), 1);
+
+        let eq_unexposed = e.equity(acct(99)).unwrap();
+        let eq_m2 = e.equity(acct(50)).unwrap();
+        e.set_mark_price(mkt(1), price(110)).unwrap();
+        // Holders of market 1 gain equity; everyone else is unchanged.
+        assert_eq!(e.equity(acct(1)).unwrap(), amt(1_010));
+        assert_eq!(e.equity(acct(99)).unwrap(), eq_unexposed);
+        assert_eq!(e.equity(acct(50)).unwrap(), eq_m2);
+        // Proportional path matches full recompute.
+        let proportional = e.state_root();
+        e.recompute_all().unwrap();
+        assert_eq!(e.state_root(), proportional);
+    }
+
+    #[test]
+    fn incremental_mark_matches_full_recompute_randomized() {
+        let mut e = build_engine_from_seed(0xC0FFEE);
+        for mark in [90i64, 105, 120, 80, 100] {
+            e.set_mark_price(mkt(1), price(mark)).unwrap();
+            let root = e.state_root();
+            e.recompute_all().unwrap();
+            assert_eq!(e.state_root(), root, "mark={mark}");
+        }
+    }
+
+    // -------- Resting IM reservation (#292) --------
+
+    #[test]
+    fn resting_notional_consumes_free_collateral() {
+        let mut e = engine();
+        e.open_account(acct(1), amt(100)).unwrap();
+        e.set_mark_price(mkt(1), price(100)).unwrap();
+        // Free = equity 100, IM 0 -> 100.
+        assert_eq!(e.free_collateral(acct(1)).unwrap(), amt(100));
+        // Reserve notional 500 -> IM 50 (10%).
+        e.reserve_resting(acct(1), amt(500)).unwrap();
+        assert_eq!(e.reserved_resting(acct(1)).unwrap(), amt(500));
+        assert_eq!(e.free_collateral(acct(1)).unwrap(), amt(50));
+        // A second order for notional 600 would need IM 110 total > 100.
+        assert!(matches!(
+            e.reserve_resting(acct(1), amt(600)),
+            Err(RiskError::InsufficientMargin { .. })
+        ));
+        // check_order also sees the reservation.
+        assert!(matches!(
+            e.check_order(acct(1), amt(600), false),
+            Err(RiskError::InsufficientMargin { .. })
+        ));
+        e.release_resting(acct(1), amt(500)).unwrap();
+        assert_eq!(e.free_collateral(acct(1)).unwrap(), amt(100));
+        assert!(e.check_order(acct(1), amt(600), false).is_ok());
+    }
+
+    #[test]
+    fn position_api_is_single_source_for_reduce_only() {
+        let mut e = engine();
+        e.open_account(acct(1), amt(1_000)).unwrap();
+        e.set_mark_price(mkt(1), price(100)).unwrap();
+        e.apply_fill(acct(1), mkt(1), qty(3), price(100)).unwrap();
+        assert_eq!(e.position(acct(1), mkt(1)).unwrap(), qty(3));
+        let positions = e.perp_positions(acct(1)).unwrap();
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].net_qty, qty(3));
+        e.apply_fill(acct(1), mkt(1), qty(-3), price(100)).unwrap();
+        assert_eq!(e.position(acct(1), mkt(1)).unwrap(), Quantity::ZERO);
+        assert_eq!(e.market_holder_count(mkt(1)).unwrap(), 0);
     }
 }

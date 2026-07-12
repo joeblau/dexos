@@ -10,7 +10,10 @@ use std::collections::{HashMap, HashSet};
 use orderbook::{BookConfig, NewOrder, OrderBook, OrderOutcome};
 use risk::{RiskConfig, RiskEngine};
 use state_tree::{LeafWriter, StateTree};
-use types::{AccountId, Amount, Hash, MarketId, MarketType, Quantity, SequenceNumber, Side};
+use types::{
+    AccountId, Amount, Hash, MarketId, MarketLifecycle, MarketType, OracleHealth, Quantity,
+    SequenceNumber, Side,
+};
 
 use crate::command::{Authorization, Command, DeterministicEngine, ExecutionReceipt, ReceiptKind};
 use crate::error::ExecutionError;
@@ -63,6 +66,14 @@ struct MarketMeta {
     market_type: MarketType,
     outcomes: u16,
     mark_price: types::Price,
+    lifecycle: MarketLifecycle,
+    oracle_health: OracleHealth,
+    /// Maker fee bps (may be negative for rebate); 0 by default.
+    maker_fee_bps: i32,
+    /// Taker fee bps; 0 by default.
+    taker_fee_bps: i32,
+    /// Last applied funding epoch (0 = none).
+    last_funding_epoch: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -95,7 +106,8 @@ pub struct Engine {
     tree: StateTree,
     books: HashMap<u32, OrderBook>,
     markets: HashMap<u32, MarketMeta>,
-    positions: HashMap<(u32, u32), Quantity>,
+    /// Resting-order notional reserved against free collateral: (market, order_id) -> notional.
+    order_reserves: HashMap<(u32, u64), (AccountId, Amount)>,
     claims: HashMap<(u32, u32), Vec<Amount>>,
     deposits_seen: HashSet<(u32, Vec<u8>, u32)>,
     withdrawals: HashMap<u64, Withdrawal>,
@@ -116,7 +128,7 @@ impl Engine {
             tree: StateTree::new(config.account_capacity, config.market_capacity),
             books: HashMap::new(),
             markets: HashMap::new(),
-            positions: HashMap::new(),
+            order_reserves: HashMap::new(),
             claims: HashMap::new(),
             deposits_seen: HashSet::new(),
             withdrawals: HashMap::new(),
@@ -154,11 +166,78 @@ impl Engine {
         self.books.get(&market.get()).map(OrderBook::resting_len)
     }
 
+    /// Single source of truth for reduce-only: the risk engine's position.
     fn position(&self, account: AccountId, market: MarketId) -> Quantity {
-        self.positions
-            .get(&(account.get(), market.get()))
-            .copied()
+        self.risk
+            .position(account, market)
             .unwrap_or(Quantity::ZERO)
+    }
+
+    /// Reject new risk when the market is not Open or the oracle freezes risk.
+    fn gate_new_risk(&self, market: MarketId) -> Result<(), ExecutionError> {
+        let meta = self
+            .markets
+            .get(&market.get())
+            .ok_or(ExecutionError::UnknownMarket)?;
+        if !matches!(meta.lifecycle, MarketLifecycle::Open) {
+            return Err(ExecutionError::MarketNotOpen);
+        }
+        match meta.oracle_health {
+            OracleHealth::Halted | OracleHealth::Stale => {
+                Err(ExecutionError::OracleRiskFrozen)
+            }
+            OracleHealth::Normal | OracleHealth::Degraded => Ok(()),
+        }
+    }
+
+    fn residual_notional(
+        result: &orderbook::MatchResult,
+        price: types::Price,
+        requested: Quantity,
+    ) -> Result<Amount, ExecutionError> {
+        let filled = result.filled_quantity();
+        let remaining = requested
+            .raw()
+            .saturating_sub(filled.raw())
+            .max(0);
+        if remaining == 0 {
+            return Ok(Amount::ZERO);
+        }
+        Ok(price.notional(Quantity::from_raw(remaining))?)
+    }
+
+    fn release_order_reserve(
+        &mut self,
+        market: MarketId,
+        order_id: types::OrderId,
+        account: AccountId,
+    ) -> Result<(), ExecutionError> {
+        if let Some((owner, notional)) = self.order_reserves.remove(&(market.get(), order_id.get())) {
+            if owner != account {
+                // Put it back; wrong owner should not release.
+                self.order_reserves
+                    .insert((market.get(), order_id.get()), (owner, notional));
+                return Err(ExecutionError::OrderNotOwned);
+            }
+            self.risk.release_resting(account, notional)?;
+        }
+        Ok(())
+    }
+
+    fn reserve_order(
+        &mut self,
+        market: MarketId,
+        order_id: types::OrderId,
+        account: AccountId,
+        notional: Amount,
+    ) -> Result<(), ExecutionError> {
+        if notional.raw() == 0 {
+            return Ok(());
+        }
+        self.risk.reserve_resting(account, notional)?;
+        self.order_reserves
+            .insert((market.get(), order_id.get()), (account, notional));
+        Ok(())
     }
 
     /// The full committed leaf for `account`: settlement ledger balances, auth
@@ -183,11 +262,13 @@ impl Engine {
             .field_i128(self.risk.exposure(account)?.raw())
             .field_i128(self.risk.initial_margin(account)?.raw())
             .field_i128(self.risk.maintenance_margin(account)?.raw());
-        // Open positions, ascending by market; flats omitted.
+        // Open positions from risk (single source of truth); flats omitted.
         let mut positions: Vec<(u32, i64)> = Vec::new();
-        for (&(a, m), qty) in &self.positions {
-            if a == account.get() && qty.raw() != 0 {
-                positions.push((m, qty.raw()));
+        if let Ok(perps) = self.risk.perp_positions(account) {
+            for pos in perps {
+                if pos.net_qty.raw() != 0 {
+                    positions.push((pos.market.get(), pos.net_qty.raw()));
+                }
             }
         }
         positions.sort_unstable_by_key(|&(m, _)| m);
@@ -301,6 +382,11 @@ impl Engine {
         market: MarketId,
         result: &orderbook::MatchResult,
     ) -> Result<Vec<AccountId>, ExecutionError> {
+        let (maker_bps, taker_bps) = self
+            .markets
+            .get(&market.get())
+            .map(|m| (m.maker_fee_bps, m.taker_fee_bps))
+            .unwrap_or((0, 0));
         let mut touched = Vec::new();
         for fill in &result.fills {
             let taker_signed = Self::signed(fill.taker_side, fill.quantity)?;
@@ -309,8 +395,43 @@ impl Engine {
                 .apply_fill(fill.taker_account, market, taker_signed, fill.price)?;
             self.risk
                 .apply_fill(fill.maker_account, market, maker_signed, fill.price)?;
-            self.bump_position(fill.taker_account, market, taker_signed)?;
-            self.bump_position(fill.maker_account, market, maker_signed)?;
+            // Release reserved IM on the filled portion of the resting maker.
+            let fill_notional = fill.price.notional(fill.quantity)?;
+            let key = (market.get(), fill.maker_order.get());
+            if let Some((owner, reserved)) = self.order_reserves.get(&key).copied() {
+                let release = if fill_notional.raw() > reserved.raw() {
+                    reserved
+                } else {
+                    fill_notional
+                };
+                let next = reserved.checked_sub(release)?;
+                self.risk.release_resting(owner, release)?;
+                if next.raw() == 0 {
+                    self.order_reserves.remove(&key);
+                } else {
+                    self.order_reserves.insert(key, (owner, next));
+                }
+            }
+            // Maker/taker fees on actual fill notional (directed rounding).
+            if taker_bps != 0 {
+                let fee = Self::markets_fill_fee(fill_notional, taker_bps)?;
+                if fee.raw() > 0 {
+                    self.risk.apply_fee(fill.taker_account, fee)?;
+                } else if fee.raw() < 0 {
+                    // Rebate: credit collateral.
+                    self.risk
+                        .apply_funding(fill.taker_account, Amount::from_raw(-fee.raw()))?;
+                }
+            }
+            if maker_bps != 0 {
+                let fee = Self::markets_fill_fee(fill_notional, maker_bps)?;
+                if fee.raw() > 0 {
+                    self.risk.apply_fee(fill.maker_account, fee)?;
+                } else if fee.raw() < 0 {
+                    self.risk
+                        .apply_funding(fill.maker_account, Amount::from_raw(-fee.raw()))?;
+                }
+            }
             touched.push(fill.taker_account);
             touched.push(fill.maker_account);
         }
@@ -319,18 +440,29 @@ impl Engine {
         Ok(touched)
     }
 
-    fn bump_position(
-        &mut self,
-        account: AccountId,
-        market: MarketId,
-        delta: Quantity,
-    ) -> Result<(), ExecutionError> {
-        let entry = self
-            .positions
-            .entry((account.get(), market.get()))
-            .or_insert(Quantity::ZERO);
-        *entry = entry.checked_add(delta)?;
-        Ok(())
+    fn markets_fill_fee(notional: Amount, bps: i32) -> Result<Amount, ExecutionError> {
+        // Inline fee math (ceil for positive, floor rebate) to avoid a markets dep cycle.
+        if bps == 0 || notional.raw() == 0 {
+            return Ok(Amount::ZERO);
+        }
+        let abs_bps = bps.unsigned_abs();
+        if abs_bps > 10_000 {
+            return Err(ExecutionError::NotImplemented("fee bps out of range"));
+        }
+        let mag = if notional.is_negative() {
+            Amount::from_raw(notional.raw().checked_neg().ok_or(types::ArithError::Overflow)?)
+        } else {
+            notional
+        };
+        let ratio = types::Ratio::from_bps(i64::from(abs_bps))?;
+        if bps > 0 {
+            Ok(mag.mul_ratio_ceil(ratio)?)
+        } else {
+            let rebate = mag.mul_ratio(ratio)?;
+            Ok(Amount::from_raw(
+                rebate.raw().checked_neg().ok_or(types::ArithError::Overflow)?,
+            ))
+        }
     }
 
     fn receipt(&self, sequence: u64, kind: ReceiptKind) -> ExecutionReceipt {
@@ -481,6 +613,11 @@ impl Engine {
                         market_type: c.market_type,
                         outcomes: c.outcomes,
                         mark_price: c.mark_price,
+                        lifecycle: MarketLifecycle::Open,
+                        oracle_health: OracleHealth::Normal,
+                        maker_fee_bps: 0,
+                        taker_fee_bps: 0,
+                        last_funding_epoch: 0,
                     },
                 );
                 self.books
@@ -500,6 +637,9 @@ impl Engine {
                 Ok(self.receipt(seq, ReceiptKind::MarketUpdated(c.market)))
             }
             Command::PlaceOrder(c) => {
+                // Lifecycle + oracle gates: closed/halted markets and frozen
+                // oracles reject new risk before any book/risk mutation.
+                self.gate_new_risk(c.market)?;
                 let meta = self
                     .markets
                     .get(&c.market.get())
@@ -515,6 +655,7 @@ impl Engine {
                 self.authorize(c.account, c.market, notional, &c.auth)?;
                 self.risk
                     .check_order_in_market(c.account, c.market, notional, c.reduce_only)?;
+                // Reduce-only clamps against the risk engine position.
                 let pos = self.position(c.account, c.market);
                 let book = self
                     .books
@@ -542,6 +683,17 @@ impl Engine {
                     OrderOutcome::Resting { .. } | OrderOutcome::PartiallyFilledResting { .. }
                 );
                 let touched = self.apply_fills(c.market, &result)?;
+                // Reserve IM for any residual that rests on the book.
+                if rested {
+                    let rest_notional = Self::residual_notional(&result, c.price, c.quantity)?;
+                    // Limit orders use their limit price; market residuals do not rest.
+                    let rest_notional = if c.price.raw() > 0 {
+                        rest_notional
+                    } else {
+                        Amount::ZERO
+                    };
+                    self.reserve_order(c.market, c.order_id, c.account, rest_notional)?;
+                }
                 for a in touched {
                     self.commit_account(a)?;
                 }
@@ -575,6 +727,10 @@ impl Engine {
                     Err(orderbook::OrderError::UnknownOrder) => 0,
                     Err(e) => return Err(e.into()),
                 };
+                if count == 1 {
+                    self.release_order_reserve(c.market, c.order_id, c.account)?;
+                    self.commit_account(c.account)?;
+                }
                 self.commit_market(c.market)?;
                 Ok(self.receipt(seq, ReceiptKind::Cancelled(count)))
             }
@@ -589,10 +745,24 @@ impl Engine {
                     .get_mut(&c.market.get())
                     .ok_or(ExecutionError::UnknownMarket)?;
                 let count = book.cancel_all(c.account);
+                // Release every resting reservation for this account in the market.
+                let keys: Vec<(u32, u64)> = self
+                    .order_reserves
+                    .iter()
+                    .filter(|((m, _), (a, _))| *m == c.market.get() && *a == c.account)
+                    .map(|(k, _)| *k)
+                    .collect();
+                for key in keys {
+                    if let Some((owner, notional)) = self.order_reserves.remove(&key) {
+                        self.risk.release_resting(owner, notional)?;
+                    }
+                }
+                self.commit_account(c.account)?;
                 self.commit_market(c.market)?;
                 Ok(self.receipt(seq, ReceiptKind::Cancelled(count)))
             }
             Command::ReplaceOrder(c) => {
+                self.gate_new_risk(c.market)?;
                 let owner = self
                     .books
                     .get(&c.market.get())
@@ -607,21 +777,32 @@ impl Engine {
                 // session's per-order notional cap like a fresh placement.
                 let notional = c.price.notional(c.quantity)?;
                 self.authorize(c.account, c.market, notional, &c.auth)?;
+                // Release prior reservation, re-check risk for the new notional,
+                // then re-reserve residual after the replace — all inside the
+                // transactional working copy so failure is atomic.
+                self.release_order_reserve(c.market, c.order_id, c.account)?;
+                self.risk
+                    .check_order_in_market(c.account, c.market, notional, false)?;
                 let book = self
                     .books
                     .get_mut(&c.market.get())
                     .ok_or(ExecutionError::UnknownMarket)?;
                 let result = book.replace(c.order_id, c.price, c.quantity)?;
                 let touched = self.apply_fills(c.market, &result)?;
-                for a in touched {
-                    self.commit_account(a)?;
-                }
-                self.commit_market(c.market)?;
                 let filled = result.filled_quantity();
                 let rested = matches!(
                     result.outcome,
                     OrderOutcome::Resting { .. } | OrderOutcome::PartiallyFilledResting { .. }
                 );
+                if rested {
+                    let rest_notional = Self::residual_notional(&result, c.price, c.quantity)?;
+                    self.reserve_order(c.market, c.order_id, c.account, rest_notional)?;
+                }
+                for a in touched {
+                    self.commit_account(a)?;
+                }
+                self.commit_account(c.account)?;
+                self.commit_market(c.market)?;
                 Ok(self.receipt(seq, ReceiptKind::OrderApplied { filled, rested }))
             }
             Command::MintCompleteSet(c) => {
@@ -691,8 +872,8 @@ impl Engine {
                 // Phases 2-4: auto-deleverage, insurance draw, and socialization
                 // are settled by the risk engine.
                 let outcome = self.risk.liquidate(c.account)?;
-                // Reconcile the external position mirror for every account the
-                // pipeline touched (the victim plus each ADL counterparty).
+                // Commit every account the pipeline touched (victim + ADL
+                // counterparties + haircuts). Positions live only in risk.
                 let mut affected: Vec<AccountId> = Vec::with_capacity(outcome.adl_fills.len() + 1);
                 affected.push(c.account);
                 for f in &outcome.adl_fills {
@@ -703,17 +884,19 @@ impl Engine {
                 }
                 affected.sort_by_key(|a| a.get());
                 affected.dedup();
-                for a in &affected {
-                    for m in &market_ids {
-                        let market = MarketId::new(*m);
-                        let qty = self.risk.position(*a, market).unwrap_or(Quantity::ZERO);
-                        let key = (a.get(), *m);
-                        if qty.raw() == 0 {
-                            self.positions.remove(&key);
-                        } else {
-                            self.positions.insert(key, qty);
-                        }
+                // Drop any resting reservations for the liquidated account.
+                let drop_keys: Vec<(u32, u64)> = self
+                    .order_reserves
+                    .iter()
+                    .filter(|(_, (a, _))| *a == c.account)
+                    .map(|(k, _)| *k)
+                    .collect();
+                for key in drop_keys {
+                    if let Some((owner, notional)) = self.order_reserves.remove(&key) {
+                        let _ = self.risk.release_resting(owner, notional);
                     }
+                }
+                for a in &affected {
                     self.commit_account(*a)?;
                 }
                 // Cancelled orders and reconciled book positions change every
@@ -727,6 +910,73 @@ impl Engine {
                         account: c.account,
                         insurance_drawn: outcome.insurance_drawn,
                         socialized_loss: outcome.socialized_loss,
+                    },
+                ))
+            }
+            Command::SetMarketLifecycle(c) => {
+                let meta = self
+                    .markets
+                    .get_mut(&c.market.get())
+                    .ok_or(ExecutionError::UnknownMarket)?;
+                meta.lifecycle = c.lifecycle;
+                self.commit_market(c.market)?;
+                Ok(self.receipt(seq, ReceiptKind::MarketUpdated(c.market)))
+            }
+            Command::SetOracleHealth(c) => {
+                let meta = self
+                    .markets
+                    .get_mut(&c.market.get())
+                    .ok_or(ExecutionError::UnknownMarket)?;
+                meta.oracle_health = c.health;
+                self.commit_market(c.market)?;
+                Ok(self.receipt(seq, ReceiptKind::MarketUpdated(c.market)))
+            }
+            Command::ApplyFundingEpoch(c) => {
+                let meta = self
+                    .markets
+                    .get_mut(&c.market.get())
+                    .ok_or(ExecutionError::UnknownMarket)?;
+                let expected = meta.last_funding_epoch.saturating_add(1);
+                if c.epoch != expected {
+                    return Err(ExecutionError::FundingEpochConflict);
+                }
+                let mark = meta.mark_price;
+                let rate = c.rate;
+                meta.last_funding_epoch = c.epoch;
+                // Collect holders from risk by scanning open accounts via
+                // liquidation candidates path is wrong; use market holders by
+                // probing positions for known accounts through ledger.
+                let accounts: Vec<AccountId> = {
+                    // Dense accounts 0..ledger count via risk account_count.
+                    let n = self.risk.account_count();
+                    let mut v = Vec::new();
+                    for i in 0..n {
+                        if let Ok(a) = AccountId::from_index(i) {
+                            if self.risk.position(a, c.market).map(|q| q.raw() != 0).unwrap_or(false)
+                            {
+                                v.push(a);
+                            }
+                        }
+                    }
+                    v
+                };
+                for a in &accounts {
+                    let qty = self.risk.position(*a, c.market)?;
+                    // payment positive => account pays (long when rate > 0).
+                    let pay = mark.notional(qty)?.mul_ratio(rate)?;
+                    // apply_funding credits; so credit -pay.
+                    let credit = Amount::from_raw(
+                        pay.raw().checked_neg().ok_or(types::ArithError::Overflow)?,
+                    );
+                    self.risk.apply_funding(*a, credit)?;
+                    self.commit_account(*a)?;
+                }
+                self.commit_market(c.market)?;
+                Ok(self.receipt(
+                    seq,
+                    ReceiptKind::FundingApplied {
+                        market: c.market,
+                        epoch: c.epoch,
                     },
                 ))
             }
@@ -901,11 +1151,17 @@ mod tests {
             w.field_i128(e.risk.collateral(a).unwrap().raw());
             w.field_i128(e.risk.equity(a).unwrap().raw());
         }
-        let mut positions: Vec<(u32, u32, i64)> = e
-            .positions
-            .iter()
-            .map(|(&(a, m), q)| (a, m, q.raw()))
-            .collect();
+        let mut positions: Vec<(u32, u32, i64)> = Vec::new();
+        for i in 0..n {
+            let a = AccountId::from_index(i).unwrap();
+            if let Ok(perps) = e.risk.perp_positions(a) {
+                for pos in perps {
+                    if pos.net_qty.raw() != 0 {
+                        positions.push((a.get(), pos.market.get(), pos.net_qty.raw()));
+                    }
+                }
+            }
+        }
         positions.sort_unstable();
         w.field_i128(i128::try_from(positions.len()).unwrap());
         for (a, m, q) in positions {
@@ -1012,19 +1268,6 @@ mod tests {
             assert_eq!(
                 reserved, expected,
                 "account {i} reserved {reserved} != pending withdrawals {expected}",
-            );
-        }
-
-        // The external position mirror equals the risk engine's own positions.
-        for (&(a, m), qty) in &e.positions {
-            let risk_qty = e
-                .risk
-                .position(AccountId::new(a), MarketId::new(m))
-                .unwrap_or(Quantity::ZERO);
-            assert_eq!(
-                risk_qty.raw(),
-                qty.raw(),
-                "position mirror mismatch for account {a} market {m}",
             );
         }
 
@@ -1238,7 +1481,6 @@ mod tests {
                 Quantity::ZERO,
             );
         }
-        assert!(e.positions.is_empty(), "partial fill leaked a position");
         assert_eq!(fingerprint(&e), before);
         check_invariants(&e);
     }

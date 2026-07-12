@@ -38,15 +38,16 @@ pub use error::{
 };
 pub use escrow::EscrowLedger;
 pub use lifecycle::{
-    accepts_orders, advance, is_legal_transition, is_terminal, ALL_LIFECYCLE_STATES,
+    accepts_orders, advance, is_legal_transition, is_terminal, HaltReason, HaltState,
+    ALL_LIFECYCLE_STATES,
 };
 pub use payout::{
     dead_heat, invalid_refund, payout_sum, scalar_payout, winner_takes_all, worst_case_liability,
     CompleteSetPool, PayoutRule, Settlement,
 };
 pub use perpetual::{
-    apply_funding, book_mid, derive_mark, funding_payment, realized_pnl, FundingUpdate,
-    PerpMarketState,
+    apply_funding, book_mid, derive_mark, fill_fee, funding_payment, realized_pnl, FundingEpochReceipt,
+    FundingUpdate, PerpMarketState,
 };
 pub use registry::{LifecycleEvent, MarketCommand, MarketDefinition, MarketRegistry};
 pub use resolution::{

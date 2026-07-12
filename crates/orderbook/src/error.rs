@@ -79,6 +79,15 @@ pub enum ConditionalError {
     /// An arithmetic operation overflowed.
     #[error("arithmetic overflow")]
     Overflow,
+    /// Referenced conditional id is unknown.
+    #[error("unknown conditional id")]
+    UnknownId,
+    /// Caller is not the authenticated owner of the conditional.
+    #[error("conditional owner mismatch")]
+    OwnerMismatch,
+    /// Operation is not valid for the conditional's current status.
+    #[error("invalid conditional status for operation")]
+    InvalidStatus,
 }
 
 impl From<types::ArithError> for ConditionalError {

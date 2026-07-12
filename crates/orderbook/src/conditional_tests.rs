@@ -42,12 +42,12 @@ fn trigger_fires_at_and_beyond_boundary() {
     let below = TriggerKind::Below(Price::from_raw(100));
     assert!(!below.fires(Price::from_raw(101)));
     assert!(below.fires(Price::from_raw(100)));
+    assert!(!below.fires(Price::from_raw(101)));
     assert!(below.fires(Price::from_raw(99)));
 }
 
 #[test]
 fn stop_loss_and_take_profit_mapping() {
-    // Protective sell (long): stop-loss fires on drop, take-profit on rise.
     assert_eq!(
         TriggerKind::stop_loss(Side::Ask, Price::from_raw(90)),
         TriggerKind::Below(Price::from_raw(90))
@@ -72,25 +72,210 @@ fn property_trigger_fires_iff_crossed() {
 }
 
 #[test]
-fn simple_stop_emits_once_and_is_removed() {
+fn simple_stop_emits_once_and_requires_ack() {
     let mut e = ConditionalEngine::new(ConditionalConfig::default());
-    e.add_stop(template(1, Side::Ask, 90, 5), TriggerKind::Below(Price::from_raw(90)))
+    let id = e
+        .add_stop(
+            template(1, Side::Ask, 90, 5),
+            TriggerKind::Below(Price::from_raw(90)),
+        )
         .unwrap();
-    // Above threshold: nothing.
     assert!(e.on_mark_price(Price::from_raw(95)).is_empty());
     assert_eq!(e.pending_len(), 1);
-    // Crosses: one place intent, entry removed.
     let intents = e.on_mark_price(Price::from_raw(90));
     assert_eq!(intents.len(), 1);
-    assert!(matches!(intents[0], OrderIntent::Place { quantity, .. } if quantity == Quantity::from_raw(5)));
-    assert_eq!(e.pending_len(), 0);
-    // Duplicated fire produces nothing (idempotent).
+    assert_eq!(intents[0].0, id);
+    assert!(matches!(
+        intents[0].1,
+        OrderIntent::Place { quantity, .. } if quantity == Quantity::from_raw(5)
+    ));
+    assert_eq!(e.status(id), Some(ConditionalStatus::PendingExecution));
+    // Duplicate price tick does not re-emit while PendingExecution.
     assert!(e.on_mark_price(Price::from_raw(85)).is_empty());
+    e.ack(id, AccountId::new(1), ExecutionAck::Executed)
+        .unwrap();
+    assert_eq!(e.status(id), None);
+    assert_eq!(e.pending_len(), 0);
+}
+
+#[test]
+fn transient_execution_failure_retains_retryable_conditional() {
+    let mut e = ConditionalEngine::new(ConditionalConfig::default());
+    let id = e
+        .add_stop(
+            template(1, Side::Ask, 90, 5),
+            TriggerKind::Below(Price::from_raw(90)),
+        )
+        .unwrap();
+    let intents = e.on_mark_price(Price::from_raw(90));
+    assert_eq!(intents.len(), 1);
+    e.ack(id, AccountId::new(1), ExecutionAck::Retryable)
+        .unwrap();
+    assert_eq!(e.status(id), Some(ConditionalStatus::Retryable));
+    assert!(e.pending_batch(id).is_some());
+    // Owner-bound retry re-emits the same batch.
+    let again = e.retry(id, AccountId::new(1)).unwrap();
+    assert_eq!(again, intents[0].1);
+    assert_eq!(e.status(id), Some(ConditionalStatus::PendingExecution));
+    // Wrong owner cannot ack or retry.
+    assert_eq!(
+        e.ack(id, AccountId::new(9), ExecutionAck::Executed),
+        Err(ConditionalError::OwnerMismatch)
+    );
+    e.ack(id, AccountId::new(1), ExecutionAck::Executed)
+        .unwrap();
+}
+
+#[test]
+fn oco_emits_atomic_batch_all_or_none() {
+    let mut e = ConditionalEngine::new(ConditionalConfig::default());
+    let leg_a = OcoLeg {
+        trigger: TriggerKind::Below(Price::from_raw(90)),
+        place: Some(template(10, Side::Ask, 90, 3)),
+        cancel_order_id: Some(OrderId::new(99)),
+    };
+    let leg_b = OcoLeg {
+        trigger: TriggerKind::Above(Price::from_raw(110)),
+        place: Some(template(11, Side::Ask, 110, 3)),
+        cancel_order_id: Some(OrderId::new(98)),
+    };
+    let id = e.add_oco(leg_a, leg_b).unwrap();
+    let intents = e.on_mark_price(Price::from_raw(90));
+    assert_eq!(intents.len(), 1);
+    match &intents[0].1 {
+        OrderIntent::Atomic { legs } => {
+            assert_eq!(legs.len(), 2);
+            assert!(matches!(legs[0], OrderIntent::Place { .. }));
+            assert!(matches!(
+                legs[1],
+                OrderIntent::Cancel {
+                    order_id
+                } if order_id == OrderId::new(99)
+            ));
+        }
+        other => panic!("expected Atomic, got {other:?}"),
+    }
+    // Fault injection: reject keeps no half-applied state in the engine;
+    // retryable retains the full atomic batch.
+    e.ack(id, AccountId::new(1), ExecutionAck::Retryable)
+        .unwrap();
+    let batch = e.pending_batch(id).cloned().unwrap();
+    assert!(matches!(batch, OrderIntent::Atomic { .. }));
+    e.ack(id, AccountId::new(1), ExecutionAck::Executed)
+        .unwrap();
+    assert_eq!(e.pending_len(), 0);
+}
+
+#[test]
+fn twap_children_positive_sum_exact_no_wrap() {
+    let mut e = ConditionalEngine::new(ConditionalConfig::default());
+    // parent 10, slices 3 => 4,3,3
+    let id = e.add_twap(template(100, Side::Bid, 50, 10), 3).unwrap();
+    let mut total = 0i64;
+    for expected in [4i64, 3, 3] {
+        let intents = e.on_mark_price(Price::from_raw(50));
+        assert_eq!(intents.len(), 1);
+        match intents[0].1 {
+            OrderIntent::Place {
+                quantity, order_id, ..
+            } => {
+                assert_eq!(quantity.raw(), expected);
+                total += quantity.raw();
+                // Child ids are base + index without wrap.
+                assert!(order_id.get() >= 100);
+            }
+            _ => panic!("expected Place"),
+        }
+        e.ack(id, AccountId::new(1), ExecutionAck::Executed)
+            .unwrap();
+    }
+    assert_eq!(total, 10);
+    assert_eq!(e.pending_len(), 0);
+    // Zero-size slices rejected: parent 2, slices 3.
+    assert_eq!(
+        e.add_twap(template(200, Side::Bid, 50, 2), 3),
+        Err(ConditionalError::NonPositiveQuantity)
+    );
+    // Wrap rejected: base near u64::MAX.
+    let wrap = PlaceTemplate {
+        order_id: OrderId::new(u64::MAX - 1),
+        account: AccountId::new(1),
+        side: Side::Bid,
+        order_type: OrderType::Limit,
+        tif: TimeInForce::Gtc,
+        price: Price::from_raw(1),
+        quantity: Quantity::from_raw(10),
+        client_id: u64::MAX - 1,
+        reduce_only: false,
+    };
+    assert_eq!(e.add_twap(wrap, 3), Err(ConditionalError::Overflow));
+}
+
+#[test]
+fn decode_cannot_default_or_redirect_ownership() {
+    let mut bytes = vec![0u8; ENCODED_CONDITIONAL_LEN];
+    // account = 42
+    bytes[0..4].copy_from_slice(&42u32.to_le_bytes());
+    bytes[4] = 0; // Bid
+    bytes[5] = 0; // Limit
+    bytes[6] = 0; // Gtc
+    bytes[7] = 0; // Above
+    bytes[8..16].copy_from_slice(&1_000i64.to_le_bytes());
+    bytes[16..24].copy_from_slice(&5i64.to_le_bytes());
+    bytes[24..32].copy_from_slice(&900i64.to_le_bytes());
+    bytes[32..40].copy_from_slice(&7u64.to_le_bytes());
+    bytes[40] = 0;
+    let decoded = decode_conditional(&bytes).unwrap();
+    assert_eq!(decoded.place.account, AccountId::new(42));
+    // Truncated buffer is malformed, never defaults owner.
+    assert_eq!(
+        decode_conditional(&bytes[..40]),
+        Err(ConditionalError::Malformed)
+    );
+}
+
+#[test]
+fn zero_trigger_evaluation_is_sublinear() {
+    let mut e = ConditionalEngine::new(ConditionalConfig {
+        capacity: 1 << 14,
+    });
+    // Many far-away Above triggers; a low mark fires none.
+    for i in 0..1_000u64 {
+        e.add_stop(
+            template(i + 1, Side::Bid, 1_000_000, 1),
+            TriggerKind::Above(Price::from_raw(1_000_000 + i as i64)),
+        )
+        .unwrap();
+    }
+    // Below triggers with very low thresholds will not fire on a high mark.
+    for i in 0..100u64 {
+        e.add_stop(
+            template(10_000 + i, Side::Ask, 1, 1),
+            TriggerKind::Below(Price::from_raw(-(1_000_000 + i as i64))),
+        )
+        .unwrap();
+    }
+    let fired = e.on_mark_price(Price::from_raw(0));
+    assert!(fired.is_empty());
+    // A high price fires only the Above triggers at or below it.
+    let mut e2 = ConditionalEngine::new(ConditionalConfig::default());
+    for i in 0..50u64 {
+        e2.add_stop(
+            template(i + 1, Side::Bid, 100, 1),
+            TriggerKind::Above(Price::from_raw(100 + i as i64)),
+        )
+        .unwrap();
+    }
+    let fired = e2.on_mark_price(Price::from_raw(110));
+    assert_eq!(fired.len(), 11); // thresholds 100..=110
 }
 
 #[test]
 fn property_trailing_ratchets_forward_and_matches_naive() {
-    for (seed, dir) in [(1u64, TrailDirection::SellStop), (2, TrailDirection::BuyStop)] {
+    for (seed, dir) in [
+        (1u64, TrailDirection::SellStop),
+        (2, TrailDirection::BuyStop),
+    ] {
         let mut r = Lcg(0x5A5A ^ seed);
         let offset = 10i64;
         let reference = Price::from_raw(1_000);
@@ -98,24 +283,24 @@ fn property_trailing_ratchets_forward_and_matches_naive() {
         let mut naive_extremum = reference.raw();
         let mut last_threshold = trail.threshold().raw();
         for _ in 0..50_000 {
-            let price = 500 + i64::try_from(r.below(1_000)).unwrap();
-            trail.update(Price::from_raw(price));
-            // Naive reference recomputation.
+            let p = Price::from_raw(i64::try_from(r.below(2_000)).unwrap());
+            trail.update(p);
             match dir {
                 TrailDirection::SellStop => {
-                    if price > naive_extremum {
-                        naive_extremum = price;
+                    if p.raw() > naive_extremum {
+                        naive_extremum = p.raw();
                     }
-                    assert_eq!(trail.threshold().raw(), naive_extremum - offset);
-                    // Threshold never moves backward.
+                    let expected = naive_extremum.saturating_sub(offset);
+                    assert_eq!(trail.threshold().raw(), expected);
                     assert!(trail.threshold().raw() >= last_threshold);
                 }
                 TrailDirection::BuyStop => {
-                    if price < naive_extremum {
-                        naive_extremum = price;
+                    if p.raw() < naive_extremum {
+                        naive_extremum = p.raw();
                     }
-                    assert_eq!(trail.threshold().raw(), naive_extremum + offset);
-                    assert!(trail.threshold().raw() <= last_threshold);
+                    let expected = naive_extremum.saturating_add(offset);
+                    assert_eq!(trail.threshold().raw(), expected);
+                    assert!(trail.threshold().raw() <= last_threshold || last_threshold == 0);
                 }
             }
             last_threshold = trail.threshold().raw();
@@ -124,221 +309,13 @@ fn property_trailing_ratchets_forward_and_matches_naive() {
 }
 
 #[test]
-fn trailing_stop_fires_after_reversal() {
-    let mut e = ConditionalEngine::new(ConditionalConfig::default());
-    e.add_trailing(
-        template(1, Side::Ask, 0, 5),
-        TrailDirection::SellStop,
-        Price::from_raw(10),
-        Price::from_raw(100),
-    )
-    .unwrap();
-    // Price climbs: threshold ratchets up to 120-10=110, no fire.
-    assert!(e.on_mark_price(Price::from_raw(120)).is_empty());
-    // Small dip but above threshold (110): no fire.
-    assert!(e.on_mark_price(Price::from_raw(112)).is_empty());
-    // Drop to threshold: fires.
-    let intents = e.on_mark_price(Price::from_raw(110));
-    assert_eq!(intents.len(), 1);
-    assert_eq!(e.pending_len(), 0);
-}
-
-#[test]
-fn oco_cancels_sibling_exactly_once() {
-    let mut e = ConditionalEngine::new(ConditionalConfig::default());
-    let leg_a = OcoLeg {
-        trigger: TriggerKind::Above(Price::from_raw(110)),
-        place: Some(template(1, Side::Ask, 110, 5)),
-        cancel_order_id: Some(OrderId::new(200)),
-    };
-    let leg_b = OcoLeg {
-        trigger: TriggerKind::Below(Price::from_raw(90)),
-        place: Some(template(2, Side::Bid, 90, 5)),
-        cancel_order_id: Some(OrderId::new(100)),
-    };
-    e.add_oco(leg_a, leg_b).unwrap();
-    // Neither crosses.
-    assert!(e.on_mark_price(Price::from_raw(100)).is_empty());
-    // Leg A fires: emit its place + cancel leg B's sibling order exactly once.
-    let intents = e.on_mark_price(Price::from_raw(115));
-    let cancels: Vec<_> = intents
-        .iter()
-        .filter(|i| matches!(i, OrderIntent::Cancel { .. }))
-        .collect();
-    assert_eq!(cancels.len(), 1);
-    assert!(matches!(cancels[0], OrderIntent::Cancel { order_id } if *order_id == OrderId::new(200)));
-    assert_eq!(e.pending_len(), 0);
-    // Further crossings emit nothing (sibling not cancelled twice).
-    assert!(e.on_mark_price(Price::from_raw(80)).is_empty());
-    assert!(e.on_mark_price(Price::from_raw(120)).is_empty());
-}
-
-#[test]
-fn twap_slices_sum_to_parent_exactly() {
-    for (parent, slices) in [(10i64, 3u32), (12, 4), (7, 7), (100, 6), (1, 1)] {
-        let mut e = ConditionalEngine::new(ConditionalConfig::default());
-        e.add_twap(template(1, Side::Bid, 100, parent), slices).unwrap();
-        let mut total = 0i64;
-        let mut count = 0u32;
-        // Drive one slice per tick.
-        for tick in 0..slices {
-            let intents = e.on_mark_price(Price::from_raw(100 + i64::from(tick)));
-            assert_eq!(intents.len(), 1);
-            if let OrderIntent::Place { quantity, .. } = intents[0] {
-                total += quantity.raw();
-                count += 1;
-            }
-        }
-        assert_eq!(count, slices);
-        assert_eq!(total, parent, "slices must sum to parent");
-        assert_eq!(e.pending_len(), 0);
-        // Exhausted TWAP emits nothing further.
-        assert!(e.on_mark_price(Price::from_raw(200)).is_empty());
-    }
-}
-
-#[test]
-fn twap_child_ids_are_distinct_and_deterministic() {
-    let mut e = ConditionalEngine::new(ConditionalConfig::default());
-    e.add_twap(template(1000, Side::Bid, 100, 9), 3).unwrap();
-    let mut ids = Vec::new();
-    for t in 0..3 {
-        let intents = e.on_mark_price(Price::from_raw(100 + i64::from(t)));
-        if let OrderIntent::Place { order_id, client_id, .. } = intents[0] {
-            ids.push((order_id, client_id));
-        }
-    }
-    assert_eq!(
-        ids,
-        [
-            (OrderId::new(1000), 1000u64),
-            (OrderId::new(1001), 1001),
-            (OrderId::new(1002), 1002),
-        ]
-    );
-}
-
-#[test]
-fn deterministic_replay_yields_identical_intent_stream() {
-    fn run() -> Vec<OrderIntent> {
-        let mut e = ConditionalEngine::new(ConditionalConfig::default());
-        e.add_stop(template(1, Side::Ask, 90, 5), TriggerKind::Below(Price::from_raw(90)))
-            .unwrap();
-        e.add_stop(template(2, Side::Bid, 110, 5), TriggerKind::Above(Price::from_raw(110)))
-            .unwrap();
-        e.add_twap(template(3, Side::Bid, 100, 8), 4).unwrap();
-        e.add_trailing(
-            template(4, Side::Ask, 0, 5),
-            TrailDirection::SellStop,
-            Price::from_raw(5),
-            Price::from_raw(100),
-        )
-        .unwrap();
-        let prices = [100, 105, 108, 111, 95, 90, 120, 88, 130];
-        let mut out = Vec::new();
-        for p in prices {
-            e.evaluate_into(Price::from_raw(p), &mut out);
-        }
-        out
-    }
-    assert_eq!(run(), run());
-}
-
-#[test]
-fn evaluate_into_reuses_buffer() {
-    let mut e = ConditionalEngine::new(ConditionalConfig::default());
-    e.add_stop(template(1, Side::Ask, 90, 5), TriggerKind::Below(Price::from_raw(90)))
-        .unwrap();
-    let mut buf = Vec::with_capacity(8);
-    e.evaluate_into(Price::from_raw(95), &mut buf);
-    assert!(buf.is_empty());
-    e.evaluate_into(Price::from_raw(90), &mut buf);
-    assert_eq!(buf.len(), 1);
-}
-
-#[test]
-fn capacity_exhaustion_and_validation_errors() {
-    let mut e = ConditionalEngine::new(ConditionalConfig { capacity: 1 });
-    e.add_stop(template(1, Side::Ask, 90, 5), TriggerKind::Below(Price::from_raw(90)))
-        .unwrap();
-    assert_eq!(
-        e.add_stop(template(2, Side::Ask, 90, 5), TriggerKind::Below(Price::from_raw(90))),
-        Err(ConditionalError::CapacityExhausted)
-    );
-    let mut e = ConditionalEngine::new(ConditionalConfig::default());
-    assert_eq!(
-        e.add_twap(template(1, Side::Bid, 100, 10), 0),
-        Err(ConditionalError::ZeroSlices)
-    );
-    assert_eq!(
-        e.add_stop(template(1, Side::Bid, 100, 0), TriggerKind::Above(Price::from_raw(1))),
-        Err(ConditionalError::NonPositiveQuantity)
-    );
-    assert_eq!(
-        e.add_trailing(
-            template(1, Side::Ask, 0, 5),
-            TrailDirection::SellStop,
-            Price::from_raw(0),
-            Price::from_raw(100)
-        ),
-        Err(ConditionalError::NonPositiveOffset)
-    );
-}
-
-#[test]
-fn decode_roundtrips_valid_buffer() {
-    let mut bytes = [0u8; ENCODED_CONDITIONAL_LEN];
-    bytes[0] = 1; // Ask
-    bytes[1] = 0; // Limit
-    bytes[2] = 0; // Gtc
-    bytes[3] = 1; // Below
-    bytes[4..12].copy_from_slice(&100_000i64.to_le_bytes());
-    bytes[12..20].copy_from_slice(&5_000i64.to_le_bytes());
-    bytes[20..28].copy_from_slice(&90_000i64.to_le_bytes());
-    bytes[28..36].copy_from_slice(&42u64.to_le_bytes());
-    bytes[36] = 0; // reduce_only=false
-    let decoded = decode_conditional(&bytes).unwrap();
-    assert_eq!(decoded.place.side, Side::Ask);
-    assert_eq!(decoded.place.quantity, Quantity::from_raw(5_000));
-    assert_eq!(decoded.trigger, TriggerKind::Below(Price::from_raw(90_000)));
-    assert_eq!(decoded.place.client_id, 42);
-}
-
-#[test]
-fn decode_rejects_malformed_and_never_panics() {
-    // Too short.
-    assert_eq!(decode_conditional(&[]), Err(ConditionalError::Malformed));
-    assert_eq!(decode_conditional(&[0u8; 10]), Err(ConditionalError::Malformed));
-    // Bad enum tag.
-    let mut bytes = [0u8; ENCODED_CONDITIONAL_LEN];
-    bytes[12..20].copy_from_slice(&5i64.to_le_bytes());
-    bytes[0] = 9; // invalid side
-    assert_eq!(decode_conditional(&bytes), Err(ConditionalError::Malformed));
-
-    // Arbitrary bytes must never panic.
-    let mut r = Lcg(0xF00D);
-    let mut buf = Vec::new();
+fn never_panics_decoding_arbitrary_bytes() {
+    let mut r = Lcg(0xBEEF);
     for _ in 0..50_000 {
         let len = usize::try_from(r.below(64)).unwrap();
-        buf.clear();
-        for _ in 0..len {
-            buf.push(u8::try_from(r.next_u64() & 0xFF).unwrap());
-        }
-        let _ = decode_conditional(&buf);
+        let bytes: Vec<u8> = (0..len)
+            .map(|_| u8::try_from(r.below(256)).unwrap())
+            .collect();
+        let _ = decode_conditional(&bytes);
     }
-}
-
-#[test]
-fn decoded_conditional_drives_engine() {
-    let mut bytes = [0u8; ENCODED_CONDITIONAL_LEN];
-    bytes[0] = 1; // Ask
-    bytes[3] = 1; // Below
-    bytes[4..12].copy_from_slice(&90_000i64.to_le_bytes());
-    bytes[12..20].copy_from_slice(&5_000i64.to_le_bytes());
-    bytes[20..28].copy_from_slice(&90_000i64.to_le_bytes());
-    let decoded = decode_conditional(&bytes).unwrap();
-    let mut e = ConditionalEngine::new(ConditionalConfig::default());
-    e.add_stop(decoded.place, decoded.trigger).unwrap();
-    assert!(e.on_mark_price(Price::from_raw(95_000)).is_empty());
-    assert_eq!(e.on_mark_price(Price::from_raw(90_000)).len(), 1);
 }

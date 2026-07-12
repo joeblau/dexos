@@ -120,4 +120,13 @@ pub enum ExecutionError {
         /// Requested version.
         requested: u16,
     },
+    /// Market lifecycle does not accept new risk (not Open).
+    #[error("market not open for trading")]
+    MarketNotOpen,
+    /// Oracle health freezes or halts new risk.
+    #[error("oracle health rejects new risk")]
+    OracleRiskFrozen,
+    /// Funding epoch was already applied or is not sequential.
+    #[error("funding epoch not sequential")]
+    FundingEpochConflict,
 }

@@ -115,6 +115,17 @@ pub enum PerpError {
     /// The price oracle is halted; no deterministic mark can be produced.
     #[error("price oracle halted")]
     OracleHalted,
+    /// Funding epoch was already applied or is not the next sequential epoch.
+    #[error("funding epoch not sequential: last {last}, got {got}")]
+    DuplicateEpoch {
+        /// Last applied epoch (0 = none).
+        last: u64,
+        /// Epoch presented.
+        got: u64,
+    },
+    /// Fee basis points outside the permitted range.
+    #[error("fee bps out of range")]
+    FeeOutOfRange,
     /// A fixed-point arithmetic failure (overflow/out-of-range).
     #[error("arithmetic error: {0}")]
     Arith(#[from] ArithError),
@@ -198,6 +209,15 @@ pub enum MarketError {
     /// The command is not permitted in the market's current lifecycle state.
     #[error("command not permitted in current lifecycle state")]
     WrongLifecycleState,
+    /// Resume rejected: stake, bootstrap liquidity, or oracle health unmet.
+    #[error("resume prerequisites not met")]
+    ResumePrerequisites,
+    /// Archive rejected: outstanding orders, claims, escrow, or disputes remain.
+    #[error("archive blocked by outstanding liabilities")]
+    ArchiveLiabilities,
+    /// Oracle is not healthy enough to open or resume new risk.
+    #[error("oracle unhealthy for trading")]
+    OracleUnhealthy,
     /// A lifecycle transition error.
     #[error(transparent)]
     Lifecycle(#[from] LifecycleError),

@@ -2,8 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 use types::{
-    AccountId, Hash, MarketId, MarketType, OrderId, OrderType, Price, Quantity, SequenceNumber,
-    Side, TimeInForce,
+    AccountId, Hash, MarketId, MarketLifecycle, MarketType, OracleHealth, OrderId, OrderType, Price,
+    Quantity, Ratio, SequenceNumber, Side, TimeInForce,
 };
 
 use crate::error::ExecutionError;
@@ -249,6 +249,35 @@ pub struct Liquidate {
     pub account: AccountId,
 }
 
+/// Set a market's lifecycle state (e.g. Open / Halted / Closed) for trading gates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetMarketLifecycle {
+    /// Market id.
+    pub market: MarketId,
+    /// New lifecycle state.
+    pub lifecycle: MarketLifecycle,
+}
+
+/// Set a market's observed price-oracle health for trading gates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetOracleHealth {
+    /// Market id.
+    pub market: MarketId,
+    /// New oracle health.
+    pub health: OracleHealth,
+}
+
+/// Apply a sequenced perpetual funding epoch to every position in a market.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplyFundingEpoch {
+    /// Market id.
+    pub market: MarketId,
+    /// Strictly monotonic epoch index for this market.
+    pub epoch: u64,
+    /// Signed funding rate (positive = longs pay shorts).
+    pub rate: Ratio,
+}
+
 /// The deterministic command set applied by the engine.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Command {
@@ -286,6 +315,12 @@ pub enum Command {
     ProtocolUpgrade(ProtocolUpgrade),
     /// Liquidate a distressed account.
     Liquidate(Liquidate),
+    /// Set market lifecycle for trading gates.
+    SetMarketLifecycle(SetMarketLifecycle),
+    /// Set oracle health for trading gates.
+    SetOracleHealth(SetOracleHealth),
+    /// Apply a perpetual funding epoch.
+    ApplyFundingEpoch(ApplyFundingEpoch),
 }
 
 impl Command {
@@ -309,6 +344,9 @@ impl Command {
             Command::RedeemCompleteSet(_) => 15,
             Command::ProtocolUpgrade(_) => 16,
             Command::Liquidate(_) => 17,
+            Command::SetMarketLifecycle(_) => 18,
+            Command::SetOracleHealth(_) => 19,
+            Command::ApplyFundingEpoch(_) => 20,
         }
     }
 }
@@ -351,6 +389,13 @@ pub enum ReceiptKind {
         insurance_drawn: types::Amount,
         /// Shortfall socialized after the insurance fund was exhausted.
         socialized_loss: types::Amount,
+    },
+    /// A funding epoch was applied.
+    FundingApplied {
+        /// Market.
+        market: MarketId,
+        /// Epoch index.
+        epoch: u64,
     },
 }
 
