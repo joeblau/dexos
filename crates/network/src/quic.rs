@@ -325,39 +325,28 @@ fn spawn_quic_connection(
 
     let mut tasks = Vec::with_capacity(NUM_CLASSES * 2 + 3);
 
-    let mut class_txs = Vec::with_capacity(NUM_CLASSES);
-    let mut class_rxs = Vec::with_capacity(NUM_CLASSES);
-    for _ in 0..NUM_CLASSES {
-        let (tx, rx) = mpsc::channel::<Frame>(cfg.queue_capacity.max(1));
-        class_txs.push(tx);
-        class_rxs.push(rx);
-    }
-
-    let dispatcher_out = out_reliable.clone();
-    let dispatcher_disconnects = disconnects.clone();
-    let dispatcher = tokio::spawn(async move {
-        loop {
-            let Some(frame) = dispatcher_out.recv().await else {
-                break;
-            };
-            let idx = usize::from(frame.class.priority());
-            if let Some(tx) = class_txs.get(idx) {
-                if tx.send(frame).await.is_err() {
-                    dispatcher_disconnects.record(DisconnectReason::Io);
-                    break;
-                }
-            }
-        }
-    });
-    tasks.push(dispatcher);
-
-    for (idx, (mut send, mut rx)) in class_sends.into_iter().zip(class_rxs).enumerate() {
+    // One writer task per class, each pulling **its own class** directly from
+    // the shared strict-priority channel (`recv_class`). There is deliberately
+    // no central dispatcher: a dispatcher forwarding into per-class relay
+    // queues re-introduces cross-class head-of-line blocking the moment one
+    // class's relay fills while its writer is parked on QUIC stream
+    // flow-control credit — the dispatcher parks on that one full relay and
+    // stops dispatching every other class, including P0 consensus (#395).
+    // With per-class pulls, a parked Sync writer leaves frames queued in the
+    // Sync class only; every other writer keeps draining independently, each
+    // class stays FIFO, and cross-class precedence is expressed by the QUIC
+    // stream priorities set below.
+    for (idx, mut send) in class_sends.into_iter().enumerate() {
         let class = TrafficClass::from_u8(u8::try_from(idx).unwrap_or(u8::MAX))
             .unwrap_or(TrafficClass::Sync);
+        // Higher classes get strictly higher stream priority so quinn transmits
+        // their pending stream data first when the path is congested.
+        let _ = send.set_priority(i32::try_from(NUM_CLASSES.saturating_sub(idx)).unwrap_or(0));
         let chunk = class_chunk_limit(class);
+        let writer_out = out_reliable.clone();
         let writer_disconnects = disconnects.clone();
         let writer = tokio::spawn(async move {
-            while let Some(frame) = rx.recv().await {
+            while let Some(frame) = writer_out.recv_class(class).await {
                 // Yield between large sync writes so the runtime can schedule P0.
                 if frame.payload.len() > chunk {
                     tokio::task::yield_now().await;
@@ -1060,6 +1049,131 @@ mod tests {
             p0_latency < p0_deadline,
             "P0 latency {p0_latency:?} exceeded SLA {p0_deadline:?} under sync load"
         );
+    }
+
+    /// Regression for #395: saturate the Sync pipeline end to end — the server
+    /// does not drain, so its Sync class fills, its Sync reader parks, QUIC
+    /// stream flow-control credit exhausts, the client's Sync writer parks on
+    /// `write_frame`, and the client's Sync class queue fills to backpressure.
+    /// A P0 consensus frame enqueued at that point must still be dispatched
+    /// onto its own stream and delivered. With the old single-dispatcher
+    /// design the dispatcher parked forwarding Sync into its full relay queue
+    /// and stopped dispatching every class, so the consensus frame never left
+    /// the client's queue.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn parked_sync_class_does_not_block_consensus_dispatch() {
+        let mut c = cfg();
+        c.queue_capacity = 8;
+        c.max_class_bytes = 64 * 1024 * 1024;
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server = Arc::new(QuicTransport::bind(addr, kp(160), c).await.unwrap());
+        let client = Arc::new(QuicTransport::bind(addr, kp(161), c).await.unwrap());
+        let server_addr = server.local_addr().unwrap();
+        let server_id = server.id();
+        let acceptor = {
+            let server = server.clone();
+            tokio::spawn(async move { server.accept().await })
+        };
+        let client_conn = client
+            .connect(&Peer::dial(server_id, server_addr))
+            .await
+            .unwrap();
+        let server_conn = acceptor.await.unwrap().unwrap();
+
+        // 256 KiB sync payloads: a handful exhaust the 2 MiB per-stream receive
+        // window once the server-side reader is parked on its full Sync class.
+        let sync_payload = vec![0x5Au8; 256 * 1024];
+        let mut accepted = 0u32;
+        let mut backpressured = false;
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(20) {
+            match client_conn.send_priority(TrafficClass::Sync, &sync_payload) {
+                Ok(()) => accepted += 1,
+                Err(TransportError::Backpressure { .. }) => {
+                    backpressured = true;
+                    // Confirm the stall is sustained (the writer is parked on
+                    // stream credit, not a transient scheduling hiccup): the
+                    // class must still be full after a settle delay.
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    match client_conn.send_priority(TrafficClass::Sync, &sync_payload) {
+                        Ok(()) => accepted += 1,
+                        Err(TransportError::Backpressure { .. }) => break,
+                        Err(e) => panic!("unexpected send error: {e}"),
+                    }
+                }
+                Err(e) => panic!("unexpected send error: {e}"),
+            }
+        }
+        assert!(
+            backpressured,
+            "sync pipeline must saturate for this regression ({accepted} accepted)"
+        );
+        assert!(
+            client_conn.pending_outbound() > 0,
+            "the sync class queue must still hold parked frames"
+        );
+
+        // The regression: with Sync fully parked, a P0 frame must still be
+        // accepted (its class is empty) *and* dispatched onto its own stream.
+        client_conn
+            .send_priority(TrafficClass::Consensus, b"P0-VOTE-UNDER-SYNC-PARK")
+            .unwrap();
+
+        // The server has drained nothing; the consensus frame must arrive over
+        // its independent stream while the sync stream stays parked.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while server_conn.inbound_class_bytes(TrafficClass::Consensus) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "consensus frame never dispatched: cross-class head-of-line blocking"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Strict priority on the inbound queue then delivers the P0 frame
+        // ahead of the entire queued sync backlog.
+        let got = to(Duration::from_secs(5), server_conn.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.class, TrafficClass::Consensus);
+        assert_eq!(got.payload, b"P0-VOTE-UNDER-SYNC-PARK");
+    }
+
+    /// Wakeup correctness: with all nine class writers parked on their empty
+    /// classes, a frame enqueued for one specific class must wake exactly that
+    /// class's writer and be delivered — for every class.
+    #[tokio::test]
+    async fn every_class_writer_wakes_for_its_own_class() {
+        let server = bound(170).await;
+        let client = bound(171).await;
+        let server_addr = server.local_addr().unwrap();
+        let server_id = server.id();
+        let acceptor = {
+            let server = server.clone();
+            tokio::spawn(async move { server.accept().await })
+        };
+        let client_conn = client
+            .connect(&Peer::dial(server_id, server_addr))
+            .await
+            .unwrap();
+        let server_conn = acceptor.await.unwrap().unwrap();
+
+        // Let every writer task reach its parked recv_class await first, so
+        // each subsequent enqueue exercises a real wakeup (not a pre-check).
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        for class_byte in 0..u8::try_from(NUM_CLASSES).unwrap() {
+            let class = TrafficClass::from_u8(class_byte).unwrap();
+            let payload = vec![class_byte; 8];
+            client_conn.send_priority(class, &payload).unwrap();
+            let got = to(Duration::from_secs(5), server_conn.recv())
+                .await
+                .unwrap_or_else(|_| panic!("writer for {class:?} never woke"))
+                .unwrap();
+            assert_eq!(got.class, class);
+            assert_eq!(got.payload, payload);
+        }
     }
 
     #[tokio::test]

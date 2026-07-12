@@ -318,6 +318,19 @@ impl PriorityScheduler {
         }
         None
     }
+
+    /// Remove and return the next frame of `class` alone, in FIFO order.
+    ///
+    /// Unlike [`dequeue`](Self::dequeue) this performs **no cross-class
+    /// arbitration** (P0 quantum / DRR): it is for consumers that drain exactly
+    /// one class each — the per-class QUIC stream writers — where cross-class
+    /// precedence is expressed by independent transport streams instead of a
+    /// shared dequeue order. Frame/byte accounting and the per-class
+    /// dequeued-byte metrics are updated exactly as in `dequeue`, and the
+    /// arbitration state used by `dequeue` is left untouched.
+    pub fn dequeue_class(&mut self, class: TrafficClass) -> Option<Frame> {
+        self.take_from(usize::from(class.priority()))
+    }
 }
 
 #[cfg(test)]
@@ -570,6 +583,39 @@ mod tests {
             // which the DRR path guarantees when the sink is slower than offer).
             assert_eq!(got, 10_000);
         }
+    }
+
+    #[test]
+    fn dequeue_class_drains_only_its_own_class_in_fifo() {
+        let mut s = PriorityScheduler::new(16);
+        for seq in 0..3 {
+            s.enqueue(frame(TrafficClass::Sync, seq)).unwrap();
+        }
+        s.enqueue(frame(TrafficClass::Consensus, 100)).unwrap();
+
+        // Class-scoped dequeue is FIFO within the class and never yields another
+        // class's frame — not even a higher-priority pending one.
+        for seq in 0..3 {
+            let f = s.dequeue_class(TrafficClass::Sync).unwrap();
+            assert_eq!(f.class, TrafficClass::Sync);
+            assert_eq!(f.sequence, seq);
+        }
+        assert!(s.dequeue_class(TrafficClass::Sync).is_none());
+
+        // The consensus frame is untouched, with accounting intact.
+        assert_eq!(s.len(), 1);
+        assert_eq!(s.class_len(TrafficClass::Consensus), 1);
+        let f = s.dequeue_class(TrafficClass::Consensus).unwrap();
+        assert_eq!(f.class, TrafficClass::Consensus);
+        assert_eq!(f.sequence, 100);
+        assert!(s.is_empty());
+
+        // Byte metrics are maintained exactly as with `dequeue` (each test
+        // frame carries a 1-byte payload).
+        assert_eq!(s.queued_bytes(), 0);
+        assert_eq!(s.dequeued_bytes(TrafficClass::Sync), 3);
+        assert_eq!(s.dequeued_bytes(TrafficClass::Consensus), 1);
+        assert_eq!(s.total_dequeued_bytes(), 4);
     }
 
     #[test]
