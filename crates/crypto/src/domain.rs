@@ -60,6 +60,12 @@ pub const DOMAIN_WITHDRAWAL_CERT: &[u8] = b"dexos:custody:withdrawal-cert:v1";
 /// Deposit observation / certificate body (entry path).
 pub const DOMAIN_DEPOSIT: &[u8] = b"dexos:custody:deposit:v1";
 
+/// Quorum-signed validator-set transition (light-client / consensus epoch change).
+///
+/// Preimage binds `(old_epoch, new_epoch, new_set_commitment)` so a committee can
+/// only install a successor set that the prior committee certified.
+pub const DOMAIN_VALIDATOR_SET_TRANSITION: &[u8] = b"dexos:validator-set-transition:v1";
+
 /// Every registered domain tag (for docs, fuzzing, and "no dual scheme" tests).
 pub const ALL_DOMAINS: &[&[u8]] = &[
     DOMAIN_LEAF,
@@ -75,6 +81,7 @@ pub const ALL_DOMAINS: &[&[u8]] = &[
     DOMAIN_WITHDRAWAL_AUTH,
     DOMAIN_WITHDRAWAL_CERT,
     DOMAIN_DEPOSIT,
+    DOMAIN_VALIDATOR_SET_TRANSITION,
 ];
 
 #[cfg(test)]

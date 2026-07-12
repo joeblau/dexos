@@ -55,7 +55,8 @@ pub use proofs::{
 };
 pub use rpc::{RpcRequest, RpcResponse};
 pub use sync::{
-    IngestOutcome, ShardSync, VerifiedTip, DEFAULT_BUFFER_LIMIT, DEFAULT_HISTORY_LIMIT,
+    validator_set_transition_digest, AcceptedRange, IngestOutcome, ShardSync, ValidatorSetTransition,
+    VerifiedTip, DEFAULT_BUFFER_LIMIT, DEFAULT_HISTORY_LIMIT,
 };
 pub use verification::{Verification, VerifiedValue};
 
@@ -980,6 +981,53 @@ mod tests {
     // ---- RpcRequest round-trips through codec -----------------------------
 
     #[test]
+
+    #[test]
+    fn unsolicited_validator_set_replacement_rejected() {
+        let ts = signers();
+        let other = ThresholdSigners::from_seeds(&[[20u8; 32], [21u8; 32], [22u8; 32], [23u8; 32]], 3);
+        let shard = ShardId::new(0);
+        let mut sync = ShardSync::new(shard, Hash::ZERO);
+        sync.bootstrap_validator_set(0, ts.validator_set()).unwrap();
+        // Free host install of a different set for a new epoch is rejected.
+        assert_eq!(
+            sync.try_register_validator_set(1, other.validator_set()),
+            Err(LightClientError::UnsolicitedValidatorSet { epoch: 1 })
+        );
+        // Idempotent re-bootstrap of the same epoch+commitment is OK.
+        assert!(sync.try_register_validator_set(0, ts.validator_set()).is_ok());
+    }
+
+    #[test]
+    fn quorum_proven_validator_set_transition() {
+        let ts = signers();
+        let next = ThresholdSigners::from_seeds(&[[30u8; 32], [31u8; 32], [32u8; 32], [33u8; 32]], 3);
+        let shard = ShardId::new(0);
+        let mut sync = ShardSync::new(shard, Hash::ZERO);
+        sync.bootstrap_validator_set(0, ts.validator_set()).unwrap();
+        let new_set = next.validator_set();
+        let digest = validator_set_transition_digest(0, 1, &new_set);
+        let certificate = ts.sign(digest, vec![0, 1, 2]);
+        sync.apply_validator_set_transition(ValidatorSetTransition {
+            old_epoch: 0,
+            new_epoch: 1,
+            new_set: new_set.clone(),
+            certificate,
+        })
+        .unwrap();
+        assert_eq!(sync.latest_epoch(), Some(1));
+        // Tampered transition rejected.
+        let bad_cert = ts.sign(Hash::from_bytes([9; 32]), vec![0, 1, 2]);
+        assert!(sync
+            .apply_validator_set_transition(ValidatorSetTransition {
+                old_epoch: 1,
+                new_epoch: 2,
+                new_set: ts.validator_set(),
+                certificate: bad_cert,
+            })
+            .is_err());
+    }
+
     fn rpc_request_round_trips() {
         let req = RpcRequest::GetAccountProof {
             shard: 0,

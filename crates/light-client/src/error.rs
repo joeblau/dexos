@@ -88,6 +88,32 @@ pub enum LightClientError {
         /// Last sequence of the conflicting range.
         last: u64,
     },
+    /// A checkpoint conflicts with territory that has been pruned from local
+    /// history; peers must supply slash/equivocation evidence rather than the
+    /// light client silently treating it as a stale duplicate.
+    #[error("pruned-history conflict over range [{first}, {last}]")]
+    PrunedHistoryConflict {
+        /// First sequence of the conflicting range.
+        first: u64,
+        /// Last sequence of the conflicting range.
+        last: u64,
+    },
+    /// Host attempted to replace a validator set without a quorum-proven
+    /// transition (or without weak-subjectivity bootstrap).
+    #[error("unsolicited validator-set install for epoch {epoch}")]
+    UnsolicitedValidatorSet {
+        /// Epoch the host tried to install.
+        epoch: u64,
+    },
+    /// A validator-set transition certificate failed verification or was
+    /// malformed (wrong epochs, wrong digest, below-threshold QC).
+    #[error("invalid validator-set transition {old_epoch} -> {new_epoch}")]
+    InvalidValidatorSetTransition {
+        /// Prior epoch.
+        old_epoch: u64,
+        /// Claimed new epoch.
+        new_epoch: u64,
+    },
     /// A query requiring a verified state root was made before any checkpoint
     /// had been verified.
     #[error("no verified checkpoint is available yet")]

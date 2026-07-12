@@ -40,7 +40,9 @@ pub use binding::{
     WalletRegistry, BIND_AUTH_DOMAIN, BIND_DOMAIN,
 };
 pub use chain::{evm_address_from_pubkey, ChainId, ChainKind, WalletAddress};
-pub use controller::{ControlCommand, CustodyController, SignedWithdrawal};
+pub use controller::{
+    ControlCommand, CustodyController, SettlementFinality, SignedWithdrawal, UserWithdrawalAuth,
+};
 pub use policy::ChainPolicy;
 pub use session::{AuthorizeSession, SessionKey, SessionRegistry, SessionScope, SESSION_DOMAIN};
 pub use signer::{HsmBackend, HsmSigner, KeyHandle, KeyRef, Signer, SignerSet, MAX_SIGNERS};

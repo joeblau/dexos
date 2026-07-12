@@ -276,8 +276,28 @@ fn validate_membership(validators: &[Validator]) -> Result<u64, QuorumError> {
     Ok(total)
 }
 
+/// Wire layout version for the compact QC packing
+/// (`message[32] || bitmap_le[8] || signatures[64 * popcount]`).
+pub const QC_WIRE_VERSION: u16 = 1;
+
+/// Fixed header size of a packed QC: 32-byte message + 8-byte little-endian bitmap.
+pub const QC_PACKED_HEADER_LEN: usize = 32 + 8;
+
 /// A quorum certificate: signatures over `message` from the validators named in
 /// `signer_bitmap` (bit `i` == validator `i`), in ascending index order.
+///
+/// # Canonical wire packing
+///
+/// [`Self::encode_packed`] / [`Self::decode_packed`] use a single allocation
+/// (encode) and no per-signature heap allocation (decode):
+///
+/// ```text
+/// message[32] || signer_bitmap_le[8] || sig_0[64] || … || sig_{k-1}[64]
+/// ```
+///
+/// where `k = popcount(signer_bitmap)` and signatures are in ascending set-bit
+/// order. Count is always derived from the bitmap; a mismatched signature count
+/// is rejected before any large allocation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuorumCertificate {
     /// The message that was signed (typically a checkpoint or block hash).
@@ -289,23 +309,110 @@ pub struct QuorumCertificate {
     pub signatures: Vec<[u8; 64]>,
 }
 
+impl QuorumCertificate {
+    /// Number of set bits (expected signature count).
+    #[must_use]
+    pub fn signer_count(&self) -> usize {
+        self.signer_bitmap.count_ones() as usize
+    }
+
+    /// Encode into the canonical packed form. Allocates once.
+    #[must_use]
+    pub fn encode_packed(&self) -> Vec<u8> {
+        let k = self.signatures.len();
+        let mut out = Vec::with_capacity(QC_PACKED_HEADER_LEN + k * 64);
+        out.extend_from_slice(self.message.as_bytes());
+        out.extend_from_slice(&self.signer_bitmap.to_le_bytes());
+        for sig in &self.signatures {
+            out.extend_from_slice(sig);
+        }
+        out
+    }
+
+    /// Decode a packed QC. Rejects length mismatches **before** allocating a
+    /// signature vector larger than the input can justify.
+    pub fn decode_packed(bytes: &[u8]) -> Result<Self, QuorumError> {
+        if bytes.len() < QC_PACKED_HEADER_LEN {
+            return Err(QuorumError::MalformedCertificate);
+        }
+        let mut msg = [0u8; 32];
+        msg.copy_from_slice(&bytes[..32]);
+        let mut bm = [0u8; 8];
+        bm.copy_from_slice(&bytes[32..40]);
+        let signer_bitmap = u64::from_le_bytes(bm);
+        let k = signer_bitmap.count_ones() as usize;
+        let expected = QC_PACKED_HEADER_LEN.saturating_add(k.saturating_mul(64));
+        // Fail closed on malicious lengths before allocation.
+        if bytes.len() != expected || k > MAX_VALIDATORS {
+            return Err(QuorumError::MalformedCertificate);
+        }
+        let mut signatures = Vec::with_capacity(k);
+        let mut off = QC_PACKED_HEADER_LEN;
+        for _ in 0..k {
+            let mut sig = [0u8; 64];
+            sig.copy_from_slice(&bytes[off..off + 64]);
+            signatures.push(sig);
+            off += 64;
+        }
+        Ok(Self {
+            message: Hash::from_bytes(msg),
+            signer_bitmap,
+            signatures,
+        })
+    }
+}
+
 /// serde adapter for `Vec<[u8; 64]>` (serde has no built-in impl past 32 bytes).
+///
+/// Encode writes each signature as a fixed 64-byte byte string without building
+/// an intermediate `Vec<&[u8]>`. Decode validates each element is exactly 64
+/// bytes and rejects oversized sequences before filling the output.
 mod sig_vec {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use serde::de::{SeqAccess, Visitor};
+    use serde::ser::SerializeSeq;
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::fmt;
 
     pub(super) fn serialize<S: Serializer>(v: &[[u8; 64]], s: S) -> Result<S::Ok, S::Error> {
-        let as_slices: Vec<&[u8]> = v.iter().map(|a| a.as_slice()).collect();
-        as_slices.serialize(s)
+        let mut seq = s.serialize_seq(Some(v.len()))?;
+        for sig in v {
+            // Serialize as a byte slice so postcard / bincode pack densely.
+            seq.serialize_element(sig.as_slice())?;
+        }
+        seq.end()
     }
 
     pub(super) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<[u8; 64]>, D::Error> {
-        let vecs: Vec<Vec<u8>> = Vec::deserialize(d)?;
-        vecs.into_iter()
-            .map(|v| {
-                <[u8; 64]>::try_from(v.as_slice())
-                    .map_err(|_| serde::de::Error::custom("signature must be 64 bytes"))
-            })
-            .collect()
+        struct SigVisitor;
+        impl<'de> Visitor<'de> for SigVisitor {
+            type Value = Vec<[u8; 64]>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a sequence of 64-byte signatures")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                // Bound by the 64-bit signer bitmap: never more than 64 sigs.
+                let hint = seq.size_hint().unwrap_or(0).min(64);
+                let mut out = Vec::with_capacity(hint);
+                while let Some(v) = seq.next_element::<SigBytes>()? {
+                    if out.len() >= 64 {
+                        return Err(serde::de::Error::custom("too many signatures"));
+                    }
+                    out.push(v.0);
+                }
+                Ok(out)
+            }
+        }
+        // Local newtype so we can accept a 64-byte byte buffer.
+        struct SigBytes([u8; 64]);
+        impl<'de> Deserialize<'de> for SigBytes {
+            fn deserialize<D2: Deserializer<'de>>(d: D2) -> Result<Self, D2::Error> {
+                let v = <Vec<u8>>::deserialize(d)?;
+                let arr = <[u8; 64]>::try_from(v.as_slice())
+                    .map_err(|_| serde::de::Error::custom("signature must be 64 bytes"))?;
+                Ok(SigBytes(arr))
+            }
+        }
+        d.deserialize_seq(SigVisitor)
     }
 }
 
@@ -641,6 +748,41 @@ mod tests {
         // Same members, weights, and threshold in a different input order ->
         // identical canonical commitment.
         assert_eq!(forward.commitment(), shuffled.commitment());
+    }
+
+    #[test]
+    fn packed_qc_roundtrip_and_rejects_bad_lengths() {
+        let ts = signers(4, 3);
+        let msg = Hash::from_bytes([42u8; 32]);
+        let qc = ts.sign(msg, vec![0, 1, 2]);
+        let bytes = qc.encode_packed();
+        // message(32) + bitmap(8) + 3*64
+        assert_eq!(bytes.len(), 32 + 8 + 3 * 64);
+        let decoded = QuorumCertificate::decode_packed(&bytes).unwrap();
+        assert_eq!(decoded, qc);
+        assert_eq!(decoded.signer_count(), 3);
+
+        // Truncated.
+        assert_eq!(
+            QuorumCertificate::decode_packed(&bytes[..10]),
+            Err(QuorumError::MalformedCertificate)
+        );
+        // Extra trailing byte.
+        let mut long = bytes.clone();
+        long.push(0);
+        assert_eq!(
+            QuorumCertificate::decode_packed(&long),
+            Err(QuorumError::MalformedCertificate)
+        );
+        // Bitmap claims more signatures than provided.
+        let mut forged = bytes;
+        // Set bit 3 (4th signer) without adding a signature.
+        let bm = u64::from_le_bytes(forged[32..40].try_into().unwrap()) | (1 << 3);
+        forged[32..40].copy_from_slice(&bm.to_le_bytes());
+        assert_eq!(
+            QuorumCertificate::decode_packed(&forged),
+            Err(QuorumError::MalformedCertificate)
+        );
     }
 
     #[test]

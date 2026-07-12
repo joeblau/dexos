@@ -78,7 +78,9 @@ impl From<CryptoError> for OracleError {
         match e {
             CryptoError::MalformedKey => OracleError::MalformedSigner,
             CryptoError::MalformedSignature => OracleError::MalformedSignature,
-            CryptoError::InvalidSignature => OracleError::InvalidSignature,
+            CryptoError::InvalidSignature
+            | CryptoError::HighS
+            | CryptoError::ContractAddressMismatch => OracleError::InvalidSignature,
         }
     }
 }

@@ -16,9 +16,11 @@ use std::sync::Arc;
 use crypto::{hash_leaf, hash_node, QuorumCertificate, ValidatorSet};
 use types::{Amount, Hash, SequenceNumber};
 
-use crate::chain::ChainId;
+use crate::binding::{WalletProof, WalletRegistry};
+use crate::chain::{ChainId, WalletAddress};
 use crate::error::CustodyError;
 use crate::policy::ChainPolicy;
+use crate::session::SessionRegistry;
 use crate::signer::{HsmBackend, HsmSigner, KeyHandle, KeyRef, SignerSet, MAX_SIGNERS};
 use crate::wire::{Reader, Writer};
 use crate::withdrawal::{verify_certificate, WithdrawalCertificate, WithdrawalId};
@@ -40,6 +42,53 @@ pub struct SignedWithdrawal {
     pub epoch: u64,
     /// The threshold certificate over the withdrawal id.
     pub certificate: QuorumCertificate,
+}
+
+/// Wallet- or session-layer authorization that must precede threshold signing.
+///
+/// Binding and session registries are composed here so
+/// [`CustodyController::authorize_withdrawal`] cannot be called with only a
+/// consensus certificate — a live user proof is a hard precondition.
+#[derive(Debug, Clone, Copy)]
+pub enum UserWithdrawalAuth<'a> {
+    /// A bound wallet flagged `withdrawals_allowed`, with a fresh proof over
+    /// the withdrawal authorization message.
+    Wallet {
+        /// Registry holding the binding.
+        registry: &'a WalletRegistry,
+        /// Bound wallet address.
+        address: &'a WalletAddress,
+        /// Proof from the bound key.
+        proof: &'a WalletProof,
+    },
+    /// A live session key with the withdrawal scope enabled.
+    Session {
+        /// Session registry.
+        registry: &'a SessionRegistry,
+        /// Session public key.
+        session_pubkey: &'a [u8; 32],
+    },
+}
+
+/// Chain-adapter-style finality attestation required to settle a withdrawal.
+///
+/// Produced by verified header-chain observation (see `chain-adapter::FinalityProof`).
+/// Host-asserted settle without this proof is rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SettlementFinality {
+    /// Including block / slot number.
+    pub block_number: u64,
+    /// Including block / slot hash.
+    pub block_hash: Hash,
+    /// Confirmation depth derived from a verified header chain.
+    pub confirmations: u32,
+}
+
+/// Per-id pending authorization record (amount + chain) for settlement checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingAuth {
+    chain: u64,
+    amount: Amount,
 }
 
 /// A control-plane command against the custody controller.
@@ -157,6 +206,8 @@ pub struct CustodyController {
     halted: bool,
     policies: BTreeMap<u64, ChainPolicy>,
     signed_ids: BTreeSet<[u8; 32]>,
+    /// Per-withdrawal pending records so settle must match authorize exactly.
+    pending_by_id: BTreeMap<[u8; 32], PendingAuth>,
     pending: BTreeMap<u64, Amount>,
     pending_count: BTreeMap<u64, u32>,
     audit_root: Hash,
@@ -181,6 +232,7 @@ impl CustodyController {
             halted: false,
             policies: BTreeMap::new(),
             signed_ids: BTreeSet::new(),
+            pending_by_id: BTreeMap::new(),
             pending: BTreeMap::new(),
             pending_count: BTreeMap::new(),
             audit_root: Hash::ZERO,
@@ -257,21 +309,26 @@ impl CustodyController {
         Ok(())
     }
 
-    /// Independently verify a finalized certificate and, if it passes policy and
-    /// has not been signed before, produce a threshold certificate over its id.
+    /// Independently verify a finalized certificate **and** a user
+    /// wallet/session authorization, then — if policy and duplicate checks pass
+    /// — produce a threshold certificate over its id.
     ///
-    /// Order of checks: halt, certificate verification, chain policy, duplicate
-    /// suppression, threshold signing. State is mutated only after every check
-    /// (including that the produced certificate meets threshold) succeeds.
+    /// Order of checks: halt, **user auth (hard precondition)**, certificate
+    /// verification, chain policy, duplicate suppression, threshold signing.
+    /// State is mutated only after every check succeeds.
     pub fn authorize_withdrawal(
         &mut self,
         cert: &WithdrawalCertificate,
+        user_auth: UserWithdrawalAuth<'_>,
         signer_indices: &[usize],
         now: SequenceNumber,
     ) -> Result<SignedWithdrawal, CustodyError> {
         if self.halted {
             return Err(CustodyError::EmergencyHalt);
         }
+
+        // Hard precondition: wallet or session must authorize this withdrawal.
+        self.verify_user_auth(cert, user_auth, now)?;
 
         // Independent verification of the consensus-authorized certificate.
         verify_certificate(cert, &self.consensus, now)?;
@@ -304,6 +361,13 @@ impl CustodyController {
         self.pending.insert(chain, new_pending);
         self.pending_count.insert(chain, new_count);
         self.signed_ids.insert(*id.as_bytes());
+        self.pending_by_id.insert(
+            *id.as_bytes(),
+            PendingAuth {
+                chain,
+                amount: cert.request.amount,
+            },
+        );
 
         let mut body = Writer::new();
         body.raw(id.as_bytes());
@@ -317,10 +381,96 @@ impl CustodyController {
         })
     }
 
-    /// Settle a previously authorized withdrawal, releasing its pending amount
-    /// and rate-limit slot. The id remains permanently in the signed ledger.
-    pub fn settle(&mut self, chain: ChainId, id: &WithdrawalId, amount: Amount) {
+    fn verify_user_auth(
+        &self,
+        cert: &WithdrawalCertificate,
+        user_auth: UserWithdrawalAuth<'_>,
+        now: SequenceNumber,
+    ) -> Result<(), CustodyError> {
+        // Message binds the withdrawal id so a proof cannot be reused across
+        // different withdrawals.
+        let mut msg = Writer::new();
+        msg.raw(b"dexos:custody:user-withdraw-auth:v1");
+        msg.raw(cert.withdrawal_id.as_bytes());
+        msg.u32(cert.request.account.get());
+        let message = msg.into_vec();
+
+        match user_auth {
+            UserWithdrawalAuth::Wallet {
+                registry,
+                address,
+                proof,
+            } => registry
+                .authorize_withdrawal(
+                    cert.request.account,
+                    address,
+                    proof,
+                    &message,
+                    now,
+                )
+                .map_err(|e| {
+                    // Surface missing-auth distinctly from other wallet errors
+                    // when the wallet is unknown / not permitted.
+                    match e {
+                        CustodyError::UnknownWallet
+                        | CustodyError::WithdrawalNotAllowed
+                        | CustodyError::NotMaster => CustodyError::MissingUserAuthorization,
+                        other => other,
+                    }
+                }),
+            UserWithdrawalAuth::Session {
+                registry,
+                session_pubkey,
+            } => registry
+                .authorize_withdrawal(cert.request.account, session_pubkey, now)
+                .map_err(|e| match e {
+                    CustodyError::UnknownSession
+                    | CustodyError::SessionExpired
+                    | CustodyError::SessionRevoked
+                    | CustodyError::OutOfScope => CustodyError::MissingUserAuthorization,
+                    other => other,
+                }),
+        }
+    }
+
+    /// Settle a previously authorized withdrawal against a verified finality
+    /// attestation. Releases the pending amount and rate-limit slot only when:
+    ///
+    /// 1. `id` was authorized (present in the signed / pending-by-id ledger),
+    /// 2. `chain` and `amount` match the authorized record exactly, and
+    /// 3. `finality.confirmations` meets the chain policy minimum.
+    ///
+    /// Unauthenticated or mismatched settle attempts error without mutating
+    /// pending accounting. The id remains permanently in the signed ledger.
+    pub fn settle(
+        &mut self,
+        chain: ChainId,
+        id: &WithdrawalId,
+        amount: Amount,
+        finality: &SettlementFinality,
+    ) -> Result<(), CustodyError> {
         let key = chain.get();
+        let auth = self
+            .pending_by_id
+            .get(id.as_bytes())
+            .copied()
+            .ok_or(CustodyError::UnauthenticatedSettle)?;
+        if auth.chain != key || auth.amount != amount {
+            return Err(CustodyError::UnauthenticatedSettle);
+        }
+        let policy = self
+            .policies
+            .get(&key)
+            .ok_or(CustodyError::UnknownChain)?;
+        if finality.confirmations < policy.min_confirmations {
+            return Err(CustodyError::UnverifiedFinality);
+        }
+        // Non-zero block hash required so a zeroed host stub cannot settle.
+        if finality.block_hash == Hash::ZERO {
+            return Err(CustodyError::UnverifiedFinality);
+        }
+
+        self.pending_by_id.remove(id.as_bytes());
         let cur = self.policies_pending(key);
         self.pending.insert(key, cur.saturating_sub(amount));
         let cnt = self.pending_count.get(&key).copied().unwrap_or(0);
@@ -330,7 +480,11 @@ impl CustodyController {
         body.u64(key);
         body.raw(id.as_bytes());
         body.i128(amount.raw());
+        body.u64(finality.block_number);
+        body.raw(finality.block_hash.as_bytes());
+        body.u32(finality.confirmations);
         self.append_audit(AUDIT_SETTLED, &body.into_vec());
+        Ok(())
     }
 
     fn append_audit(&mut self, tag: u8, body: &[u8]) {
@@ -394,11 +548,15 @@ impl CustodyController {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chain::WalletAddress;
+    use crate::binding::{BindWallet, WalletProof, WalletRegistry};
+    use crate::chain::{evm_address_from_pubkey, WalletAddress};
     use crate::signer::MockHsm;
     use crate::withdrawal::{withdrawal_authorization_digest, ReservationProof, WithdrawalRequest};
-    use crypto::{MerkleTree, ThresholdSigners};
+    use crypto::{EvmKeyPair, MerkleTree, ThresholdSigners};
+    use k256::ecdsa::SigningKey;
     use types::AccountId;
+
+    const MASTER_SEED: [u8; 32] = [0x42; 32];
 
     fn seeds(n: usize) -> Vec<[u8; 32]> {
         (0..n).map(|i| [u8::try_from(i).unwrap() + 1; 32]).collect()
@@ -460,6 +618,75 @@ mod tests {
         c
     }
 
+    fn evm_uncompressed(seed: &[u8; 32]) -> Vec<u8> {
+        let sk = SigningKey::from_slice(seed).unwrap();
+        sk.verifying_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec()
+    }
+
+    /// Wallet registry with account 1's master established and withdrawals allowed.
+    fn wallets() -> (WalletRegistry, WalletAddress) {
+        let mut reg = WalletRegistry::new(4);
+        let uncompressed = evm_uncompressed(&MASTER_SEED);
+        let addr = evm_address_from_pubkey(&uncompressed).unwrap();
+        let mut cmd = BindWallet {
+            account: AccountId::new(1),
+            address: WalletAddress::Evm(addr),
+            is_master: true,
+            withdrawals_allowed: true,
+            nonce: 0,
+            proof: WalletProof::Eip712 {
+                public_key_sec1: uncompressed,
+                signature: vec![0u8; 64],
+            },
+        };
+        let kp = EvmKeyPair::from_seed(&MASTER_SEED).unwrap();
+        let sig = kp.sign_evm(&cmd.binding_message()).unwrap();
+        if let WalletProof::Eip712 { signature, .. } = &mut cmd.proof {
+            *signature = sig.to_vec();
+        }
+        reg.establish_master(&cmd, SequenceNumber::new(1)).unwrap();
+        (reg, WalletAddress::Evm(addr))
+    }
+
+    fn user_message(cert: &WithdrawalCertificate) -> Vec<u8> {
+        let mut msg = Writer::new();
+        msg.raw(b"dexos:custody:user-withdraw-auth:v1");
+        msg.raw(cert.withdrawal_id.as_bytes());
+        msg.u32(cert.request.account.get());
+        msg.into_vec()
+    }
+
+    fn wallet_proof_for(cert: &WithdrawalCertificate) -> WalletProof {
+        let kp = EvmKeyPair::from_seed(&MASTER_SEED).unwrap();
+        WalletProof::Eip712 {
+            public_key_sec1: evm_uncompressed(&MASTER_SEED),
+            signature: kp.sign_evm(&user_message(cert)).unwrap().to_vec(),
+        }
+    }
+
+    fn auth<'a>(
+        reg: &'a WalletRegistry,
+        addr: &'a WalletAddress,
+        proof: &'a WalletProof,
+    ) -> UserWithdrawalAuth<'a> {
+        UserWithdrawalAuth::Wallet {
+            registry: reg,
+            address: addr,
+            proof,
+        }
+    }
+
+    fn good_finality() -> SettlementFinality {
+        SettlementFinality {
+            block_number: 100,
+            block_hash: Hash::from_bytes([0x77; 32]),
+            confirmations: 12,
+        }
+    }
+
     // Build a certificate whose finalizing checkpoint genuinely commits to the
     // request's authorization digest via a Merkle inclusion proof, and whose
     // consensus quorum signs that checkpoint. This mirrors what a correct
@@ -517,10 +744,12 @@ mod tests {
     #[test]
     fn k_of_n_signs_and_k_minus_1_does_not() {
         let mut c = controller();
+        let (reg, addr) = wallets();
         let crt = cert(1, 100, 6);
+        let proof = wallet_proof_for(&crt);
         // 3-of-4 succeeds.
         let signed = c
-            .authorize_withdrawal(&crt, &[0, 1, 2], SequenceNumber::new(1))
+            .authorize_withdrawal(&crt, auth(&reg, &addr, &proof), &[0, 1, 2], SequenceNumber::new(1))
             .unwrap();
         assert!(c
             .signers
@@ -530,20 +759,51 @@ mod tests {
 
         // 2-of-4 (below threshold) on a fresh id fails with ThresholdNotMet.
         let crt2 = cert(2, 100, 6);
+        let proof2 = wallet_proof_for(&crt2);
         assert_eq!(
-            c.authorize_withdrawal(&crt2, &[0, 1], SequenceNumber::new(2)),
+            c.authorize_withdrawal(
+                &crt2,
+                auth(&reg, &addr, &proof2),
+                &[0, 1],
+                SequenceNumber::new(2)
+            ),
             Err(CustodyError::ThresholdNotMet)
+        );
+    }
+
+    #[test]
+    fn authorize_without_wallet_proof_fails() {
+        let mut c = controller();
+        let reg = WalletRegistry::new(4); // empty — no bindings
+        let addr = WalletAddress::Evm([0xAB; 20]);
+        let crt = cert(1, 100, 6);
+        let proof = wallet_proof_for(&crt);
+        assert_eq!(
+            c.authorize_withdrawal(
+                &crt,
+                auth(&reg, &addr, &proof),
+                &[0, 1, 2],
+                SequenceNumber::new(1)
+            ),
+            Err(CustodyError::MissingUserAuthorization)
         );
     }
 
     #[test]
     fn duplicate_sign_prevented() {
         let mut c = controller();
+        let (reg, addr) = wallets();
         let crt = cert(1, 100, 6);
-        c.authorize_withdrawal(&crt, &[0, 1, 2], SequenceNumber::new(1))
+        let proof = wallet_proof_for(&crt);
+        c.authorize_withdrawal(&crt, auth(&reg, &addr, &proof), &[0, 1, 2], SequenceNumber::new(1))
             .unwrap();
         assert_eq!(
-            c.authorize_withdrawal(&crt, &[0, 1, 2], SequenceNumber::new(2)),
+            c.authorize_withdrawal(
+                &crt,
+                auth(&reg, &addr, &proof),
+                &[0, 1, 2],
+                SequenceNumber::new(2)
+            ),
             Err(CustodyError::DuplicateSign)
         );
     }
@@ -551,29 +811,56 @@ mod tests {
     #[test]
     fn emergency_halt_blocks_then_resume() {
         let mut c = controller();
+        let (reg, addr) = wallets();
         c.halt();
         let crt = cert(1, 100, 6);
+        let proof = wallet_proof_for(&crt);
         assert_eq!(
-            c.authorize_withdrawal(&crt, &[0, 1, 2], SequenceNumber::new(1)),
+            c.authorize_withdrawal(
+                &crt,
+                auth(&reg, &addr, &proof),
+                &[0, 1, 2],
+                SequenceNumber::new(1)
+            ),
             Err(CustodyError::EmergencyHalt)
         );
         c.resume();
         assert!(c
-            .authorize_withdrawal(&crt, &[0, 1, 2], SequenceNumber::new(2))
+            .authorize_withdrawal(
+                &crt,
+                auth(&reg, &addr, &proof),
+                &[0, 1, 2],
+                SequenceNumber::new(2)
+            )
             .is_ok());
     }
 
     #[test]
     fn per_chain_limits_and_unknown_chain() {
         let mut c = controller();
+        let (reg, addr) = wallets();
+        let crt_over = cert(1, 5_000, 6);
+        let p_over = wallet_proof_for(&crt_over);
         // Over per-tx cap.
         assert_eq!(
-            c.authorize_withdrawal(&cert(1, 5_000, 6), &[0, 1, 2], SequenceNumber::new(1)),
+            c.authorize_withdrawal(
+                &crt_over,
+                auth(&reg, &addr, &p_over),
+                &[0, 1, 2],
+                SequenceNumber::new(1)
+            ),
             Err(CustodyError::PolicyViolation)
         );
         // Under confirmations.
+        let crt_conf = cert(2, 100, 3);
+        let p_conf = wallet_proof_for(&crt_conf);
         assert_eq!(
-            c.authorize_withdrawal(&cert(2, 100, 3), &[0, 1, 2], SequenceNumber::new(2)),
+            c.authorize_withdrawal(
+                &crt_conf,
+                auth(&reg, &addr, &p_conf),
+                &[0, 1, 2],
+                SequenceNumber::new(2)
+            ),
             Err(CustodyError::PolicyViolation)
         );
         // Unknown chain id. Build the certificate for chain 999 directly so its
@@ -588,8 +875,14 @@ mod tests {
             },
             6,
         );
+        let p_bad = wallet_proof_for(&bad);
         assert_eq!(
-            c.authorize_withdrawal(&bad, &[0, 1, 2], SequenceNumber::new(3)),
+            c.authorize_withdrawal(
+                &bad,
+                auth(&reg, &addr, &p_bad),
+                &[0, 1, 2],
+                SequenceNumber::new(3)
+            ),
             Err(CustodyError::UnknownChain)
         );
     }
@@ -597,32 +890,83 @@ mod tests {
     #[test]
     fn cumulative_pending_cap_enforced_and_settle_frees() {
         let mut c = controller();
+        let (reg, addr) = wallets();
         // max_pending = 2000; three 1000-withdrawals: 2 fit, 3rd exceeds.
-        c.authorize_withdrawal(&cert(1, 1_000, 6), &[0, 1, 2], SequenceNumber::new(1))
+        let c1 = cert(1, 1_000, 6);
+        let p1 = wallet_proof_for(&c1);
+        c.authorize_withdrawal(&c1, auth(&reg, &addr, &p1), &[0, 1, 2], SequenceNumber::new(1))
             .unwrap();
-        c.authorize_withdrawal(&cert(2, 1_000, 6), &[0, 1, 2], SequenceNumber::new(2))
+        let c2 = cert(2, 1_000, 6);
+        let p2 = wallet_proof_for(&c2);
+        c.authorize_withdrawal(&c2, auth(&reg, &addr, &p2), &[0, 1, 2], SequenceNumber::new(2))
             .unwrap();
         assert_eq!(c.pending(ChainId(1)), Amount::from_raw(2_000));
+        let c3 = cert(3, 1_000, 6);
+        let p3 = wallet_proof_for(&c3);
         assert_eq!(
-            c.authorize_withdrawal(&cert(3, 1_000, 6), &[0, 1, 2], SequenceNumber::new(3)),
+            c.authorize_withdrawal(
+                &c3,
+                auth(&reg, &addr, &p3),
+                &[0, 1, 2],
+                SequenceNumber::new(3)
+            ),
             Err(CustodyError::PolicyViolation)
         );
-        // Settle one, freeing headroom.
-        let id = cert(1, 1_000, 6).withdrawal_id;
-        c.settle(ChainId(1), &id, Amount::from_raw(1_000));
+        // Unauthenticated settle is ignored / errors and conserves pending.
+        let id = c1.withdrawal_id;
+        assert_eq!(
+            c.settle(
+                ChainId(1),
+                &id,
+                Amount::from_raw(1_000),
+                &SettlementFinality {
+                    block_number: 1,
+                    block_hash: Hash::ZERO,
+                    confirmations: 100,
+                }
+            ),
+            Err(CustodyError::UnverifiedFinality)
+        );
+        assert_eq!(c.pending(ChainId(1)), Amount::from_raw(2_000));
+        // Wrong amount does not free slots.
+        assert_eq!(
+            c.settle(
+                ChainId(1),
+                &id,
+                Amount::from_raw(999),
+                &good_finality()
+            ),
+            Err(CustodyError::UnauthenticatedSettle)
+        );
+        assert_eq!(c.pending(ChainId(1)), Amount::from_raw(2_000));
+        // Verified finality settle frees headroom.
+        c.settle(ChainId(1), &id, Amount::from_raw(1_000), &good_finality())
+            .unwrap();
         assert_eq!(c.pending(ChainId(1)), Amount::from_raw(1_000));
         assert!(c
-            .authorize_withdrawal(&cert(3, 1_000, 6), &[0, 1, 2], SequenceNumber::new(4))
+            .authorize_withdrawal(
+                &c3,
+                auth(&reg, &addr, &p3),
+                &[0, 1, 2],
+                SequenceNumber::new(4)
+            )
             .is_ok());
     }
 
     #[test]
     fn rotation_invalidates_old_set_and_preserves_dup_ledger() {
         let mut c = controller();
+        let (reg, addr) = wallets();
         let old_vs = c.signers.validator_set();
         let crt = cert(1, 100, 6);
+        let proof = wallet_proof_for(&crt);
         let signed = c
-            .authorize_withdrawal(&crt, &[0, 1, 2], SequenceNumber::new(1))
+            .authorize_withdrawal(
+                &crt,
+                auth(&reg, &addr, &proof),
+                &[0, 1, 2],
+                SequenceNumber::new(1),
+            )
             .unwrap();
         assert!(old_vs.verify(&signed.certificate).is_ok());
 
@@ -644,15 +988,26 @@ mod tests {
 
         // New signatures verify under the NEW set, not the old one.
         let crt2 = cert(2, 100, 6);
+        let proof2 = wallet_proof_for(&crt2);
         let signed2 = c
-            .authorize_withdrawal(&crt2, &[0, 1, 2], SequenceNumber::new(2))
+            .authorize_withdrawal(
+                &crt2,
+                auth(&reg, &addr, &proof2),
+                &[0, 1, 2],
+                SequenceNumber::new(2),
+            )
             .unwrap();
         assert!(new_vs.verify(&signed2.certificate).is_ok());
         assert!(old_vs.verify(&signed2.certificate).is_err());
 
         // The already-signed id cannot be re-signed after rotation.
         assert_eq!(
-            c.authorize_withdrawal(&crt, &[0, 1, 2], SequenceNumber::new(3)),
+            c.authorize_withdrawal(
+                &crt,
+                auth(&reg, &addr, &proof),
+                &[0, 1, 2],
+                SequenceNumber::new(3)
+            ),
             Err(CustodyError::DuplicateSign)
         );
     }
@@ -749,10 +1104,25 @@ mod tests {
             for cmd in &stream {
                 c.apply_control(cmd).unwrap();
             }
-            c.authorize_withdrawal(&cert(1, 100, 6), &[0, 1, 2], SequenceNumber::new(1))
-                .unwrap();
-            c.authorize_withdrawal(&cert(2, 200, 6), &[0, 1, 2], SequenceNumber::new(2))
-                .unwrap();
+            let (reg, addr) = wallets();
+            let c1 = cert(1, 100, 6);
+            let p1 = wallet_proof_for(&c1);
+            c.authorize_withdrawal(
+                &c1,
+                auth(&reg, &addr, &p1),
+                &[0, 1, 2],
+                SequenceNumber::new(1),
+            )
+            .unwrap();
+            let c2 = cert(2, 200, 6);
+            let p2 = wallet_proof_for(&c2);
+            c.authorize_withdrawal(
+                &c2,
+                auth(&reg, &addr, &p2),
+                &[0, 1, 2],
+                SequenceNumber::new(2),
+            )
+            .unwrap();
             (c.audit_root(), c.signed_ids.clone())
         };
         let (root_a, set_a) = run();

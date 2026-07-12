@@ -14,18 +14,21 @@ pub mod signature;
 pub use domain::{
     ALL_DOMAINS, DOMAIN_ACCOUNT, DOMAIN_COMMAND, DOMAIN_DECISION, DOMAIN_DEPOSIT, DOMAIN_EXECUTION,
     DOMAIN_LEAF, DOMAIN_MARKET, DOMAIN_NODE, DOMAIN_ORACLE, DOMAIN_VALIDATOR_SET,
-    DOMAIN_WITHDRAWAL_AUTH, DOMAIN_WITHDRAWAL_CERT, DOMAIN_WITHDRAWAL_ID,
+    DOMAIN_VALIDATOR_SET_TRANSITION, DOMAIN_WITHDRAWAL_AUTH, DOMAIN_WITHDRAWAL_CERT,
+    DOMAIN_WITHDRAWAL_ID,
 };
 pub use hash::{hash_domain, hash_leaf, hash_node, keccak256};
 pub use merkle::{merkle_root, verify_proof, MerkleError, MerkleTree};
 pub use quorum::{
     QuorumCertificate, QuorumError, ThresholdSigners, Validator, ValidatorSet, MAX_VALIDATORS,
-    VALIDATOR_SET_VERSION,
+    QC_PACKED_HEADER_LEN, QC_WIRE_VERSION, VALIDATOR_SET_VERSION,
 };
 #[allow(deprecated)]
 pub use signature::batch_verify_ed25519;
 pub use signature::{
-    verify_ed25519, verify_ed25519_all, verify_eip1271, verify_secp256k1_evm, CryptoError,
+    eip712_digest, eip712_domain_separator, eip712_hash_struct, is_low_s_secp256k1, verify_ed25519,
+    verify_ed25519_all, verify_eip1271, verify_eip1271_prehash, verify_eip712,
+    verify_secp256k1_evm, verify_secp256k1_prehash, CachedEd25519Key, CryptoError, Eip712Domain,
     EvmKeyPair, KeyPair,
 };
 

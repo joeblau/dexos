@@ -6,10 +6,16 @@
 //! bit-identical `oracle_root`. A malformed or sub-threshold certificate is
 //! rejected without mutating canonical state and without panicking. The price
 //! oracle here is deliberately independent of market *resolution*.
+//!
+//! # Root complexity
+//!
+//! Per-market leaves are held in ascending market-id order. Updating an
+//! **existing** market is O(log M) via the incremental Merkle tree; inserting a
+//! new market rebuilds the tree in O(M) bottom-up. Root reads are O(1).
 
 use std::collections::BTreeMap;
 
-use crypto::{merkle_root, ValidatorSet};
+use crypto::{MerkleTree, ValidatorSet};
 use types::{Amount, Hash, MarketId, OracleHealth, Price};
 
 use crate::certificate::{AggregatePrice, OracleCertificate};
@@ -55,14 +61,24 @@ impl MarketOracleState {
 pub struct OracleEngine {
     validator_set: ValidatorSet,
     markets: BTreeMap<u32, MarketOracleState>,
+    /// Dense leaf order matching ascending market-id iteration.
+    leaf_order: Vec<u32>,
+    /// Incremental Merkle over `leaf_order` digests. Rebuilt on insert.
+    tree: MerkleTree,
+    /// Cached root (O(1) reads).
+    cached_root: Hash,
 }
 
 impl OracleEngine {
     /// Create an engine that accepts certificates from `validator_set`.
     pub fn new(validator_set: ValidatorSet) -> Self {
+        // Empty root is the canonical zero hash (matches `merkle_root(&[])`).
         Self {
             validator_set,
             markets: BTreeMap::new(),
+            leaf_order: Vec::new(),
+            tree: MerkleTree::new(1),
+            cached_root: Hash::ZERO,
         }
     }
 
@@ -82,13 +98,45 @@ impl OracleEngine {
                 });
             }
         }
-        self.markets.insert(
-            market,
-            MarketOracleState {
-                last: cert.aggregate,
-            },
-        );
+        let state = MarketOracleState {
+            last: cert.aggregate,
+        };
+        let leaf = state.leaf();
+        let is_new = !self.markets.contains_key(&market);
+        self.markets.insert(market, state);
+        if is_new {
+            // Insert into sorted leaf_order and rebuild bottom-up O(M).
+            let pos = self
+                .leaf_order
+                .binary_search(&market)
+                .unwrap_or_else(|i| i);
+            self.leaf_order.insert(pos, market);
+            self.rebuild_tree();
+        } else {
+            // Existing market: O(log M) path update.
+            let idx = self
+                .leaf_order
+                .binary_search(&market)
+                .expect("leaf_order tracks markets");
+            self.tree.set(idx, leaf).expect("index in range");
+            self.cached_root = self.tree.root();
+        }
         Ok(())
+    }
+
+    fn rebuild_tree(&mut self) {
+        let leaves: Vec<Hash> = self
+            .leaf_order
+            .iter()
+            .map(|m| self.markets[m].leaf())
+            .collect();
+        if leaves.is_empty() {
+            self.tree = MerkleTree::new(1);
+            self.cached_root = Hash::ZERO;
+            return;
+        }
+        self.tree = MerkleTree::from_leaves(&leaves);
+        self.cached_root = self.tree.root();
     }
 
     /// Current committed state for `market`, if any.
@@ -114,19 +162,17 @@ impl OracleEngine {
     }
 
     /// Commit the oracle root: a Merkle root over per-market leaves in ascending
-    /// market-id order. Deterministic and non-trivial; changes whenever any
-    /// market's committed aggregate changes.
+    /// market-id order. O(1) cached read; changes whenever any market's
+    /// committed aggregate changes.
     pub fn oracle_root(&self) -> Hash {
-        // BTreeMap iterates in ascending key order, giving canonical leaf order.
-        let leaves: Vec<Hash> = self.markets.values().map(MarketOracleState::leaf).collect();
-        merkle_root(&leaves)
+        self.cached_root
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crypto::ThresholdSigners;
+    use crypto::{merkle_root, ThresholdSigners};
 
     fn signers(n: usize, k: u64) -> ThresholdSigners {
         let seeds: Vec<[u8; 32]> = (0..n).map(|i| [u8::try_from(i).unwrap(); 32]).collect();
@@ -233,5 +279,29 @@ mod tests {
         let ts = signers(4, 3);
         let engine = OracleEngine::new(ts.validator_set());
         assert_eq!(engine.health(MarketId::new(42)), OracleHealth::Halted);
+    }
+
+    #[test]
+    fn incremental_root_matches_from_scratch() {
+        let ts = signers(4, 3);
+        let mut eng = OracleEngine::new(ts.validator_set());
+        for m in [3u32, 1, 7, 2] {
+            eng.apply(&cert(&ts, m, 1, 100 + i64::from(m), OracleHealth::Normal))
+                .unwrap();
+            let leaves: Vec<Hash> = eng
+                .leaf_order
+                .iter()
+                .map(|id| eng.markets[id].leaf())
+                .collect();
+            assert_eq!(eng.oracle_root(), merkle_root(&leaves));
+        }
+        eng.apply(&cert(&ts, 1, 2, 999, OracleHealth::Normal))
+            .unwrap();
+        let leaves: Vec<Hash> = eng
+            .leaf_order
+            .iter()
+            .map(|id| eng.markets[id].leaf())
+            .collect();
+        assert_eq!(eng.oracle_root(), merkle_root(&leaves));
     }
 }

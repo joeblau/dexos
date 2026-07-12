@@ -47,9 +47,10 @@ pub use checkpoint::{
 };
 pub use sequencer::{detect_gap, CommandRecord, CommandStatus, Sequencer, SequencerError};
 pub use vote::{
-    timeout_digest, vote_digest, Committee, Equivocation, TimeoutCertificate, TimeoutCollector,
-    TimeoutVote, Vote, VoteCollector, VoteError, VoteOutcome, VotePhase, DOMAIN_TIMEOUT,
-    DOMAIN_VOTE, MAX_VALIDATORS,
+    timeout_digest, vote_digest, CollectorWindow, Committee, Equivocation, NoopSlashHook,
+    SlashEvidence, SlashHook, SlashKind, TimeoutCertificate, TimeoutCollector, TimeoutVote, Vote,
+    VoteCollector, VoteError, VoteOutcome, VotePhase, DEFAULT_EVIDENCE_LIMIT,
+    DEFAULT_HEIGHT_HORIZON, DEFAULT_VIEW_HORIZON, DOMAIN_TIMEOUT, DOMAIN_VOTE, MAX_VALIDATORS,
 };
 
 /// Crate identity, used by the node composition root for a startup manifest.
@@ -426,11 +427,38 @@ mod tests {
             other => panic!("expected equivocation, got {other:?}"),
         }
         assert!(collector.has_equivocation());
-        // Re-submitting the identical vote is idempotent.
-        assert_eq!(
-            collector.add_vote(&comm, &v1).unwrap(),
-            VoteOutcome::Duplicate
+        // Offender is halted: further votes (even the original) are refused and
+        // their weight is excluded from QC formation.
+        assert!(matches!(
+            collector.add_vote(&comm, &v1),
+            Err(VoteError::HaltedOffender(1))
+        ));
+        assert!(collector.is_halted(1));
+        assert!(!collector.slash_evidence().is_empty());
+    }
+
+    #[test]
+    fn out_of_window_votes_rejected_before_counting() {
+        let (comm, kps) = committee(4, 0);
+        let mut window = CollectorWindow::default_for(0);
+        window.height_horizon = 2;
+        window.min_height = 0;
+        let mut collector = VoteCollector::with_window(window);
+        let far = signed_vote(
+            &kps[0],
+            0,
+            0,
+            100,
+            VotePhase::Commit,
+            Hash::from_bytes([9; 32]),
+            0,
         );
+        assert_eq!(
+            collector.add_vote(&comm, &far),
+            Err(VoteError::OutsideWindow)
+        );
+        assert_eq!(collector.window_drops(), 1);
+        assert_eq!(collector.retained_digests(), 0);
     }
 
     // ---- pipelining -------------------------------------------------------
@@ -714,7 +742,8 @@ mod tests {
         let mut rng = Lcg(0xC0FF_EE00_1234_5678);
         for _ in 0..500 {
             let block = rng.hash();
-            let height = rng.next() % 1000;
+            // Stay inside the default collector height horizon.
+            let height = rng.next() % DEFAULT_HEIGHT_HORIZON;
 
             // Build a QC twice from the same votes; results must be identical.
             let form = || {
@@ -1071,8 +1100,13 @@ mod tests {
             Err(BftError::ForkedRound { height: 1, view: 0 })
         ));
 
+        // Offender (leader 0) is halted and excluded from QC weight.
+        assert!(engine.is_offender_halted(0));
+        assert!(!engine.slash_evidence().is_empty());
+
         // A timeout certificate carries the height to view 1 under an honest leader.
-        for i in 0..3u32 {
+        // Use non-halted validators for the timeout quorum (1,2,3).
+        for i in 1..4u32 {
             engine
                 .add_timeout(&signed_timeout(&kps[i as usize], 0, 0, i))
                 .unwrap();
@@ -1083,17 +1117,19 @@ mod tests {
             .receive_proposal(signed_proposal(&kps[1], 0, 1, 1, a, Hash::ZERO, 0, 4, 1))
             .unwrap();
         engine.execute(1).unwrap();
+        // Recovery QC uses honest validators only — the halted offender cannot
+        // contribute weight.
         for phase in [VotePhase::Prepare, VotePhase::PreCommit, VotePhase::Commit] {
             add_votes_to_all(
                 std::slice::from_mut(&mut engine),
-                &phase_votes(&kps, &[0, 1, 2], 0, 1, 1, phase, a),
+                &phase_votes(&kps, &[1, 2, 3], 0, 1, 1, phase, a),
             );
             assert!(engine.try_certify(1, phase).unwrap().is_some());
         }
         let exec = Hash::from_bytes([9; 32]);
         let cert = quorum_over(
             &kps,
-            &[0, 1, 2],
+            &[1, 2, 3],
             execution_commitment_digest(0, 1, 1, a, exec),
         );
         engine.certify_execution(1, exec, &cert).unwrap();

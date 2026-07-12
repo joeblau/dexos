@@ -116,15 +116,27 @@ impl LightClient {
             .insert(shard_id.get(), ShardSync::new(shard_id, trusted_root));
     }
 
-    /// Register the validator set trusted for `epoch` on `shard_id`.
+    /// Weak-subjectivity bootstrap: install the first trusted validator set for
+    /// `shard_id`. Fails if a set is already installed (use
+    /// [`Self::apply_validator_set_transition`] for later epochs).
     pub fn register_validator_set(
         &mut self,
         shard_id: ShardId,
         epoch: u64,
         set: ValidatorSet,
     ) -> Result<(), LightClientError> {
-        self.shard_mut(shard_id)?.register_validator_set(epoch, set);
-        Ok(())
+        self.shard_mut(shard_id)?
+            .try_register_validator_set(epoch, set)
+    }
+
+    /// Install a quorum-proven successor validator set on `shard_id`.
+    pub fn apply_validator_set_transition(
+        &mut self,
+        shard_id: ShardId,
+        transition: crate::sync::ValidatorSetTransition,
+    ) -> Result<(), LightClientError> {
+        self.shard_mut(shard_id)?
+            .apply_validator_set_transition(transition)
     }
 
     /// Access a followed shard's sync state.
