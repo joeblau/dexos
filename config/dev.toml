@@ -8,8 +8,10 @@ roles = ["validator", "sequencer", "witness", "gateway"]
 [network]
 listen = "0.0.0.0:9000"
 bootstrap_peers = []
-enable_quic = true
-enable_datagrams = true
+# QUIC sessions and datagram dissemination are not implemented yet; leaving them
+# enabled would fail closed at startup. Set true once the transport lands.
+enable_quic = false
+enable_datagrams = false
 
 [consensus]
 checkpoint_interval_ms = 100
@@ -26,6 +28,7 @@ listen = "0.0.0.0:8080"
 read_only = false
 
 [performance]
-pin_threads = true
-busy_poll = true
+# Core pinning and busy-polled ingress are not implemented yet (fail closed).
+pin_threads = false
+busy_poll = false
 simd = "auto"

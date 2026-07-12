@@ -9,8 +9,10 @@ roles = ["gateway", "observer"]
 [network]
 listen = "0.0.0.0:9001"
 bootstrap_peers = ["us-1.dexos.local:9000"]
-enable_quic = true
-enable_datagrams = true
+# QUIC sessions and datagram dissemination are not implemented yet; leaving them
+# enabled would fail closed at startup. Set true once the transport lands.
+enable_quic = false
+enable_datagrams = false
 
 [consensus]
 checkpoint_interval_ms = 100

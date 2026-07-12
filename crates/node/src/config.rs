@@ -18,6 +18,13 @@ pub const CHECKPOINT_INTERVAL_MIN_MS: u64 = 50;
 /// Upper bound of the configurable checkpoint cadence.
 pub const CHECKPOINT_INTERVAL_MAX_MS: u64 = 100;
 
+/// Smallest permitted log segment size, in megabytes. A zero-sized segment can
+/// never hold a framed record, so it is rejected rather than silently accepted.
+pub const SEGMENT_SIZE_MIN_MB: u64 = 1;
+/// Largest permitted log segment size, in megabytes (64 GiB). Bounding this keeps
+/// the megabyte→byte conversion well clear of `usize` overflow on any target.
+pub const SEGMENT_SIZE_MAX_MB: u64 = 65_536;
+
 /// A role a node may assume. A node may hold multiple roles simultaneously.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -119,8 +126,11 @@ impl Default for NetworkSection {
         Self {
             listen: "0.0.0.0:9000".to_string(),
             bootstrap_peers: Vec::new(),
-            enable_quic: true,
-            enable_datagrams: true,
+            // Fail closed by default: neither the QUIC session layer nor datagram
+            // dissemination is wired into the node yet, so the safe default is off.
+            // Requesting either explicitly is rejected by `validate`.
+            enable_quic: false,
+            enable_datagrams: false,
         }
     }
 }
@@ -203,8 +213,11 @@ pub struct PerformanceSection {
 impl Default for PerformanceSection {
     fn default() -> Self {
         Self {
-            pin_threads: true,
-            busy_poll: true,
+            // Fail closed by default: core pinning is a portable no-op and ingress
+            // busy-polling is not implemented in this release, so the honest default
+            // is off. Requesting either explicitly is rejected by `validate`.
+            pin_threads: false,
+            busy_poll: false,
             simd: SimdMode::Auto,
         }
     }
@@ -276,6 +289,18 @@ pub enum ConfigError {
     /// The configuration was internally contradictory.
     #[error("invalid configuration: {0}")]
     Validation(String),
+
+    /// A feature flag or mode selected behavior this release does not yet
+    /// implement. Rather than silently ignore it — which would let an operator
+    /// believe a capability is active when it is not — the node fails closed at
+    /// startup and reports how to make the configuration valid.
+    #[error("unsupported configuration '{field}': {detail}")]
+    Unsupported {
+        /// The offending field, e.g. `network.enable_quic`.
+        field: &'static str,
+        /// Why the setting is unsupported and how to make the config valid.
+        detail: &'static str,
+    },
 }
 
 impl NodeConfig {
@@ -327,6 +352,8 @@ impl NodeConfig {
                 "consensus.epoch_length must be greater than zero".to_string(),
             ));
         }
+        self.validate_storage()?;
+        self.reject_unsupported_features()?;
         if self.node.light {
             if let Some(bad) = self.node.roles.iter().find(|r| r.is_consensus_bearing()) {
                 return Err(ConfigError::Validation(format!(
@@ -334,6 +361,77 @@ impl NodeConfig {
                      vote, execute canonical state, or hold custody shares",
                     bad.as_str()
                 )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Range-check the `[storage]` settings so a pathological value fails closed
+    /// at startup rather than surfacing later as a division-by-zero or an
+    /// overflowing segment allocation once the durable journal is wired.
+    fn validate_storage(&self) -> Result<(), ConfigError> {
+        if self.storage.snapshot_interval_sequences == 0 {
+            return Err(ConfigError::Validation(
+                "storage.snapshot_interval_sequences must be greater than zero".to_string(),
+            ));
+        }
+        let mb = self.storage.segment_size_mb;
+        if !(SEGMENT_SIZE_MIN_MB..=SEGMENT_SIZE_MAX_MB).contains(&mb) {
+            return Err(ConfigError::OutOfRange {
+                field: "storage.segment_size_mb",
+                value: mb,
+                min: SEGMENT_SIZE_MIN_MB,
+                max: SEGMENT_SIZE_MAX_MB,
+            });
+        }
+        Ok(())
+    }
+
+    /// Reject feature flags and modes whose implementations have not landed in
+    /// this release. Silently no-oping them would let an operator believe a
+    /// capability (QUIC sessions, datagram dissemination, core pinning,
+    /// busy-polled ingress, a forced SIMD ISA) is active when it is not, so the
+    /// node refuses to start until each is set back to a supported value.
+    fn reject_unsupported_features(&self) -> Result<(), ConfigError> {
+        if self.network.enable_quic {
+            return Err(ConfigError::Unsupported {
+                field: "network.enable_quic",
+                detail: "QUIC reliable sessions are not implemented in this release; \
+                         set network.enable_quic = false",
+            });
+        }
+        if self.network.enable_datagrams {
+            return Err(ConfigError::Unsupported {
+                field: "network.enable_datagrams",
+                detail: "datagram market-data dissemination is not implemented in this \
+                         release; set network.enable_datagrams = false",
+            });
+        }
+        if self.performance.pin_threads {
+            return Err(ConfigError::Unsupported {
+                field: "performance.pin_threads",
+                detail: "core pinning uses a portable no-op backend in this release; \
+                         set performance.pin_threads = false",
+            });
+        }
+        if self.performance.busy_poll {
+            return Err(ConfigError::Unsupported {
+                field: "performance.busy_poll",
+                detail: "busy-polled ingress is not implemented in this release; \
+                         set performance.busy_poll = false",
+            });
+        }
+        match self.performance.simd {
+            // `auto` (runtime detection) and `scalar` (the deterministic reference
+            // kernels, always present) are honored. Forcing a specific vector ISA
+            // promises acceleration the node does not yet dispatch on.
+            SimdMode::Auto | SimdMode::Scalar => {}
+            SimdMode::Avx2 | SimdMode::Avx512 | SimdMode::Neon => {
+                return Err(ConfigError::Unsupported {
+                    field: "performance.simd",
+                    detail: "forcing a specific SIMD ISA is not implemented in this release; \
+                             set performance.simd = \"auto\" or \"scalar\"",
+                });
             }
         }
         Ok(())
@@ -369,8 +467,8 @@ roles = ["validator", "witness", "gateway"]
 [network]
 listen = "0.0.0.0:9000"
 bootstrap_peers = ["1.2.3.4:9000"]
-enable_quic = true
-enable_datagrams = true
+enable_quic = false
+enable_datagrams = false
 
 [consensus]
 checkpoint_interval_ms = 100
@@ -387,8 +485,8 @@ listen = "0.0.0.0:8080"
 read_only = false
 
 [performance]
-pin_threads = true
-busy_poll = true
+pin_threads = false
+busy_poll = false
 simd = "auto"
 "#
     }
@@ -488,6 +586,142 @@ simd = "auto"
             })
             .unwrap();
         assert_eq!(cfg.node.roles, vec![Role::Validator, Role::Sequencer]);
+    }
+
+    // --- fail-closed rejection of unsupported settings (issue #312, AC #5) ---
+
+    #[test]
+    fn default_config_disables_unimplemented_features() {
+        // The honest default must be the supported one, so an operator who edits
+        // nothing never unknowingly requests a capability the node cannot deliver.
+        let cfg = NodeConfig::default();
+        assert!(!cfg.network.enable_quic);
+        assert!(!cfg.network.enable_datagrams);
+        assert!(!cfg.performance.pin_threads);
+        assert!(!cfg.performance.busy_poll);
+        assert_eq!(cfg.performance.simd, SimdMode::Auto);
+        // And it validates cleanly.
+        cfg.validate().expect("default config must be valid");
+    }
+
+    #[test]
+    fn rejects_unsupported_quic() {
+        let mut cfg = NodeConfig::default();
+        cfg.network.enable_quic = true;
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::Unsupported {
+                field: "network.enable_quic",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_unsupported_datagrams() {
+        let mut cfg = NodeConfig::default();
+        cfg.network.enable_datagrams = true;
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::Unsupported {
+                field: "network.enable_datagrams",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_unsupported_thread_pinning_and_busy_poll() {
+        let mut cfg = NodeConfig::default();
+        cfg.performance.pin_threads = true;
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::Unsupported {
+                field: "performance.pin_threads",
+                ..
+            })
+        ));
+
+        let mut cfg = NodeConfig::default();
+        cfg.performance.busy_poll = true;
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::Unsupported {
+                field: "performance.busy_poll",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_forced_simd_isa_but_accepts_auto_and_scalar() {
+        for forced in [SimdMode::Avx2, SimdMode::Avx512, SimdMode::Neon] {
+            let mut cfg = NodeConfig::default();
+            cfg.performance.simd = forced;
+            assert!(
+                matches!(
+                    cfg.validate(),
+                    Err(ConfigError::Unsupported {
+                        field: "performance.simd",
+                        ..
+                    })
+                ),
+                "forcing {forced:?} must fail closed"
+            );
+        }
+        for ok in [SimdMode::Auto, SimdMode::Scalar] {
+            let mut cfg = NodeConfig::default();
+            cfg.performance.simd = ok;
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("{ok:?} must be supported: {e}"));
+        }
+    }
+
+    #[test]
+    fn unsupported_flag_rejected_through_full_toml_load() {
+        // The rejection is enforced by the public loader, not just field access:
+        // a real operator file that enables QUIC fails closed at load time.
+        let toml = "[network]\nlisten = \"0.0.0.0:9000\"\nbootstrap_peers = []\n\
+                    enable_quic = true\nenable_datagrams = false";
+        assert!(matches!(
+            NodeConfig::from_toml_str(toml),
+            Err(ConfigError::Unsupported {
+                field: "network.enable_quic",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_pathological_storage_settings() {
+        let mut cfg = NodeConfig::default();
+        cfg.storage.snapshot_interval_sequences = 0;
+        assert!(matches!(cfg.validate(), Err(ConfigError::Validation(_))));
+
+        let mut cfg = NodeConfig::default();
+        cfg.storage.segment_size_mb = 0;
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::OutOfRange {
+                field: "storage.segment_size_mb",
+                ..
+            })
+        ));
+
+        let mut cfg = NodeConfig::default();
+        cfg.storage.segment_size_mb = SEGMENT_SIZE_MAX_MB + 1;
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::OutOfRange {
+                field: "storage.segment_size_mb",
+                ..
+            })
+        ));
+
+        // A boundary value inside the range is accepted.
+        let mut cfg = NodeConfig::default();
+        cfg.storage.segment_size_mb = SEGMENT_SIZE_MAX_MB;
+        cfg.validate().expect("max segment size is in range");
     }
 
     #[test]
