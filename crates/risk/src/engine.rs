@@ -597,6 +597,32 @@ impl RiskEngine {
         Ok(self.market_holders.get(mi).map(|s| s.len()).unwrap_or(0))
     }
 
+    /// Accounts holding a non-flat position in `market`, in ascending account
+    /// (dense slab) index order.
+    ///
+    /// Read side of the market -> holders reverse index that mark updates and
+    /// auto-deleveraging already drive: `sync_market_holder` inserts an account
+    /// exactly when a fill leaves its position non-flat and removes it when the
+    /// position flattens (liquidation clears the account from every market), so
+    /// membership is definitionally `position(a, market) != 0`. The `BTreeSet`
+    /// iterates in ascending slab-index order — the same accounts, in the same
+    /// sequence, as a dense `0..account_count()` scan filtered by non-zero
+    /// position — so callers that accumulate or round per holder observe an
+    /// identical order either way. Index conversion fails closed with `?`
+    /// rather than skipping entries; indices are bounded by the account
+    /// capacity, so the conversion cannot fail in practice.
+    pub fn market_holders(&self, market: MarketId) -> Result<Vec<AccountId>, RiskError> {
+        let mi = market.index()?;
+        let Some(holders) = self.market_holders.get(mi) else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::with_capacity(holders.len());
+        for &i in holders {
+            out.push(AccountId::from_index(i)?);
+        }
+        Ok(out)
+    }
+
     /// Current collateral balance.
     pub fn collateral(&self, account: AccountId) -> Result<Amount, RiskError> {
         Ok(self.collateral[self.read_index(account)?])
@@ -2374,6 +2400,40 @@ mod tests {
         let proportional = e.state_root();
         e.recompute_all().unwrap();
         assert_eq!(e.state_root(), proportional);
+    }
+
+    #[test]
+    fn market_holders_matches_dense_position_scan() {
+        let mut e = engine();
+        for a in 0..=6u32 {
+            e.open_account(acct(a), amt(10_000)).unwrap();
+        }
+        e.set_mark_price(mkt(1), price(100)).unwrap();
+        e.set_mark_price(mkt(2), price(50)).unwrap();
+        e.apply_fill(acct(1), mkt(1), qty(2), price(100)).unwrap();
+        e.apply_fill(acct(3), mkt(1), qty(-1), price(100)).unwrap();
+        e.apply_fill(acct(5), mkt(1), qty(4), price(100)).unwrap();
+        // Holds only the other market.
+        e.apply_fill(acct(2), mkt(2), qty(1), price(50)).unwrap();
+        // Opens then flattens: dropped from the index like the dense filter.
+        e.apply_fill(acct(4), mkt(1), qty(1), price(100)).unwrap();
+        e.apply_fill(acct(4), mkt(1), qty(-1), price(100)).unwrap();
+
+        let holders = e.market_holders(mkt(1)).unwrap();
+        assert_eq!(holders, vec![acct(1), acct(3), acct(5)]);
+        assert_eq!(holders.len(), e.market_holder_count(mkt(1)).unwrap());
+        // Definitional reference: the dense ascending account scan filtered by
+        // non-zero position must yield the same accounts in the same order.
+        let mut reference = Vec::new();
+        for i in 0..e.account_count() {
+            let a = AccountId::from_index(i).unwrap();
+            if e.position(a, mkt(1)).unwrap().raw() != 0 {
+                reference.push(a);
+            }
+        }
+        assert_eq!(holders, reference);
+        // A market slab that never grew yields an empty holder set, not an error.
+        assert!(e.market_holders(mkt(9)).unwrap().is_empty());
     }
 
     #[test]
