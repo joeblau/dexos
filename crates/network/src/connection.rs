@@ -23,6 +23,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use codec::{Frame, TrafficClass, MAX_FRAME_PAYLOAD};
 use tokio::sync::mpsc;
@@ -30,9 +31,11 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 
 use crate::channel::AsyncPriorityChannel;
+use crate::class_auth::{authorize_class, PeerRole};
 use crate::error::TransportError;
 use crate::peer::PeerId;
-use crate::replay::ReplayWindow;
+use crate::reconnect::ReconnectPolicy;
+use crate::replay::{PeerDedup, ReplayWindow};
 use crate::scheduler::NUM_CLASSES;
 
 /// Reserved `msg_type` marking a frame as an unreliable datagram on transports
@@ -147,6 +150,33 @@ pub const DEFAULT_SEMANTIC_MAX: [usize; NUM_CLASSES] = [
     MAX_FRAME_PAYLOAD, // P8 Sync — chunked/streamed by the application
 ];
 
+/// Default handshake I/O deadline (5 s). Stalled half-open peers are dropped.
+pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Default maximum concurrent handshakes in flight on one transport.
+pub const DEFAULT_MAX_HANDSHAKES: usize = 64;
+/// Default TCP keepalive idle time before probes begin (30 s).
+pub const DEFAULT_KEEPALIVE_TIME: Duration = Duration::from_secs(30);
+/// Default TCP keepalive probe interval (10 s).
+pub const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+/// Default application-level idle timeout (120 s without authenticated traffic).
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Default deployment / network identity (0 = unspecified / any).
+pub const DEFAULT_NETWORK_ID: u64 = 0;
+/// Default minimum supported wire protocol version.
+pub const DEFAULT_MIN_WIRE_VERSION: u16 = 1;
+/// Default maximum supported wire protocol version.
+pub const DEFAULT_MAX_WIRE_VERSION: u16 = 1;
+/// Default capability bitset (bit0 = encrypted session, bit1 = multipath dedup).
+pub const DEFAULT_CAPABILITIES: u64 = 0b11;
+/// Default max concurrent connections per remote peer identity.
+pub const DEFAULT_CONN_BUDGET_PER_PEER: usize = 4;
+/// Default max forward sequence jump on the datagram / multipath window.
+pub const DEFAULT_MAX_SEQ_JUMP: u64 = 1024;
+/// Default per-validator outstanding consensus-byte permit.
+pub const DEFAULT_CONSENSUS_PEER_BYTES: usize = 4 * 1024 * 1024;
+/// Default node-wide outstanding consensus-byte permit budget.
+pub const DEFAULT_CONSENSUS_NODE_BYTES: usize = 64 * 1024 * 1024;
+
 /// Tunables shared by all transports.
 #[derive(Debug, Clone, Copy)]
 pub struct TransportConfig {
@@ -176,6 +206,36 @@ pub struct TransportConfig {
     /// before a payload-sized allocation on send and before being copied into
     /// the queue on receive.
     pub semantic_max: [usize; NUM_CLASSES],
+    /// Deadline for the authenticated handshake I/O (both connect and accept).
+    pub handshake_timeout: Duration,
+    /// Maximum concurrent handshakes (limits FD / task pin under flood).
+    pub max_concurrent_handshakes: usize,
+    /// TCP keepalive idle time before the first probe (SO_KEEPALIVE).
+    pub keepalive_time: Duration,
+    /// TCP keepalive probe interval.
+    pub keepalive_interval: Duration,
+    /// Application-level idle timeout (no authenticated frame traffic).
+    pub idle_timeout: Duration,
+    /// Deployment / network identity negotiated in the handshake. `0` accepts
+    /// any remote id (dev); non-zero requires an exact match.
+    pub network_id: u64,
+    /// Minimum wire protocol version this node supports.
+    pub min_wire_version: u16,
+    /// Maximum wire protocol version this node supports.
+    pub max_wire_version: u16,
+    /// Capability bits advertised in the handshake.
+    pub capabilities: u64,
+    /// Maximum concurrent live connections per remote peer identity.
+    pub connection_budget_per_peer: usize,
+    /// Maximum forward sequence jump accepted by multipath / datagram windows
+    /// before the frame is treated as a resync-required gap.
+    pub max_seq_jump: u64,
+    /// Per-validator outstanding consensus payload permits (bytes).
+    pub consensus_peer_bytes: usize,
+    /// Node-wide outstanding consensus payload permits (bytes).
+    pub consensus_node_bytes: usize,
+    /// Reconnect backoff policy used by dial helpers.
+    pub reconnect: ReconnectPolicy,
 }
 
 impl Default for TransportConfig {
@@ -191,6 +251,20 @@ impl Default for TransportConfig {
             max_node_bytes: DEFAULT_MAX_NODE_BYTES,
             datagram_max_bytes: DEFAULT_DATAGRAM_MAX_BYTES,
             semantic_max: DEFAULT_SEMANTIC_MAX,
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            max_concurrent_handshakes: DEFAULT_MAX_HANDSHAKES,
+            keepalive_time: DEFAULT_KEEPALIVE_TIME,
+            keepalive_interval: DEFAULT_KEEPALIVE_INTERVAL,
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            network_id: DEFAULT_NETWORK_ID,
+            min_wire_version: DEFAULT_MIN_WIRE_VERSION,
+            max_wire_version: DEFAULT_MAX_WIRE_VERSION,
+            capabilities: DEFAULT_CAPABILITIES,
+            connection_budget_per_peer: DEFAULT_CONN_BUDGET_PER_PEER,
+            max_seq_jump: DEFAULT_MAX_SEQ_JUMP,
+            consensus_peer_bytes: DEFAULT_CONSENSUS_PEER_BYTES,
+            consensus_node_bytes: DEFAULT_CONSENSUS_NODE_BYTES,
+            reconnect: ReconnectPolicy::default(),
         }
     }
 }
@@ -212,6 +286,15 @@ impl TransportConfig {
 #[derive(Debug)]
 pub struct Connection {
     peer: PeerId,
+    /// Connection epoch: increments on each new session to the same logical
+    /// peer so multipath/reconnect sequences cannot replay under a stale epoch.
+    epoch: u64,
+    /// Authenticated role used to authorize inbound traffic classes.
+    role: PeerRole,
+    /// Negotiated wire protocol version for this session.
+    wire_version: u16,
+    /// Negotiated capability intersection.
+    capabilities: u64,
     out_reliable: Arc<AsyncPriorityChannel>,
     in_reliable: Arc<AsyncPriorityChannel>,
     out_datagram: mpsc::Sender<Frame>,
@@ -227,6 +310,8 @@ pub struct Connection {
     seq_datagram: AtomicU64,
     order_reliable: Mutex<ReliableOrder>,
     dedup_datagram: Mutex<ReplayWindow>,
+    /// Shared multipath dedup table (optional — TCP wires this; loopback may not).
+    peer_dedup: Option<Arc<Mutex<PeerDedup>>>,
     max_payload: usize,
     /// Per-class semantic payload ceilings (indexed by priority). Enforced
     /// before a payload-sized allocation on send.
@@ -234,6 +319,28 @@ pub struct Connection {
     /// Maximum datagram payload accepted on send.
     datagram_max: usize,
     tasks: Vec<JoinHandle<()>>,
+}
+
+/// Options that transports pass when assembling a [`Connection`].
+#[derive(Debug, Clone)]
+pub(crate) struct ConnectionOpts {
+    pub epoch: u64,
+    pub role: PeerRole,
+    pub wire_version: u16,
+    pub capabilities: u64,
+    pub peer_dedup: Option<Arc<Mutex<PeerDedup>>>,
+}
+
+impl Default for ConnectionOpts {
+    fn default() -> Self {
+        Self {
+            epoch: 0,
+            role: PeerRole::Validator,
+            wire_version: DEFAULT_MAX_WIRE_VERSION,
+            capabilities: DEFAULT_CAPABILITIES,
+            peer_dedup: None,
+        }
+    }
 }
 
 impl Connection {
@@ -248,8 +355,36 @@ impl Connection {
         cfg: &TransportConfig,
         tasks: Vec<JoinHandle<()>>,
     ) -> Self {
+        Self::new_with_opts(
+            peer,
+            out_reliable,
+            in_reliable,
+            out_datagram,
+            in_datagram,
+            cfg,
+            tasks,
+            ConnectionOpts::default(),
+        )
+    }
+
+    /// Assemble a connection with explicit epoch / role / multipath dedup.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_opts(
+        peer: PeerId,
+        out_reliable: Arc<AsyncPriorityChannel>,
+        in_reliable: Arc<AsyncPriorityChannel>,
+        out_datagram: mpsc::Sender<Frame>,
+        in_datagram: mpsc::Receiver<Frame>,
+        cfg: &TransportConfig,
+        tasks: Vec<JoinHandle<()>>,
+        opts: ConnectionOpts,
+    ) -> Self {
         Self {
             peer,
+            epoch: opts.epoch,
+            role: opts.role,
+            wire_version: opts.wire_version,
+            capabilities: opts.capabilities,
             out_reliable,
             in_reliable,
             out_datagram,
@@ -257,12 +392,36 @@ impl Connection {
             seq_reliable: Mutex::new([None; NUM_CLASSES]),
             seq_datagram: AtomicU64::new(0),
             order_reliable: Mutex::new(ReliableOrder::new()),
-            dedup_datagram: Mutex::new(ReplayWindow::new(cfg.dedup_window)),
+            dedup_datagram: Mutex::new(ReplayWindow::with_max_jump(
+                cfg.dedup_window,
+                cfg.max_seq_jump,
+            )),
+            peer_dedup: opts.peer_dedup,
             max_payload: cfg.max_payload.min(MAX_FRAME_PAYLOAD),
             semantic_max: cfg.semantic_max,
             datagram_max: cfg.datagram_max_bytes,
             tasks,
         }
+    }
+
+    /// Connection epoch for this session.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Authenticated peer role used for class authorization.
+    pub fn role(&self) -> PeerRole {
+        self.role
+    }
+
+    /// Negotiated wire protocol version.
+    pub fn wire_version(&self) -> u16 {
+        self.wire_version
+    }
+
+    /// Negotiated capability intersection.
+    pub fn capabilities(&self) -> u64 {
+        self.capabilities
     }
 
     /// The semantic payload ceiling for `class` (bounded by `max_payload`).
@@ -370,6 +529,9 @@ impl Connection {
     /// the inbound stream is closed and [`TransportError::ReliableGap`] is
     /// returned so the caller resyncs instead of silently proceeding past the
     /// hole. Returns [`TransportError::ConnectionClosed`] once the link ends.
+    ///
+    /// When a shared [`PeerDedup`] is wired (TCP multipath), dual delivery of
+    /// the same `(peer, epoch, class, seq)` across paths is rejected here.
     pub async fn recv(&self) -> Result<Frame, TransportError> {
         loop {
             let frame = self
@@ -377,6 +539,21 @@ impl Connection {
                 .recv()
                 .await
                 .ok_or(TransportError::ConnectionClosed)?;
+            // Class authorization: non-validators cannot smuggle P0 etc.
+            if let Err(err) = authorize_class(self.role, frame.class) {
+                self.in_reliable.close();
+                return Err(err);
+            }
+            // Multipath at-most-once across connections sharing this peer/epoch.
+            if let Some(dedup) = &self.peer_dedup {
+                let fresh = dedup
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .accept_class(self.peer, self.epoch, frame.class, frame.sequence)?;
+                if !fresh {
+                    continue;
+                }
+            }
             let admit = self
                 .order_reliable
                 .lock()
@@ -407,6 +584,15 @@ impl Connection {
         let mut rx = self.in_datagram.lock().await;
         loop {
             let frame = rx.recv().await.ok_or(TransportError::ConnectionClosed)?;
+            if let Some(dedup) = &self.peer_dedup {
+                let fresh = dedup
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .accept_class(self.peer, self.epoch, frame.class, frame.sequence)?;
+                if !fresh {
+                    continue;
+                }
+            }
             let fresh = self
                 .dedup_datagram
                 .lock()

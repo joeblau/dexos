@@ -16,6 +16,10 @@ use types::MarketId;
 
 /// Maximum dial addresses a single record may advertise (bounds allocation).
 pub const MAX_ADDRESSES: usize = 16;
+/// Maximum UTF-8 byte length of a single address string (bounds allocation).
+pub const MAX_ADDRESS_BYTES: usize = 256;
+/// Maximum total UTF-8 bytes across all address strings in one record.
+pub const MAX_ADDRESSES_TOTAL_BYTES: usize = 2048;
 /// Maximum regions a single record may claim.
 pub const MAX_REGIONS: usize = 8;
 /// Maximum protocol identifiers a single record may list.
@@ -23,6 +27,8 @@ pub const MAX_PROTOCOLS: usize = 64;
 /// Maximum markets a single record may advertise. Adversarial lists beyond this
 /// are rejected by [`PeerRecord::verify`] without allocating further.
 pub const MAX_MARKET_IDS: usize = 1024;
+/// Maximum static seeds retained for bootstrap fallback.
+pub const MAX_STATIC_SEEDS: usize = 64;
 
 /// A network role a peer may fulfil. Encoded as a single bit in a [`RoleSet`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -176,7 +182,11 @@ pub struct PeerRecord {
     pub public_key: [u8; 32],
     /// Dial addresses (host:port or multiaddr strings).
     pub addresses: Vec<String>,
-    /// Roles the peer claims to serve.
+    /// Roles the peer *claims* to serve.
+    ///
+    /// Self-attested role bits are **hints only** unless a committee/registry
+    /// independently authorizes them. Consumers must not grant privileged
+    /// admission (e.g. consensus) based solely on this field.
     pub roles: RoleSet,
     /// Regions the peer is reachable from.
     pub regions: Vec<Region>,
@@ -258,10 +268,41 @@ impl PeerRecord {
 
     /// Whether any variable-length field is within its allocation bound.
     fn bounds_ok(&self) -> bool {
-        self.addresses.len() <= MAX_ADDRESSES
-            && self.regions.len() <= MAX_REGIONS
-            && self.supported_protocols.len() <= MAX_PROTOCOLS
-            && self.market_ids.len() <= MAX_MARKET_IDS
+        if self.addresses.len() > MAX_ADDRESSES
+            || self.regions.len() > MAX_REGIONS
+            || self.supported_protocols.len() > MAX_PROTOCOLS
+            || self.market_ids.len() > MAX_MARKET_IDS
+        {
+            return false;
+        }
+        let mut total = 0usize;
+        for addr in &self.addresses {
+            if addr.len() > MAX_ADDRESS_BYTES {
+                return false;
+            }
+            total = total.saturating_add(addr.len());
+            if total > MAX_ADDRESSES_TOTAL_BYTES {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Self-attested roles as **hints only**. Prefer
+    /// [`PeerRecord::roles_if_authorized`] when a registry is available.
+    #[must_use]
+    pub fn claimed_roles(&self) -> RoleSet {
+        self.roles
+    }
+
+    /// Roles authorized by an external registry (committee / membership).
+    ///
+    /// Returns the intersection of self-attested roles with `authorized`. When
+    /// `authorized` is empty the peer has no registry-backed privileges and the
+    /// result is empty — self-attested privileged roles alone never grant access.
+    #[must_use]
+    pub fn roles_if_authorized(&self, authorized: RoleSet) -> RoleSet {
+        RoleSet::from_bits_truncate(self.roles.bits() & authorized.bits())
     }
 
     /// The canonical bytes that are signed: every field except `signature`.
@@ -421,6 +462,70 @@ mod tests {
         let over = u32::try_from(MAX_MARKET_IDS).unwrap() + 1;
         rec.market_ids = (0..over).map(MarketId::new).collect();
         assert_eq!(rec.verify(999), Err(RecordError::OversizedField));
+    }
+
+    #[test]
+    fn rejects_oversized_address_string() {
+        let kp = keypair(12);
+        let too_long = "x".repeat(MAX_ADDRESS_BYTES + 1);
+        let rec = PeerRecord::new_unsigned(
+            vec![too_long],
+            RoleSet::empty(),
+            vec![Region::Other],
+            vec![1],
+            vec![],
+            0,
+            1_000,
+        );
+        assert!(matches!(rec.sign(&kp), Err(RecordError::OversizedField)));
+    }
+
+    #[test]
+    fn rejects_oversized_total_address_bytes() {
+        let kp = keypair(13);
+        // Each address under the per-string cap, but total over the aggregate.
+        let n = (MAX_ADDRESSES_TOTAL_BYTES / MAX_ADDRESS_BYTES) + 2;
+        let addresses: Vec<String> = (0..n.min(MAX_ADDRESSES))
+            .map(|_| "a".repeat(MAX_ADDRESS_BYTES))
+            .collect();
+        let total: usize = addresses.iter().map(String::len).sum();
+        assert!(total > MAX_ADDRESSES_TOTAL_BYTES);
+        let rec = PeerRecord::new_unsigned(
+            addresses,
+            RoleSet::empty(),
+            vec![Region::Other],
+            vec![1],
+            vec![],
+            0,
+            1_000,
+        );
+        assert!(matches!(rec.sign(&kp), Err(RecordError::OversizedField)));
+    }
+
+    #[test]
+    fn roles_are_hints_unless_registry_backed() {
+        let kp = keypair(14);
+        let rec = PeerRecord::new_unsigned(
+            vec!["10.0.0.1:1".into()],
+            RoleSet::empty().with(Role::Validator).with(Role::Oracle),
+            vec![Region::UsEast],
+            vec![1],
+            vec![],
+            0,
+            1_000,
+        )
+        .sign(&kp)
+        .unwrap();
+        // Self-attested claim includes Validator.
+        assert!(rec.claimed_roles().contains(Role::Validator));
+        // Without registry authorization, privileged roles are empty.
+        let none = rec.roles_if_authorized(RoleSet::empty());
+        assert!(none.is_empty());
+        // Registry authorizes only Oracle: Validator claim is stripped.
+        let auth = RoleSet::empty().with(Role::Oracle);
+        let effective = rec.roles_if_authorized(auth);
+        assert!(effective.contains(Role::Oracle));
+        assert!(!effective.contains(Role::Validator));
     }
 
     #[test]

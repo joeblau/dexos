@@ -21,3 +21,4 @@ hkdf.workspace = true
 sha2.workspace = true
 getrandom.workspace = true
 serde.workspace = true
+socket2 = "0.6"

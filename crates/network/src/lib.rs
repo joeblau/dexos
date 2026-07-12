@@ -48,12 +48,14 @@
 pub mod batch;
 mod budget;
 mod channel;
+mod class_auth;
 mod connection;
 mod disconnect;
 mod error;
 mod framing;
 mod loopback;
 mod peer;
+mod reconnect;
 mod replay;
 mod scheduler;
 mod session;
@@ -68,19 +70,33 @@ pub const CRATE_NAME: &str = "network";
 // directly for the common path.
 pub use codec::{Frame, TrafficClass};
 
+pub use batch::{BatchDropMetrics, BatchSender, BatchSink, DropReason, DEFAULT_BATCH};
 pub use budget::ByteBudget;
+pub use class_auth::{authorize_class, ConsensusPermits, PeerRole};
 pub use connection::{
-    Connection, TransportConfig, DEFAULT_ACCEPT_QUEUE, DEFAULT_DATAGRAM_MAX_BYTES,
-    DEFAULT_MAX_CLASS_BYTES, DEFAULT_MAX_NODE_BYTES, DEFAULT_MAX_PEER_BYTES, DEFAULT_SEMANTIC_MAX,
+    Connection, TransportConfig, DEFAULT_ACCEPT_QUEUE, DEFAULT_CAPABILITIES,
+    DEFAULT_CONN_BUDGET_PER_PEER, DEFAULT_CONSENSUS_NODE_BYTES, DEFAULT_CONSENSUS_PEER_BYTES,
+    DEFAULT_DATAGRAM_MAX_BYTES, DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_IDLE_TIMEOUT,
+    DEFAULT_KEEPALIVE_INTERVAL, DEFAULT_KEEPALIVE_TIME, DEFAULT_MAX_CLASS_BYTES,
+    DEFAULT_MAX_HANDSHAKES, DEFAULT_MAX_NODE_BYTES, DEFAULT_MAX_PEER_BYTES, DEFAULT_MAX_SEQ_JUMP,
+    DEFAULT_MAX_WIRE_VERSION, DEFAULT_MIN_WIRE_VERSION, DEFAULT_NETWORK_ID, DEFAULT_SEMANTIC_MAX,
     MSG_TYPE_DATAGRAM,
 };
 pub use disconnect::{classify_disconnect, DisconnectMetrics, DisconnectReason};
 pub use error::TransportError;
 pub use loopback::{LoopbackFabric, LoopbackTransport};
 pub use peer::{Peer, PeerId};
-pub use replay::{PeerDedup, ReplayWindow, DEFAULT_WINDOW, MAX_WINDOW};
-pub use scheduler::{PriorityScheduler, NUM_CLASSES};
-pub use tcp::TcpTransport;
+pub use reconnect::{
+    ReconnectBackoff, ReconnectPolicy, DEFAULT_INITIAL_MS, DEFAULT_MAX_MS, DEFAULT_MULTIPLIER_DEN,
+    DEFAULT_MULTIPLIER_NUM,
+};
+pub use replay::{
+    PeerDedup, ReplayAdmit, ReplayWindow, DEFAULT_MAX_JUMP, DEFAULT_WINDOW, MAX_WINDOW,
+};
+pub use scheduler::{
+    PriorityScheduler, DEFAULT_CLASS_WEIGHTS, DEFAULT_P0_QUANTUM_BYTES, NUM_CLASSES,
+};
+pub use tcp::{Membership, TcpTransport};
 pub use transport::Transport;
 
 #[cfg(test)]
