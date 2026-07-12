@@ -348,6 +348,27 @@ fn spawn_quic_connection(
     assert_eq!(class_sends.len(), NUM_CLASSES);
     assert_eq!(class_recvs.len(), NUM_CLASSES);
 
+    // Per-connection datagram clamp (#415). A native QUIC DATAGRAM must fit
+    // the path's max datagram frame size (~1200 bytes at handshake), which is
+    // only known once the connection is established — far below the configured
+    // `datagram_max_bytes` default (64 KiB). Clamp the payload ceiling for
+    // *this connection* to what the path can actually carry (minus the frame
+    // header the writer prepends), so `Connection::send_datagram` rejects an
+    // uncarriable payload synchronously with `MessageTooLarge` instead of
+    // accepting it and having the datagram writer silently shed it on the
+    // wire. `None` (datagrams unsupported/disabled by the peer) clamps to 0,
+    // making every datagram send fail typed — consistent with the writer's
+    // fail-closed handling of `UnsupportedByPeer`/`Disabled`. The global
+    // default is untouched; other transports (TCP multiplexes datagrams over
+    // the reliable stream) keep the configured ceiling.
+    let mut cfg = *cfg;
+    cfg.datagram_max_bytes = cfg.datagram_max_bytes.min(
+        quinn_conn
+            .max_datagram_size()
+            .unwrap_or(0)
+            .saturating_sub(FRAME_HEADER_LEN),
+    );
+
     let peer_budget = ByteBudget::child(cfg.max_peer_bytes, node_budget.clone());
     let out_reliable = Arc::new(AsyncPriorityChannel::with_limits(
         cfg.queue_capacity,
@@ -442,6 +463,7 @@ fn spawn_quic_connection(
                 let Ok(bytes) = frame.encode() else {
                     continue;
                 };
+                let encoded_len = bytes.len();
                 // QUIC datagrams are unordered and unreliable; drop on full buffer.
                 if let Err(e) = dgram_conn.send_datagram(Bytes::from(bytes)) {
                     match e {
@@ -451,7 +473,20 @@ fn spawn_quic_connection(
                             break;
                         }
                         quinn::SendDatagramError::TooLarge => {
-                            // Shed oversized datagram; do not tear down.
+                            // Send-side clamping is the primary guard: the
+                            // per-connection `datagram_max_bytes` clamp in
+                            // `spawn_quic_connection` makes `send_datagram`
+                            // reject anything the path could not carry at
+                            // handshake time with `MessageTooLarge`. Reaching
+                            // this arm therefore means the path MTU shrank
+                            // after the clamp; datagrams are lossy by
+                            // contract, so shed this one datagram — never
+                            // tear down the whole connection for it.
+                            tracing::debug!(
+                                encoded_len,
+                                max = ?dgram_conn.max_datagram_size(),
+                                "QUIC datagram exceeded shrunken path max; shed"
+                            );
                             continue;
                         }
                         quinn::SendDatagramError::ConnectionLost(_) => {
@@ -510,7 +545,7 @@ fn spawn_quic_connection(
         in_reliable,
         out_dtx,
         in_drx,
-        cfg,
+        &cfg,
         tasks,
         opts,
     )
@@ -1137,6 +1172,65 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(got, b"tick");
+    }
+
+    #[tokio::test]
+    async fn datagram_over_path_max_rejected_synchronously_at_send() {
+        // #415: the configured `datagram_max_bytes` default (64 KiB) is far
+        // above what a QUIC DATAGRAM frame can carry (path MTU ~1200 bytes).
+        // Before the per-connection clamp, send_datagram accepted such a
+        // payload and the datagram writer silently shed it on the wire
+        // (`SendDatagramError::TooLarge` -> continue). With the clamp, the
+        // sender must learn immediately via a typed error.
+        let server = bound(140).await;
+        let client = bound(141).await;
+        let server_addr = server.local_addr().unwrap();
+        let server_id = server.id();
+        let acceptor = {
+            let server = server.clone();
+            tokio::spawn(async move { server.accept().await })
+        };
+        let client_conn = client
+            .connect(&Peer::dial(server_id, server_addr))
+            .await
+            .unwrap();
+        let server_conn = acceptor.await.unwrap().unwrap();
+
+        // 64 KiB was accepted (then dropped) before the fix; it must now be
+        // rejected synchronously — not Ok, not silently shed.
+        let oversized = vec![0u8; crate::connection::DEFAULT_DATAGRAM_MAX_BYTES];
+        assert!(matches!(
+            client_conn.send_datagram(&oversized),
+            Err(TransportError::MessageTooLarge)
+        ));
+
+        // A payload the path can carry (well under the ~1200-byte QUIC
+        // datagram floor, minus the frame header) still sends and arrives.
+        let within = vec![7u8; 512];
+        client_conn.send_datagram(&within).unwrap();
+        let got = to(Duration::from_secs(5), server_conn.recv_datagram())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, within);
+    }
+
+    #[test]
+    fn datagram_clamp_arithmetic_bounds_payload_to_path() {
+        // The clamp applied per connection in `spawn_quic_connection`:
+        // payload ceiling = min(configured, path_max - header). `None`
+        // (datagrams unsupported) clamps to 0 so all sends fail typed.
+        let clamp = |configured: usize, path_max: Option<usize>| -> usize {
+            configured.min(path_max.unwrap_or(0).saturating_sub(FRAME_HEADER_LEN))
+        };
+        // Typical post-handshake path max: ceiling shrinks to fit the frame.
+        assert_eq!(clamp(64 * 1024, Some(1200)), 1200 - FRAME_HEADER_LEN);
+        // Configured below the path max: configured wins (no widening).
+        assert_eq!(clamp(256, Some(1200)), 256);
+        // Peer without datagram support: everything is rejected at send.
+        assert_eq!(clamp(64 * 1024, None), 0);
+        // Degenerate path max below the header never underflows.
+        assert_eq!(clamp(64 * 1024, Some(FRAME_HEADER_LEN - 1)), 0);
     }
 
     #[tokio::test]
