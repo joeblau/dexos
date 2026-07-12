@@ -1,0 +1,50 @@
+{
+  "name": "@dexos/sdk",
+  "version": "0.1.0",
+  "description": "DexOS client SDK (TypeScript wrappers over the shared Rust/wasm core)",
+  "type": "module",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/joeblau/dexos"
+  },
+  "sideEffects": ["./wasm/*"],
+  "main": "./dist/index.node.js",
+  "module": "./dist/index.bundler.js",
+  "types": "./dist/index.d.ts",
+  "browser": "./dist/index.web.js",
+  "exports": {
+    ".": {
+      "browser": {
+        "types": "./dist/index.web.d.ts",
+        "default": "./dist/index.web.js"
+      },
+      "import": {
+        "types": "./dist/index.node.d.ts",
+        "default": "./dist/index.node.js"
+      },
+      "default": {
+        "types": "./dist/index.bundler.d.ts",
+        "default": "./dist/index.bundler.js"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "files": ["dist", "wasm", "LICENSE"],
+  "scripts": {
+    "codegen:wasm": "wasm-pack build ../wasm --target web --release --out-dir pkg/web && wasm-pack build ../wasm --target nodejs --release --out-dir pkg/nodejs && wasm-pack build ../wasm --target bundler --release --out-dir pkg/bundler",
+    "copy-wasm": "node scripts/copy-wasm.mjs",
+    "prebuild": "npm run copy-wasm",
+    "build": "tsc -p tsconfig.json",
+    "pretest": "npm run copy-wasm",
+    "test": "vitest run",
+    "lint": "eslint src"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.0",
+    "eslint": "^9.13.0",
+    "typescript": "^5.6.0",
+    "typescript-eslint": "^8.10.0",
+    "vitest": "^2.1.0"
+  }
+}

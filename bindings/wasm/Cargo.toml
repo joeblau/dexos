@@ -1,0 +1,40 @@
+[package]
+name = "dexos-sdk-wasm"
+version = "0.1.0"                 # decoupled from workspace 0.0.1
+edition.workspace = true
+license.workspace = true
+rust-version = "1.92"  # floored by 1.92-pinned path deps (types/codec/crypto/proto)
+repository.workspace = true
+publish = false                  # npm ships the compiled wasm, not this crate
+
+[lib]
+# cdylib for the wasm artifact; rlib so a Node/CI harness can also link it.
+crate-type = ["cdylib", "rlib"]
+
+# FFI crate: it deliberately does NOT inherit the workspace `[lints]` (whose
+# `unsafe_code = "deny"` would trip wasm-bindgen's generated `unsafe`). The other
+# engineering standards are kept explicitly; the crate root also
+# `#![allow(unsafe_code)]` for the macro expansion.
+[lints.rust]
+unused_must_use = "deny"
+unreachable_pub = "warn"
+
+[dependencies]
+dexos-sdk-core = { path = "../../crates/sdk-core" }
+wasm-bindgen.workspace = true       # =0.2.126, must match the wasm-pack CLI's bindgen
+serde-wasm-bindgen.workspace = true
+js-sys.workspace = true
+# `serde` supplies only the `Serialize` trait so `decode_response` can drive the
+# bigint-aware `serde_wasm_bindgen::Serializer` (128-bit money -> JS BigInt). No
+# derives or wire types are defined here; the shim stays thin.
+serde.workspace = true
+
+# `dexos-sdk-core` reaches `getrandom` 0.2 (via k256 in `crypto`); on wasm32 that
+# crate needs its `js` backend feature turned on by the final cdylib, exactly as
+# `ui/web` and `crates/sdk-core` do. getrandom 0.3+/0.4 is covered by the
+# `getrandom_backend` rustflag in `.cargo/config.toml`. Native builds never see it.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { workspace = true, features = ["js"] }
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-O3"]

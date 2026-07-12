@@ -1,0 +1,48 @@
+[package]
+name = "dexos-sdk-py"
+version = "0.1.0"                 # decoupled from workspace 0.0.1
+edition.workspace = true
+license.workspace = true
+rust-version = "1.92"  # floored by 1.92-pinned path deps (types/codec/crypto/proto)
+repository.workspace = true
+publish = false                  # PyPI ships the wheel, not this crate
+
+[lib]
+# Default crate name `dexos_sdk_py` (so the `stub_gen` bin can name it); maturin
+# renames the compiled cdylib to `_core` per `module-name = "dexos._core"` in
+# pyproject.toml, so Python still imports it as `dexos._core`.
+# cdylib for the Python extension; rlib so the stub-gen bin can link the lib.
+crate-type = ["cdylib", "rlib"]
+
+# Generates `python/dexos/_core.pyi` from the `#[gen_stub_pyfunction]` items.
+# Built WITHOUT the `extension-module` feature so it links libpython on the host
+# and runs (`cargo run -p dexos-sdk-py --bin stub_gen`).
+[[bin]]
+name = "stub_gen"
+path = "src/bin/stub_gen.rs"
+doc = false
+
+# FFI crate: it deliberately does NOT inherit the workspace `[lints]` (whose
+# `unsafe_code = "deny"` would trip pyo3's generated `unsafe`). The other
+# engineering standards are kept explicitly; the crate root also
+# `#![allow(unsafe_code)]` for the macro expansion.
+[lints.rust]
+unused_must_use = "deny"
+unreachable_pub = "warn"
+
+[features]
+default = []
+# NON-default: maturin turns it on for the wheel. Building WITHOUT it lets the
+# crate link on the host without libpython (the engine gate skips this crate
+# entirely, so it is never compiled there anyway).
+extension-module = ["pyo3/extension-module"]
+
+[dependencies]
+dexos-sdk-core = { path = "../../crates/sdk-core" }
+# `macros` is a pyo3 default feature the workspace pin turns off
+# (default-features = false); re-enable it here for the `#[pymodule]` /
+# `#[pyfunction]` attribute macros.
+pyo3 = { workspace = true, features = ["abi3-py39", "macros"] }
+# `#[gen_stub_pyfunction]` + `define_stub_info_gatherer!` drive the `stub_gen`
+# bin that writes the committed, diff-gated `_core.pyi`.
+pyo3-stub-gen.workspace = true

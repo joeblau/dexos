@@ -52,3 +52,17 @@ Thumbs.db
 .venv/
 venv/
 node_modules/
+
+# Client SDK build outputs (generated, never committed). The generated wasm
+# packages, TS build, Python native artifacts, and stub caches are all rebuilt
+# from `crates/sdk-core`. COMMITTED source-of-truth that must NOT be ignored:
+#   conformance/vectors.json, conformance/*.hex,
+#   bindings/py/python/dexos/_core.pyi, bindings/ts/src/wire.ts
+bindings/wasm/pkg/
+bindings/ts/wasm/
+bindings/ts/dist/
+dist/
+**/*.so
+**/*.pyd
+**/__pycache__/
+**/.pytest_cache/
