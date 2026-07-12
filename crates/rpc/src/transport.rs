@@ -35,13 +35,15 @@ pub fn encode_request(request: &RpcRequest) -> Result<Vec<u8>, RpcError> {
 }
 
 /// Decode a framed request. Returns [`RpcError::InvalidRequest`] on a wrong
-/// message type, and never panics on arbitrary bytes.
+/// message type, and never panics on arbitrary bytes. Decodes through a
+/// borrowed [`codec::FrameRef`]: the caller already holds the full contiguous
+/// frame, so the payload is read in place with no intermediate copy.
 pub fn decode_request(bytes: &[u8]) -> Result<RpcRequest, RpcError> {
-    let (frame, _) = Frame::decode(bytes).map_err(RpcError::from)?;
+    let (frame, _) = Frame::decode_ref(bytes).map_err(RpcError::from)?;
     if frame.msg_type != MSG_REQUEST {
         return Err(RpcError::InvalidRequest("expected request frame".into()));
     }
-    codec::decode(&frame.payload).map_err(RpcError::from)
+    codec::decode(frame.payload).map_err(RpcError::from)
 }
 
 /// Encode a response into a framed byte buffer.
@@ -56,13 +58,14 @@ pub fn encode_response(response: &RpcResponse) -> Result<Vec<u8>, RpcError> {
     frame.encode().map_err(RpcError::from)
 }
 
-/// Decode a framed response. Never panics on arbitrary bytes.
+/// Decode a framed response. Never panics on arbitrary bytes. Reads the
+/// payload in place via a borrowed [`codec::FrameRef`] (no intermediate copy).
 pub fn decode_response(bytes: &[u8]) -> Result<RpcResponse, RpcError> {
-    let (frame, _) = Frame::decode(bytes).map_err(RpcError::from)?;
+    let (frame, _) = Frame::decode_ref(bytes).map_err(RpcError::from)?;
     if frame.msg_type != MSG_RESPONSE {
         return Err(RpcError::InvalidRequest("expected response frame".into()));
     }
-    codec::decode(&frame.payload).map_err(RpcError::from)
+    codec::decode(frame.payload).map_err(RpcError::from)
 }
 
 /// Encode a stream event into a framed byte buffer, tagging market-data events
@@ -78,11 +81,12 @@ pub fn encode_stream_event(event: &StreamEvent) -> Result<Vec<u8>, RpcError> {
     frame.encode().map_err(RpcError::from)
 }
 
-/// Decode a framed stream event. Never panics on arbitrary bytes.
+/// Decode a framed stream event. Never panics on arbitrary bytes. Reads the
+/// payload in place via a borrowed [`codec::FrameRef`] (no intermediate copy).
 pub fn decode_stream_event(bytes: &[u8]) -> Result<StreamEvent, RpcError> {
-    let (frame, _) = Frame::decode(bytes).map_err(RpcError::from)?;
+    let (frame, _) = Frame::decode_ref(bytes).map_err(RpcError::from)?;
     if frame.msg_type != MSG_STREAM_EVENT {
         return Err(RpcError::InvalidRequest("expected stream frame".into()));
     }
-    codec::decode(&frame.payload).map_err(RpcError::from)
+    codec::decode(frame.payload).map_err(RpcError::from)
 }

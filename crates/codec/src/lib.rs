@@ -167,6 +167,36 @@ pub struct Frame {
     pub payload: Vec<u8>,
 }
 
+/// A decoded frame whose payload borrows from the input buffer.
+///
+/// Produced by [`Frame::decode_ref`] / [`Frame::decode_ref_with_max`] for
+/// callers that already hold the full contiguous frame in an owned buffer and
+/// only need to read the payload (e.g. a follow-up typed [`decode`]). Skips
+/// the payload copy that [`Frame::decode`] performs.
+#[derive(Debug, PartialEq, Eq)]
+pub struct FrameRef<'a> {
+    /// Traffic class / priority.
+    pub class: TrafficClass,
+    /// Application message type tag.
+    pub msg_type: u16,
+    /// Per-connection message sequence number (replay/dup detection).
+    pub sequence: u64,
+    /// Serialized payload, borrowed from the decoded buffer.
+    pub payload: &'a [u8],
+}
+
+impl FrameRef<'_> {
+    /// Copy the borrowed payload into an owned [`Frame`].
+    pub fn to_owned(&self) -> Frame {
+        Frame {
+            class: self.class,
+            msg_type: self.msg_type,
+            sequence: self.sequence,
+            payload: self.payload.to_vec(),
+        }
+    }
+}
+
 impl Frame {
     /// Encode the frame with its header, capped at [`MAX_FRAME_PAYLOAD`].
     pub fn encode(&self) -> Result<Vec<u8>, CodecError> {
@@ -198,7 +228,29 @@ impl Frame {
 
     /// Decode one frame with an explicit payload ceiling (e.g. the lower RPC
     /// control-plane cap). Total on adversarial input.
+    ///
+    /// Byte-identical to [`Frame::decode_ref_with_max`] followed by
+    /// [`FrameRef::to_owned`]; use the borrowed form to skip the payload copy.
     pub fn decode_with_max(bytes: &[u8], max_payload: usize) -> Result<(Frame, usize), CodecError> {
+        Self::decode_ref_with_max(bytes, max_payload)
+            .map(|(frame, consumed)| (frame.to_owned(), consumed))
+    }
+
+    /// Decode one frame without copying the payload, returning a borrowed
+    /// [`FrameRef`] and the number of bytes consumed. Total. Payload length is
+    /// capped at [`MAX_FRAME_PAYLOAD`].
+    pub fn decode_ref(bytes: &[u8]) -> Result<(FrameRef<'_>, usize), CodecError> {
+        Self::decode_ref_with_max(bytes, MAX_FRAME_PAYLOAD)
+    }
+
+    /// Decode one frame with an explicit payload ceiling, borrowing the
+    /// payload from `bytes` instead of copying it. The fail-closed checks
+    /// (magic, version, class, length cap, truncation) are identical to
+    /// [`Frame::decode_with_max`]. Total on adversarial input.
+    pub fn decode_ref_with_max(
+        bytes: &[u8],
+        max_payload: usize,
+    ) -> Result<(FrameRef<'_>, usize), CodecError> {
         if bytes.len() < FRAME_HEADER_LEN {
             return Err(CodecError::Truncated);
         }
@@ -226,11 +278,11 @@ impl Frame {
             .get(FRAME_HEADER_LEN..end)
             .ok_or(CodecError::Truncated)?;
         Ok((
-            Frame {
+            FrameRef {
                 class,
                 msg_type,
                 sequence,
-                payload: payload.to_vec(),
+                payload,
             },
             end,
         ))
@@ -273,6 +325,86 @@ mod tests {
         let (back, consumed) = Frame::decode(&bytes).unwrap();
         assert_eq!(f, back);
         assert_eq!(consumed, bytes.len());
+    }
+
+    #[test]
+    fn frame_ref_decode_matches_owned_and_borrows_payload() {
+        let f = Frame {
+            class: TrafficClass::NewOrder,
+            msg_type: 7,
+            sequence: 123,
+            payload: vec![9; 100],
+        };
+        let bytes = f.encode().unwrap();
+        let (borrowed, consumed) = Frame::decode_ref(&bytes).unwrap();
+        assert_eq!(borrowed.class, f.class);
+        assert_eq!(borrowed.msg_type, f.msg_type);
+        assert_eq!(borrowed.sequence, f.sequence);
+        assert_eq!(borrowed.payload, f.payload.as_slice());
+        assert_eq!(consumed, bytes.len());
+        // The payload is the input buffer's own region — no copy.
+        assert!(std::ptr::eq(
+            borrowed.payload,
+            &bytes[FRAME_HEADER_LEN..consumed]
+        ));
+        // Materializing the borrowed frame reproduces the owned decode exactly.
+        assert_eq!(borrowed.to_owned(), f);
+        let (owned, owned_consumed) = Frame::decode(&bytes).unwrap();
+        assert_eq!(owned, f);
+        assert_eq!(owned_consumed, consumed);
+    }
+
+    /// `decode_ref_with_max` must fail closed with the SAME typed errors as
+    /// `decode_with_max` for every header-check arm (magic, version, class,
+    /// length cap, overdeclared length, short header).
+    #[test]
+    fn frame_ref_decode_errors_match_owned_decode() {
+        let frame = Frame {
+            class: TrafficClass::RiskReducing,
+            msg_type: 42,
+            sequence: 9,
+            payload: vec![1, 2, 3, 4],
+        };
+        let bytes = frame.encode().unwrap();
+
+        let mut bad_magic = bytes.clone();
+        bad_magic[0..2].copy_from_slice(&0u16.to_le_bytes());
+
+        let mut bad_version = bytes.clone();
+        bad_version[2..4].copy_from_slice(&0xFFFFu16.to_le_bytes());
+
+        let mut bad_class = bytes.clone();
+        bad_class[4] = 9;
+
+        let mut oversized = bytes.clone();
+        let over_cap = u32::try_from(MAX_FRAME_PAYLOAD + 1).unwrap();
+        oversized[15..19].copy_from_slice(&over_cap.to_le_bytes());
+
+        let mut overdeclared = bytes.clone();
+        let one_past = u32::try_from(frame.payload.len() + 1).unwrap();
+        overdeclared[15..19].copy_from_slice(&one_past.to_le_bytes());
+
+        let short_header = bytes[..FRAME_HEADER_LEN - 1].to_vec();
+
+        let cases: Vec<(Vec<u8>, CodecError)> = vec![
+            (bad_magic, CodecError::BadMagic),
+            (bad_version, CodecError::UnsupportedVersion(0xFFFF)),
+            (bad_class, CodecError::UnknownClass(9)),
+            (oversized, CodecError::LengthOutOfRange),
+            (overdeclared, CodecError::Truncated),
+            (short_header, CodecError::Truncated),
+        ];
+        for (case, expected) in cases {
+            assert_eq!(
+                Frame::decode_ref_with_max(&case, MAX_FRAME_PAYLOAD)
+                    .map(|(r, n)| (r.to_owned(), n)),
+                Err(expected.clone()),
+            );
+            assert_eq!(
+                Frame::decode_with_max(&case, MAX_FRAME_PAYLOAD),
+                Err(expected),
+            );
+        }
     }
 
     #[test]
