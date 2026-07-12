@@ -32,8 +32,9 @@ struct Locator {
 ///
 /// [`Clone`] yields a bit-identical, independent book. Baskets use it to
 /// snapshot before speculatively applying legs so a mid-basket failure can be
-/// rolled back to the exact pre-command state.
-#[derive(Clone)]
+/// rolled back to the exact pre-command state. The clone re-reserves every
+/// eagerly-sized container (slab, id index, dedup cache) back to its configured
+/// capacity, so cloned books keep the warm-path no-allocation guarantee.
 pub struct OrderBook {
     config: BookConfig,
     slab: Slab<Node>,
@@ -48,6 +49,30 @@ pub struct OrderBook {
     /// Running XOR of every resting order-leaf digest (pre-finalize aggregate).
     /// Updated only for touched orders so the hot path never rehashes the book.
     order_leaf_xor: [u8; 32],
+}
+
+impl Clone for OrderBook {
+    fn clone(&self) -> Self {
+        // `HashMap::clone` sizes the new table for the current entries only,
+        // discarding the eager `with_capacity(config.capacity)` reservation
+        // made in [`OrderBook::new`]. Restore it after cloning so warm-path
+        // inserts on a cloned book (basket snapshot restore, the engine's
+        // per-command transaction copy) never reallocate. Capacity is not part
+        // of logical state, so the clone stays bit-identical in behavior.
+        let mut id_index = self.id_index.clone();
+        id_index.reserve(self.config.capacity.saturating_sub(id_index.len()));
+        OrderBook {
+            config: self.config,
+            slab: self.slab.clone(),
+            bids: self.bids.clone(),
+            asks: self.asks.clone(),
+            id_index,
+            account_orders: self.account_orders.clone(),
+            positions: self.positions.clone(),
+            dedup: self.dedup.clone(),
+            order_leaf_xor: self.order_leaf_xor,
+        }
+    }
 }
 
 impl OrderBook {

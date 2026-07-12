@@ -22,11 +22,29 @@ struct Key {
 }
 
 /// A fixed-capacity FIFO cache of recent submission results.
-#[derive(Clone)]
 pub(crate) struct DedupCache {
     capacity: usize,
     map: HashMap<Key, MatchResult>,
     order: VecDeque<Key>,
+}
+
+impl Clone for DedupCache {
+    fn clone(&self) -> Self {
+        // Container `clone` sizes the copies for the current entries only,
+        // dropping the eager reservation made by
+        // [`DedupCache::with_capacity`]. Restore it so inserts into a cloned
+        // cache (via a cloned book) stay allocation-free up to `capacity`.
+        // Reserved capacity is not logical state; behavior is bit-identical.
+        let mut map = self.map.clone();
+        map.reserve(self.capacity.saturating_sub(map.len()));
+        let mut order = self.order.clone();
+        order.reserve(self.capacity.saturating_sub(order.len()));
+        DedupCache {
+            capacity: self.capacity,
+            map,
+            order,
+        }
+    }
 }
 
 impl DedupCache {
@@ -123,6 +141,18 @@ mod tests {
         assert!(c.get(a, 2).is_some());
         assert!(c.get(a, 3).is_some());
         assert_eq!(c.len(), 2);
+    }
+
+    #[test]
+    fn clone_preserves_reserved_capacity() {
+        let mut c = DedupCache::with_capacity(32);
+        let a = AccountId::new(1);
+        c.insert(a, 7, result(10));
+        let cloned = c.clone();
+        assert_eq!(cloned.get(a, 7), Some(&result(10)));
+        // The eager reservations must survive the clone, not shrink to len.
+        assert!(cloned.map.capacity() >= 32);
+        assert!(cloned.order.capacity() >= 32);
     }
 
     #[test]
