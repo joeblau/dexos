@@ -320,12 +320,16 @@ where
                             method = ?request.method,
                         );
                         let _g = span.enter();
+                        let request_id = request.request_id;
                         let backend = Arc::clone(&backend);
                         let dispatch_timeout = config.dispatch_timeout;
                         // Isolate synchronous backend work off the IO worker.
-                        let join =
+                        let mut join =
                             tokio::task::spawn_blocking(move || dispatch(&*backend, mode, request));
-                        let result = match tokio::time::timeout(dispatch_timeout, join).await {
+                        // Poll the JoinHandle by reference: on timeout the handle
+                        // must survive so the still-running blocking task (which
+                        // cannot be aborted) can be reaped below.
+                        let result = match tokio::time::timeout(dispatch_timeout, &mut join).await {
                             Ok(Ok(resp)) => resp,
                             Ok(Err(join_err)) => RpcResponse::new(
                                 0,
@@ -334,9 +338,23 @@ where
                             Err(_elapsed) => {
                                 // Pre-admission succeeded but the handler outran
                                 // the wait budget. We cannot cancel a committed
-                                // command; surface backpressure / timeout to the
-                                // client and drop the connection after the reply.
-                                RpcResponse::new(0, Err(RpcError::Backpressure))
+                                // command, and a `spawn_blocking` task cannot be
+                                // aborted: it keeps running on the blocking pool.
+                                // Keep the process-wide work permit charged until
+                                // that orphaned task really finishes so the budget
+                                // reflects in-flight work; the per-connection
+                                // permit dies with this connection, which is
+                                // failed closed after the reply below.
+                                tokio::spawn(async move {
+                                    let _proc_permit = proc_permit;
+                                    let _ = join.await;
+                                });
+                                let resp =
+                                    RpcResponse::new(request_id, Err(RpcError::Backpressure));
+                                let out = encode_response(&resp)?;
+                                let _ =
+                                    write_all_timed(&mut stream, &out, config.write_timeout).await;
+                                return Ok(());
                             }
                         };
                         drop(proc_permit);

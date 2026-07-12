@@ -1883,6 +1883,238 @@ async fn in_flight_byte_budget_rejects_before_admission() {
 }
 
 // ---------------------------------------------------------------------------
+// #396: dispatch timeout fails the connection closed and keeps the work
+// budget charged until the orphaned blocking task finishes
+// ---------------------------------------------------------------------------
+
+/// A backend whose `get_network_status` blocks (on the blocking pool) until the
+/// test releases it via the channel — simulating a dispatch that outruns
+/// `dispatch_timeout`. Every other method is unused by the test.
+struct StallingBackend {
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl RpcBackend for StallingBackend {
+    fn get_node_info(&self) -> Result<NodeInfo, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn get_peers(&self) -> Result<Vec<PeerInfo>, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn get_markets(&self, _page: PageParams) -> Result<Vec<MarketSummary>, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn get_market(&self, _market: MarketId) -> Result<MarketDetail, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn get_market_book(&self, _market: MarketId, _depth: u32) -> Result<Book, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn get_market_trades(
+        &self,
+        _market: MarketId,
+        _page: PageParams,
+    ) -> Result<Vec<Trade>, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn get_market_status(&self, _market: MarketId) -> Result<MarketStatus, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn get_oracle_status(&self, _market: MarketId) -> Result<OracleStatus, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn get_checkpoint(&self, _height: u64) -> Result<Checkpoint, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn get_latest_checkpoint(&self) -> Result<Checkpoint, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn get_account(&self, _account: AccountId) -> Result<Account, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn get_account_proof(&self, _account: AccountId) -> Result<AccountProof, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn get_position(&self, _account: AccountId, _market: MarketId) -> Result<Position, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn get_orders(&self, _account: AccountId, _page: PageParams) -> Result<Vec<Order>, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn get_execution_receipt(&self, _command_hash: Hash) -> Result<ExecutionReceipt, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn get_deposit_status(&self, _tx_hash: Hash) -> Result<DepositStatus, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn get_withdrawal_status(&self, _request_hash: Hash) -> Result<WithdrawalStatus, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn get_network_status(&self) -> Result<NetworkStatus, RpcError> {
+        // Block the dispatching thread until the test releases it (or the test
+        // drops the sender, which also unblocks).
+        let _ = self
+            .release
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recv();
+        Ok(NetworkStatus {
+            peer_count: 0,
+            height: 0,
+            finalized_height: 0,
+            syncing: false,
+        })
+    }
+    fn submit_order(
+        &self,
+        _meta: &ControlMeta,
+        _params: &SubmitOrderParams,
+    ) -> Result<CommandAck, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn cancel_order(
+        &self,
+        _meta: &ControlMeta,
+        _params: &CancelOrderParams,
+    ) -> Result<CommandAck, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn cancel_all(
+        &self,
+        _meta: &ControlMeta,
+        _params: &CancelAllParams,
+    ) -> Result<CommandAck, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn replace_order(
+        &self,
+        _meta: &ControlMeta,
+        _params: &ReplaceOrderParams,
+    ) -> Result<CommandAck, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn submit_basket(
+        &self,
+        _meta: &ControlMeta,
+        _params: &BasketParams,
+    ) -> Result<CommandAck, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn authorize_session(
+        &self,
+        _meta: &ControlMeta,
+        _params: &AuthorizeSessionParams,
+    ) -> Result<CommandAck, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn revoke_session(
+        &self,
+        _meta: &ControlMeta,
+        _params: &RevokeSessionParams,
+    ) -> Result<CommandAck, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn bind_wallet(
+        &self,
+        _meta: &ControlMeta,
+        _params: &BindWalletParams,
+    ) -> Result<CommandAck, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn request_withdrawal(
+        &self,
+        _meta: &ControlMeta,
+        _params: &RequestWithdrawalParams,
+    ) -> Result<CommandAck, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn create_market(
+        &self,
+        _meta: &ControlMeta,
+        _params: &CreateMarketParams,
+    ) -> Result<CommandAck, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn stake_market(
+        &self,
+        _meta: &ControlMeta,
+        _params: &StakeMarketParams,
+    ) -> Result<CommandAck, RpcError> {
+        Err(RpcError::NotFound)
+    }
+}
+
+/// Acceptance (#396): a backend dispatch that outruns `dispatch_timeout` gets a
+/// `Backpressure` reply and the connection is failed closed (the loop serves no
+/// further requests), while the process-wide work-budget permit stays charged
+/// until the orphaned blocking task — which cannot be aborted — actually
+/// finishes.
+#[tokio::test]
+async fn dispatch_timeout_fails_connection_closed_and_holds_work_budget() {
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let backend: Arc<dyn RpcBackend> = Arc::new(StallingBackend {
+        release: std::sync::Mutex::new(release_rx),
+    });
+    let mut cfg = budget_config(4);
+    cfg.dispatch_timeout = Duration::from_millis(100);
+    let work = crate::work::WorkBudget::new(&cfg.work);
+
+    let (mut client, server_io) = tokio::io::duplex(64 * 1024);
+    let server = {
+        let work = Arc::clone(&work);
+        tokio::spawn(async move {
+            crate::server::handle_connection_with(
+                server_io,
+                backend,
+                RpcMode::Full,
+                &cfg,
+                Some(work),
+            )
+            .await
+        })
+    };
+
+    let req = RpcRequest::new(42, RpcMethod::GetNetworkStatus);
+    let out = encode_request(&req).unwrap();
+    client.write_all(&out).await.unwrap();
+    client.flush().await.unwrap();
+
+    // The timed-out dispatch surfaces Backpressure, correlated to the request.
+    let frame = read_one_frame(&mut client).await.unwrap();
+    let resp = decode_response(&frame).unwrap();
+    assert_eq!(resp.request_id, 42);
+    assert_eq!(resp.result, Err(RpcError::Backpressure));
+
+    // The connection is failed closed after the reply: the next read is EOF,
+    // not another served request, and the handler exits cleanly.
+    let mut buf = [0u8; 1];
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(n, 0, "connection must close after a dispatch timeout");
+    assert!(server.await.unwrap().is_ok());
+
+    // The blocking task is still running (spawn_blocking cannot be aborted), so
+    // the process-wide work budget must still be charged.
+    assert_eq!(work.in_flight_requests(), 1);
+    assert!(work.in_flight_bytes() > 0);
+
+    // Release the backend; once the orphaned task finishes, the reaper drops
+    // the permit and the budget returns to zero.
+    release_tx.send(()).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while work.in_flight_requests() != 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "work permit was never released after the blocking task finished"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(work.in_flight_bytes(), 0);
+}
+
+// ---------------------------------------------------------------------------
 // P1 #355: stream fanout byte-bounded, sharded, copy-light
 // ---------------------------------------------------------------------------
 
