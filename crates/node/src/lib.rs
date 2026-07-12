@@ -134,11 +134,15 @@ impl Node {
         let mut flush_hooks = FlushHooks::new();
         // Placeholder flush hooks for subsystems not yet fully wired. When the
         // durable journal / RPC server / peer mesh land they replace these with
-        // real fsync / close / disconnect work. Empty success keeps the hook
-        // path exercised on every shutdown.
-        flush_hooks.push("journal", Box::new(|| Ok(())));
-        flush_hooks.push("rpc", Box::new(|| Ok(())));
-        flush_hooks.push("network", Box::new(|| Ok(())));
+        // real fsync / close / disconnect work. Empty success keeps both hook
+        // phases exercised on every shutdown. Phase placement is the contract
+        // (issue #436): ingress-stopping hooks (RPC listener close, peer
+        // disconnect) run PRE-drain; durability hooks (journal fsync/close)
+        // run POST-drain, after every handler has emptied its bounded queue,
+        // so commands processed during the drain are covered by the flush.
+        flush_hooks.push_pre_drain("rpc", Box::new(|| Ok(())));
+        flush_hooks.push_pre_drain("network", Box::new(|| Ok(())));
+        flush_hooks.push_post_drain("journal", Box::new(|| Ok(())));
 
         Ok(Self {
             config,
@@ -170,9 +174,19 @@ impl Node {
             .map(|(_, tx)| tx.clone())
     }
 
-    /// Register an additional shutdown flush hook (control path only).
-    pub fn push_flush_hook(&mut self, name: &'static str, hook: shutdown::FlushHook) {
-        self.flush_hooks.push(name, hook);
+    /// Register a PRE-drain shutdown hook: ingress-stopping work only (RPC
+    /// listener close, peer intake stop). Runs after the shutdown signal and
+    /// before handlers drain their bounded queues. Control path only.
+    pub fn push_pre_drain_hook(&mut self, name: &'static str, hook: shutdown::FlushHook) {
+        self.flush_hooks.push_pre_drain(name, hook);
+    }
+
+    /// Register a POST-drain shutdown hook: durability work only (journal
+    /// fsync/close). Runs after every handler has drained its bounded queue,
+    /// so the flush covers commands processed during shutdown. Control path
+    /// only.
+    pub fn push_post_drain_hook(&mut self, name: &'static str, hook: shutdown::FlushHook) {
+        self.flush_hooks.push_post_drain(name, hook);
     }
 
     /// A node-info-style startup manifest, emitted once at startup (off any hot path).
@@ -352,32 +366,60 @@ impl Node {
             handles.len()
         );
         let _ = self.shutdown_tx.send(true);
+        let mut pending_error = pending_error;
 
-        // Flush durable / network resources before joining handlers.
-        if let Err(e) = self.flush_hooks.run_all() {
-            if pending_error.is_none() {
-                if let Some(task) = metrics_task {
-                    task.abort();
-                }
-                readiness.mark_not_live();
-                return Err(e);
-            }
-            tracing::error!(target: "node", error = %e, "flush failed during already-failed shutdown");
+        // Shutdown ordering contract (issue #436): PRE-drain hooks stop
+        // ingress (RPC listener close, peer intake stop) so no new work
+        // arrives while queues drain. Durability work (journal fsync/close)
+        // MUST NOT run here — handlers are still processing queued commands,
+        // and a flush now would not cover them.
+        if let Err(flush_err) = self.flush_hooks.run_pre_drain() {
+            pending_error = Some(match pending_error {
+                None => flush_err,
+                Some(primary) => primary.with_flush_failure(flush_err),
+            });
         }
 
+        // Drain: every handler empties its bounded queue under the configured
+        // deadline (stragglers are aborted).
         let deadline = shutdown::drain_timeout_from_ms(self.config.performance.drain_timeout_ms);
         let drain_result = shutdown::drain_handlers_abort_on_timeout(handles, deadline).await;
+
+        // POST-drain hooks make state durable (journal fsync/close). They run
+        // only after the drain completed, so every command processed during
+        // shutdown is covered by the flush — running them before the drain
+        // was the data-loss ordering this contract exists to prevent.
+        let post_drain_result = self.flush_hooks.run_post_drain();
 
         if let Some(task) = metrics_task {
             task.abort();
         }
         readiness.mark_not_live();
 
-        if let Some(err) = pending_error {
-            return Err(err);
-        }
+        // Resolve the outcome oldest-failure-first; a post-drain flush
+        // failure attaches to an earlier pending error instead of being
+        // dropped.
+        let outcome = match (pending_error, drain_result) {
+            (Some(primary), drain_result) => {
+                if let Err(drain_err) = drain_result {
+                    tracing::error!(
+                        target: "node",
+                        error = %drain_err,
+                        "drain failed during already-failed shutdown"
+                    );
+                }
+                Err(primary)
+            }
+            (None, Err(drain_err)) => Err(drain_err),
+            (None, Ok(drained)) => Ok(drained),
+        };
+        let outcome = match (outcome, post_drain_result) {
+            (outcome, Ok(())) => outcome,
+            (Ok(_), Err(flush_err)) => Err(flush_err),
+            (Err(primary), Err(flush_err)) => Err(primary.with_flush_failure(flush_err)),
+        };
 
-        let (processed, handler_count) = drain_result?;
+        let (processed, handler_count) = outcome?;
         tracing::info!(
             target: "node",
             "drained {} queued command(s) across {} subsystem(s)",
@@ -576,6 +618,118 @@ mod tests {
         let report = node.run_until(async {}).await.unwrap();
         assert_eq!(report.handlers, 0);
         assert_eq!(report.processed, 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_runs_pre_drain_then_drain_then_post_drain() {
+        use std::sync::Mutex;
+
+        // Issue #436: durability hooks used to run before handlers drained
+        // their bounded queues, so any command processed during the drain
+        // happened after the journal flush. Prove the fixed ordering:
+        // pre-drain hooks → handler drain → post-drain hooks.
+        let mut node = Node::new(cfg_with_roles(false, vec![])).unwrap();
+        let order: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let o = Arc::clone(&order);
+        node.push_pre_drain_hook(
+            "test-rpc",
+            Box::new(move || {
+                o.lock().expect("order lock").push("pre-drain");
+                Ok(())
+            }),
+        );
+        let o = Arc::clone(&order);
+        node.push_post_drain_hook(
+            "test-journal",
+            Box::new(move || {
+                o.lock().expect("order lock").push("post-drain");
+                Ok(())
+            }),
+        );
+
+        // Stand-in role handler: waits for the shutdown signal, then records
+        // that it drained its queue (mirroring run_handler's drain-on-stop).
+        let o = Arc::clone(&order);
+        let mut stop = node.shutdown_tx.subscribe();
+        let handler = tokio::spawn(async move {
+            let _ = stop.changed().await;
+            o.lock().expect("order lock").push("drained");
+            3u64
+        });
+
+        let report = node
+            .finish_shutdown(
+                vec![("gateway".to_string(), handler)],
+                None,
+                Readiness::new(),
+                Arc::new(MetricsRegistry::new()),
+                None,
+            )
+            .await
+            .expect("clean shutdown");
+        assert_eq!(report.processed, 3);
+        assert_eq!(report.handlers, 1);
+
+        let recorded = order.lock().expect("order lock").clone();
+        assert_eq!(
+            recorded,
+            vec!["pre-drain", "drained", "post-drain"],
+            "durability hooks must run only after every handler drained"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_drain_hook_failure_surfaces_from_shutdown() {
+        let mut node = Node::new(cfg_with_roles(false, vec![])).unwrap();
+        node.push_post_drain_hook("journal", Box::new(|| Err("fsync failed".into())));
+        let err = node
+            .run_until(async {})
+            .await
+            .expect_err("post-drain flush failure must fail shutdown");
+        assert!(
+            matches!(
+                err,
+                NodeError::Flush { ref detail } if detail.contains("journal: fsync failed")
+            ),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_drain_failure_attaches_to_pending_error() {
+        let mut node = Node::new(cfg_with_roles(false, vec![])).unwrap();
+        node.push_post_drain_hook("journal", Box::new(|| Err("fsync failed".into())));
+        let pending = NodeError::CriticalTask {
+            role: "gateway".to_string(),
+            detail: "handler returned before shutdown".to_string(),
+        };
+        let err = node
+            .finish_shutdown(
+                Vec::new(),
+                None,
+                Readiness::new(),
+                Arc::new(MetricsRegistry::new()),
+                Some(pending),
+            )
+            .await
+            .expect_err("pending error must surface");
+        match err {
+            NodeError::FlushDuringFailedShutdown {
+                primary,
+                flush_detail,
+            } => {
+                assert!(
+                    matches!(*primary, NodeError::CriticalTask { .. }),
+                    "primary error must be preserved: {primary}"
+                );
+                assert!(
+                    flush_detail.contains("journal: fsync failed"),
+                    "{flush_detail}"
+                );
+            }
+            other => panic!("expected combined error, got: {other}"),
+        }
     }
 
     #[tokio::test]

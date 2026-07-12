@@ -1,9 +1,14 @@
 //! Production shutdown: SIGTERM + SIGINT, drain deadline, and flush hooks.
 //!
 //! The composition root waits for a stop signal, broadcasts shutdown to every
-//! subsystem, runs registered flush hooks (journal fsync, RPC close, peer
-//! disconnect), and enforces a drain deadline. An incomplete drain is reported
-//! as [`crate::NodeError::DrainTimeout`].
+//! subsystem, and runs registered flush hooks in two ordered phases around the
+//! handler drain: PRE-drain hooks stop ingress (RPC listener close, peer
+//! disconnect) before handlers empty their bounded queues, and POST-drain
+//! hooks make state durable (journal fsync/close) only after every handler
+//! has finished draining — so a command processed during the drain can never
+//! land behind an already-completed journal flush (issue #436). A drain
+//! deadline is enforced; an incomplete drain is reported as
+//! [`crate::NodeError::DrainTimeout`].
 
 use std::future::Future;
 use std::sync::Arc;
@@ -14,48 +19,89 @@ use crate::error::NodeError;
 /// Default graceful drain window when config does not override it.
 pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// A flush hook invoked once during shutdown, before handler joins complete.
+/// A flush hook invoked exactly once during shutdown, in one of two phases.
 ///
-/// Hooks are control-path only (journal fsync, listener close, peer drain). They
-/// must be bounded and must not block the hot path at registration time.
+/// Hooks are control-path only and phase placement is the contract (see
+/// [`FlushHooks`]): PRE-drain hooks stop ingress (RPC listener close, peer
+/// intake stop) and run before handlers drain their bounded queues; POST-drain
+/// hooks make state durable (journal fsync/close) and run only after every
+/// handler has drained. They must be bounded and must not block the hot path
+/// at registration time.
 pub type FlushHook = Box<dyn FnOnce() -> Result<(), String> + Send>;
 
-/// Registry of shutdown flush hooks.
+/// Registry of shutdown flush hooks, split into two `FnOnce`-drain phases.
+///
+/// Shutdown ordering contract (issue #436): signal shutdown → run PRE-drain
+/// (ingress-stopping) hooks → drain every handler queue → run POST-drain
+/// (durability) hooks. Each bucket is drained exactly once and cannot rerun.
+/// A durability hook registered pre-drain would flush before drained commands
+/// exist and lose them; an ingress-stopping hook registered post-drain would
+/// keep accepting work while queues drain. Journal fsync/close MUST therefore
+/// be registered via [`FlushHooks::push_post_drain`].
 #[derive(Default)]
 pub struct FlushHooks {
-    hooks: Vec<(&'static str, FlushHook)>,
+    pre_drain: Vec<(&'static str, FlushHook)>,
+    post_drain: Vec<(&'static str, FlushHook)>,
 }
 
 impl FlushHooks {
     /// Empty registry.
     #[must_use]
     pub fn new() -> Self {
-        Self { hooks: Vec::new() }
-    }
-
-    /// Register a named flush hook (e.g. `"journal"`, `"rpc"`, `"network"`).
-    pub fn push(&mut self, name: &'static str, hook: FlushHook) {
-        self.hooks.push((name, hook));
-    }
-
-    /// Run every hook in registration order. Collects failures without panicking.
-    pub fn run_all(&mut self) -> Result<(), NodeError> {
-        let mut failures = Vec::new();
-        for (name, hook) in self.hooks.drain(..) {
-            if let Err(detail) = hook() {
-                tracing::error!(target: "node", hook = name, %detail, "flush hook failed");
-                failures.push(format!("{name}: {detail}"));
-            } else {
-                tracing::info!(target: "node", hook = name, "flush hook completed");
-            }
+        Self {
+            pre_drain: Vec::new(),
+            post_drain: Vec::new(),
         }
-        if failures.is_empty() {
-            Ok(())
+    }
+
+    /// Register a named PRE-drain hook: ingress-stopping work only (e.g.
+    /// `"rpc"` listener close, `"network"` peer intake stop). Runs before
+    /// handlers drain their queues; MUST NOT perform durability work.
+    pub fn push_pre_drain(&mut self, name: &'static str, hook: FlushHook) {
+        self.pre_drain.push((name, hook));
+    }
+
+    /// Register a named POST-drain hook: durability work only (e.g.
+    /// `"journal"` fsync/close). Runs after every handler has drained its
+    /// bounded queue, so the flush covers commands processed during shutdown.
+    pub fn push_post_drain(&mut self, name: &'static str, hook: FlushHook) {
+        self.post_drain.push((name, hook));
+    }
+
+    /// Run every PRE-drain hook in registration order, draining the bucket.
+    /// Collects failures without panicking.
+    pub fn run_pre_drain(&mut self) -> Result<(), NodeError> {
+        run_phase("pre-drain", &mut self.pre_drain)
+    }
+
+    /// Run every POST-drain hook in registration order, draining the bucket.
+    /// Collects failures without panicking.
+    pub fn run_post_drain(&mut self) -> Result<(), NodeError> {
+        run_phase("post-drain", &mut self.post_drain)
+    }
+}
+
+/// Run one phase's hooks in registration order, `FnOnce`-draining its bucket
+/// and aggregating failures without panicking.
+fn run_phase(
+    phase: &'static str,
+    hooks: &mut Vec<(&'static str, FlushHook)>,
+) -> Result<(), NodeError> {
+    let mut failures = Vec::new();
+    for (name, hook) in hooks.drain(..) {
+        if let Err(detail) = hook() {
+            tracing::error!(target: "node", phase, hook = name, %detail, "flush hook failed");
+            failures.push(format!("{name}: {detail}"));
         } else {
-            Err(NodeError::Flush {
-                detail: failures.join("; "),
-            })
+            tracing::info!(target: "node", phase, hook = name, "flush hook completed");
         }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(NodeError::Flush {
+            detail: format!("{phase}: {}", failures.join("; ")),
+        })
     }
 }
 
@@ -246,12 +292,31 @@ mod tests {
     }
 
     #[test]
-    fn flush_hooks_collect_failures() {
+    fn flush_hooks_collect_failures_per_phase() {
         let mut hooks = FlushHooks::new();
-        hooks.push("ok", Box::new(|| Ok(())));
-        hooks.push("bad", Box::new(|| Err("boom".into())));
-        let err = hooks.run_all().unwrap_err();
-        assert!(matches!(err, NodeError::Flush { .. }));
+        hooks.push_pre_drain("ok", Box::new(|| Ok(())));
+        hooks.push_pre_drain("bad", Box::new(|| Err("boom".into())));
+        hooks.push_post_drain("journal", Box::new(|| Err("fsync failed".into())));
+
+        let err = hooks.run_pre_drain().unwrap_err();
+        assert!(
+            matches!(err, NodeError::Flush { ref detail } if detail.contains("bad: boom")),
+            "{err}"
+        );
+
+        // A pre-drain failure must not consume the post-drain bucket.
+        let err = hooks.run_post_drain().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                NodeError::Flush { ref detail } if detail.contains("journal: fsync failed")
+            ),
+            "{err}"
+        );
+
+        // FnOnce drain: each bucket runs exactly once; reruns are empty and Ok.
+        assert!(hooks.run_pre_drain().is_ok());
+        assert!(hooks.run_post_drain().is_ok());
     }
 
     #[tokio::test]
