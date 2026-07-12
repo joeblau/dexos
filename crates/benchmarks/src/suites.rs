@@ -63,6 +63,22 @@ pub fn registry() -> Vec<Suite> {
             run: market_order_execution,
         },
         Suite {
+            name: "market-order-execution-empty-book",
+            run: market_order_execution_empty_book,
+        },
+        Suite {
+            name: "market-order-execution-half-book",
+            run: market_order_execution_half_book,
+        },
+        Suite {
+            name: "market-order-execution-full-book",
+            run: market_order_execution_full_book,
+        },
+        Suite {
+            name: "market-order-fill-fanout",
+            run: market_order_fill_fanout,
+        },
+        Suite {
             name: "command-execution",
             run: command_execution,
         },
@@ -141,6 +157,158 @@ pub fn registry() -> Vec<Suite> {
 #[must_use]
 pub fn find(name: &str) -> Option<Suite> {
     registry().into_iter().find(|s| s.name == name)
+}
+
+/// Gate provenance for a suite: the exact production call path it drives and the
+/// scale of its fixtures.
+///
+/// This is what keeps a performance claim honest. Every current suite is a
+/// **microbenchmark** of a single crate call (`microbenchmark == true`), *not* a
+/// measurement of the fully composed authenticated-RPC → sequencing → durable-journal
+/// → execution/risk/root → receipt/checkpoint path over real sockets and storage. A
+/// reader of the report can see, for example, that `market-order-execution` calls
+/// `OrderBook::submit` directly against a one-maker book — so the number is an
+/// engine-only latency, and must be read as such.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SuiteProvenance {
+    /// The suite name (matches [`Suite::name`]).
+    pub name: &'static str,
+    /// The production call path the suite exercises.
+    pub call_path: &'static str,
+    /// The fixture scale: book depth, account/position counts, batch sizes, etc.
+    pub fixture_scale: &'static str,
+    /// `true` for a single-crate microbenchmark; `false` for a composed end-to-end
+    /// path. No current suite is end-to-end.
+    pub microbenchmark: bool,
+}
+
+/// Provenance for a named suite, or `None` if the name is not registered.
+#[must_use]
+pub fn provenance(name: &str) -> Option<SuiteProvenance> {
+    // Resolve the canonical `'static` name from the registry; this also rejects any
+    // name that is not actually registered.
+    let canonical = registry().into_iter().find(|s| s.name == name)?.name;
+    let micro = |call_path, fixture_scale| SuiteProvenance {
+        name: canonical,
+        call_path,
+        fixture_scale,
+        microbenchmark: true,
+    };
+    let p = match canonical {
+        "order-insertion" => micro(
+            "orderbook::OrderBook::submit (resting bid, no cross)",
+            "rolling window of 1024 resting orders across 32 price levels",
+        ),
+        "order-cancellation" => micro(
+            "orderbook::OrderBook::{cancel,submit}",
+            "steady 1024 resting orders; O(1) cancel + O(1) rest per op",
+        ),
+        "order-replacement" => micro(
+            "orderbook::OrderBook::replace (in-place cancel-replace)",
+            "single resting order alternating price/quantity",
+        ),
+        "market-order-execution" => micro(
+            "orderbook::OrderBook::submit (crossing taker, 1 fill)",
+            "one resting maker, replenished each op; engine-only, no sockets/journal",
+        ),
+        "market-order-execution-empty-book" => micro(
+            "orderbook::OrderBook::submit (crossing bid, empty book)",
+            "0 resting maker levels; the no-liquidity path",
+        ),
+        "market-order-execution-half-book" => micro(
+            "orderbook::OrderBook::submit (crossing taker, 1 fill)",
+            "128 resting maker levels; taker consumes 1, depth held constant",
+        ),
+        "market-order-execution-full-book" => micro(
+            "orderbook::OrderBook::submit (crossing taker, 1 fill)",
+            "256 resting maker levels; taker consumes 1, depth held constant",
+        ),
+        "market-order-fill-fanout" => micro(
+            "orderbook::OrderBook::submit (crossing taker, 8 fills)",
+            "8 maker levels swept per taker; fan-out of 8 fills from one submit",
+        ),
+        "command-execution" => micro(
+            "execution::Engine::execute (SetMarkPrice → risk recompute)",
+            "1 account, 1 perpetual market; engine-only, no sockets/journal",
+        ),
+        "risk-check" => micro(
+            "risk::RiskEngine::check_order (pre-trade)",
+            "256 accounts, 1 position each; rotating account set",
+        ),
+        "incremental-margin" => micro(
+            "risk::RiskEngine::apply_fill (per-account recompute)",
+            "64 accounts, alternating fills",
+        ),
+        "liquidation-scan" => micro(
+            "risk::RiskEngine::liquidation_candidates (full scan)",
+            "1024 accounts, 1 position each",
+        ),
+        "oracle-aggregation" => micro(
+            "integer fixed-point median (oracle aggregation stand-in)",
+            "21 feeds, one rotated per op",
+        ),
+        "signature-verify-single" => {
+            micro("crypto::verify_ed25519", "1 signature over a fixed message")
+        }
+        "signature-verify-batch" => {
+            micro("crypto::verify_ed25519_all (batch)", "32 signatures per op")
+        }
+        "checkpoint-construction" => micro(
+            "consensus::{build_checkpoint_header,checkpoint_hash}",
+            "8 command + 8 execution leaf hashes; no consensus round, no sockets",
+        ),
+        "state-root-update" => micro(
+            "state_tree::StateTree::set_account + root",
+            "4096-account tree, 256-byte leaves",
+        ),
+        "log-serialization" => micro(
+            "storage::Record::encode",
+            "single 64-byte-payload record; in-memory, no fsync/disk",
+        ),
+        "snapshot-create-restore" => micro(
+            "storage::Snapshot::{encode,decode,verify}",
+            "256-byte state; in-memory round trip, no disk",
+        ),
+        "command-replay" => micro(
+            "storage::replay over an in-memory SegmentedLog",
+            "64 records; in-memory log, no disk",
+        ),
+        "peer-message-encode" => micro(
+            "codec::Frame::encode",
+            "single market-data frame; bytes only, no socket",
+        ),
+        "peer-message-decode" => micro(
+            "codec::Frame::decode",
+            "single market-data frame; bytes only, no socket",
+        ),
+        "rpc-request-handling" => micro(
+            "codec decode → dispatch → encode (RPC hot path)",
+            "single request; bytes only, no socket, no auth",
+        ),
+        "market-data-fanout" => micro(
+            "codec::Frame::encode → per-subscriber buffer copy",
+            "64 subscribers, 1-slot queues; in-process, no sockets",
+        ),
+        "consensus-vote-handling" => micro(
+            "consensus::VoteCollector::add_vote (verifies signature)",
+            "4-validator BFT committee, 1 vote per op",
+        ),
+        "light-client-proof-verify" => micro(
+            "state_tree::verify_account (Merkle proof)",
+            "1024-account tree, 64 populated; single membership proof",
+        ),
+        _ => return None,
+    };
+    Some(p)
+}
+
+/// Provenance for every registered suite, in registry order.
+#[must_use]
+pub fn all_provenance() -> Vec<SuiteProvenance> {
+    registry()
+        .iter()
+        .filter_map(|s| provenance(s.name))
+        .collect()
 }
 
 // --------------------------------------------------------------------- helpers
@@ -271,6 +439,75 @@ fn market_order_execution(cfg: Config) -> BenchStat {
         let r = book.submit(taker);
         black_box(r.is_ok());
         oid += 2;
+    })
+}
+
+/// Execution against an **empty** book: a marketable bid finds no resting maker and
+/// rests instead of filling. Bounds the resting set with an O(1) cancel of the order
+/// inserted `WINDOW` steps ago. This is the no-liquidity leg of the book-state matrix.
+fn market_order_execution_empty_book(cfg: Config) -> BenchStat {
+    const WINDOW: u64 = 1024;
+    let mut book = OrderBook::new(BookConfig::default());
+    let mut n: u64 = 0;
+    bench("market-order-execution-empty-book", cfg, || {
+        // No resting asks: the crossing bid finds nothing and rests.
+        let r = book.submit(bid(n, n, 100, 1));
+        black_box(r.is_ok());
+        if n >= WINDOW {
+            let _ = book.cancel(OrderId::new(n - WINDOW));
+        }
+        n += 1;
+    })
+}
+
+/// Execution against a book resting `prefill` distinct ask levels, crossing the best
+/// maker each step and replenishing that level so the depth stays constant. Shared by
+/// the half- and full-book legs of the matrix.
+fn execution_over_depth(name: &'static str, cfg: Config, prefill: i64) -> BenchStat {
+    let mut book = OrderBook::new(BookConfig::default());
+    let mut oid: u64 = 1;
+    // Pre-fill `prefill` distinct resting ask levels (prices 200..200+prefill).
+    for lvl in 0..prefill {
+        let _ = book.submit(ask(oid, oid, 200 + lvl, 1, 2));
+        oid += 1;
+    }
+    bench(name, cfg, || {
+        // Cross the best resting maker (price 200), then replenish that level so the
+        // book stays deep: a taker consuming one maker with `prefill-1` levels resting.
+        let r = book.submit(bid(oid, oid, 200, 1));
+        black_box(r.is_ok());
+        oid += 1;
+        let _ = book.submit(ask(oid, oid, 200, 1, 2));
+        oid += 1;
+    })
+}
+
+/// Execution against a **half-depth** resting book (128 levels).
+fn market_order_execution_half_book(cfg: Config) -> BenchStat {
+    execution_over_depth("market-order-execution-half-book", cfg, 128)
+}
+
+/// Execution against a **full-depth** resting book (256 levels).
+fn market_order_execution_full_book(cfg: Config) -> BenchStat {
+    execution_over_depth("market-order-execution-full-book", cfg, 256)
+}
+
+/// Fill fan-out: one crossing taker sweeps `FANOUT` resting makers across `FANOUT`
+/// price levels in a single submit, producing `FANOUT` fills. The makers are rebuilt
+/// each step so the workload stays bounded.
+fn market_order_fill_fanout(cfg: Config) -> BenchStat {
+    const FANOUT: i64 = 8;
+    let mut book = OrderBook::new(BookConfig::default());
+    let mut oid: u64 = 1;
+    bench("market-order-fill-fanout", cfg, || {
+        for lvl in 0..FANOUT {
+            let _ = book.submit(ask(oid, oid, 100 + lvl, 1, 2));
+            oid += 1;
+        }
+        // Taker priced at the top level with quantity FANOUT sweeps every maker.
+        let r = book.submit(bid(oid, oid, 100 + FANOUT - 1, FANOUT));
+        black_box(r.is_ok());
+        oid += 1;
     })
 }
 
@@ -722,6 +959,60 @@ mod tests {
                 suite.name
             );
         }
+    }
+
+    #[test]
+    fn every_registered_suite_has_provenance() {
+        for suite in registry() {
+            let p = provenance(suite.name)
+                .unwrap_or_else(|| panic!("no provenance for {}", suite.name));
+            assert_eq!(p.name, suite.name);
+            assert!(!p.call_path.is_empty(), "{} call_path empty", suite.name);
+            assert!(
+                !p.fixture_scale.is_empty(),
+                "{} fixture_scale empty",
+                suite.name
+            );
+            assert!(
+                p.microbenchmark,
+                "{} should be a microbenchmark",
+                suite.name
+            );
+        }
+        assert_eq!(all_provenance().len(), registry().len());
+        assert!(provenance("no-such-suite").is_none());
+    }
+
+    #[test]
+    fn fill_fanout_workload_produces_multiple_fills() {
+        // Prove the fan-out matrix does real multi-fill work: 1 taker, 8 makers, 8 fills.
+        let mut book = OrderBook::new(BookConfig::default());
+        let mut oid = 1u64;
+        for lvl in 0..8i64 {
+            book.submit(ask(oid, oid, 100 + lvl, 1, 2)).unwrap();
+            oid += 1;
+        }
+        let res = book.submit(bid(oid, oid, 107, 8)).unwrap();
+        assert_eq!(res.fills.len(), 8, "taker should sweep all 8 makers");
+    }
+
+    #[test]
+    fn full_book_cross_fills_exactly_one_maker() {
+        let mut book = OrderBook::new(BookConfig::default());
+        let mut oid = 1u64;
+        for lvl in 0..256i64 {
+            book.submit(ask(oid, oid, 200 + lvl, 1, 2)).unwrap();
+            oid += 1;
+        }
+        let res = book.submit(bid(oid, oid, 200, 1)).unwrap();
+        assert_eq!(res.fills.len(), 1, "taker at best price crosses one maker");
+    }
+
+    #[test]
+    fn empty_book_cross_rests_without_fills() {
+        let mut book = OrderBook::new(BookConfig::default());
+        let res = book.submit(bid(1, 1, 100, 1)).unwrap();
+        assert!(res.fills.is_empty(), "no makers means no fills");
     }
 
     #[test]

@@ -41,7 +41,10 @@ pub mod targets;
 pub use harness::{bench, measure_allocations, Config};
 pub use report::{Provenance, Report, SCHEMA_VERSION};
 pub use stats::{percentile_permille, BenchStat, HwCounters};
-pub use suites::{find as find_suite, registry, Suite};
+pub use suites::{
+    all_provenance, find as find_suite, provenance as suite_provenance, registry, Suite,
+    SuiteProvenance,
+};
 pub use targets::{
     evaluate as evaluate_targets, spec_targets, Comparison, Metric, Target, TargetEvaluation,
     TargetResult,

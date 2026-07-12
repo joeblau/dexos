@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use clap::Parser;
 use loadgen::{
-    ratio_from_unit_f64, run_scenario, Adversarial, Impairment, LoadScenario, OracleWorkload,
-    RegionConfig,
+    ratio_from_unit_f64, run_measured, run_scenario, Adversarial, Impairment, LoadScenario,
+    OracleWorkload, RegionConfig,
 };
 
 #[derive(Parser, Debug)]
@@ -61,6 +61,11 @@ struct Cli {
     /// Load a full TOML scenario file (overrides the flags above).
     #[arg(long, value_name = "PATH")]
     scenario: Option<PathBuf>,
+    /// Drive the real target over a live socket and measure it. An unreachable
+    /// target exits nonzero, and submitted commands are reconciled against server
+    /// receipts. Without this flag the run is a labelled deterministic *simulation*.
+    #[arg(long)]
+    measured: bool,
 }
 
 /// Parse a duration with an `ms`, `s`, or `m` suffix into a [`Duration`].
@@ -151,6 +156,29 @@ fn main() -> ExitCode {
         None => scenario_from_cli(&cli),
     };
 
+    if cli.measured {
+        // Live measurement: a real socket to the real target. Unreachable targets and
+        // count mismatches fail loudly here instead of yielding a rosy report.
+        return match run_measured(&scenario) {
+            Ok(report) => {
+                println!("{}", report.to_json());
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("error: {err}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    // Simulation: no socket is opened. The report models the pipeline from fixed
+    // per-stage costs; it is explicitly NOT a measurement of `--target`. We say so on
+    // stderr so an operator cannot mistake a simulation for a live measurement.
+    eprintln!(
+        "note: simulation mode — results model the pipeline and are NOT a live \
+         measurement of '{}'. Re-run with --measured to drive the real target.",
+        scenario.target
+    );
     match run_scenario(&scenario) {
         Ok(report) => {
             println!("{}", report.to_json());
@@ -287,5 +315,42 @@ mod tests {
         let report = run_scenario(&scenario_from_cli(&cli)).unwrap();
         assert_eq!(report.planned_orders, 200);
         assert!(report.to_json().starts_with('{'));
+    }
+
+    #[test]
+    fn measured_flag_parses_and_defaults_off() {
+        let sim = Cli::try_parse_from(["market-loadgen", "--target", "127.0.0.1:9000"]).unwrap();
+        assert!(!sim.measured, "measured is opt-in");
+        let meas =
+            Cli::try_parse_from(["market-loadgen", "--target", "127.0.0.1:9000", "--measured"])
+                .unwrap();
+        assert!(meas.measured);
+    }
+
+    #[test]
+    fn measured_run_against_unreachable_target_fails() {
+        use loadgen::LoadError;
+        use std::net::TcpListener;
+
+        // Bind then drop so the port is guaranteed closed and refuses connections.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("addr");
+        drop(listener);
+
+        let cli = Cli::try_parse_from([
+            "market-loadgen",
+            "--target",
+            &addr.to_string(),
+            "--users",
+            "4",
+            "--orders-per-second",
+            "8",
+            "--duration",
+            "1s",
+            "--measured",
+        ])
+        .unwrap();
+        let err = run_measured(&scenario_from_cli(&cli)).expect_err("unreachable must fail");
+        assert!(matches!(err, LoadError::Unreachable { .. }), "{err:?}");
     }
 }

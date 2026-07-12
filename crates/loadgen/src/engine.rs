@@ -41,6 +41,29 @@ pub enum LoadError {
     /// The scenario or flat config was invalid.
     #[error("invalid configuration: {0}")]
     Config(#[from] crate::config::ConfigError),
+    /// The measured-mode target could not be reached (DNS/connect failure or
+    /// timeout). A load run against an unreachable target fails here rather than
+    /// silently producing a rosy simulated report.
+    #[error("target `{target}` unreachable: {reason}")]
+    Unreachable {
+        /// The configured target address.
+        target: String,
+        /// Why the connection could not be established.
+        reason: String,
+    },
+    /// A socket read/write failed mid-run in measured mode.
+    #[error("measured-mode network I/O error: {0}")]
+    Io(String),
+    /// The submitted command count did not reconcile with the server's receipts.
+    /// This is the guard that stops measured mode from ever reporting success for a
+    /// run the server did not fully acknowledge.
+    #[error("reconciliation failed: submitted {submitted} but server acknowledged {receipts}")]
+    Reconciliation {
+        /// Commands the generator submitted.
+        submitted: u64,
+        /// Receipts the server acknowledged.
+        receipts: u64,
+    },
 }
 
 /// A synchronisation barrier all regions arrive at before generating load.

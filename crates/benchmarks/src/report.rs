@@ -275,6 +275,33 @@ impl Report {
                 t.id, t.suite, t.metric, t.comparison, t.threshold, measured, result,
             );
         }
+
+        // Gate provenance: for every measured suite, the exact production call path and
+        // fixture scale, so a reader can see precisely what each number does — and does
+        // not — measure. Every current suite is a single-crate microbenchmark, not the
+        // fully composed end-to-end path.
+        let _ = writeln!(md, "\n## Suite provenance\n");
+        let _ = writeln!(
+            md,
+            "| suite | production call path | fixture scale | kind |"
+        );
+        let _ = writeln!(md, "|---|---|---|---|");
+        for s in &self.stats {
+            if let Some(p) = crate::suites::provenance(&s.name) {
+                let kind = if p.microbenchmark {
+                    "microbenchmark"
+                } else {
+                    "end-to-end"
+                };
+                let _ = writeln!(
+                    md,
+                    "| {} | {} | {} | {} |",
+                    s.name, p.call_path, p.fixture_scale, kind,
+                );
+            } else {
+                let _ = writeln!(md, "| {} | (unregistered) | (unknown) | unknown |", s.name);
+            }
+        }
         md
     }
 }
@@ -391,6 +418,27 @@ mod tests {
         assert!(md.contains("order-insertion"));
         assert!(md.contains("Spec target gate"));
         assert!(md.len() > 200);
+    }
+
+    #[test]
+    fn markdown_includes_gate_provenance() {
+        let r = sample_report();
+        let md = r.to_markdown();
+        // The provenance section names the exact production call path and fixture
+        // scale for each suite, and marks the microbenchmark kind.
+        assert!(
+            md.contains("## Suite provenance"),
+            "provenance section missing"
+        );
+        assert!(
+            md.contains("orderbook::OrderBook::submit"),
+            "call path missing"
+        );
+        assert!(md.contains("microbenchmark"), "kind column missing");
+        assert!(
+            md.contains("one resting maker"),
+            "fixture scale for market-order-execution missing"
+        );
     }
 
     #[test]

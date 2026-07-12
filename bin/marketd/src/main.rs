@@ -159,19 +159,7 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
             );
             Ok(())
         }
-        Command::Benchmark(a) => {
-            let report = benchmarks::run_all();
-            let json = benchmarks::render_json(&report);
-            std::fs::write(&a.output, &json)
-                .map_err(|e| anyhow::anyhow!("writing {}: {e}", a.output.display()))?;
-            println!("{}", benchmarks::render_markdown(&report));
-            println!(
-                "suite='{}' — wrote machine-readable results to {}",
-                a.suite,
-                a.output.display()
-            );
-            Ok(())
-        }
+        Command::Benchmark(a) => run_benchmark(&a, benchmarks::Config::default()),
         Command::Replay(a) => {
             println!(
                 "replay: snapshot='{}' log='{}' [Phase 0 stub — deterministic replay lands in the storage epic]",
@@ -231,6 +219,61 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+/// The reserved suite selector that runs every registered suite and enforces the
+/// spec-target gate.
+const SUITE_ALL: &str = "all";
+
+/// Run the benchmark subcommand: honour `--suite` and `--config`, and exit nonzero
+/// when the suite selector is invalid or the spec-target gate fails.
+///
+/// Suite selection genuinely changes what runs: `all` runs every suite (and gates on
+/// the spec targets), a specific name runs exactly that suite, and an unknown name is
+/// rejected rather than silently falling back to a full pass.
+fn run_benchmark(args: &BenchmarkArgs, config: benchmarks::Config) -> anyhow::Result<()> {
+    // `--config` is no longer ignored: an invalid benchmarked-node config aborts the
+    // run (nonzero) instead of being silently discarded.
+    if let Some(path) = &args.config {
+        let _validated = NodeConfig::load(path)
+            .map_err(|e| anyhow::anyhow!("invalid --config {}: {e}", path.display()))?;
+        println!("benchmarked-node config: {} (validated)", path.display());
+    }
+
+    let gated = args.suite == SUITE_ALL;
+    let report = if gated {
+        benchmarks::run_all_with(config)
+    } else {
+        benchmarks::run_suite(&args.suite, config).ok_or_else(|| {
+            let known: Vec<&str> = std::iter::once(SUITE_ALL)
+                .chain(benchmarks::registry().iter().map(|s| s.name))
+                .collect();
+            anyhow::anyhow!(
+                "unknown benchmark suite '{}'; known suites: {}",
+                args.suite,
+                known.join(", ")
+            )
+        })?
+    };
+
+    let json = benchmarks::render_json(&report);
+    std::fs::write(&args.output, &json)
+        .map_err(|e| anyhow::anyhow!("writing {}: {e}", args.output.display()))?;
+    println!("{}", benchmarks::render_markdown(&report));
+    println!(
+        "suite='{}' — ran {} suite(s), wrote machine-readable results to {}",
+        args.suite,
+        report.stats.len(),
+        args.output.display()
+    );
+
+    // Only the full run carries every gated suite; a single-suite run is a targeted
+    // micro-measurement and is not held to the whole-system gate (whose other suites
+    // would be reported missing).
+    if gated && !report.all_targets_passed {
+        anyhow::bail!("spec-target gate FAILED — see the report above");
+    }
+    Ok(())
 }
 
 /// Lowercase hex encoding (no external dep).
@@ -435,6 +478,82 @@ mod tests {
             "seed file must be owner read/write only"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A small benchmark config so suite-selection tests run fast.
+    fn tiny_bench() -> benchmarks::Config {
+        benchmarks::Config {
+            iterations: 16,
+            warmup: 2,
+        }
+    }
+
+    fn bench_args(suite: &str, output: PathBuf, config: Option<PathBuf>) -> BenchmarkArgs {
+        BenchmarkArgs {
+            suite: suite.to_string(),
+            output,
+            config,
+        }
+    }
+
+    #[test]
+    fn unknown_benchmark_suite_is_rejected() {
+        let out = unique_temp_path("bench-unknown");
+        let err = run_benchmark(
+            &bench_args("does-not-exist", out.clone(), None),
+            tiny_bench(),
+        )
+        .expect_err("unknown suite must be rejected");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("unknown benchmark suite"), "{msg}");
+        // A rejected selection must not fabricate a results file.
+        assert!(
+            !out.exists(),
+            "no output should be written for a bad selection"
+        );
+    }
+
+    #[test]
+    fn single_suite_selection_runs_exactly_that_suite() {
+        let out = unique_temp_path("bench-single");
+        run_benchmark(&bench_args("risk-check", out.clone(), None), tiny_bench())
+            .expect("valid single suite runs");
+        let json = std::fs::read_to_string(&out).expect("results written");
+        let report = benchmarks::Report::from_json(&json).expect("valid results json");
+        assert_eq!(report.stats.len(), 1, "only the selected suite ran");
+        assert_eq!(report.stats[0].name, "risk-check");
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn all_selection_runs_the_full_suite_set() {
+        let out = unique_temp_path("bench-all");
+        // The whole-system gate may pass or fail on arbitrary CI hardware, so we do
+        // not assert on the Result — only that `all` actually ran every suite.
+        let _ = run_benchmark(&bench_args("all", out.clone(), None), tiny_bench());
+        let json = std::fs::read_to_string(&out).expect("results written");
+        let report = benchmarks::Report::from_json(&json).expect("valid results json");
+        assert_eq!(
+            report.stats.len(),
+            benchmarks::registry().len(),
+            "all suites ran"
+        );
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn invalid_config_aborts_the_benchmark() {
+        let out = unique_temp_path("bench-cfg");
+        let cfg = unique_temp_path("bench-badcfg");
+        std::fs::write(&cfg, "this is = not [valid toml").unwrap();
+        let err = run_benchmark(
+            &bench_args("risk-check", out.clone(), Some(cfg.clone())),
+            tiny_bench(),
+        )
+        .expect_err("invalid config must abort");
+        assert!(format!("{err:#}").contains("invalid --config"));
+        let _ = std::fs::remove_file(&cfg);
+        let _ = std::fs::remove_file(&out);
     }
 
     /// A unique, per-invocation temp path so parallel tests never collide.
