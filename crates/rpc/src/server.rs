@@ -381,8 +381,14 @@ where
                         // cannot be aborted) can be reaped below.
                         let result = match tokio::time::timeout(dispatch_timeout, &mut join).await {
                             Ok(Ok(resp)) => resp,
+                            // The dispatch task died (a panic — it is never
+                            // aborted). The request was decoded, so like every
+                            // post-decode error reply this one echoes the
+                            // request's id: a pipelining client correlates
+                            // in-flight requests by `request_id`, and an
+                            // uncorrelated reply would break that (#421).
                             Ok(Err(join_err)) => RpcResponse::new(
-                                0,
+                                request_id,
                                 Err(RpcError::Internal(format!("dispatch join: {join_err}"))),
                             ),
                             Err(_elapsed) => {
