@@ -47,7 +47,7 @@ use tokio::time::timeout;
 
 use crate::budget::ByteBudget;
 use crate::channel::AsyncPriorityChannel;
-use crate::connection::{Connection, ConnectionOpts, TransportConfig, MSG_TYPE_DATAGRAM};
+use crate::connection::{ConnSlot, Connection, ConnectionOpts, TransportConfig, MSG_TYPE_DATAGRAM};
 use crate::disconnect::{classify_disconnect, DisconnectMetrics, DisconnectReason};
 use crate::error::TransportError;
 use crate::peer::{Peer, PeerId};
@@ -351,11 +351,7 @@ fn spawn_quic_connection(
     });
     tasks.push(dispatcher);
 
-    for (idx, (mut send, mut rx)) in class_sends
-        .into_iter()
-        .zip(class_rxs.into_iter())
-        .enumerate()
-    {
+    for (idx, (mut send, mut rx)) in class_sends.into_iter().zip(class_rxs).enumerate() {
         let class = TrafficClass::from_u8(u8::try_from(idx).unwrap_or(u8::MAX))
             .unwrap_or(TrafficClass::Sync);
         let chunk = class_chunk_limit(class);
@@ -553,7 +549,10 @@ pub struct QuicTransport {
     peer_dedup: Arc<Mutex<PeerDedup>>,
     handshake_sem: Arc<Semaphore>,
     epoch_counter: AtomicU64,
-    conn_counts: Mutex<HashMap<PeerId, usize>>,
+    /// Live connection counts per peer (connection budget). Shared with the
+    /// [`ConnSlot`] guards owned by live [`Connection`]s, which release their
+    /// reservation on drop.
+    conn_counts: Arc<Mutex<HashMap<PeerId, usize>>>,
     /// When false, datagram channels are not wired (fail-closed vs silent no-op).
     enable_datagrams: bool,
 }
@@ -600,7 +599,7 @@ impl QuicTransport {
             membership: Arc::new(Mutex::new(membership)),
             handshake_sem: Arc::new(Semaphore::new(max_hs)),
             epoch_counter: AtomicU64::new(1),
-            conn_counts: Mutex::new(HashMap::new()),
+            conn_counts: Arc::new(Mutex::new(HashMap::new())),
             enable_datagrams,
         })
     }
@@ -636,19 +635,25 @@ impl QuicTransport {
             .unwrap_or_else(PoisonError::into_inner) = membership;
     }
 
-    fn reserve_conn_slot(&self, peer: PeerId) -> Result<(), TransportError> {
+    /// Reserve one connection slot for `peer` against the per-peer budget.
+    ///
+    /// Returns a [`ConnSlot`] guard that releases the reservation when dropped,
+    /// so the budget tracks live connections rather than lifetime totals. A
+    /// refused reservation never inserts an entry, keeping the map bounded.
+    fn reserve_conn_slot(&self, peer: PeerId) -> Result<ConnSlot, TransportError> {
         let mut counts = self
             .conn_counts
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let entry = counts.entry(peer).or_insert(0);
-        if *entry >= self.cfg.connection_budget_per_peer {
+        let count = counts.get(&peer).copied().unwrap_or(0);
+        if count >= self.cfg.connection_budget_per_peer {
             return Err(TransportError::Backpressure {
                 class: TrafficClass::Sync,
             });
         }
-        *entry += 1;
-        Ok(())
+        counts.insert(peer, count + 1);
+        drop(counts);
+        Ok(ConnSlot::new(peer, self.conn_counts.clone()))
     }
 
     async fn finish_session(
@@ -733,13 +738,14 @@ impl QuicTransport {
             }
         };
 
-        self.reserve_conn_slot(hs.peer)?;
+        let conn_slot = self.reserve_conn_slot(hs.peer)?;
         let opts = ConnectionOpts {
             epoch: hs.epoch,
             role,
             wire_version: hs.wire_version,
             capabilities: hs.capabilities,
             peer_dedup: Some(self.peer_dedup.clone()),
+            conn_slot: Some(conn_slot),
         };
 
         Ok(spawn_quic_connection(
@@ -881,6 +887,41 @@ mod tests {
     async fn bound(seed: u8) -> Arc<QuicTransport> {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         Arc::new(QuicTransport::bind(addr, kp(seed), cfg()).await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn conn_budget_releases_slots_when_guards_drop() {
+        let t = bound(109).await;
+        let peer = PeerId::from([42u8; 32]);
+        let budget = t.cfg.connection_budget_per_peer;
+        assert!(budget > 0);
+
+        // The budget admits exactly `budget` live reservations.
+        let mut slots = Vec::new();
+        for _ in 0..budget {
+            slots.push(t.reserve_conn_slot(peer).unwrap());
+        }
+        assert!(matches!(
+            t.reserve_conn_slot(peer),
+            Err(TransportError::Backpressure { .. })
+        ));
+
+        // Dropping one guard frees exactly one slot.
+        drop(slots.pop());
+        let refilled = t.reserve_conn_slot(peer).unwrap();
+        assert!(matches!(
+            t.reserve_conn_slot(peer),
+            Err(TransportError::Backpressure { .. })
+        ));
+
+        // Releasing every slot removes the peer's entry entirely.
+        drop(refilled);
+        slots.clear();
+        assert!(t
+            .conn_counts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty());
     }
 
     #[tokio::test]

@@ -47,7 +47,7 @@ use crate::batch::{BatchSender, BatchSink};
 use crate::budget::ByteBudget;
 use crate::channel::AsyncPriorityChannel;
 use crate::class_auth::PeerRole;
-use crate::connection::{Connection, ConnectionOpts, TransportConfig, MSG_TYPE_DATAGRAM};
+use crate::connection::{ConnSlot, Connection, ConnectionOpts, TransportConfig, MSG_TYPE_DATAGRAM};
 use crate::disconnect::{classify_disconnect, DisconnectMetrics, DisconnectReason};
 use crate::error::TransportError;
 use crate::framing::{append_encrypted_record, read_encrypted_frame};
@@ -575,8 +575,10 @@ pub struct TcpTransport {
     handshake_sem: Arc<Semaphore>,
     /// Monotonic epoch counter for outbound sessions.
     epoch_counter: AtomicU64,
-    /// Live connection counts per peer (connection budget).
-    conn_counts: Mutex<HashMap<PeerId, usize>>,
+    /// Live connection counts per peer (connection budget). Shared with the
+    /// [`ConnSlot`] guards owned by live [`Connection`]s, which release their
+    /// reservation on drop.
+    conn_counts: Arc<Mutex<HashMap<PeerId, usize>>>,
 }
 
 impl TcpTransport {
@@ -614,7 +616,7 @@ impl TcpTransport {
             membership: Arc::new(Mutex::new(membership)),
             handshake_sem: Arc::new(Semaphore::new(max_hs)),
             epoch_counter: AtomicU64::new(1),
-            conn_counts: Mutex::new(HashMap::new()),
+            conn_counts: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -720,19 +722,25 @@ impl TcpTransport {
         }
     }
 
-    fn reserve_conn_slot(&self, peer: PeerId) -> Result<(), TransportError> {
+    /// Reserve one connection slot for `peer` against the per-peer budget.
+    ///
+    /// Returns a [`ConnSlot`] guard that releases the reservation when dropped,
+    /// so the budget tracks live connections rather than lifetime totals. A
+    /// refused reservation never inserts an entry, keeping the map bounded.
+    fn reserve_conn_slot(&self, peer: PeerId) -> Result<ConnSlot, TransportError> {
         let mut counts = self
             .conn_counts
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let entry = counts.entry(peer).or_insert(0);
-        if *entry >= self.cfg.connection_budget_per_peer {
+        let count = counts.get(&peer).copied().unwrap_or(0);
+        if count >= self.cfg.connection_budget_per_peer {
             return Err(TransportError::Backpressure {
                 class: codec::TrafficClass::Sync,
             });
         }
-        *entry += 1;
-        Ok(())
+        counts.insert(peer, count + 1);
+        drop(counts);
+        Ok(ConnSlot::new(peer, self.conn_counts.clone()))
     }
 }
 
@@ -745,7 +753,7 @@ impl Transport for TcpTransport {
         let (hs, session) = self
             .handshake_gated(&mut stream, Some(peer.id), true, local_epoch)
             .await?;
-        self.reserve_conn_slot(hs.peer)?;
+        let conn_slot = self.reserve_conn_slot(hs.peer)?;
         let role = self
             .membership
             .lock()
@@ -758,6 +766,7 @@ impl Transport for TcpTransport {
             wire_version: hs.wire_version,
             capabilities: hs.capabilities,
             peer_dedup: Some(self.peer_dedup.clone()),
+            conn_slot: Some(conn_slot),
         };
         Ok(spawn_connection(
             stream,
@@ -791,13 +800,14 @@ impl Transport for TcpTransport {
                 }
             }
         };
-        self.reserve_conn_slot(hs.peer)?;
+        let conn_slot = self.reserve_conn_slot(hs.peer)?;
         let opts = ConnectionOpts {
             epoch: hs.epoch,
             role,
             wire_version: hs.wire_version,
             capabilities: hs.capabilities,
             peer_dedup: Some(self.peer_dedup.clone()),
+            conn_slot: Some(conn_slot),
         };
         Ok(spawn_connection(
             stream,
@@ -1261,6 +1271,7 @@ mod tests {
                 wire_version: 1,
                 capabilities: 0,
                 peer_dedup: None,
+                conn_slot: None,
             },
         );
         inbound
@@ -1279,6 +1290,44 @@ mod tests {
                 role: PeerRole::Gateway
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn conn_budget_releases_slots_when_guards_drop() {
+        let t = bound(9).await;
+        let peer = PeerId::from([42u8; 32]);
+        let budget = t.cfg.connection_budget_per_peer;
+        assert!(budget > 0);
+
+        // (a) The budget admits exactly `budget` live reservations; the next
+        // reserve is refused with Backpressure.
+        let mut slots = Vec::new();
+        for _ in 0..budget {
+            slots.push(t.reserve_conn_slot(peer).unwrap());
+        }
+        assert!(matches!(
+            t.reserve_conn_slot(peer),
+            Err(TransportError::Backpressure { .. })
+        ));
+
+        // (b) Dropping one guard frees exactly one slot: a new reserve
+        // succeeds again, and the budget is enforced once more after it.
+        drop(slots.pop());
+        let refilled = t.reserve_conn_slot(peer).unwrap();
+        assert!(matches!(
+            t.reserve_conn_slot(peer),
+            Err(TransportError::Backpressure { .. })
+        ));
+
+        // (c) Releasing every slot removes the peer's entry entirely, so the
+        // map stays bounded by peers with live connections.
+        drop(refilled);
+        slots.clear();
+        assert!(t
+            .conn_counts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty());
     }
 
     #[test]
