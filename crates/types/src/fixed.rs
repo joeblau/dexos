@@ -152,6 +152,29 @@ impl Amount {
         Ok(Amount(product / i128::from(RATIO_SCALE)))
     }
 
+    /// Multiply by a ratio and round the result toward positive infinity.
+    ///
+    /// Use this for non-negative obligations such as initial/maintenance
+    /// margin and fees: a fractional micro-unit is collected instead of being
+    /// silently discarded. Signed economic values (PnL, funding and scenario
+    /// payoffs) should continue to use [`Amount::mul_ratio`], whose toward-zero
+    /// policy is symmetric around zero.
+    #[inline]
+    pub fn mul_ratio_ceil(self, ratio: Ratio) -> Result<Amount, ArithError> {
+        let product = self
+            .0
+            .checked_mul(i128::from(ratio.0))
+            .ok_or(ArithError::Overflow)?;
+        let divisor = i128::from(RATIO_SCALE);
+        let quotient = product / divisor;
+        let remainder = product % divisor;
+        Ok(Amount(if remainder > 0 {
+            quotient.checked_add(1).ok_or(ArithError::Overflow)?
+        } else {
+            quotient
+        }))
+    }
+
     /// Widen a [`Quantity`] into an [`Amount`] at the same 6-dp scale.
     #[inline]
     pub const fn from_quantity(q: Quantity) -> Amount {
@@ -174,6 +197,23 @@ impl Price {
         // product scale is PRICE_SCALE*QTY_SCALE (1e12); Amount scale is 1e6.
         let divisor = i128::from(PRICE_SCALE) * i128::from(QTY_SCALE) / AMOUNT_SCALE;
         Ok(Amount(product / divisor))
+    }
+
+    /// Non-negative notional rounded toward positive infinity, suitable for
+    /// risk limits and fee bases. Signed PnL must use [`Price::notional`].
+    #[inline]
+    pub fn notional_ceil(self, qty: Quantity) -> Result<Amount, ArithError> {
+        let product = i128::from(self.0)
+            .checked_mul(i128::from(qty.0))
+            .ok_or(ArithError::Overflow)?;
+        let divisor = i128::from(PRICE_SCALE) * i128::from(QTY_SCALE) / AMOUNT_SCALE;
+        let quotient = product / divisor;
+        let remainder = product % divisor;
+        Ok(Amount(if remainder > 0 {
+            quotient.checked_add(1).ok_or(ArithError::Overflow)?
+        } else {
+            quotient
+        }))
     }
 }
 
@@ -251,6 +291,25 @@ mod tests {
         // 50 bps of 1_000_000 micro (=1.0) is 0.005 = 5000 micro
         let fifty_bps = Ratio::from_bps(50).unwrap();
         assert_eq!(Amount(1_000_000).mul_ratio(fifty_bps), Ok(Amount(5_000)));
+    }
+
+    #[test]
+    fn directed_rounding_golden_dust_vectors() {
+        let half = Ratio::from_raw(RATIO_SCALE / 2);
+        assert_eq!(Amount::from_raw(1).mul_ratio(half), Ok(Amount::ZERO));
+        assert_eq!(
+            Amount::from_raw(1).mul_ratio_ceil(half),
+            Ok(Amount::from_raw(1))
+        );
+        assert_eq!(Amount::from_raw(-1).mul_ratio_ceil(half), Ok(Amount::ZERO));
+        assert_eq!(
+            Amount::from_raw(2).mul_ratio_ceil(half),
+            Ok(Amount::from_raw(1))
+        );
+        assert_eq!(
+            Price::from_raw(1).notional_ceil(Quantity::from_raw(1)),
+            Ok(Amount::from_raw(1))
+        );
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //! cancellation, atomic cancel-replace, cancel-all, baskets, self-trade
 //! prevention, reduce-only clamping, and client idempotency.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use types::{AccountId, Hash, OrderId, OrderType, Price, Quantity, Side, TimeInForce};
 
@@ -37,6 +37,7 @@ pub struct OrderBook {
     bids: SideBook,
     asks: SideBook,
     id_index: HashMap<OrderId, Locator>,
+    account_orders: HashMap<AccountId, BTreeSet<OrderId>>,
     positions: HashMap<AccountId, Quantity>,
     dedup: DedupCache,
 }
@@ -50,6 +51,7 @@ impl OrderBook {
             bids: SideBook::new(Side::Bid),
             asks: SideBook::new(Side::Ask),
             id_index: HashMap::with_capacity(config.capacity),
+            account_orders: HashMap::new(),
             positions: HashMap::new(),
             dedup: DedupCache::with_capacity(config.dedup_capacity),
             config,
@@ -133,12 +135,10 @@ impl OrderBook {
     /// Cancel every resting order owned by `account`, returning the count.
     /// Cancellation order is deterministic (ascending order id).
     pub fn cancel_all(&mut self, account: AccountId) -> u32 {
-        let mut targets: Vec<OrderId> = self
-            .id_index
-            .iter()
-            .filter_map(|(id, loc)| (loc.account == account).then_some(*id))
-            .collect();
-        targets.sort_unstable();
+        let targets: Vec<OrderId> = self
+            .account_orders
+            .get(&account)
+            .map_or_else(Vec::new, |ids| ids.iter().copied().collect());
         for id in &targets {
             if let Some(loc) = self.id_index.get(id).copied() {
                 self.remove_resting(loc.side, loc.slot);
@@ -526,6 +526,13 @@ impl OrderBook {
 
     /// Insert `order` onto the book as a resting maker.
     fn rest_order(&mut self, order: &NewOrder, remaining: Quantity) -> Result<(), OrderError> {
+        let current = match order.side {
+            Side::Bid => self.bids.level_total(order.price),
+            Side::Ask => self.asks.level_total(order.price),
+        };
+        current
+            .checked_add(remaining)
+            .map_err(|_| OrderError::Overflow)?;
         let node = Node::new(order, remaining);
         let slot = self
             .slab
@@ -544,13 +551,17 @@ impl OrderBook {
                 account: order.account,
             },
         );
+        self.account_orders
+            .entry(order.account)
+            .or_default()
+            .insert(order.order_id);
         Ok(())
     }
 
     /// Unlink and free a resting order in O(1), keeping the id index consistent.
     fn remove_resting(&mut self, side: Side, slot: u32) {
-        let oid = match self.slab.get(slot) {
-            Some(n) => n.order_id,
+        let (oid, account) = match self.slab.get(slot) {
+            Some(n) => (n.order_id, n.account),
             None => return,
         };
         let book = match side {
@@ -560,6 +571,12 @@ impl OrderBook {
         book.unlink(&mut self.slab, slot);
         let _ = self.slab.remove(slot);
         self.id_index.remove(&oid);
+        if let Some(ids) = self.account_orders.get_mut(&account) {
+            ids.remove(&oid);
+            if ids.is_empty() {
+                self.account_orders.remove(&account);
+            }
+        }
     }
 }
 

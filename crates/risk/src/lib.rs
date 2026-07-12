@@ -19,6 +19,19 @@
 //!
 //! # Margin & liquidation waterfall
 //!
+//! # Rounding and dust policy
+//!
+//! | Operation | Direction | Rationale |
+//! |---|---|---|
+//! | Initial/maintenance margin and non-negative fees | toward +infinity | obligations never under-collect |
+//! | Notional risk/fee bases | toward +infinity | sub-micro-unit exposure is retained |
+//! | Realized/unrealized PnL, funding and scenario payoffs | toward zero | symmetric signed accounting |
+//! | Settlement transfers | exact fixed-point units | no implicit dust redistribution |
+//!
+//! Any positive fractional obligation therefore becomes one micro-unit. Dust is
+//! retained by the collecting account; signed economic values never inherit
+//! this directed rounding rule.
+//!
 //! Isolated or cross (risk-group-netted) margin, per-market and portfolio
 //! notional caps, an allocation-free [`RiskEngine::check_order`] pre-trade gate,
 //! a maintenance-margin liquidation scan and FIFO queue, an

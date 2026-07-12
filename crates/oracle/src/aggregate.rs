@@ -34,6 +34,10 @@ use crate::math::{
 use crate::observation::PriceObservation;
 use crate::producer::ProducerRegistry;
 
+/// Hard bound on untrusted reports admitted to one aggregation tick. The check
+/// precedes registry lookup, signature verification, and statistical work.
+pub const MAX_AGGREGATION_OBSERVATIONS: usize = 1_024;
+
 /// Tunable parameters for local aggregation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AggregationConfig {
@@ -143,6 +147,12 @@ pub fn aggregate_local(
     cfg: &AggregationConfig,
     producers: &ProducerRegistry,
 ) -> Result<LocalAggregate, OracleError> {
+    if observations.len() > MAX_AGGREGATION_OBSERVATIONS {
+        return Err(OracleError::TooManyObservations {
+            have: observations.len(),
+            max: MAX_AGGREGATION_OBSERVATIONS,
+        });
+    }
     // 1. Authorize, authenticate, and normalize; 2. keep the newest per signer.
     //    Keyed by signer, so iteration order is canonical and input-order
     //    independent.
@@ -354,6 +364,18 @@ mod tests {
             min_sources: 3,
             mad_k: Ratio::from_raw(3 * RATIO_SCALE),
         }
+    }
+
+    #[test]
+    fn oversized_batch_is_rejected_before_authentication() {
+        let obs = vec![signed(1, 100_000_000, 1, 1_000, 1, 1); MAX_AGGREGATION_OBSERVATIONS + 1];
+        assert_eq!(
+            aggregate_local(MarketId::new(1), &obs, 1_000, &cfg(), &registry(&[1])),
+            Err(OracleError::TooManyObservations {
+                have: MAX_AGGREGATION_OBSERVATIONS + 1,
+                max: MAX_AGGREGATION_OBSERVATIONS,
+            })
+        );
     }
 
     #[test]

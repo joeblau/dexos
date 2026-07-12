@@ -146,8 +146,14 @@ impl SideBook {
             }
             level.tail = slot;
         }
-        level.count = level.count.saturating_add(1);
-        level.total_qty = level.total_qty.saturating_add(qty);
+        level.count = level
+            .count
+            .checked_add(1)
+            .expect("order capacity bounds level count");
+        level.total_qty = level
+            .total_qty
+            .checked_add(qty)
+            .expect("rest_order validates aggregate quantity before insertion");
     }
 
     /// Unlink `slot` from its level in O(1). The caller still owns freeing the
@@ -182,8 +188,14 @@ impl SideBook {
             n.prev = NIL;
             n.next = NIL;
         }
-        level.count = level.count.saturating_sub(1);
-        level.total_qty = level.total_qty.saturating_sub(qty);
+        level.count = level
+            .count
+            .checked_sub(1)
+            .expect("non-empty level invariant");
+        level.total_qty = level
+            .total_qty
+            .checked_sub(qty)
+            .expect("level quantity equals the sum of its nodes");
         if level.count == 0 {
             self.levels.remove(&price);
         }
@@ -193,7 +205,10 @@ impl SideBook {
     /// of its head order (the node's own `remaining` is updated by the caller).
     pub(crate) fn reduce_level_qty(&mut self, price: Price, delta: Quantity) {
         if let Some(level) = self.levels.get_mut(&price) {
-            level.total_qty = level.total_qty.saturating_sub(delta);
+            level.total_qty = level
+                .total_qty
+                .checked_sub(delta)
+                .expect("fill cannot exceed level aggregate");
         }
     }
 

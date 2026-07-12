@@ -27,6 +27,14 @@ pub enum OracleError {
     /// No observations remained to aggregate (all filtered, or none supplied).
     #[error("no observations to aggregate")]
     NoObservations,
+    /// The untrusted batch exceeded the hard pre-statistics work bound.
+    #[error("observation batch exceeds bound: have {have}, maximum {max}")]
+    TooManyObservations {
+        /// Submitted observations.
+        have: usize,
+        /// Hard aggregation bound.
+        max: usize,
+    },
     /// Fewer usable observations than the configured minimum after filtering.
     #[error("too few observations: have {have}, need {need}")]
     TooFewObservations {

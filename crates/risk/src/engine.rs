@@ -386,7 +386,7 @@ impl RiskEngine {
         // Initial margin on the projected perp notional plus the worst-case
         // scenario collateral the existing payout-vector book already reserves.
         let required = projected
-            .mul_ratio(self.config.initial_margin)?
+            .mul_ratio_ceil(self.config.initial_margin)?
             .checked_add(self.cached_scenario[i])?;
         let available = self.cached_equity[i];
         if available.raw() < required.raw() {
@@ -917,10 +917,10 @@ impl RiskEngine {
         // worst-case scenario liability (settlement is certain to realize some
         // outcome, so no volatility haircut applies). Both requirements add.
         let im = exposure
-            .mul_ratio(self.config.initial_margin)?
+            .mul_ratio_ceil(self.config.initial_margin)?
             .checked_add(scenario)?;
         let mm = exposure
-            .mul_ratio(self.config.maintenance_margin)?
+            .mul_ratio_ceil(self.config.maintenance_margin)?
             .checked_add(scenario)?;
         Ok(CachedColumns {
             equity,

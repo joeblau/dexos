@@ -6,12 +6,15 @@
 //!
 //! # Order book
 //! [`OrderBook`] is a central-limit order book with strict price-time priority,
-//! O(1) cancellation (an id → slab-slot index), intrusive FIFO price levels,
+//! O(1)-average cancel-by-id lookup plus O(1) intrusive unlink, intrusive FIFO price levels,
 //! and a fixed-capacity slab arena with a free list (no per-operation heap
 //! allocation on the warm path). It supports Limit / Market / PostOnly /
 //! ReduceOnly order types, Gtc / Ioc / Fok time-in-force, self-trade
 //! prevention, client-assigned idempotency keys, atomic cancel-replace,
 //! baskets, and cancel-all.
+//! Cancel-all uses a per-account ordered index and costs O(K log K) for that
+//! account's K orders; it never scans all N orders in the book. Hash-table
+//! lookup is amortized, while the unlink itself has a strict constant bound.
 //!
 //! # Conditional engine
 //! [`ConditionalEngine`] evaluates stop-loss, take-profit, trailing-stop, OCO,
