@@ -50,21 +50,20 @@ where
         }
 
         match expected {
-            Some(exp) => {
-                if rec.sequence != exp {
-                    return Err(if rec.sequence > exp {
-                        LogError::SequenceGap {
-                            expected: exp,
-                            got: rec.sequence,
-                        }
-                    } else {
-                        LogError::OutOfOrder {
-                            last: exp.saturating_sub(1),
-                            got: rec.sequence,
-                        }
-                    });
-                }
+            Some(exp) if rec.sequence != exp => {
+                return Err(if rec.sequence > exp {
+                    LogError::SequenceGap {
+                        expected: exp,
+                        got: rec.sequence,
+                    }
+                } else {
+                    LogError::OutOfOrder {
+                        last: exp.saturating_sub(1),
+                        got: rec.sequence,
+                    }
+                });
             }
+            Some(_) => {}
             None => {
                 // No snapshot: the first record establishes the baseline.
             }

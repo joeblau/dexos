@@ -22,4 +22,39 @@ pub enum NodeError {
         #[source]
         source: tokio::task::JoinError,
     },
+
+    /// Graceful drain did not finish before the configured deadline.
+    #[error(
+        "drain timed out with {outstanding} subsystem task(s) still running \
+         (deadline {deadline_ms} ms)"
+    )]
+    DrainTimeout {
+        /// Tasks that had not finished when the deadline elapsed.
+        outstanding: usize,
+        /// Configured deadline in milliseconds.
+        deadline_ms: u64,
+    },
+
+    /// One or more shutdown flush hooks failed (journal, RPC, network, …).
+    #[error("shutdown flush failed: {detail}")]
+    Flush {
+        /// Combined failure detail.
+        detail: String,
+    },
+
+    /// A critical supervised task exited unexpectedly.
+    #[error("critical task '{role}' failed: {detail}")]
+    CriticalTask {
+        /// Task / role name.
+        role: String,
+        /// Failure detail.
+        detail: String,
+    },
+
+    /// `pin_threads=true` but the host cannot apply affinity.
+    #[error("thread pinning failed: {detail}")]
+    PinningUnsupported {
+        /// Operator-visible detail.
+        detail: String,
+    },
 }

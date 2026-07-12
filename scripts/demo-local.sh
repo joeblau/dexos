@@ -1,27 +1,30 @@
 #!/usr/bin/env bash
 # Local three-region demo: starts three full nodes (US / EU / Japan) and one
 # light node on distinct ports, shows their startup manifests, then shuts them
-# down cleanly on SIGINT. Preserves the production process model (separate
+# down cleanly on SIGINT/SIGTERM. Preserves the production process model (separate
 # marketd processes with region configs).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 echo "==> building marketd (release)"
-cargo build --release --bin marketd
+cargo build --release --locked --bin marketd
 
 BIN=./target/release/marketd
 RUN=$(mktemp -d)
-trap 'echo "==> stopping nodes"; kill -INT ${PIDS[@]:-} 2>/dev/null || true; wait 2>/dev/null || true; rm -rf "$RUN"' EXIT
+trap 'echo "==> stopping nodes"; kill -TERM ${PIDS[@]:-} 2>/dev/null || true; wait 2>/dev/null || true; rm -rf "$RUN"' EXIT
 
-# Derive per-node configs with distinct listen/rpc ports so they coexist on one host.
-mkconf() { # name base_config listen_port rpc_port
-    sed -E "s#listen = \"0.0.0.0:9000\"#listen = \"0.0.0.0:$3\"#; s#listen = \"0.0.0.0:8080\"#listen = \"0.0.0.0:$4\"#" \
-        "config/$2.toml" > "$RUN/$1.toml"
-}
-mkconf us    us    9000 8080
-mkconf eu    eu    9010 8081
-mkconf tokyo tokyo 9020 8082
-mkconf light light 9030 8083
+# Example configs already use non-colliding ports (us/eu/tokyo/light).
+# Copy them into the temp dir so per-node data dirs stay under $RUN.
+for name in us eu tokyo light; do
+  sed "s#data_dir = \"./data/#data_dir = \"$RUN/data/#g" "config/${name}.toml" > "$RUN/${name}.toml"
+done
+# Shared validators set next to the resolved configs.
+cp config/validators.toml "$RUN/validators.toml"
+# Point validator_set_path at the temp copy (paths resolve relative to config file dir).
+for name in us eu tokyo light; do
+  # already "validators.toml" relative to $RUN — good.
+  :
+done
 
 PIDS=()
 start() { # name config extra...
@@ -32,13 +35,18 @@ start() { # name config extra...
 start us    us
 start eu    eu
 start tokyo tokyo
-start light light --light
+start light light
 
 sleep 2
 echo
 echo "==> startup manifests:"
 grep -h "dexos node" "$RUN"/*.log || true
 echo
+echo "==> probe metrics (us-1 metrics_listen 127.0.0.1:9100) if bound:"
+curl -sS "http://127.0.0.1:9100/livez" || true
+echo
+curl -sS "http://127.0.0.1:9100/readyz" || true
+echo
 echo "Three full nodes (US/EU/Japan) + one light node are running."
-echo "Press Ctrl-C to stop them (they drain their bounded queues and exit cleanly)."
+echo "Press Ctrl-C to stop them (SIGTERM drain under performance.drain_timeout_ms)."
 wait

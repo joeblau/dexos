@@ -28,12 +28,14 @@ listen = "0.0.0.0:8080"
 read_only = false
 
 [performance]
-# Core pinning and busy-polled ingress are not implemented yet (fail closed).
+# Real affinity on Linux (sched_setaffinity) / macOS (thread policy). Fail/warn
+# when pin_threads=true cannot be applied.
 pin_threads = false
 busy_poll = false
+drain_timeout_ms = 30000
 
 [observability]
 # Use `json` in production log pipelines; `text` is easier for local dev.
 log_format = "text"
 # Empty disables the scrape server. Example: "127.0.0.1:9100"
-metrics_listen = ""
+metrics_listen = "127.0.0.1:9100"

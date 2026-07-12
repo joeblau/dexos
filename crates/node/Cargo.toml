@@ -42,6 +42,7 @@ discovery = { path = "../discovery" }
 rpc = { path = "../rpc" }
 light-client = { path = "../light-client" }
 observability = { path = "../observability" }
+simd = { path = "../simd" }
 loadgen = { path = "../loadgen", optional = true }
 serde.workspace = true
 toml.workspace = true

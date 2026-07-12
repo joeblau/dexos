@@ -1,0 +1,48 @@
+name: release-artifacts
+
+# Tag-driven production artifact build. Runs the same scaffolding as CI's
+# release-artifacts job but for explicit version tags. Does not require write
+# permissions — artifacts are produced in the workspace for operators to
+# collect from the job log / local rerun; attach signatures offline with the
+# org signing key.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  artifacts-linux:
+    name: linux artifacts (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # Host builds on ubuntu-latest are x86_64. aarch64 cross needs a
+        # toolchain; we still document the matrix entry and build host for now.
+        target: ["x86_64-unknown-linux-gnu"]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+      - name: build artifacts
+        env:
+          TARGET: ${{ matrix.target }}
+          OUT_DIR: dist-${{ matrix.target }}
+        run: ./scripts/build-release-artifacts.sh
+      - name: smoke test
+        run: |
+          BIN=$(ls dist-${{ matrix.target }}/marketd-* | head -1)
+          "${BIN}" --help
+          (cd dist-${{ matrix.target }} && shasum -a 256 -c SHA256SUMS)
+          test -s dist-${{ matrix.target }}/sbom.cdx.json
+          test -s dist-${{ matrix.target }}/ROLLBACK.md

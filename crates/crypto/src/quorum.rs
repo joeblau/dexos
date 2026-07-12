@@ -219,7 +219,7 @@ impl ValidatorSet {
     #[must_use]
     pub fn commitment(&self) -> Hash {
         let mut ordered: Vec<&Validator> = self.validators.iter().collect();
-        ordered.sort_unstable_by(|a, b| a.public_key.cmp(&b.public_key));
+        ordered.sort_unstable_by_key(|a| a.public_key);
 
         let mut buf = Vec::with_capacity(2 + 8 + 8 + 4 + ordered.len() * (32 + 8));
         buf.extend_from_slice(&VALIDATOR_SET_VERSION.to_le_bytes());

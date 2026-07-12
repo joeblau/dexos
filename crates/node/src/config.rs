@@ -9,7 +9,8 @@
 //! core — so the core never links serde/toml.
 
 use std::fs;
-use std::path::Path;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -25,7 +26,12 @@ pub const SEGMENT_SIZE_MIN_MB: u64 = 1;
 /// the megabyte→byte conversion well clear of `usize` overflow on any target.
 pub const SEGMENT_SIZE_MAX_MB: u64 = 65_536;
 
-/// A role a node may assume. A node may hold multiple roles simultaneously.
+/// Maximum permitted drain timeout (10 minutes). Larger values almost certainly
+/// indicate a unit mistake and are rejected rather than hanging shutdown.
+pub const DRAIN_TIMEOUT_MAX_MS: u64 = 600_000;
+
+/// A role a node may assume. A node may hold multiple roles simultaneously,
+/// but each role may appear at most once (see [`NodeConfig::validate`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -49,6 +55,14 @@ impl Role {
     /// Roles that mutate canonical state and are therefore forbidden in `--light` mode.
     pub const fn is_consensus_bearing(self) -> bool {
         matches!(self, Role::Validator | Role::Sequencer | Role::Custody)
+    }
+
+    /// Roles that require a validator-set descriptor on disk.
+    pub const fn requires_validator_set(self) -> bool {
+        matches!(
+            self,
+            Role::Validator | Role::Sequencer | Role::Witness | Role::Custody
+        )
     }
 
     /// Lowercase wire name, matching the config/CLI spelling.
@@ -75,7 +89,7 @@ pub struct NodeSection {
     pub region: String,
     /// Whether this node runs in light mode.
     pub light: bool,
-    /// Roles this node assumes.
+    /// Roles this node assumes (unique; order preserved).
     pub roles: Vec<Role>,
 }
 
@@ -185,10 +199,13 @@ impl Default for RpcSection {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PerformanceSection {
-    /// Pin subsystem threads to cores.
+    /// Pin subsystem threads to cores (Linux/macOS).
     pub pin_threads: bool,
     /// Busy-poll ingress queues.
     pub busy_poll: bool,
+    /// Graceful drain deadline in milliseconds. `0` = default (30s).
+    #[serde(default)]
+    pub drain_timeout_ms: u64,
 }
 
 /// Log line format for the process-wide tracing subscriber.
@@ -209,7 +226,7 @@ pub struct ObservabilitySection {
     /// Log format: `text` (default) or `json` (production).
     #[serde(default)]
     pub log_format: LogFormat,
-    /// Optional listen address for Prometheus `/metrics` (and `/livez`).
+    /// Optional listen address for Prometheus `/metrics` (and `/livez`/`/readyz`).
     /// Empty string disables the scrape server.
     #[serde(default)]
     pub metrics_listen: String,
@@ -308,10 +325,10 @@ pub enum ConfigError {
 }
 
 impl NodeConfig {
-    /// Parse and validate a configuration from a TOML string.
+    /// Parse and validate a configuration from a TOML string (no filesystem checks).
     ///
     /// The input is untrusted; any error is returned as [`ConfigError`] without
-    /// panicking.
+    /// panicking. Path *existence* is checked by [`Self::load`].
     pub fn from_toml_str(s: &str) -> Result<Self, ConfigError> {
         let cfg: NodeConfig = toml::from_str(s)?;
         cfg.validate()?;
@@ -319,13 +336,29 @@ impl NodeConfig {
     }
 
     /// Read, parse, and validate a configuration file.
+    ///
+    /// Relative paths in the file (`validator_set_path`, `data_dir`) are resolved
+    /// against the config file's parent directory before validation.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
         let text = fs::read_to_string(path).map_err(|source| ConfigError::Io {
             path: path.display().to_string(),
             source,
         })?;
-        Self::from_toml_str(&text)
+        let mut cfg: NodeConfig = toml::from_str(&text)?;
+        if let Some(dir) = path.parent() {
+            cfg.resolve_relative_paths(dir);
+        }
+        cfg.validate()?;
+        cfg.validate_paths()?;
+        Ok(cfg)
+    }
+
+    /// Resolve relative path fields against `base` (typically the config file dir).
+    fn resolve_relative_paths(&mut self, base: &Path) {
+        self.consensus.validator_set_path =
+            resolve_against(base, &self.consensus.validator_set_path);
+        self.storage.data_dir = resolve_against(base, &self.storage.data_dir);
     }
 
     /// Apply CLI overrides on top of file values, then re-validate.
@@ -340,8 +373,21 @@ impl NodeConfig {
         Ok(self)
     }
 
-    /// Validate cross-field invariants. Called by every constructor.
+    /// Validate cross-field invariants (no filesystem I/O).
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.node.name.trim().is_empty() {
+            return Err(ConfigError::Validation(
+                "node.name must not be empty".to_string(),
+            ));
+        }
+        if self.node.region.trim().is_empty() {
+            return Err(ConfigError::Validation(
+                "node.region must not be empty".to_string(),
+            ));
+        }
+
+        self.validate_unique_roles()?;
+
         let ms = self.consensus.checkpoint_interval_ms;
         if !(CHECKPOINT_INTERVAL_MIN_MS..=CHECKPOINT_INTERVAL_MAX_MS).contains(&ms) {
             return Err(ConfigError::OutOfRange {
@@ -356,8 +402,17 @@ impl NodeConfig {
                 "consensus.epoch_length must be greater than zero".to_string(),
             ));
         }
+        if self.requires_validator_set() && self.consensus.validator_set_path.trim().is_empty() {
+            return Err(ConfigError::Validation(
+                "consensus.validator_set_path is required for validator/sequencer/witness/custody roles"
+                    .to_string(),
+            ));
+        }
+
         self.validate_storage()?;
+        self.validate_listen_addresses()?;
         self.reject_unsupported_features()?;
+
         if self.node.light {
             if let Some(bad) = self.node.roles.iter().find(|r| r.is_consensus_bearing()) {
                 return Err(ConfigError::Validation(format!(
@@ -370,10 +425,70 @@ impl NodeConfig {
         Ok(())
     }
 
+    /// Filesystem checks performed by [`Self::load`] after path resolution.
+    pub fn validate_paths(&self) -> Result<(), ConfigError> {
+        if self.requires_validator_set() {
+            let path = Path::new(&self.consensus.validator_set_path);
+            if !path.is_file() {
+                return Err(ConfigError::Validation(format!(
+                    "consensus.validator_set_path '{}' does not exist or is not a file \
+                     (required for roles {:?})",
+                    self.consensus.validator_set_path,
+                    self.node
+                        .roles
+                        .iter()
+                        .filter(|r| r.requires_validator_set())
+                        .map(|r| r.as_str())
+                        .collect::<Vec<_>>()
+                )));
+            }
+        }
+        if self.storage.data_dir.trim().is_empty() {
+            return Err(ConfigError::Validation(
+                "storage.data_dir must not be empty".to_string(),
+            ));
+        }
+        // data_dir may not exist yet (created at bootstrap); reject only if a
+        // non-directory file occupies the path.
+        let data = Path::new(&self.storage.data_dir);
+        if data.exists() && !data.is_dir() {
+            return Err(ConfigError::Validation(format!(
+                "storage.data_dir '{}' exists and is not a directory",
+                self.storage.data_dir
+            )));
+        }
+        Ok(())
+    }
+
+    /// True when any configured role needs a validator-set file.
+    fn requires_validator_set(&self) -> bool {
+        self.node.roles.iter().any(|r| r.requires_validator_set())
+    }
+
+    /// Reject duplicate roles (named in the error). Preserves canonical order.
+    fn validate_unique_roles(&self) -> Result<(), ConfigError> {
+        let mut seen = Vec::with_capacity(self.node.roles.len());
+        for role in &self.node.roles {
+            if seen.contains(role) {
+                return Err(ConfigError::Validation(format!(
+                    "duplicate node role '{}'; each role may appear at most once",
+                    role.as_str()
+                )));
+            }
+            seen.push(*role);
+        }
+        Ok(())
+    }
+
     /// Range-check the `[storage]` settings so a pathological value fails closed
     /// at startup rather than surfacing later as a division-by-zero or an
     /// overflowing segment allocation once the durable journal is wired.
     fn validate_storage(&self) -> Result<(), ConfigError> {
+        if self.storage.data_dir.trim().is_empty() {
+            return Err(ConfigError::Validation(
+                "storage.data_dir must not be empty".to_string(),
+            ));
+        }
         if self.storage.snapshot_interval_sequences == 0 {
             return Err(ConfigError::Validation(
                 "storage.snapshot_interval_sequences must be greater than zero".to_string(),
@@ -391,11 +506,44 @@ impl NodeConfig {
         Ok(())
     }
 
+    /// Parse listen addresses so a typo fails at load, not at bind.
+    fn validate_listen_addresses(&self) -> Result<(), ConfigError> {
+        parse_listen("network.listen", &self.network.listen)?;
+        parse_listen("rpc.listen", &self.rpc.listen)?;
+        if !self.observability.metrics_listen.trim().is_empty() {
+            parse_listen(
+                "observability.metrics_listen",
+                &self.observability.metrics_listen,
+            )?;
+        }
+        for (i, peer) in self.network.bootstrap_peers.iter().enumerate() {
+            // Bootstrap peers may be hostnames; require host:port form at minimum.
+            if peer.trim().is_empty() {
+                return Err(ConfigError::Validation(format!(
+                    "network.bootstrap_peers[{i}] must not be empty"
+                )));
+            }
+            if !peer.contains(':') {
+                return Err(ConfigError::Validation(format!(
+                    "network.bootstrap_peers[{i}] = '{peer}' must be host:port"
+                )));
+            }
+        }
+        let drain = self.performance.drain_timeout_ms;
+        if drain > DRAIN_TIMEOUT_MAX_MS {
+            return Err(ConfigError::OutOfRange {
+                field: "performance.drain_timeout_ms",
+                value: drain,
+                min: 0,
+                max: DRAIN_TIMEOUT_MAX_MS,
+            });
+        }
+        Ok(())
+    }
+
     /// Reject feature flags and modes whose implementations have not landed in
     /// this release. Silently no-oping them would let an operator believe a
-    /// capability (QUIC sessions, datagram dissemination, core pinning,
-    /// busy-polled ingress, a forced SIMD ISA) is active when it is not, so the
-    /// node refuses to start until each is set back to a supported value.
+    /// capability is active when it is not.
     fn reject_unsupported_features(&self) -> Result<(), ConfigError> {
         if self.network.enable_quic {
             return Err(ConfigError::Unsupported {
@@ -411,10 +559,11 @@ impl NodeConfig {
                          release; set network.enable_datagrams = false",
             });
         }
-        if self.performance.pin_threads {
+        // pin_threads is implemented on Linux/macOS; reject only elsewhere.
+        if self.performance.pin_threads && !crate::threading::pinning_supported() {
             return Err(ConfigError::Unsupported {
                 field: "performance.pin_threads",
-                detail: "core pinning uses a portable no-op backend in this release; \
+                detail: "core pinning is not supported on this platform; \
                          set performance.pin_threads = false",
             });
         }
@@ -429,6 +578,7 @@ impl NodeConfig {
     }
 
     /// The roles this node will actually run, honoring light-mode restrictions.
+    /// Order is the canonical config order; duplicates are impossible post-validate.
     pub fn effective_roles(&self) -> Vec<Role> {
         if self.node.light {
             self.node
@@ -440,6 +590,27 @@ impl NodeConfig {
         } else {
             self.node.roles.clone()
         }
+    }
+}
+
+fn parse_listen(field: &'static str, value: &str) -> Result<SocketAddr, ConfigError> {
+    value.parse::<SocketAddr>().map_err(|e| {
+        ConfigError::Validation(format!(
+            "{field} = '{value}' is not a valid socket address: {e}"
+        ))
+    })
+}
+
+fn resolve_against(base: &Path, value: &str) -> String {
+    let p = Path::new(value);
+    if p.is_absolute() || value.is_empty() {
+        value.to_string()
+    } else {
+        base.join(p)
+            .components()
+            .collect::<PathBuf>()
+            .display()
+            .to_string()
     }
 }
 
@@ -478,6 +649,7 @@ read_only = false
 [performance]
 pin_threads = false
 busy_poll = false
+drain_timeout_ms = 15000
 
 [observability]
 log_format = "json"
@@ -499,6 +671,7 @@ metrics_listen = "127.0.0.1:9100"
         assert!(!cfg.rpc.read_only);
         assert_eq!(cfg.observability.log_format, LogFormat::Json);
         assert_eq!(cfg.observability.metrics_listen, "127.0.0.1:9100");
+        assert_eq!(cfg.performance.drain_timeout_ms, 15_000);
     }
 
     #[test]
@@ -565,7 +738,6 @@ metrics_listen = "127.0.0.1:9100"
 
     #[test]
     fn light_mode_filters_consensus_roles_from_effective_set() {
-        // gateway + observer are legal for a light node.
         let toml = "[node]\nname=\"n\"\nregion=\"r\"\nlight=true\nroles=[\"gateway\",\"observer\"]";
         let cfg = NodeConfig::from_toml_str(toml).unwrap();
         assert_eq!(cfg.effective_roles(), vec![Role::Gateway, Role::Observer]);
@@ -583,18 +755,42 @@ metrics_listen = "127.0.0.1:9100"
         assert_eq!(cfg.node.roles, vec![Role::Validator, Role::Sequencer]);
     }
 
-    // --- fail-closed rejection of unsupported settings (issue #312, AC #5) ---
+    #[test]
+    fn rejects_duplicate_roles_with_name() {
+        let toml =
+            "[node]\nname=\"n\"\nregion=\"r\"\nlight=false\nroles=[\"gateway\",\"validator\",\"gateway\"]";
+        let err = NodeConfig::from_toml_str(toml).unwrap_err();
+        match err {
+            ConfigError::Validation(msg) => {
+                assert!(msg.contains("duplicate"), "{msg}");
+                assert!(msg.contains("gateway"), "{msg}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_bad_listen_addresses() {
+        let mut cfg = NodeConfig::default();
+        cfg.network.listen = "not-an-addr".into();
+        assert!(matches!(cfg.validate(), Err(ConfigError::Validation(_))));
+
+        let mut cfg = NodeConfig::default();
+        cfg.rpc.listen = "8080".into(); // missing host
+        assert!(matches!(cfg.validate(), Err(ConfigError::Validation(_))));
+
+        let mut cfg = NodeConfig::default();
+        cfg.observability.metrics_listen = "localhost".into();
+        assert!(matches!(cfg.validate(), Err(ConfigError::Validation(_))));
+    }
 
     #[test]
     fn default_config_disables_unimplemented_features() {
-        // The honest default must be the supported one, so an operator who edits
-        // nothing never unknowingly requests a capability the node cannot deliver.
         let cfg = NodeConfig::default();
         assert!(!cfg.network.enable_quic);
         assert!(!cfg.network.enable_datagrams);
         assert!(!cfg.performance.pin_threads);
         assert!(!cfg.performance.busy_poll);
-        // And it validates cleanly.
         cfg.validate().expect("default config must be valid");
     }
 
@@ -625,17 +821,7 @@ metrics_listen = "127.0.0.1:9100"
     }
 
     #[test]
-    fn rejects_unsupported_thread_pinning_and_busy_poll() {
-        let mut cfg = NodeConfig::default();
-        cfg.performance.pin_threads = true;
-        assert!(matches!(
-            cfg.validate(),
-            Err(ConfigError::Unsupported {
-                field: "performance.pin_threads",
-                ..
-            })
-        ));
-
+    fn rejects_unsupported_busy_poll() {
         let mut cfg = NodeConfig::default();
         cfg.performance.busy_poll = true;
         assert!(matches!(
@@ -648,9 +834,24 @@ metrics_listen = "127.0.0.1:9100"
     }
 
     #[test]
+    fn pin_threads_allowed_on_supported_platforms() {
+        let mut cfg = NodeConfig::default();
+        cfg.performance.pin_threads = true;
+        if crate::threading::pinning_supported() {
+            cfg.validate().expect("pin_threads ok on this platform");
+        } else {
+            assert!(matches!(
+                cfg.validate(),
+                Err(ConfigError::Unsupported {
+                    field: "performance.pin_threads",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
     fn unsupported_flag_rejected_through_full_toml_load() {
-        // The rejection is enforced by the public loader, not just field access:
-        // a real operator file that enables QUIC fails closed at load time.
         let toml = "[network]\nlisten = \"0.0.0.0:9000\"\nbootstrap_peers = []\n\
                     enable_quic = true\nenable_datagrams = false";
         assert!(matches!(
@@ -688,16 +889,71 @@ metrics_listen = "127.0.0.1:9100"
             })
         ));
 
-        // A boundary value inside the range is accepted.
         let mut cfg = NodeConfig::default();
         cfg.storage.segment_size_mb = SEGMENT_SIZE_MAX_MB;
         cfg.validate().expect("max segment size is in range");
     }
 
     #[test]
+    fn load_requires_validators_file_for_consensus_roles() {
+        let dir = std::env::temp_dir().join(format!(
+            "dexos-cfg-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let cfg_path = dir.join("node.toml");
+        let validators = dir.join("validators.toml");
+        fs::write(
+            &cfg_path,
+            r#"
+[node]
+name = "t"
+region = "r"
+light = false
+roles = ["validator"]
+
+[network]
+listen = "127.0.0.1:19000"
+bootstrap_peers = []
+enable_quic = false
+enable_datagrams = false
+
+[consensus]
+checkpoint_interval_ms = 100
+epoch_length = 10
+validator_set_path = "validators.toml"
+
+[storage]
+data_dir = "./data"
+snapshot_interval_sequences = 1000
+segment_size_mb = 64
+
+[rpc]
+listen = "127.0.0.1:18080"
+read_only = false
+"#,
+        )
+        .unwrap();
+
+        // Missing validators.toml → fail.
+        let err = NodeConfig::load(&cfg_path).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation(ref m) if m.contains("validator_set_path")),
+            "{err}"
+        );
+
+        fs::write(&validators, "validators = []\n").unwrap();
+        let cfg = NodeConfig::load(&cfg_path).expect("with validators file");
+        assert!(Path::new(&cfg.consensus.validator_set_path).is_file());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn never_panics_on_arbitrary_input() {
-        // Deterministic pseudo-random byte soup; the loader must always return a
-        // Result (parse or validation error), never panic, never truncate.
         let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
         for _ in 0..4096 {
             let mut buf = Vec::new();

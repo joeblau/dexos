@@ -59,11 +59,14 @@ thiserror = "2.0"
 anyhow = "1.0"
 
 # Thin release profile suitable for latency benchmarking later phases will tune.
+# Exchange kernels abort on panic so a single task panic cannot unwind across
+# the process and leave partial state; operators restart from the last durable
+# checkpoint instead.
 [profile.release]
 opt-level = 3
 lto = "thin"
 codegen-units = 1
-panic = "unwind"
+panic = "abort"
 
 # Production-equivalent optimization with symbols for `perf`/flamegraphs.
 [profile.release-with-debug]

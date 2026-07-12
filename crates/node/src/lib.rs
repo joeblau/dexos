@@ -11,9 +11,13 @@
 pub mod config;
 pub mod error;
 pub mod metrics;
+pub mod readiness;
+pub mod shutdown;
+pub mod supervisor;
 pub mod threading;
 
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, watch};
@@ -25,6 +29,8 @@ pub use config::{
 };
 pub use error::NodeError;
 pub use observability::{MetricsRegistry, TraceGen, TraceId};
+pub use readiness::Readiness;
+pub use shutdown::{FlushHooks, DEFAULT_DRAIN_TIMEOUT};
 
 /// Capacity of each subsystem ingress queue. Bounded by construction.
 pub const INGRESS_CAPACITY: usize = 1024;
@@ -55,6 +61,7 @@ pub const SUBSYSTEMS: &[&str] = &[
     rpc::CRATE_NAME,
     light_client::CRATE_NAME,
     observability::CRATE_NAME,
+    simd::CRATE_NAME,
     #[cfg(feature = "dev-tools")]
     loadgen::CRATE_NAME,
 ];
@@ -79,13 +86,30 @@ pub struct ShutdownReport {
 }
 
 /// A configured, not-yet-running node.
-#[derive(Debug)]
 pub struct Node {
     config: NodeConfig,
     roles: Vec<Role>,
     ingress: Vec<(Role, mpsc::Sender<Envelope>)>,
     receivers: Vec<(Role, mpsc::Receiver<Envelope>)>,
     shutdown_tx: watch::Sender<bool>,
+    flush_hooks: FlushHooks,
+}
+
+impl std::fmt::Debug for Node {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Node")
+            .field("config", &self.config)
+            .field("roles", &self.roles)
+            .field(
+                "ingress_roles",
+                &self.ingress.iter().map(|(r, _)| r).collect::<Vec<_>>(),
+            )
+            .field(
+                "receiver_roles",
+                &self.receivers.iter().map(|(r, _)| r).collect::<Vec<_>>(),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl Node {
@@ -94,6 +118,8 @@ impl Node {
     ///
     /// In light mode the effective role set excludes consensus-bearing roles; a
     /// light config that explicitly requests one is rejected by validation.
+    /// Duplicate roles are rejected during validation so exactly one handler and
+    /// ingress queue exists per role.
     pub fn new(config: NodeConfig) -> Result<Self, NodeError> {
         config.validate()?;
         let roles = config.effective_roles();
@@ -105,12 +131,22 @@ impl Node {
             ingress.push((*role, tx));
             receivers.push((*role, rx));
         }
+        let mut flush_hooks = FlushHooks::new();
+        // Placeholder flush hooks for subsystems not yet fully wired. When the
+        // durable journal / RPC server / peer mesh land they replace these with
+        // real fsync / close / disconnect work. Empty success keeps the hook
+        // path exercised on every shutdown.
+        flush_hooks.push("journal", Box::new(|| Ok(())));
+        flush_hooks.push("rpc", Box::new(|| Ok(())));
+        flush_hooks.push("network", Box::new(|| Ok(())));
+
         Ok(Self {
             config,
             roles,
             ingress,
             receivers,
             shutdown_tx,
+            flush_hooks,
         })
     }
 
@@ -125,11 +161,18 @@ impl Node {
     }
 
     /// A cloned ingress sender for the given role, if that role is active.
+    ///
+    /// At most one sender exists per role (duplicates rejected at validation).
     pub fn sender_for(&self, role: Role) -> Option<mpsc::Sender<Envelope>> {
         self.ingress
             .iter()
             .find(|(r, _)| *r == role)
             .map(|(_, tx)| tx.clone())
+    }
+
+    /// Register an additional shutdown flush hook (control path only).
+    pub fn push_flush_hook(&mut self, name: &'static str, hook: shutdown::FlushHook) {
+        self.flush_hooks.push(name, hook);
     }
 
     /// A node-info-style startup manifest, emitted once at startup (off any hot path).
@@ -143,8 +186,9 @@ impl Node {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
+        let simd_backend = simd::detect();
         format!(
-            "dexos node '{}' region={} mode={} roles=[{}] rpc={} listen={} subsystems={}",
+            "dexos node '{}' region={} mode={} roles=[{}] rpc={} listen={} subsystems={} simd={} pin_threads={} drain_timeout_ms={}",
             self.config.node.name,
             self.config.node.region,
             if self.config.node.light {
@@ -156,11 +200,18 @@ impl Node {
             self.config.rpc.listen,
             self.config.network.listen,
             SUBSYSTEMS.len(),
+            simd_backend.name(),
+            self.config.performance.pin_threads,
+            if self.config.performance.drain_timeout_ms == 0 {
+                DEFAULT_DRAIN_TIMEOUT.as_millis()
+            } else {
+                u128::from(self.config.performance.drain_timeout_ms)
+            },
         )
     }
 
     /// Run until the supplied `shutdown` future resolves, then drain every bounded
-    /// queue and stop all handlers gracefully.
+    /// queue and stop all handlers gracefully under the configured deadline.
     pub async fn run_until<F>(mut self, shutdown: F) -> Result<ShutdownReport, NodeError>
     where
         F: Future<Output = ()>,
@@ -172,18 +223,32 @@ impl Node {
         };
         init_tracing(self.config.observability.log_format, &identity);
 
+        // Apply pin_threads before spawning hot-path work.
+        threading::apply_startup_pinning(&self.config.performance)?;
+
+        let simd_backend = simd::detect();
+        tracing::info!(
+            target: "node",
+            simd_backend = simd_backend.name(),
+            simd_available = simd_backend.is_available(),
+            "selected SIMD backend"
+        );
+
+        let readiness = Readiness::new();
+
         // Process-wide metrics registry + optional Prometheus scrape listener.
         let metrics = Arc::new(MetricsRegistry::new());
         metrics.counter("node_starts_total").inc();
         let metrics_task = metrics::spawn_if_configured(
             &self.config.observability.metrics_listen,
             Arc::clone(&metrics),
+            Arc::clone(&readiness),
         )
         .await?;
 
         // Root span carries node identity + a process-level TraceId so every
         // nested event on the hot path can correlate without custom scrapers.
-        let mut trace_gen = TraceGen::from_seed(0x0de05_0001);
+        let mut trace_gen = TraceGen::from_seed(0x0000_de05_0001);
         let process_trace = trace_gen.new_trace();
         let root = tracing::info_span!(
             "node.run",
@@ -195,46 +260,137 @@ impl Node {
         let _enter = root.enter();
         tracing::info!(target: "node", "{}", self.startup_summary());
 
+        // Set once shutdown is intentional so handler completions are not
+        // misclassified as unexpected exits.
+        let shutting_down = Arc::new(AtomicBool::new(false));
+        let (fail_tx, mut fail_rx) = mpsc::unbounded_channel::<NodeError>();
+
         let receivers = std::mem::take(&mut self.receivers);
         let mut handles: Vec<(String, JoinHandle<u64>)> = Vec::with_capacity(receivers.len());
         for (role, rx) in receivers {
             let stop = self.shutdown_tx.subscribe();
             let role_name = role.as_str().to_string();
+            let shutting_down = Arc::clone(&shutting_down);
+            let fail_tx = fail_tx.clone();
+            let readiness_h = Arc::clone(&readiness);
+            let name = role_name.clone();
             handles.push((
                 role_name.clone(),
-                tokio::spawn(run_handler(rx, stop, role_name, process_trace)),
+                tokio::spawn(async move {
+                    // Nested spawn so panics become JoinError we can classify.
+                    let join =
+                        tokio::task::spawn(run_handler(rx, stop, name.clone(), process_trace))
+                            .await;
+                    match join {
+                        Ok(processed) => {
+                            if !shutting_down.load(Ordering::Acquire) {
+                                readiness_h
+                                    .mark_not_ready(format!("critical task '{name}' exited early"));
+                                let _ = fail_tx.send(NodeError::CriticalTask {
+                                    role: name,
+                                    detail: "handler returned before shutdown".into(),
+                                });
+                            }
+                            processed
+                        }
+                        Err(join_err) => {
+                            let detail = join_err.to_string();
+                            readiness_h.mark_not_ready(format!(
+                                "critical task '{name}' panicked: {detail}"
+                            ));
+                            let _ = fail_tx.send(NodeError::CriticalTask { role: name, detail });
+                            0
+                        }
+                    }
+                }),
             ));
         }
+        drop(fail_tx);
 
-        shutdown.await;
-        tracing::info!(target: "node", "shutdown requested; draining {} subsystem queue(s)", handles.len());
-        // Ignore the error when there are zero handlers (no receivers to notify).
+        // Bootstrap complete: metrics listener bound (if any), handlers spawned.
+        readiness.mark_ready();
+        metrics.gauge("node_ready").set(1);
+        tracing::info!(target: "node", "readiness=true (bootstrap complete)");
+
+        // Wait for external shutdown OR critical-task failure.
+        let pending_error = tokio::select! {
+            _ = shutdown => {
+                tracing::info!(target: "node", "external shutdown requested");
+                None
+            }
+            maybe = fail_rx.recv() => {
+                match maybe {
+                    Some(err) => {
+                        tracing::error!(target: "node", error = %err, "critical subsystem failed");
+                        Some(err)
+                    }
+                    None => None,
+                }
+            }
+        };
+
+        shutting_down.store(true, Ordering::Release);
+        self.finish_shutdown(handles, metrics_task, readiness, metrics, pending_error)
+            .await
+    }
+
+    async fn finish_shutdown(
+        mut self,
+        handles: Vec<(String, JoinHandle<u64>)>,
+        metrics_task: Option<JoinHandle<()>>,
+        readiness: Arc<Readiness>,
+        metrics: Arc<MetricsRegistry>,
+        pending_error: Option<NodeError>,
+    ) -> Result<ShutdownReport, NodeError> {
+        readiness.mark_not_ready("shutting down");
+        metrics.gauge("node_ready").set(0);
+        tracing::info!(
+            target: "node",
+            "shutdown requested; draining {} subsystem queue(s)",
+            handles.len()
+        );
         let _ = self.shutdown_tx.send(true);
 
-        let handler_count = handles.len();
-        let mut processed = 0u64;
-        for (role, handle) in handles {
-            let count = handle
-                .await
-                .map_err(|source| NodeError::Join { role, source })?;
-            processed += count;
+        // Flush durable / network resources before joining handlers.
+        if let Err(e) = self.flush_hooks.run_all() {
+            if pending_error.is_none() {
+                if let Some(task) = metrics_task {
+                    task.abort();
+                }
+                readiness.mark_not_live();
+                return Err(e);
+            }
+            tracing::error!(target: "node", error = %e, "flush failed during already-failed shutdown");
         }
+
+        let deadline = shutdown::drain_timeout_from_ms(self.config.performance.drain_timeout_ms);
+        let drain_result = shutdown::drain_handlers_abort_on_timeout(handles, deadline).await;
+
         if let Some(task) = metrics_task {
             task.abort();
         }
-        tracing::info!(target: "node", "drained {} queued command(s) across {} subsystem(s)", processed, handler_count);
+        readiness.mark_not_live();
+
+        if let Some(err) = pending_error {
+            return Err(err);
+        }
+
+        let (processed, handler_count) = drain_result?;
+        tracing::info!(
+            target: "node",
+            "drained {} queued command(s) across {} subsystem(s)",
+            processed,
+            handler_count
+        );
         Ok(ShutdownReport {
             processed,
             handlers: handler_count,
         })
     }
 
-    /// Run until an OS interrupt (SIGINT/SIGTERM via ctrl_c) is received.
+    /// Run until an OS interrupt (SIGINT/SIGTERM) is received.
     pub async fn run(self) -> Result<ShutdownReport, NodeError> {
-        self.run_until(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await
+        self.run_until(shutdown::wait_for_stop_signal()).await
     }
 
     /// Build a multi-threaded runtime here (owned at the edge) and run to completion.
@@ -259,9 +415,6 @@ struct NodeIdentity {
 
 /// One role handler: process ingress envelopes until the stop signal, then drain
 /// whatever remains in the bounded queue. Returns the number processed.
-///
-/// Each envelope is handled under a child span that carries the process
-/// `trace_id` and the role name so RPC/network-adjacent work can correlate.
 async fn run_handler(
     mut rx: mpsc::Receiver<Envelope>,
     mut stop: watch::Receiver<bool>,
@@ -300,10 +453,6 @@ async fn run_handler(
 }
 
 /// Initialize structured logging exactly once, outside any hot path.
-///
-/// - [`LogFormat::Text`]: human `fmt` (default for local dev).
-/// - [`LogFormat::Json`]: production JSON lines with `node.name` / `node.region`
-///   / `node.version` injected as subscriber fields.
 fn init_tracing(format: LogFormat, identity: &NodeIdentity) {
     use std::sync::Once;
     static INIT: Once = Once::new();
@@ -318,8 +467,6 @@ fn init_tracing(format: LogFormat, identity: &NodeIdentity) {
                     .with_current_span(true)
                     .with_span_list(true)
                     .try_init();
-                // Identity is also on the root span; emit once so early lines
-                // before any span still carry process fields via a record.
                 tracing::info!(
                     target: "node",
                     node_name = %identity.name,
@@ -342,6 +489,7 @@ fn init_tracing(format: LogFormat, identity: &NodeIdentity) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn cfg_with_roles(light: bool, roles: Vec<Role>) -> NodeConfig {
         let mut c = NodeConfig::default();
@@ -383,7 +531,6 @@ mod tests {
 
     #[tokio::test]
     async fn light_mode_disables_consensus_roles() {
-        // Legal light roles run; a light config asking for validator is a construction error.
         let node = Node::new(cfg_with_roles(true, vec![Role::Gateway, Role::Observer])).unwrap();
         assert_eq!(node.roles(), &[Role::Gateway, Role::Observer]);
 
@@ -394,11 +541,100 @@ mod tests {
     }
 
     #[test]
-    fn startup_summary_reports_mode_and_roles() {
+    fn startup_summary_reports_mode_roles_and_simd() {
         let node = Node::new(cfg_with_roles(true, vec![Role::Gateway])).unwrap();
         let s = node.startup_summary();
         assert!(s.contains("mode=light"));
         assert!(s.contains("gateway"));
         assert!(s.contains(&format!("subsystems={}", SUBSYSTEMS.len())));
+        assert!(s.contains("simd="), "{s}");
+    }
+
+    #[test]
+    fn duplicate_roles_rejected_before_handlers_spawn() {
+        let mut c = NodeConfig::default();
+        c.node.roles = vec![Role::Gateway, Role::Gateway];
+        let err = Node::new(c).unwrap_err();
+        assert!(matches!(
+            err,
+            NodeError::Config(ConfigError::Validation(ref m)) if m.contains("duplicate")
+        ));
+    }
+
+    #[tokio::test]
+    async fn readiness_false_until_bootstrap_then_true() {
+        let mut cfg = cfg_with_roles(false, vec![Role::Gateway]);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        cfg.observability.metrics_listen = addr.to_string();
+
+        let node = Node::new(cfg).unwrap();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(node.run_until(async move {
+            let _ = stop_rx.await;
+        }));
+
+        let mut ready = false;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            if let Ok(mut stream) = tokio::net::TcpStream::connect(addr).await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let _ = stream
+                    .write_all(b"GET /readyz HTTP/1.0\r\nHost: localhost\r\n\r\n")
+                    .await;
+                let mut buf = Vec::new();
+                let _ = stream.read_to_end(&mut buf).await;
+                let text = String::from_utf8_lossy(&buf);
+                if text.contains("200 OK") && text.contains("ready") {
+                    ready = true;
+                    break;
+                }
+            }
+        }
+        assert!(ready, "readyz should become ready after bootstrap");
+
+        {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            stream
+                .write_all(b"GET /livez HTTP/1.0\r\nHost: localhost\r\n\r\n")
+                .await
+                .unwrap();
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.unwrap();
+            let text = String::from_utf8_lossy(&buf);
+            assert!(text.contains("200 OK"), "{text}");
+        }
+
+        {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            stream
+                .write_all(b"GET /metrics HTTP/1.0\r\nHost: localhost\r\n\r\n")
+                .await
+                .unwrap();
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.unwrap();
+            let text = String::from_utf8_lossy(&buf);
+            assert!(text.contains("node_starts_total"), "{text}");
+        }
+
+        stop_tx.send(()).unwrap();
+        handle.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn exactly_one_ingress_per_role() {
+        let node = Node::new(cfg_with_roles(
+            false,
+            vec![Role::Gateway, Role::Oracle, Role::Observer],
+        ))
+        .unwrap();
+        assert_eq!(node.roles().len(), 3);
+        assert!(node.sender_for(Role::Gateway).is_some());
+        assert!(node.sender_for(Role::Oracle).is_some());
+        assert!(node.sender_for(Role::Observer).is_some());
+        assert!(node.sender_for(Role::Validator).is_none());
     }
 }

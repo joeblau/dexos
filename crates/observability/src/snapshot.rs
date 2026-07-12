@@ -127,8 +127,7 @@ impl Snapshot {
         }
         out
     }
-
-    }
+}
 
 /// Prometheus text exposition Content-Type header value (0.0.4).
 pub const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
