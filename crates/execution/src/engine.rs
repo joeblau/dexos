@@ -102,6 +102,28 @@ struct Withdrawal {
 /// Book-order coordinates: `(market, instrument, order_id)`.
 type OrderKey = (u32, u16, u64);
 
+/// Notional reserved for one resting perp order, plus the resting quantity it
+/// was computed from.
+///
+/// Invariant: `reserved == limit_price.notional(qty_remaining)` (toward-zero),
+/// where the limit price is the maker's resting price — the price every fill
+/// against this maker executes at. Releases telescope against that identity:
+/// each fill releases `reserved - price.notional(new_qty)` rather than the
+/// floor of its own fill notional, so the sum of releases over the order's
+/// lifetime equals the reserved amount bit-exactly. Summing per-fill floors
+/// instead (`floor(a) + floor(b) <= floor(a + b)`) can strand up to one
+/// micro-unit per fill in `reserved_resting` forever once the maker leaves
+/// the book (#408).
+#[derive(Debug, Clone, Copy)]
+struct OrderReserve {
+    /// Owning account.
+    account: AccountId,
+    /// Notional currently reserved in [`RiskEngine::reserve_resting`].
+    reserved: Amount,
+    /// Resting quantity the reserve was computed from.
+    qty_remaining: Quantity,
+}
+
 /// Add `amount` into a committed escrow column entry (creating it if absent).
 fn column_add<K: Ord>(
     column: &mut BTreeMap<K, Amount>,
@@ -192,8 +214,11 @@ pub struct Engine {
     /// Per-(market, instrument) order books.
     books: HashMap<(u32, u16), OrderBook>,
     markets: HashMap<u32, MarketMeta>,
-    /// Resting-order notional reserved: (market, instrument, order_id) -> notional.
-    order_reserves: HashMap<(u32, u16, u64), (AccountId, Amount)>,
+    /// Resting-order notional reserved, keyed by book-order coordinates. Each
+    /// record carries the resting quantity its reserve was computed from so
+    /// fill-by-fill releases telescope to exactly the reserved amount (see
+    /// [`OrderReserve`]).
+    order_reserves: HashMap<OrderKey, OrderReserve>,
     /// Outcome claims: (account, market) -> per-outcome balances. Live
     /// (spendable) claims only; claims backing resting asks are moved into
     /// `ask_claims_escrow` while the order rests.
@@ -329,17 +354,22 @@ impl Engine {
         }
     }
 
+    /// Reserve basis for the residual of a just-matched order: the resting
+    /// quantity (`requested - filled`) and its limit-price notional (toward
+    /// zero). Both are returned together so the stored [`OrderReserve`] holds
+    /// exactly the quantity its reserved amount was computed from.
     fn residual_notional(
         result: &orderbook::MatchResult,
         price: types::Price,
         requested: Quantity,
-    ) -> Result<Amount, ExecutionError> {
+    ) -> Result<(Amount, Quantity), ExecutionError> {
         let filled = result.filled_quantity();
         let remaining = requested.raw().saturating_sub(filled.raw()).max(0);
         if remaining == 0 {
-            return Ok(Amount::ZERO);
+            return Ok((Amount::ZERO, Quantity::ZERO));
         }
-        Ok(price.notional(Quantity::from_raw(remaining))?)
+        let qty = Quantity::from_raw(remaining);
+        Ok((price.notional(qty)?, qty))
     }
 
     fn release_order_reserve(
@@ -350,13 +380,15 @@ impl Engine {
         account: AccountId,
     ) -> Result<(), ExecutionError> {
         let key = (market.get(), instrument, order_id.get());
-        if let Some((owner, notional)) = self.order_reserves.remove(&key) {
-            if owner != account {
+        if let Some(rec) = self.order_reserves.remove(&key) {
+            if rec.account != account {
                 // Put it back; wrong owner should not release.
-                self.order_reserves.insert(key, (owner, notional));
+                self.order_reserves.insert(key, rec);
                 return Err(ExecutionError::OrderNotOwned);
             }
-            self.risk.release_resting(account, notional)?;
+            // Release the CURRENT reserved amount (already telescoped down by
+            // any prior fills), never a recomputation from scratch.
+            self.risk.release_resting(account, rec.reserved)?;
         }
         Ok(())
     }
@@ -368,6 +400,7 @@ impl Engine {
         order_id: types::OrderId,
         account: AccountId,
         notional: Amount,
+        qty_remaining: Quantity,
     ) -> Result<(), ExecutionError> {
         if notional.raw() == 0 {
             return Ok(());
@@ -375,7 +408,11 @@ impl Engine {
         self.risk.reserve_resting(account, notional)?;
         self.order_reserves.insert(
             (market.get(), instrument, order_id.get()),
-            (account, notional),
+            OrderReserve {
+                account,
+                reserved: notional,
+                qty_remaining,
+            },
         );
         Ok(())
     }
@@ -781,20 +818,34 @@ impl Engine {
                     .apply_fill(fill.maker_account, market, maker_signed, fill.price)?;
             }
             // Release reserved IM on the filled portion of the resting maker.
+            // The release telescopes: recompute the reserve the residual still
+            // needs (`fill.price` IS the maker's limit price — the same basis
+            // the reservation was floored on) and release the difference, so
+            // Σ releases over the maker's lifetime equals the reserved amount
+            // bit-exactly. Releasing per-fill floors instead under-releases
+            // (floor(a) + floor(b) <= floor(a + b)) and, once the maker fully
+            // fills off the book, the dust would stay reserved forever (#408).
             let fill_notional = fill.price.notional(fill.quantity)?;
             let key = (market.get(), instrument, fill.maker_order.get());
-            if let Some((owner, reserved)) = self.order_reserves.get(&key).copied() {
-                let release = if fill_notional.raw() > reserved.raw() {
-                    reserved
-                } else {
-                    fill_notional
-                };
-                let next = reserved.checked_sub(release)?;
-                self.risk.release_resting(owner, release)?;
-                if next.raw() == 0 {
+            if let Some(rec) = self.order_reserves.get(&key).copied() {
+                let new_qty = rec.qty_remaining.saturating_sub(fill.quantity);
+                let new_reserve = fill.price.notional(new_qty)?;
+                // Non-negative: notional is monotone in quantity at a fixed
+                // price; a shortfall (never expected) fails typed in
+                // `release_resting`, rolling the whole command back.
+                let release = rec.reserved.checked_sub(new_reserve)?;
+                self.risk.release_resting(rec.account, release)?;
+                if new_qty.raw() == 0 {
                     self.order_reserves.remove(&key);
                 } else {
-                    self.order_reserves.insert(key, (owner, next));
+                    self.order_reserves.insert(
+                        key,
+                        OrderReserve {
+                            account: rec.account,
+                            reserved: new_reserve,
+                            qty_remaining: new_qty,
+                        },
+                    );
                 }
             }
             // When this fill fully consumed the resting maker (it no longer
@@ -1334,14 +1385,15 @@ impl Engine {
                             remaining,
                         )?;
                     } else {
-                        let rest_notional = Self::residual_notional(&result, c.price, c.quantity)?;
+                        let (rest_notional, rest_qty) =
+                            Self::residual_notional(&result, c.price, c.quantity)?;
                         // Limit orders use their limit price; market residuals
                         // do not rest.
-                        let rest_notional =
+                        let (rest_notional, rest_qty) =
                             if !matches!(c.order_type, OrderType::Market) && c.price.raw() > 0 {
-                                rest_notional
+                                (rest_notional, rest_qty)
                             } else {
-                                Amount::ZERO
+                                (Amount::ZERO, Quantity::ZERO)
                             };
                         self.reserve_order(
                             c.market,
@@ -1349,6 +1401,7 @@ impl Engine {
                             c.order_id,
                             c.account,
                             rest_notional,
+                            rest_qty,
                         )?;
                     }
                 }
@@ -1419,15 +1472,15 @@ impl Engine {
                     }
                 }
                 // Release every resting reservation for this account in the market.
-                let keys: Vec<(u32, u16, u64)> = self
+                let keys: Vec<OrderKey> = self
                     .order_reserves
                     .iter()
-                    .filter(|((m, _, _), (a, _))| *m == c.market.get() && *a == c.account)
+                    .filter(|((m, _, _), rec)| *m == c.market.get() && rec.account == c.account)
                     .map(|(k, _)| *k)
                     .collect();
                 for key in keys {
-                    if let Some((owner, notional)) = self.order_reserves.remove(&key) {
-                        self.risk.release_resting(owner, notional)?;
+                    if let Some(rec) = self.order_reserves.remove(&key) {
+                        self.risk.release_resting(rec.account, rec.reserved)?;
                     }
                 }
                 // Release every claim escrow this account holds in the market,
@@ -1521,13 +1574,15 @@ impl Engine {
                     if let Some(side) = claim_side {
                         self.escrow_claim_resting(order_key, c.account, side, c.price, remaining)?;
                     } else {
-                        let rest_notional = Self::residual_notional(&result, c.price, c.quantity)?;
+                        let (rest_notional, rest_qty) =
+                            Self::residual_notional(&result, c.price, c.quantity)?;
                         self.reserve_order(
                             c.market,
                             instrument,
                             c.order_id,
                             c.account,
                             rest_notional,
+                            rest_qty,
                         )?;
                     }
                 }
@@ -1676,15 +1731,15 @@ impl Engine {
                 affected.sort_by_key(|a| a.get());
                 affected.dedup();
                 // Drop any resting reservations for the liquidated account.
-                let drop_keys: Vec<(u32, u16, u64)> = self
+                let drop_keys: Vec<OrderKey> = self
                     .order_reserves
                     .iter()
-                    .filter(|(_, (a, _))| *a == c.account)
+                    .filter(|(_, rec)| rec.account == c.account)
                     .map(|(k, _)| *k)
                     .collect();
                 for key in drop_keys {
-                    if let Some((owner, notional)) = self.order_reserves.remove(&key) {
-                        let _ = self.risk.release_resting(owner, notional);
+                    if let Some(rec) = self.order_reserves.remove(&key) {
+                        let _ = self.risk.release_resting(rec.account, rec.reserved);
                     }
                 }
                 for a in &affected {
@@ -1809,15 +1864,15 @@ impl Engine {
                         let _ = book; // cancelled via reserves keys below
                     }
                 }
-                let reserve_keys: Vec<(u32, u16, u64)> = self
+                let reserve_keys: Vec<OrderKey> = self
                     .order_reserves
                     .keys()
                     .copied()
                     .filter(|(m, _, _)| *m == c.market.get())
                     .collect();
                 for key in reserve_keys {
-                    if let Some((owner, notional)) = self.order_reserves.remove(&key) {
-                        let _ = self.risk.release_resting(owner, notional);
+                    if let Some(rec) = self.order_reserves.remove(&key) {
+                        let _ = self.risk.release_resting(rec.account, rec.reserved);
                         if let Some(book) = self.books.get_mut(&(key.0, key.1)) {
                             let _ = book.cancel(types::OrderId::new(key.2));
                         }
@@ -3738,6 +3793,92 @@ mod tests {
             Amount::from_raw(1_000_000_000),
         );
         assert_eq!(e.ledger.locked(seller).unwrap(), Amount::ZERO);
+        check_invariants(&e);
+    }
+
+    // #408 repro: a perp maker rests 10 micro-lots at 0.333333, reserving
+    // floor(333333 * 10 / 1e6) = 3 micro-units of notional. Ten one-lot fills
+    // each floor to 0 fill notional, so summing per-fill floors releases 0 of
+    // the 3 reserved; once the maker fully fills it leaves the book, no cancel
+    // ever runs, and the 3 micro-units stay in `reserved_resting` forever.
+    // The telescoping release must return the reservation to exactly zero and
+    // drop the `order_reserves` record.
+    #[test]
+    fn full_fill_releases_floor_dust_reserve_exactly() {
+        let mut e = engine_with_caps(8, 4);
+        e.execute(seq(1), create_account(1_000_000_000)).unwrap(); // maker 0
+        e.execute(seq(2), create_account(1_000_000_000)).unwrap(); // taker 1
+        e.execute(seq(3), create_perp(0, 1_000_000)).unwrap();
+        let maker = AccountId::new(0);
+
+        // Maker bid: 10 micro-lots @ 0.333333 rests whole.
+        e.execute(seq(4), place(0, 0, 1, Side::Bid, 333_333, 10))
+            .unwrap();
+        assert_eq!(
+            e.risk.reserved_resting(maker).unwrap(),
+            Amount::from_raw(3),
+            "floor(333333 * 10 / 1e6) must reserve exactly 3",
+        );
+        assert!(e.order_reserves.contains_key(&(0, 0, 1)));
+
+        // Ten one-lot taker asks fully consume the maker. Every per-fill
+        // notional floors to zero — the leak scenario.
+        for i in 0..10u64 {
+            e.execute(seq(5 + i), place(1, 0, 2 + i, Side::Ask, 333_333, 1))
+                .unwrap();
+        }
+        assert_eq!(
+            e.risk.reserved_resting(maker).unwrap(),
+            Amount::ZERO,
+            "fully-filled maker stranded reserved notional (floor-sum leak)",
+        );
+        assert!(
+            !e.order_reserves.contains_key(&(0, 0, 1)),
+            "fully-filled maker left a dangling order_reserves record",
+        );
+        assert!(e.order_reserves.is_empty());
+        check_invariants(&e);
+    }
+
+    // #408: partial fills draw the reservation down along the telescoped
+    // schedule (reserved always equals the limit-price notional of the resting
+    // residual), and a cancel then releases exactly the stored remainder — so
+    // fills + cancel release precisely the original reserve, never less.
+    #[test]
+    fn partial_fills_then_cancel_release_original_reserve_exactly() {
+        let mut e = engine_with_caps(8, 4);
+        e.execute(seq(1), create_account(1_000_000_000)).unwrap(); // maker 0
+        e.execute(seq(2), create_account(1_000_000_000)).unwrap(); // taker 1
+        e.execute(seq(3), create_perp(0, 1_000_000)).unwrap();
+        let maker = AccountId::new(0);
+
+        e.execute(seq(4), place(0, 0, 1, Side::Bid, 333_333, 10))
+            .unwrap();
+        assert_eq!(e.risk.reserved_resting(maker).unwrap(), Amount::from_raw(3));
+
+        // Three one-lot fills leave 7 resting: the reservation must telescope
+        // to floor(333333 * 7 / 1e6) = 2 (per-fill floors would release 0 and
+        // leave it stuck at 3).
+        for i in 0..3u64 {
+            e.execute(seq(5 + i), place(1, 0, 2 + i, Side::Ask, 333_333, 1))
+                .unwrap();
+        }
+        assert_eq!(
+            e.risk.reserved_resting(maker).unwrap(),
+            Amount::from_raw(2),
+            "reservation must track the residual's limit-price notional",
+        );
+        check_invariants(&e);
+
+        // Cancel releases the CURRENT stored remainder (2), bringing the total
+        // released across fills + cancel to exactly the original 3.
+        e.execute(seq(8), cancel(0, 0, 1)).unwrap();
+        assert_eq!(
+            e.risk.reserved_resting(maker).unwrap(),
+            Amount::ZERO,
+            "fills + cancel must release exactly the original reserve",
+        );
+        assert!(e.order_reserves.is_empty());
         check_invariants(&e);
     }
 }
