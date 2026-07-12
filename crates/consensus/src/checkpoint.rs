@@ -27,6 +27,23 @@ pub const DOMAIN_CHECKPOINT: &[u8] = b"dexos:checkpoint:header:v1";
 /// Domain tag for witness-receipt digests.
 pub const DOMAIN_WITNESS: &[u8] = b"dexos:checkpoint:witness:v1";
 
+/// Default number of sequences above the [`WitnessCollector`] watermark a
+/// receipt's `last_sequence` may reach.
+///
+/// Generous enough to cover every in-flight checkpoint range between two
+/// watermark advances, while rejecting far-future garbage that pruning by
+/// watermark could never reclaim.
+pub const DEFAULT_WITNESS_SEQUENCE_HORIZON: u64 = 1 << 20;
+/// Default cap on total retained `(digest, witness)` receipt entries.
+///
+/// Honest load is one receipt per witness per in-flight checkpoint range
+/// (`<= MAX_VALIDATORS` witnesses, a handful of ranges); 16384 entries gives
+/// two orders of magnitude of headroom while bounding a Byzantine flood of
+/// crafted sub-ranges to ~2.5 MiB of retained signatures. When the cap is
+/// reached, **new** receipts are rejected fail-closed — nothing already
+/// admitted is dropped, so an in-progress certification is never lost.
+pub const DEFAULT_WITNESS_MAX_ENTRIES: usize = 16_384;
+
 /// The signed content of a checkpoint (everything except the quorum
 /// certificate).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -173,6 +190,16 @@ pub enum CheckpointError {
     /// Not enough distinct witness weight to reach threshold.
     #[error("witness receipts below threshold")]
     BelowThreshold,
+    /// Receipt epoch does not match the active committee.
+    #[error("witness receipt epoch mismatch")]
+    EpochMismatch,
+    /// Receipt sequence range is outside the admitted checkpoint window.
+    #[error("witness receipt outside admitted window")]
+    OutsideWindow,
+    /// The collector reached its retained-entry cap; the new receipt is
+    /// rejected fail-closed (already-admitted receipts are never dropped).
+    #[error("witness collector at capacity")]
+    AtCapacity,
 }
 
 /// Build a [`CheckpointHeader`] over an executed sequence range.
@@ -382,30 +409,134 @@ impl WitnessReceipt {
     }
 }
 
-/// Collects witness receipts for a single range and certifies them once a
-/// threshold of distinct, valid witnesses attest to the same execution root.
-#[derive(Debug, Clone, Default)]
+/// Collects witness receipts and certifies a range once a threshold of
+/// distinct, valid witnesses attest to the same execution root.
+///
+/// Admission is bounded three ways so a Byzantine committee member cannot
+/// exhaust memory:
+///
+/// 1. **Epoch**: a receipt must carry the active committee's epoch.
+/// 2. **Window**: the receipt's `(first_sequence, last_sequence)` must sit in
+///    `[watermark, watermark + sequence_horizon]`; callers advance the
+///    watermark via [`WitnessCollector::prune_below`] as checkpoints finalize.
+/// 3. **Cap**: total retained `(digest, witness)` entries never exceed
+///    `max_entries`; excess receipts are rejected fail-closed rather than
+///    evicting (or wiping) already-admitted receipts.
+#[derive(Debug, Clone)]
 pub struct WitnessCollector {
     // digest -> (witness_index -> signature)
     receipts: BTreeMap<Hash, BTreeMap<u32, [u8; 64]>>,
     // (witness_index, shard, first, last) -> execution_root seen
     seen: BTreeMap<(u32, u16, u64, u64), Hash>,
+    // digest -> first_sequence, so `prune_below` can evict receipts precisely
+    // (the digest key alone does not expose the range).
+    digest_starts: BTreeMap<Hash, u64>,
+    /// Lowest admissible `first_sequence` (advanced by `prune_below`).
+    watermark: u64,
+    /// How far above the watermark `last_sequence` may reach.
+    sequence_horizon: u64,
+    /// Cap on total retained `(digest, witness)` entries.
+    max_entries: usize,
+    /// Current total retained `(digest, witness)` entries.
+    entries: usize,
+}
+
+impl Default for WitnessCollector {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl WitnessCollector {
-    /// A fresh, empty collector.
+    /// A fresh, empty collector with the default admission window
+    /// (watermark 0, [`DEFAULT_WITNESS_SEQUENCE_HORIZON`],
+    /// [`DEFAULT_WITNESS_MAX_ENTRIES`]).
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self::with_window(
+            0,
+            DEFAULT_WITNESS_SEQUENCE_HORIZON,
+            DEFAULT_WITNESS_MAX_ENTRIES,
+        )
     }
 
-    /// Admit a receipt. Verifies membership + signature and rejects a witness
-    /// that already signed a *different* root for the same range (equivocation).
+    /// A collector with an explicit admission window: receipts must have
+    /// `first_sequence >= watermark` and
+    /// `last_sequence <= watermark + sequence_horizon`, and at most
+    /// `max_entries` `(digest, witness)` entries are retained in total.
+    #[must_use]
+    pub fn with_window(watermark: u64, sequence_horizon: u64, max_entries: usize) -> Self {
+        Self {
+            receipts: BTreeMap::new(),
+            seen: BTreeMap::new(),
+            digest_starts: BTreeMap::new(),
+            watermark,
+            sequence_horizon,
+            max_entries,
+            entries: 0,
+        }
+    }
+
+    /// The current admission watermark (lowest admissible `first_sequence`).
+    #[must_use]
+    pub fn watermark(&self) -> u64 {
+        self.watermark
+    }
+
+    /// Total retained `(digest, witness)` receipt entries (observability).
+    #[must_use]
+    pub fn retained_entries(&self) -> usize {
+        self.entries
+    }
+
+    /// Advance the watermark to `sequence` (never backwards) and drop every
+    /// retained receipt and equivocation key whose range starts below it.
+    ///
+    /// Precise and non-destructive: entries at or above the watermark —
+    /// including any in-progress certification — are untouched.
+    pub fn prune_below(&mut self, sequence: u64) {
+        self.watermark = self.watermark.max(sequence);
+        let watermark = self.watermark;
+        self.seen.retain(|(_, _, first, _), _| *first >= watermark);
+        let stale: Vec<Hash> = self
+            .digest_starts
+            .iter()
+            .filter(|&(_, &first)| first < watermark)
+            .map(|(digest, _)| *digest)
+            .collect();
+        for digest in &stale {
+            self.digest_starts.remove(digest);
+            if let Some(per_digest) = self.receipts.remove(digest) {
+                self.entries = self.entries.saturating_sub(per_digest.len());
+            }
+        }
+    }
+
+    /// Admit a receipt. Rejects (in order, before any signature work) a wrong
+    /// epoch, an out-of-order range, and a range outside the admission window;
+    /// then verifies membership + signature, rejects a witness that already
+    /// signed a *different* root for the same range (equivocation), and — for
+    /// a genuinely new entry — enforces the retained-entry cap fail-closed.
     pub fn add_receipt(
         &mut self,
         committee: &Committee,
         receipt: &WitnessReceipt,
     ) -> Result<(), CheckpointError> {
+        // Cheap admission-window checks before signature work.
+        if receipt.epoch != committee.epoch() {
+            return Err(CheckpointError::EpochMismatch);
+        }
+        if receipt.last_sequence < receipt.first_sequence {
+            return Err(CheckpointError::RangeOutOfOrder {
+                first: receipt.first_sequence,
+                last: receipt.last_sequence,
+            });
+        }
+        if receipt.first_sequence < self.watermark
+            || receipt.last_sequence > self.watermark.saturating_add(self.sequence_horizon)
+        {
+            return Err(CheckpointError::OutsideWindow);
+        }
         let idx = usize::try_from(receipt.witness_index)
             .map_err(|_| CheckpointError::ForeignWitness(receipt.witness_index))?;
         if idx >= committee.len() || idx >= MAX_VALIDATORS {
@@ -426,12 +557,28 @@ impl WitnessCollector {
             if *prev_root != receipt.execution_root {
                 return Err(CheckpointError::WitnessEquivocation);
             }
-        } else {
-            self.seen.insert(key, receipt.execution_root);
         }
 
+        let digest = receipt.digest();
+        let is_new = !self
+            .receipts
+            .get(&digest)
+            .is_some_and(|per| per.contains_key(&receipt.witness_index));
+        if is_new {
+            // Fail closed at the cap: reject the new entry, never evict or
+            // clear what an honest quorum has already contributed.
+            if self.entries >= self.max_entries {
+                return Err(CheckpointError::AtCapacity);
+            }
+            self.entries = self.entries.saturating_add(1);
+        }
+
+        self.seen.entry(key).or_insert(receipt.execution_root);
+        self.digest_starts
+            .entry(digest)
+            .or_insert(receipt.first_sequence);
         self.receipts
-            .entry(receipt.digest())
+            .entry(digest)
             .or_default()
             .insert(receipt.witness_index, receipt.signature);
         Ok(())

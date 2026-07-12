@@ -35,14 +35,33 @@ pub const MAX_VALIDATORS: usize = 64;
 
 /// Default how far ahead of the collector watermark a height may be.
 ///
-/// Large enough for long-running soak tests and pipelined heights; engines
-/// should call [`VoteCollector::prune_finalized`] / [`VoteCollector::set_window`]
-/// to keep the live window tight around the watermark.
-pub const DEFAULT_HEIGHT_HORIZON: u64 = 4096;
+/// Sized to realistic HotStuff pipelining depth — two full leader rotations of
+/// the maximum committee (`2 * MAX_VALIDATORS`) — not to worst-case soak
+/// length. Engines call [`VoteCollector::prune_finalized`] /
+/// [`VoteCollector::set_window`] on finalization, so the live window stays
+/// tight around the watermark. A small horizon bounds what one Byzantine
+/// member can insert: at most `(height_horizon + 1) * (view_horizon + 1) * 3`
+/// admissible round keys (further capped by the per-validator vote quota),
+/// instead of the millions the previous 4096-height window admitted.
+pub const DEFAULT_HEIGHT_HORIZON: u64 = 128;
 /// Default how far ahead of the current view a vote may target.
-pub const DEFAULT_VIEW_HORIZON: u64 = 256;
+///
+/// One full leader rotation of the maximum committee ([`MAX_VALIDATORS`]):
+/// before every leader has had a turn, either a proposal lands and
+/// finalization re-tightens the window, or the node is already in a liveness
+/// failure that a larger vote window cannot fix.
+pub const DEFAULT_VIEW_HORIZON: u64 = 64;
 /// Default bound on retained slash / equivocation evidence entries.
 pub const DEFAULT_EVIDENCE_LIMIT: usize = 256;
+/// Default per-validator retained-vote quota.
+///
+/// An honest validator retains at most `3` phase votes per in-flight height
+/// (`<= DEFAULT_HEIGHT_HORIZON + 1` heights) per view it voted in; the quota
+/// covers a full pipeline at ~20 view changes without any finalization —
+/// far beyond honest churn — while capping a single Byzantine flooder to
+/// `DEFAULT_VOTE_QUOTA` retained entries (~1 MiB) instead of unbounded growth.
+/// Excess votes are rejected fail-closed; nothing already admitted is wiped.
+pub const DEFAULT_VOTE_QUOTA: usize = 8192;
 
 /// A pipelined HotStuff voting phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -238,6 +257,10 @@ pub enum VoteError {
     /// Vote height/view is outside the admitted window.
     #[error("vote outside admitted window")]
     OutsideWindow,
+    /// The validator exceeded its retained-vote quota; the vote is rejected
+    /// fail-closed (already-admitted votes are never wiped).
+    #[error("validator {0} exceeded its retained-vote quota")]
+    QuotaExceeded(u32),
     /// The validator has been halted for prior equivocation.
     #[error("validator {0} is halted for equivocation")]
     HaltedOffender(u32),
@@ -337,6 +360,9 @@ pub struct CollectorWindow {
     pub view_horizon: u64,
     /// Max retained slash/equivocation evidence entries.
     pub evidence_limit: usize,
+    /// Max retained vote entries per validator; excess votes are rejected
+    /// fail-closed (never wiping already-admitted votes).
+    pub vote_quota: usize,
 }
 
 impl CollectorWindow {
@@ -351,6 +377,7 @@ impl CollectorWindow {
             current_view: 0,
             view_horizon: DEFAULT_VIEW_HORIZON,
             evidence_limit: DEFAULT_EVIDENCE_LIMIT,
+            vote_quota: DEFAULT_VOTE_QUOTA,
         }
     }
 
@@ -500,6 +527,11 @@ impl Committee {
 pub struct VoteCollector {
     // digest -> (validator_index -> signature), BTreeMap keeps ascending order.
     votes: BTreeMap<Hash, BTreeMap<u32, [u8; 64]>>,
+    // digest -> height, so `prune_finalized` can evict below-watermark digests
+    // precisely (the digest key alone does not expose the height).
+    digest_heights: BTreeMap<Hash, u64>,
+    // validator -> retained vote-entry count, for the per-validator quota.
+    per_validator: BTreeMap<u32, usize>,
     // round key -> first block + signature seen (for equivocation detection).
     #[allow(clippy::type_complexity)] // equivocation index key
     seen: BTreeMap<(u32, u64, u64, u64, u8), (Hash, [u8; 64])>,
@@ -530,6 +562,8 @@ impl VoteCollector {
     pub fn with_window(window: CollectorWindow) -> Self {
         Self {
             votes: BTreeMap::new(),
+            digest_heights: BTreeMap::new(),
+            per_validator: BTreeMap::new(),
             seen: BTreeMap::new(),
             equivocations: Vec::new(),
             slash_log: Vec::new(),
@@ -554,25 +588,38 @@ impl VoteCollector {
     /// heights strictly below `finalized_height` (exclusive lower bound becomes
     /// `finalized_height`). Protocol-required evidence is retained up to the
     /// evidence limit.
+    ///
+    /// Eviction is **precise and non-destructive**: only entries whose height
+    /// is below the watermark are dropped (the `digest -> height` index makes
+    /// `votes` prunable exactly like `seen`). Live, above-watermark votes —
+    /// including any in-flight quorum — are never wiped.
     pub fn prune_finalized(&mut self, finalized_height: u64) {
         self.window.min_height = self.window.min_height.max(finalized_height);
-        // Drop vote digests whose height we can no longer admit — we do not
-        // store height on the digest key, so purge `seen` by height and rebuild
-        // empty digests lazily. Clear votes entirely below watermark by
-        // scanning seen-derived heights is approximate; instead clear all votes
-        // for rounds with height < min_height via `seen` keys, then drop empty.
+        let min_height = self.window.min_height;
         self.seen
-            .retain(|(_, _, _, height, _), _| *height >= self.window.min_height);
-        // Votes map is keyed by digest only; leave it — try_form_qc still works
-        // for live heights. Bound growth by also clearing votes when the map is
-        // large relative to the horizon: drop all when over capacity.
-        let cap = usize::try_from(self.window.height_horizon)
-            .unwrap_or(usize::MAX)
-            .saturating_mul(3)
-            .saturating_mul(self.window.evidence_limit.max(1))
-            .max(64);
-        if self.votes.len() > cap {
-            self.votes.clear();
+            .retain(|(_, _, _, height, _), _| *height >= min_height);
+        let stale: Vec<Hash> = self
+            .digest_heights
+            .iter()
+            .filter(|&(_, &height)| height < min_height)
+            .map(|(digest, _)| *digest)
+            .collect();
+        for digest in &stale {
+            self.digest_heights.remove(digest);
+            if let Some(per_digest) = self.votes.remove(digest) {
+                for index in per_digest.keys() {
+                    let emptied = match self.per_validator.get_mut(index) {
+                        Some(count) => {
+                            *count = count.saturating_sub(1);
+                            *count == 0
+                        }
+                        None => false,
+                    };
+                    if emptied {
+                        self.per_validator.remove(index);
+                    }
+                }
+            }
         }
         while self.equivocations.len() > self.window.evidence_limit {
             self.equivocations.remove(0);
@@ -586,6 +633,13 @@ impl VoteCollector {
     #[must_use]
     pub fn retained_digests(&self) -> usize {
         self.votes.len()
+    }
+
+    /// Total retained per-validator vote entries across all digests
+    /// (observability; integer count, no recomputation of weights).
+    #[must_use]
+    pub fn retained_votes(&self) -> usize {
+        self.per_validator.values().sum()
     }
 
     /// Votes dropped for being outside the window.
@@ -662,16 +716,39 @@ impl VoteCollector {
                 self.record_equivocation(evidence.clone());
                 return Ok(VoteOutcome::Equivocated(evidence));
             }
-        } else {
-            self.seen.insert(key_rk, (vote.block_hash, vote.signature));
         }
 
         let digest = vote.digest();
-        let per_digest = self.votes.entry(digest).or_default();
-        if per_digest.contains_key(&vote.validator_index) {
+        if self
+            .votes
+            .get(&digest)
+            .is_some_and(|per| per.contains_key(&vote.validator_index))
+        {
             return Ok(VoteOutcome::Duplicate);
         }
-        per_digest.insert(vote.validator_index, vote.signature);
+
+        // Per-validator retained-vote quota: a flooder is rejected fail-closed
+        // once its retained entries reach the quota — nothing already admitted
+        // is evicted, so live quorums from honest validators are unaffected.
+        let count = self
+            .per_validator
+            .get(&vote.validator_index)
+            .copied()
+            .unwrap_or(0);
+        if count >= self.window.vote_quota {
+            return Err(VoteError::QuotaExceeded(vote.validator_index));
+        }
+
+        self.seen
+            .entry(key_rk)
+            .or_insert((vote.block_hash, vote.signature));
+        self.digest_heights.entry(digest).or_insert(vote.height);
+        self.votes
+            .entry(digest)
+            .or_default()
+            .insert(vote.validator_index, vote.signature);
+        self.per_validator
+            .insert(vote.validator_index, count.saturating_add(1));
         Ok(VoteOutcome::Accepted)
     }
 
@@ -681,6 +758,8 @@ impl VoteCollector {
         for per in self.votes.values_mut() {
             per.remove(&evidence.validator_index);
         }
+        // Every retained entry of the offender was just removed.
+        self.per_validator.remove(&evidence.validator_index);
         let slash = SlashEvidence {
             kind: SlashKind::VoteEquivocation,
             epoch: evidence.epoch,
@@ -710,6 +789,8 @@ impl VoteCollector {
         for per in self.votes.values_mut() {
             per.remove(&proposer);
         }
+        // Every retained entry of the offender was just removed.
+        self.per_validator.remove(&proposer);
         let evidence = Equivocation {
             validator_index: proposer,
             epoch,
