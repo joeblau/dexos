@@ -67,7 +67,12 @@ impl ControlMeta {
     /// `session_pubkey`) and the lowered `command`. The `signer` and
     /// `signature` fields are deliberately excluded so the signature cannot sign
     /// over its own value while still binding the nonce and session key.
-    pub fn signing_bytes(&self, command: &Command) -> Vec<u8> {
+    ///
+    /// Fails closed: if the payload cannot be encoded, this returns
+    /// [`RpcError::InvalidSignature`] rather than degenerating to a preimage
+    /// that no longer commits to the command — a constant preimage would make
+    /// one captured signature valid for every command and nonce.
+    pub fn signing_bytes(&self, command: &Command) -> Result<Vec<u8>, RpcError> {
         #[derive(Serialize)]
         struct Payload<'a> {
             client_id: u64,
@@ -82,32 +87,36 @@ impl ControlMeta {
             command,
         };
         let mut bytes = CONTROL_SIGNING_DOMAIN.to_vec();
-        bytes.extend_from_slice(&codec::encode(&payload).unwrap_or_default());
-        bytes
+        bytes.extend_from_slice(&codec::encode(&payload).map_err(|_| RpcError::InvalidSignature)?);
+        Ok(bytes)
     }
 
     /// Verify the envelope is authentically signed by `signer` over the
     /// canonical bytes for `command`. This proves possession of the signer's
     /// private key and binds the method, params, nonce, and session key; it does
     /// not by itself bind `signer` to the command's account (the backend does
-    /// that). Returns [`RpcError::InvalidSignature`] on any failure, and never
-    /// panics on adversarial `signer`/`signature` bytes.
+    /// that). Returns [`RpcError::InvalidSignature`] on any failure — including
+    /// a failure to encode the canonical bytes, which rejects the command
+    /// rather than verifying against a degenerate preimage — and never panics
+    /// on adversarial `signer`/`signature` bytes.
     pub fn verify_signature(&self, command: &Command) -> Result<(), RpcError> {
-        let message = self.signing_bytes(command);
+        let message = self.signing_bytes(command)?;
         crypto::verify_ed25519(&self.signer, &message, &self.signature)
             .map_err(|_| RpcError::InvalidSignature)
     }
 
     /// Build a signed control envelope: sign the canonical bytes for `command`
     /// with `keypair`, populating `signer` and `signature`. Convenience for
-    /// clients and tests; the server only ever verifies, never signs.
+    /// clients and tests; the server only ever verifies, never signs. Returns
+    /// [`RpcError::InvalidSignature`] if the canonical bytes cannot be encoded,
+    /// so a client can never emit a signature over a degenerate preimage.
     pub fn signed(
         client_id: u64,
         nonce: u64,
         session_pubkey: Option<[u8; 32]>,
         keypair: &crypto::KeyPair,
         command: &Command,
-    ) -> Self {
+    ) -> Result<Self, RpcError> {
         let mut meta = ControlMeta {
             client_id,
             nonce,
@@ -115,8 +124,8 @@ impl ControlMeta {
             signer: keypair.public(),
             signature: [0u8; 64],
         };
-        meta.signature = keypair.sign(&meta.signing_bytes(command));
-        meta
+        meta.signature = keypair.sign(&meta.signing_bytes(command)?);
+        Ok(meta)
     }
 }
 
@@ -563,4 +572,55 @@ pub struct CommandAck {
     pub order_id: Option<OrderId>,
     /// Affected market, if any.
     pub market_id: Option<MarketId>,
+}
+
+#[cfg(test)]
+mod signing_tests {
+    use super::*;
+
+    /// The signing preimage must always commit to the command: it is `Ok`,
+    /// strictly longer than the bare domain tag (so an encode failure can never
+    /// silently collapse it to a constant), differs between distinct commands,
+    /// and round-trips through sign/verify.
+    #[test]
+    fn signing_bytes_commit_to_command_and_round_trip() {
+        let keypair = crypto::KeyPair::from_seed(&[9u8; 32]);
+        let cancel_all = Command::CancelAll {
+            account: AccountId::new(1),
+            market: None,
+        };
+        let cancel_one = Command::CancelAll {
+            account: AccountId::new(1),
+            market: Some(MarketId::new(7)),
+        };
+
+        let meta = ControlMeta::signed(1, 1, None, &keypair, &cancel_all)
+            .expect("signing a well-formed command must succeed");
+
+        // The preimage is non-trivial: strictly more than the 20-byte domain
+        // tag, i.e. the encoded payload actually made it into the message.
+        let bytes = meta
+            .signing_bytes(&cancel_all)
+            .expect("signing bytes for a well-formed command must encode");
+        assert!(bytes.len() > CONTROL_SIGNING_DOMAIN.len());
+        assert_eq!(
+            &bytes[..CONTROL_SIGNING_DOMAIN.len()],
+            CONTROL_SIGNING_DOMAIN
+        );
+
+        // Different commands under the same envelope produce different
+        // preimages, so a signature over one can never authorize the other.
+        let other = meta
+            .signing_bytes(&cancel_one)
+            .expect("signing bytes for a well-formed command must encode");
+        assert_ne!(bytes, other);
+
+        // The signed envelope verifies against its own command and is rejected
+        // for any other command.
+        assert!(meta.verify_signature(&cancel_all).is_ok());
+        assert_eq!(
+            meta.verify_signature(&cancel_one),
+            Err(RpcError::InvalidSignature)
+        );
+    }
 }
