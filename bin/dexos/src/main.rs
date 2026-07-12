@@ -65,9 +65,11 @@ struct Cli {
     client_id: u64,
     /// Monotonic per-client nonce for the next control command. The server dedupes
     /// `(client_id, nonce)`, so a retransmit must reuse the same value and a new
-    /// command must increase it.
-    #[arg(long, global = true, value_name = "N", default_value_t = 0)]
-    nonce: u64,
+    /// command must increase it. Required for control (write) methods — there is
+    /// deliberately no default, so two commands can never silently collide on the
+    /// same nonce. Ignored by read-only queries.
+    #[arg(long, global = true, value_name = "N")]
+    nonce: Option<u64>,
     /// Correlation id echoed back on the response envelope.
     #[arg(long, global = true, value_name = "ID", default_value_t = 1)]
     request_id: u64,
@@ -616,10 +618,20 @@ fn build_method(cli: &Cli) -> anyhow::Result<RpcMethod> {
 }
 
 /// Sign the canonical bytes for `command` with the configured key, producing the
-/// `ControlMeta` a write method carries.
+/// `ControlMeta` a write method carries. Requires an explicit `--nonce`: the
+/// server consumes `(client_id, nonce)` exactly once, so a defaulted nonce would
+/// make a second command silently collide with the first and never execute.
 fn control_meta(cli: &Cli, command: &RpcCommand) -> anyhow::Result<ControlMeta> {
+    let Some(nonce) = cli.nonce else {
+        anyhow::bail!(
+            "control commands require an explicit --nonce: the server consumes \
+             (client_id, nonce) exactly once, so reusing one would return the previous \
+             command's ack instead of executing this one — pass --nonce <N> and \
+             increment it for each new command"
+        )
+    };
     let (keypair, session_pubkey) = load_signer(cli)?;
-    let meta = ControlMeta::signed(cli.client_id, cli.nonce, session_pubkey, &keypair, command)
+    let meta = ControlMeta::signed(cli.client_id, nonce, session_pubkey, &keypair, command)
         .map_err(|e| anyhow::anyhow!("signing control command: {e}"))?;
     Ok(meta)
 }
@@ -675,19 +687,56 @@ fn parse_hash(s: &str) -> Result<Hash, String> {
     Ok(Hash::from_bytes(parse_hex32(s)?))
 }
 
+/// The canonical [`Command`](RpcCommand) a control method carries, re-lowered
+/// from the exact params that go on the wire; `None` for read-only queries.
+/// Used to verify a returned ack's `command_hash` client-side (defense in
+/// depth against a stale ack acknowledging a different command).
+fn expected_command(method: &RpcMethod) -> Option<RpcCommand> {
+    match method {
+        RpcMethod::SubmitOrder(_, p) => Some(p.to_command()),
+        RpcMethod::CancelOrder(_, p) => Some(p.to_command()),
+        RpcMethod::CancelAll(_, p) => Some(p.to_command()),
+        RpcMethod::ReplaceOrder(_, p) => Some(p.to_command()),
+        RpcMethod::SubmitBasket(_, p) => Some(p.to_command()),
+        RpcMethod::AuthorizeSession(_, p) => Some(p.to_command()),
+        RpcMethod::RevokeSession(_, p) => Some(p.to_command()),
+        RpcMethod::BindWallet(_, p) => Some(p.to_command()),
+        RpcMethod::RequestWithdrawal(_, p) => Some(p.to_command()),
+        RpcMethod::CreateMarket(_, p) => Some(p.to_command()),
+        RpcMethod::StakeMarket(_, p) => Some(p.to_command()),
+        _ => None,
+    }
+}
+
 /// Send one request over a fresh plaintext connection and print the response.
 async fn send(cli: &Cli, method: RpcMethod) -> anyhow::Result<()> {
+    let expected = expected_command(&method);
     let request = RpcRequest::new(cli.request_id, method);
     let response = rpc::server::round_trip(cli.target, &request)
         .await
         .map_err(|e| anyhow::anyhow!("rpc round-trip to {}: {e}", cli.target))?;
-    render(response)
+    render(response, expected.as_ref())
 }
 
 /// Print a successful payload, or surface a server error as a nonzero exit.
-fn render(response: RpcResponse) -> anyhow::Result<()> {
+/// For control methods (`expected` is `Some`), the returned ack's
+/// `command_hash` must equal the canonical hash of the command that was
+/// actually sent: an ack for a different command means the server answered
+/// from its idempotency cache and this command never executed.
+fn render(response: RpcResponse, expected: Option<&RpcCommand>) -> anyhow::Result<()> {
     match response.result {
         Ok(ok) => {
+            if let (rpc::RpcOk::CommandAck(ack), Some(command)) = (&ok, expected) {
+                let sent = rpc::command_hash(command);
+                if ack.command_hash != sent {
+                    anyhow::bail!(
+                        "ack command_hash {:?} does not match the sent command's hash {:?}: \
+                         nonce already consumed by a different command — increment --nonce",
+                        ack.command_hash,
+                        sent
+                    );
+                }
+            }
             println!("{ok:#?}");
             Ok(())
         }
@@ -818,9 +867,97 @@ mod tests {
 
     #[test]
     fn control_command_requires_a_key() {
-        let cli = Cli::try_parse_from(["dexos", "cancel-all", "--account", "1"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["dexos", "--nonce", "0", "cancel-all", "--account", "1"]).unwrap();
         let err = build_method(&cli).expect_err("must require a signing key");
         assert!(format!("{err:#}").contains("signed"), "{err:#}");
+    }
+
+    /// Issue #409: `--nonce` used to default to `0`, so a user who forgot it
+    /// collided with their previous command's `(client_id, nonce)` and got that
+    /// command's stale ack back. A control command without an explicit
+    /// `--nonce` must now fail the build path (cleanly, no panic).
+    #[test]
+    fn control_command_requires_an_explicit_nonce() {
+        let cli = Cli::try_parse_from(["dexos", "--key", "k.seed", "cancel-all", "--account", "1"])
+            .unwrap();
+        assert_eq!(cli.nonce, None, "--nonce must have no default");
+        let err = build_method(&cli).expect_err("must require an explicit --nonce");
+        assert!(format!("{err:#}").contains("--nonce"), "{err:#}");
+    }
+
+    /// With an explicit `--nonce` (and a readable key), the control build path
+    /// succeeds and the signed envelope carries that nonce.
+    #[test]
+    fn control_command_with_explicit_nonce_builds() {
+        let path = std::env::temp_dir().join(format!(
+            "dexos-test-seed-{}-{}.hex",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, "11".repeat(32)).expect("write temp seed");
+        let args: Vec<std::ffi::OsString> = [
+            "dexos",
+            "--nonce",
+            "5",
+            "cancel-all",
+            "--account",
+            "1",
+            "--key",
+        ]
+        .into_iter()
+        .map(Into::into)
+        .chain([path.clone().into_os_string()])
+        .collect();
+        let cli = Cli::try_parse_from(args).unwrap();
+        let built = build_method(&cli);
+        std::fs::remove_file(&path).ok();
+        match built.expect("explicit --nonce and key must build") {
+            RpcMethod::CancelAll(meta, _) => assert_eq!(meta.nonce, 5),
+            other => panic!("unexpected method: {other:?}"),
+        }
+    }
+
+    /// Queries carry no nonce and must keep working without one.
+    #[test]
+    fn query_command_needs_no_nonce() {
+        let cli = Cli::try_parse_from(["dexos", "get-node-info"]).unwrap();
+        assert!(build_method(&cli).is_ok(), "queries ignore the nonce");
+    }
+
+    /// Defense in depth (#409): a control ack whose `command_hash` is not the
+    /// hash of the command actually sent must be a hard error, not a printed
+    /// "Accepted" — it means the server answered from its idempotency cache
+    /// and this command never executed.
+    #[test]
+    fn render_rejects_ack_for_a_different_command() {
+        let sent = CancelAllParams {
+            account: AccountId::new(1),
+            market: None,
+        }
+        .to_command();
+        let other = CancelAllParams {
+            account: AccountId::new(2),
+            market: None,
+        }
+        .to_command();
+        let stale_ack = rpc::CommandAck {
+            command_hash: rpc::command_hash(&other),
+            finality: rpc::FinalityStatus::Accepted,
+            order_id: None,
+            market_id: None,
+        };
+        let response = RpcResponse::new(1, Ok(rpc::RpcOk::CommandAck(stale_ack.clone())));
+        let err = render(response, Some(&sent)).expect_err("stale ack must fail");
+        assert!(format!("{err:#}").contains("increment --nonce"), "{err:#}");
+
+        // The matching ack renders fine.
+        let good_ack = rpc::CommandAck {
+            command_hash: rpc::command_hash(&sent),
+            ..stale_ack
+        };
+        let response = RpcResponse::new(1, Ok(rpc::RpcOk::CommandAck(good_ack)));
+        assert!(render(response, Some(&sent)).is_ok());
     }
 
     #[test]

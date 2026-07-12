@@ -15,8 +15,8 @@ use types::{AccountId, Amount, Hash, MarketId, OrderId, Price, Quantity, Sequenc
 
 use crate::backend::RpcBackend;
 use crate::command::{
-    AuthorizeSessionParams, BasketParams, BindWalletParams, CancelAllParams, CancelOrderParams,
-    Command, CommandAck, ControlMeta, CreateMarketParams, ReplaceOrderParams,
+    command_hash, AuthorizeSessionParams, BasketParams, BindWalletParams, CancelAllParams,
+    CancelOrderParams, Command, CommandAck, ControlMeta, CreateMarketParams, ReplaceOrderParams,
     RequestWithdrawalParams, RevokeSessionParams, StakeMarketParams, SubmitOrderParams,
 };
 use crate::error::RpcError;
@@ -269,11 +269,6 @@ fn account_leaf(account: &Account) -> Hash {
     crypto::hash_domain(crypto::DOMAIN_ACCOUNT, &encoded)
 }
 
-fn command_hash(command: &Command) -> Hash {
-    let encoded = codec::encode(command).unwrap_or_default();
-    crypto::hash_domain(crypto::DOMAIN_COMMAND, &encoded)
-}
-
 fn clamp_page<T: Clone>(items: &[T], page: PageParams, limit: u32) -> Vec<T> {
     let effective = page.limit.min(limit);
     let start = usize::try_from(page.offset).unwrap_or(usize::MAX);
@@ -284,7 +279,10 @@ fn clamp_page<T: Clone>(items: &[T], page: PageParams, limit: u32) -> Vec<T> {
 impl StubBackend {
     /// Common control path: validate the session (if delegated), dedupe by
     /// `(client_id, nonce)`, and produce an ack. `order_id`/`market_id` decorate
-    /// the ack when relevant.
+    /// the ack when relevant. Reusing a consumed `(client_id, nonce)` for a
+    /// command with a different canonical hash fails closed with
+    /// [`RpcError::NonceReused`]; only an identical retransmit is answered with
+    /// the cached ack.
     fn ingest(
         &self,
         meta: &ControlMeta,
@@ -331,15 +329,25 @@ impl StubBackend {
             }
         }
         // Exactly-once: a repeated (client_id, nonce) returns the stored ack
-        // without re-executing. The replay was already re-authenticated above.
-        // Advance a logical tick so capacity/TTL tests are deterministic.
+        // without re-executing — but only for the *same* command. The canonical
+        // hash is computed before the dedupe lookup so a hit can be compared
+        // against what the key actually acknowledged: a different, validly
+        // signed command on a consumed nonce must fail closed rather than
+        // receive the earlier command's stale ack (issue #409 — the new command
+        // never executed, so pretending it was "Accepted" is a silent lost
+        // write). The replay was already re-authenticated above. Advance a
+        // logical tick so capacity/TTL tests are deterministic.
+        let hash = command_hash(&command);
         g.seen_tick += Duration::from_nanos(1);
         let tick = g.seen_tick;
         if let Some(existing) = g.seen.get(&(meta.client_id, meta.nonce), tick) {
+            if existing.command_hash != hash {
+                return Err(RpcError::NonceReused);
+            }
             return Ok(existing);
         }
         let ack = CommandAck {
-            command_hash: command_hash(&command),
+            command_hash: hash,
             finality: FinalityStatus::Accepted,
             order_id,
             market_id,

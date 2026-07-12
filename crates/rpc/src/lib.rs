@@ -48,8 +48,8 @@ pub const CRATE_NAME: &str = "rpc";
 
 pub use backend::{dispatch, RpcBackend, MAX_BOOK_DEPTH};
 pub use command::{
-    AuthorizeSessionParams, BasketParams, BindWalletParams, CancelAllParams, CancelOrderParams,
-    Command, CommandAck, ControlMeta, CreateMarketParams, ReplaceOrderParams,
+    command_hash, AuthorizeSessionParams, BasketParams, BindWalletParams, CancelAllParams,
+    CancelOrderParams, Command, CommandAck, ControlMeta, CreateMarketParams, ReplaceOrderParams,
     RequestWithdrawalParams, RevokeSessionParams, SessionScope, StakeMarketParams,
     SubmitOrderParams,
 };
