@@ -106,8 +106,9 @@ npm --prefix bindings/ts run codegen:wasm
 npm --prefix bindings/ts run build
 ```
 
-The two public crates advertise `rust-version = "1.82"` (wider consumer reach
-than the engine's 1.92); the `msrv` CI job proves that floor.
+The SDK crates set `rust-version = "1.92"`: they path-depend on the engine
+crates (`types`/`codec`/`crypto`/`proto`, pinned to 1.92), so the public floor
+cannot be lower. The engine `ci.yml` gates already build them on that toolchain.
 
 ## The conformance guarantee
 
@@ -131,9 +132,8 @@ its bytes exactly.
 
 3. **Every binding is checked against it.** `.github/workflows/sdk-ci.yml`:
    - `conformance` — core tests pass, then `gen-vectors` + `git diff --exit-code`.
-   - `msrv` — the public crates build on 1.82.0.
-   - `wasm` — node PoC + headless-browser tests assert bit-identity; also asserts
-     `getrandom` 0.1 never enters the wasm cdylib graph.
+   - `wasm` — node PoC asserts bit-identity, then builds the web + bundler
+     targets; also asserts `getrandom` 0.1 never enters the wasm cdylib graph.
    - `python` — regenerate + diff-gate the `.pyi` stub, build the wheel, `pytest`.
    - `ts` — build + lint (bans JS `number` for money) + `vitest` (frame
      bit-identity and wire `deepEqual` against `vectors.json`).

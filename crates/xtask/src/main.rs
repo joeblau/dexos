@@ -30,7 +30,9 @@ fn main() {
     match std::env::args().nth(1).as_deref() {
         Some("gen-vectors") => gen_vectors(),
         Some("bump") => {
-            eprintln!("`xtask bump` is a Phase 4 concern (rename + version rewrite); not yet wired");
+            eprintln!(
+                "`xtask bump` is a Phase 4 concern (rename + version rewrite); not yet wired"
+            );
             std::process::exit(2);
         }
         other => {
@@ -50,7 +52,8 @@ fn gen_vectors() {
     let params = poc::golden_submit_params();
     let submit_params_hex = hex::encode(encode(&params).expect("encode SubmitOrderParams"));
     let command_hex = hex::encode(encode(&params.to_command()).expect("encode Command"));
-    let amount_postcard_hex = hex::encode(encode(&Amount::from_raw(1_000_000)).expect("encode Amount"));
+    let amount_postcard_hex =
+        hex::encode(encode(&Amount::from_raw(1_000_000)).expect("encode Amount"));
 
     // A small wire-struct hex map. Later TS/py stages extend this into a
     // deep-equal gate; Stage A pins the encodings so any postcard drift is

@@ -26,14 +26,14 @@ mod abi_freeze;
 // win over it for any (currently non-existent) name overlap, and the local
 // `transport` module shadows `proto`'s `transport` module. This is the single
 // contract downstream bindings consume.
+pub use codec::{self, Frame, FrameRef, TrafficClass, FRAME_HEADER_LEN};
+pub use crypto::{self, verify_ed25519, EvmKeyPair, KeyPair};
 pub use proto::{self, *};
 pub use types::{
     self, format_amount, parse_amount, AccountId, Amount, Hash, MarketId, MarketLifecycle,
     MarketType, OrderId, OrderType, Price, Quantity, Ratio, SequenceNumber, ShardId, Side,
     SponsorId, TimeInForce, AMOUNT_SCALE, PRICE_SCALE, QTY_SCALE, RATIO_SCALE,
 };
-pub use crypto::{self, verify_ed25519, EvmKeyPair, KeyPair};
-pub use codec::{self, Frame, FrameRef, TrafficClass, FRAME_HEADER_LEN};
 
 pub use signer::Signer;
 pub use transport::{Client, Transport, TransportError};

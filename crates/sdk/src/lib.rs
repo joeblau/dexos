@@ -104,15 +104,25 @@ impl<T: Transport> InfoClient<T> {
 
     /// `get_node_info`.
     pub async fn get_node_info(&self) -> Result<NodeInfo, SdkError> {
-        match ok(self.inner.call(&builders::get_node_info(self.next_id())).await?)? {
+        match ok(self
+            .inner
+            .call(&builders::get_node_info(self.next_id()))
+            .await?)?
+        {
             RpcOk::NodeInfo(v) => Ok(v),
-            _ => Err(SdkError::UnexpectedResponse { expected: "NodeInfo" }),
+            _ => Err(SdkError::UnexpectedResponse {
+                expected: "NodeInfo",
+            }),
         }
     }
 
     /// `get_peers`.
     pub async fn get_peers(&self) -> Result<Vec<PeerInfo>, SdkError> {
-        match ok(self.inner.call(&builders::get_peers(self.next_id())).await?)? {
+        match ok(self
+            .inner
+            .call(&builders::get_peers(self.next_id()))
+            .await?)?
+        {
             RpcOk::Peers(v) => Ok(v),
             _ => Err(SdkError::UnexpectedResponse { expected: "Peers" }),
         }
@@ -126,7 +136,9 @@ impl<T: Transport> InfoClient<T> {
             .await?)?
         {
             RpcOk::Markets(v) => Ok(v),
-            _ => Err(SdkError::UnexpectedResponse { expected: "Markets" }),
+            _ => Err(SdkError::UnexpectedResponse {
+                expected: "Markets",
+            }),
         }
     }
 
@@ -150,7 +162,9 @@ impl<T: Transport> InfoClient<T> {
             .await?)?
         {
             RpcOk::Account(v) => Ok(v),
-            _ => Err(SdkError::UnexpectedResponse { expected: "Account" }),
+            _ => Err(SdkError::UnexpectedResponse {
+                expected: "Account",
+            }),
         }
     }
 

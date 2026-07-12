@@ -3,7 +3,7 @@ name = "dexos-sdk-py"
 version = "0.1.0"                 # decoupled from workspace 0.0.1
 edition.workspace = true
 license.workspace = true
-rust-version = "1.82"            # matches the SDK crates' consumer-reach floor
+rust-version = "1.92"  # floored by 1.92-pinned path deps (types/codec/crypto/proto)
 repository.workspace = true
 publish = false                  # PyPI ships the wheel, not this crate
 

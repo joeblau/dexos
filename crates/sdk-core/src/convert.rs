@@ -36,7 +36,10 @@ mod tests {
     #[test]
     fn fixed_six_dp_is_canonical() {
         assert_eq!(amount_to_decimal(Amount::from_raw(1_500_000)), "1.500000");
-        assert_eq!(amount_from_decimal("1.5").unwrap(), Amount::from_raw(1_500_000));
+        assert_eq!(
+            amount_from_decimal("1.5").unwrap(),
+            Amount::from_raw(1_500_000)
+        );
         assert_eq!(amount_to_decimal(Amount::from_raw(-1)), "-0.000001");
         assert_eq!(amount_to_decimal(Amount::from_raw(0)), "0.000000");
     }

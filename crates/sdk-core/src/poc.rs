@@ -7,9 +7,7 @@
 //! architecture exists to pin these so they never drift between languages.
 
 use crypto::KeyPair;
-use proto::{
-    command_hash, encode_request, ControlMeta, RpcMethod, RpcRequest, SubmitOrderParams,
-};
+use proto::{command_hash, encode_request, ControlMeta, RpcMethod, RpcRequest, SubmitOrderParams};
 use types::{AccountId, MarketId, OrderType, Price, Quantity, Ratio, Side, TimeInForce};
 
 /// LOGIC #1 (types + codec + framing): deterministic framed `GetMarket` request.
@@ -68,8 +66,8 @@ pub fn sign_submit_order(seed: &[u8; 32], client_id: u64, nonce: u64) -> SignedS
     let meta = ControlMeta::signed(client_id, nonce, None, &kp, &cmd).expect("sign");
     // `ControlMeta` and `SubmitOrderParams` are `Copy`, so building the request
     // does not move `meta`/`params`; they are still usable below.
-    let framed = encode_request(&RpcRequest::new(7, RpcMethod::SubmitOrder(meta, params)))
-        .expect("frame");
+    let framed =
+        encode_request(&RpcRequest::new(7, RpcMethod::SubmitOrder(meta, params))).expect("frame");
     SignedSubmit {
         preimage: meta.signing_bytes(&cmd).expect("preimage"),
         signature: meta.signature.to_vec(),
