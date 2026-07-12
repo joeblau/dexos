@@ -43,12 +43,16 @@ pub fn hash_leaf(data: &[u8]) -> Hash {
 }
 
 /// Combine two child hashes into a parent (order-sensitive, domain-separated).
+///
+/// Routes through [`hash_domain`] with [`DOMAIN_NODE`] over the concatenation of
+/// the two 32-byte children (64 bytes total). Length-prefixing on the domain and
+/// data fields matches every other domain-separated hash in this crate and
+/// prevents concatenation ambiguity with other domain tags.
 pub fn hash_node(left: Hash, right: Hash) -> Hash {
-    let mut h = Sha256::new();
-    h.update(DOMAIN_NODE);
-    h.update(left.as_bytes());
-    h.update(right.as_bytes());
-    finalize(h)
+    let mut data = [0u8; 64];
+    data[..32].copy_from_slice(left.as_bytes());
+    data[32..].copy_from_slice(right.as_bytes());
+    hash_domain(DOMAIN_NODE, &data)
 }
 
 /// Keccak-256, for EVM-style message digests.
@@ -83,5 +87,19 @@ mod tests {
             hex::encode(keccak256(b"")),
             "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
         );
+    }
+
+    #[test]
+    fn hash_node_uses_length_prefixed_domain_over_64_byte_children() {
+        let left = Hash::from_bytes([1u8; 32]);
+        let right = Hash::from_bytes([2u8; 32]);
+        let mut data = [0u8; 64];
+        data[..32].copy_from_slice(left.as_bytes());
+        data[32..].copy_from_slice(right.as_bytes());
+        assert_eq!(hash_node(left, right), hash_domain(DOMAIN_NODE, &data));
+        // Order-sensitive.
+        assert_ne!(hash_node(left, right), hash_node(right, left));
+        // Distinct from a raw leaf over the same bytes.
+        assert_ne!(hash_node(left, right), hash_leaf(&data));
     }
 }

@@ -1,9 +1,17 @@
 //! Async length-prefixed framed RPC server over a Tokio TCP listener.
 //!
-//! Each connection is a sequential request/response loop: read one framed
-//! [`RpcRequest`], [`dispatch`] it against the backend (enforcing read-only /
-//! light mode), and write the framed [`RpcResponse`]. Decode failures produce an
-//! error response rather than tearing down the connection.
+//! # Sequential (non-pipelined) request handling
+//!
+//! Each connection is a **strictly sequential** request/response loop: the
+//! server reads one complete framed [`RpcRequest`], [`dispatch`]es it against
+//! the backend (enforcing read-only / light mode), writes the framed
+//! [`RpcResponse`], and only then accepts the next request on that connection.
+//! Clients must not pipeline multiple outstanding requests on a single socket
+//! and expect concurrent or out-of-order replies — there is no in-flight
+//! window, and a second request is not read until the first reply has been
+//! flushed. Decode failures produce an error response rather than tearing down
+//! the connection (except oversize frames, which send
+//! [`RpcError::MessageTooLarge`] and close).
 //!
 //! # Admission control (DoS hardening)
 //! The accept loop enforces a layered connection budget so a flood of cheap
@@ -201,7 +209,9 @@ where
                 // without a hard error.
                 Err(ServerError::Io(_)) | Err(ServerError::Timeout) => return Ok(()),
                 Err(ServerError::Oversize) => {
-                    let resp = RpcResponse::new(0, Err(RpcError::Backpressure));
+                    // Size violations are not admission pressure — use the
+                    // dedicated error so clients can distinguish retries.
+                    let resp = RpcResponse::new(0, Err(RpcError::MessageTooLarge));
                     let out = encode_response(&resp)?;
                     let _ = write_all_timed(&mut stream, &out, config.write_timeout).await;
                     return Ok(());

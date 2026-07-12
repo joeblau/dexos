@@ -6,6 +6,14 @@ use serde::{Deserialize, Serialize};
 use crate::signature::{verify_ed25519, KeyPair};
 use types::Hash;
 
+/// Maximum number of validators in a [`ValidatorSet`].
+///
+/// Bound by the 64-bit `signer_bitmap` of a [`QuorumCertificate`]: bit `i`
+/// names validator index `i`, so more than 64 members cannot be represented.
+/// Consensus committees share this operational ceiling (see
+/// `consensus::MAX_VALIDATORS`).
+pub const MAX_VALIDATORS: usize = 64;
+
 /// A quorum / threshold verification failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum QuorumError {
@@ -26,6 +34,14 @@ pub enum QuorumError {
         /// Required threshold.
         threshold: u64,
     },
+    /// Summing validator weights overflowed `u64` (weights must use checked
+    /// arithmetic; saturating sums would silently under-count the threshold).
+    #[error("validator weight sum overflowed")]
+    WeightOverflow,
+    /// The validator set is empty, exceeds [`MAX_VALIDATORS`], or has an
+    /// invalid threshold.
+    #[error("invalid validator set")]
+    InvalidSet,
 }
 
 /// A weighted validator.
@@ -47,24 +63,56 @@ pub struct ValidatorSet {
 
 impl ValidatorSet {
     /// Build a BFT set with a `2f+1`-style threshold: `floor(2*total/3)+1`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the set is invalid (empty, `> MAX_VALIDATORS`, or weight
+    /// overflow). Prefer [`Self::try_new_bft`] on untrusted input.
     pub fn new_bft(validators: Vec<Validator>) -> Self {
-        let total: u64 = validators.iter().map(|v| v.weight).sum();
+        Self::try_new_bft(validators).expect("invalid BFT validator set")
+    }
+
+    /// Fallible BFT constructor: rejects empty sets, sets larger than
+    /// [`MAX_VALIDATORS`], and weight sums that overflow `u64`.
+    pub fn try_new_bft(validators: Vec<Validator>) -> Result<Self, QuorumError> {
+        let total = sum_weights(&validators)?;
+        if validators.is_empty() || validators.len() > MAX_VALIDATORS {
+            return Err(QuorumError::InvalidSet);
+        }
         let threshold = (2 * total) / 3 + 1;
-        Self {
+        Ok(Self {
             validators,
             total_weight: total,
             threshold,
-        }
+        })
     }
 
     /// Build a set with an explicit weight threshold (e.g. crash-tolerant `f+1`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the set is invalid. Prefer [`Self::try_with_threshold`].
     pub fn with_threshold(validators: Vec<Validator>, threshold: u64) -> Self {
-        let total: u64 = validators.iter().map(|v| v.weight).sum();
-        Self {
+        Self::try_with_threshold(validators, threshold).expect("invalid validator set")
+    }
+
+    /// Fallible explicit-threshold constructor.
+    ///
+    /// Rejects empty sets, sets larger than [`MAX_VALIDATORS`], weight overflow,
+    /// and a zero threshold.
+    pub fn try_with_threshold(
+        validators: Vec<Validator>,
+        threshold: u64,
+    ) -> Result<Self, QuorumError> {
+        if validators.is_empty() || validators.len() > MAX_VALIDATORS || threshold == 0 {
+            return Err(QuorumError::InvalidSet);
+        }
+        let total = sum_weights(&validators)?;
+        Ok(Self {
             validators,
             total_weight: total,
             threshold,
-        }
+        })
     }
 
     /// Total voting weight.
@@ -108,7 +156,9 @@ impl ValidatorSet {
             sig_index += 1;
             verify_ed25519(&validator.public_key, qc.message.as_bytes(), signature)
                 .map_err(|_| QuorumError::InvalidSignature)?;
-            signed_weight = signed_weight.saturating_add(validator.weight);
+            signed_weight = signed_weight
+                .checked_add(validator.weight)
+                .ok_or(QuorumError::WeightOverflow)?;
         }
         if signed_weight < self.threshold {
             return Err(QuorumError::BelowThreshold {
@@ -118,6 +168,16 @@ impl ValidatorSet {
         }
         Ok(())
     }
+}
+
+fn sum_weights(validators: &[Validator]) -> Result<u64, QuorumError> {
+    let mut total: u64 = 0;
+    for v in validators {
+        total = total
+            .checked_add(v.weight)
+            .ok_or(QuorumError::WeightOverflow)?;
+    }
+    Ok(total)
 }
 
 /// A quorum certificate: signatures over `message` from the validators named in
@@ -191,7 +251,7 @@ impl ThresholdSigners {
         let mut bitmap = 0u64;
         let mut signatures = Vec::new();
         for &i in &indices {
-            if i >= self.signers.len() || i >= 64 {
+            if i >= self.signers.len() || i >= MAX_VALIDATORS {
                 continue;
             }
             bitmap |= 1u64 << i;
@@ -265,5 +325,49 @@ mod tests {
         }
         // Fewer than k fails.
         assert!(set.verify(&ts.sign(msg, vec![0, 4])).is_err());
+    }
+
+    #[test]
+    fn try_new_bft_rejects_empty_oversized_and_weight_overflow() {
+        assert_eq!(
+            ValidatorSet::try_new_bft(vec![]),
+            Err(QuorumError::InvalidSet)
+        );
+        let too_many: Vec<Validator> = (0..=MAX_VALIDATORS)
+            .map(|i| Validator {
+                public_key: [u8::try_from(i.min(255)).unwrap_or(0); 32],
+                weight: 1,
+            })
+            .collect();
+        assert_eq!(
+            ValidatorSet::try_new_bft(too_many),
+            Err(QuorumError::InvalidSet)
+        );
+        let overflow = vec![
+            Validator {
+                public_key: [1u8; 32],
+                weight: u64::MAX,
+            },
+            Validator {
+                public_key: [2u8; 32],
+                weight: 1,
+            },
+        ];
+        assert_eq!(
+            ValidatorSet::try_new_bft(overflow),
+            Err(QuorumError::WeightOverflow)
+        );
+    }
+
+    #[test]
+    fn try_with_threshold_rejects_zero_threshold() {
+        let v = vec![Validator {
+            public_key: [1u8; 32],
+            weight: 1,
+        }];
+        assert_eq!(
+            ValidatorSet::try_with_threshold(v, 0),
+            Err(QuorumError::InvalidSet)
+        );
     }
 }

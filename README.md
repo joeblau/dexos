@@ -57,12 +57,20 @@ runtime, networking, RPC, or storage engine. Enforced in CI by
 `scripts/check-core-deps.sh`, `scripts/check-no-float.sh`, and
 `scripts/check-unsafe.sh`.
 
+## Toolchain
+
+Rust is pinned to a single channel (currently **1.92.0**):
+[`rust-toolchain.toml`](rust-toolchain.toml) and the workspace `rust-version`
+are kept equal. There is no multi-MSRV CI matrix. See
+[docs/TOOLCHAIN.md](docs/TOOLCHAIN.md) for the full policy (including the
+optional macOS portability job).
+
 ## Build & test
 
 ```sh
-cargo build --workspace
-cargo test  --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+cargo build --workspace --locked
+cargo test  --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
 ./scripts/check-no-float.sh && ./scripts/check-core-deps.sh && ./scripts/check-unsafe.sh
 ```
 

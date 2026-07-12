@@ -15,7 +15,7 @@ use consensus::{
     build_checkpoint_header, checkpoint_hash, vote_digest, Committee, Vote, VoteCollector,
     VotePhase,
 };
-use crypto::{batch_verify_ed25519, verify_ed25519, KeyPair, Validator};
+use crypto::{verify_ed25519, verify_ed25519_all, KeyPair, Validator};
 use execution::{Command, DeterministicEngine, Engine, EngineConfig, SetMarkPrice};
 use orderbook::{BookConfig, NewOrder, OrderBook};
 use risk::{RiskConfig, RiskEngine};
@@ -429,7 +429,7 @@ fn signature_verify_batch(cfg: Config) -> BenchStat {
         items.push((kp.public(), msg, sig));
     }
     bench("signature-verify-batch", cfg, || {
-        let results = batch_verify_ed25519(&items);
+        let results = verify_ed25519_all(&items);
         black_box(results.iter().all(|&ok| ok));
     })
 }

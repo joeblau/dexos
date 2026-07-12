@@ -29,7 +29,7 @@
 //! | Module      | Kernel                                             |
 //! |-------------|----------------------------------------------------|
 //! | [`digest`]  | batch signature pre-hashing / message digests      |
-//! | [`risk`]    | scenario-vector reduction (sum / min / max, i128)  |
+//! | [`risk`]    | scenario-vector reduction (sum / min / max, i128) — **wrapping sum, not for solvency** |
 //! | [`oracle`]  | integer median / MAD + outlier mask                |
 //! | [`merkle`]  | batched Merkle-update / from-scratch root helper    |
 //!

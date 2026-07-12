@@ -15,9 +15,13 @@ pub use hash::{
     DOMAIN_LEAF, DOMAIN_MARKET, DOMAIN_NODE, DOMAIN_ORACLE,
 };
 pub use merkle::{merkle_root, verify_proof, MerkleError, MerkleTree};
-pub use quorum::{QuorumCertificate, QuorumError, ThresholdSigners, Validator, ValidatorSet};
+pub use quorum::{
+    QuorumCertificate, QuorumError, ThresholdSigners, Validator, ValidatorSet, MAX_VALIDATORS,
+};
+#[allow(deprecated)]
+pub use signature::batch_verify_ed25519;
 pub use signature::{
-    batch_verify_ed25519, verify_ed25519, verify_eip1271, verify_secp256k1_evm, CryptoError,
+    verify_ed25519, verify_ed25519_all, verify_eip1271, verify_secp256k1_evm, CryptoError,
     EvmKeyPair, KeyPair,
 };
 

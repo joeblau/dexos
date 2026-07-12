@@ -20,6 +20,11 @@ pub const FRAME_HEADER_LEN: usize = 19;
 pub const MAX_FRAME_PAYLOAD: usize = 16 * 1024 * 1024;
 
 /// A codec failure.
+///
+/// Variants stay unit-like (or tiny scalars) on the wire so the error surface is
+/// stable and does not embed serializer internals. Enable the `debug_codec`
+/// feature to print postcard error sources to stderr and expose
+/// [`CodecError::detail`] diagnostics during local debugging.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CodecError {
     /// Serialization failed.
@@ -45,14 +50,52 @@ pub enum CodecError {
     UnknownClass(u8),
 }
 
+impl CodecError {
+    /// Optional diagnostic detail for operators.
+    ///
+    /// Always returns [`None`] unless the crate is built with the `debug_codec`
+    /// feature. Production code paths must not depend on this string.
+    pub fn detail(&self) -> Option<&'static str> {
+        #[cfg(feature = "debug_codec")]
+        {
+            Some(match self {
+                CodecError::Serialize => "postcard serialization failed (see stderr)",
+                CodecError::Deserialize => "postcard deserialization failed (see stderr)",
+                CodecError::Truncated => "frame shorter than declared structure",
+                CodecError::BadMagic => "frame magic mismatch",
+                CodecError::UnsupportedVersion(_) => "unsupported frame protocol version",
+                CodecError::LengthOutOfRange => "payload length out of range",
+                CodecError::UnknownClass(_) => "unknown traffic class byte",
+            })
+        }
+        #[cfg(not(feature = "debug_codec"))]
+        {
+            let _ = self;
+            None
+        }
+    }
+}
+
 /// Encode a value to compact binary.
 pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, CodecError> {
-    postcard::to_allocvec(value).map_err(|_| CodecError::Serialize)
+    postcard::to_allocvec(value).map_err(|err| {
+        #[cfg(feature = "debug_codec")]
+        eprintln!("codec serialize error: {err}");
+        #[cfg(not(feature = "debug_codec"))]
+        let _ = err;
+        CodecError::Serialize
+    })
 }
 
 /// Decode a value from compact binary. Total on adversarial input.
 pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CodecError> {
-    postcard::from_bytes(bytes).map_err(|_| CodecError::Deserialize)
+    postcard::from_bytes(bytes).map_err(|err| {
+        #[cfg(feature = "debug_codec")]
+        eprintln!("codec deserialize error: {err}");
+        #[cfg(not(feature = "debug_codec"))]
+        let _ = err;
+        CodecError::Deserialize
+    })
 }
 
 /// Priority traffic classes (P0 highest). State sync and market data must never
@@ -248,5 +291,20 @@ mod tests {
         bytes[0] ^= 0xFF;
         assert_eq!(Frame::decode(&bytes), Err(CodecError::BadMagic));
         assert_eq!(Frame::decode(&bytes[..5]), Err(CodecError::Truncated));
+    }
+
+    #[test]
+    fn detail_is_none_without_debug_codec_feature() {
+        // Default builds keep unit variants opaque: detail() is always None.
+        #[cfg(not(feature = "debug_codec"))]
+        {
+            assert_eq!(CodecError::Serialize.detail(), None);
+            assert_eq!(CodecError::Deserialize.detail(), None);
+            assert_eq!(CodecError::Truncated.detail(), None);
+        }
+        #[cfg(feature = "debug_codec")]
+        {
+            assert!(CodecError::Serialize.detail().is_some());
+        }
     }
 }

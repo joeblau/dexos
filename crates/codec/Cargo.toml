@@ -9,6 +9,13 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+# When enabled, postcard encode/decode failures are `eprintln`'d and
+# [`CodecError::detail`] returns a static diagnostic string. Off by default so
+# production builds never leak serializer internals to logs or callers.
+debug_codec = []
+
 [dependencies]
 types = { path = "../types" }
 serde.workspace = true
