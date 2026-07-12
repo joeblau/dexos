@@ -239,7 +239,7 @@ pub enum Recovery {
 }
 
 /// Observable shed / occupancy counters for a topic (and process-wide via
-/// [`StreamHub::stats`]).
+/// `StreamHub::stats`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StreamStats {
     /// Events published.

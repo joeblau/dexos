@@ -4,7 +4,7 @@
 //! # Sequential (non-pipelined) request handling
 //!
 //! Each connection is a **strictly sequential** request/response loop: the
-//! server reads one complete framed [`RpcRequest`], dispatches it against the
+//! server reads one complete framed `RpcRequest`, dispatches it against the
 //! backend on a dedicated blocking pool (never on the Tokio IO worker), writes
 //! the framed [`RpcResponse`], and only then accepts the next request on that
 //! connection.
@@ -15,7 +15,7 @@
 //! - a process-wide concurrent-connection ceiling ([`ServerConfig::max_connections`])
 //!   backed by a [`Semaphore`];
 //! - a per-source-IP concurrent-connection cap and token-bucket connection rate
-//!   limit ([`crate::limits::ConnectionLimiter`]);
+//!   limit (`ConnectionLimiter`);
 //! - process-wide and per-connection **in-flight request / byte** budgets
 //!   ([`crate::work::WorkBudget`]) so large frames and slow handlers cannot
 //!   exhaust RSS independently of connection count;

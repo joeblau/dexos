@@ -263,7 +263,7 @@ impl PayoutVector {
 #[serde(transparent)]
 pub struct Hash(pub [u8; 32]);
 
-/// A state root is a [`Hash`] over committed state.
+/// A state root is a [`Hash`](struct@Hash) over committed state.
 pub type StateRoot = Hash;
 
 impl Hash {

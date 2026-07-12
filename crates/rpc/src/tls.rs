@@ -1,7 +1,7 @@
 //! TLS 1.3 configuration for the public RPC surface.
 //!
 //! Production deployments must present a [`TlsAcceptor`] built from a
-//! rustls [`ServerConfig`] restricted to TLS 1.3. Plain TCP remains available
+//! rustls `ServerConfig` restricted to TLS 1.3. Plain TCP remains available
 //! for local tests via [`crate::server::TlsMode::Disabled`], but
 //! [`crate::server::ServerConfig::production`] refuses to start without TLS.
 

@@ -1,5 +1,5 @@
 //! `chain-adapter-evm` — EVM chain-commitment primitives plus a feature-gated,
-//! deterministic in-memory mock [`ChainAdapter`].
+//! deterministic in-memory mock `ChainAdapter`.
 //!
 //! The always-compiled surface is the production verification primitive
 //! [`EvmCommit`]: it implements [`ChainCommit`] with EVM conventions —
@@ -8,7 +8,7 @@
 //! [`chain_adapter::verify_finality`] against a hash-linked header chain, never a
 //! self-asserted confirmation count.
 //!
-//! [`MockEvmAdapter`] and the `inject_deposit`/`advance_head` scaffolding are
+//! `MockEvmAdapter` and the `inject_deposit`/`advance_head` scaffolding are
 //! behind the `mock` feature (and the crate's own test build). They are *not*
 //! compiled into the production node binary, which depends on this crate without
 //! that feature.
@@ -95,7 +95,7 @@ mod mock {
     }
 
     /// A deterministic in-memory mock of an EVM chain implementing
-    /// [`ChainAdapter`]. Deposits credit only through
+    /// `ChainAdapter`. Deposits credit only through
     /// [`chain_adapter::verify_finality`] against a real keccak header chain.
     pub struct MockEvmAdapter {
         chain_id: ChainId,

@@ -134,7 +134,7 @@ impl ReplayWindow {
     /// Test-and-record `seq`.
     ///
     /// Returns `true` if `seq` is fresh (and records it); `false` if it is a
-    /// duplicate, a stale replay, or a forward jump larger than [`max_jump`].
+    /// duplicate, a stale replay, or a forward jump larger than `max_jump`.
     /// Reordered-but-in-window sequences are accepted exactly once.
     ///
     /// Sequential advances (and bounded jumps) are **O(1)**: only the modular

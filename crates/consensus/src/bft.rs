@@ -2,7 +2,7 @@
 //!
 //! [`BftEngine`] is a pure, synchronous state machine (no async, no I/O). It
 //! ingests [`Proposal`]s and [`Vote`]s, forms quorum certificates through a
-//! [`VoteCollector`], and advances a per-height pipeline through
+//! `VoteCollector`, and advances a per-height pipeline through
 //! `Accepted -> Executed -> Certified -> Finalized`. Multiple heights may be
 //! in flight simultaneously, so certification of one height never stalls
 //! execution of another.

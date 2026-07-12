@@ -73,7 +73,7 @@ pub fn scenario_stats_scalar(payouts: &[i128]) -> Option<ScenarioStats> {
     Some(ScenarioStats { sum, min, max })
 }
 
-/// Vectorized reduction. Lane-structured over [`LANES`] independent accumulators;
+/// Vectorized reduction. Lane-structured over `LANES` independent accumulators;
 /// bit-identical to [`scenario_stats_scalar`] because `wrapping_add`, `min` and
 /// `max` are associative and commutative.
 pub fn scenario_stats_vectorized(payouts: &[i128]) -> Option<ScenarioStats> {

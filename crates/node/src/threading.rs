@@ -193,8 +193,9 @@ mod linux {
             bits: [0u64; WORDS],
         };
         set.bits[core / BITS] |= 1u64 << (core % BITS);
-        // SAFETY: mask points to a valid CpuSet of the size we pass; pid 0 = self.
-        #[allow(unsafe_code)] // SAFETY: documented affinity call; isolated perf module
+        #[allow(unsafe_code)]
+        // SAFETY: `mask` is a valid local CpuSet; size matches sizeof; pid 0 is the
+        // calling thread. This lives in an isolated affinity helper only.
         let rc = unsafe { sched_setaffinity(0, std::mem::size_of::<CpuSet>(), &set) };
         rc == 0
     }

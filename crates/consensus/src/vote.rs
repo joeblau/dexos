@@ -495,7 +495,7 @@ impl Committee {
 /// interferes with another (supporting pipelining). Equivocation is tracked per
 /// `(validator, epoch, view, height, phase)`. Offenders are **halted**: their
 /// weight is excluded from subsequent QC formation. Signatures are verified
-/// exactly once at admission; [`try_form_qc`] does not re-verify them.
+/// exactly once at admission; `try_form_qc` does not re-verify them.
 #[derive(Debug, Clone)]
 pub struct VoteCollector {
     // digest -> (validator_index -> signature), BTreeMap keeps ascending order.
@@ -614,7 +614,7 @@ impl VoteCollector {
 
     /// Admit a vote. Window checks run before signature verification. Detects
     /// equivocation, halts the offender, and records slash evidence. A vote is
-    /// cryptographically verified **once** here; [`try_form_qc`] trusts these
+    /// cryptographically verified **once** here; `try_form_qc` trusts these
     /// retained signatures.
     pub fn add_vote(
         &mut self,
@@ -852,7 +852,7 @@ impl TimeoutCollector {
 
     /// Attempt to form a [`TimeoutCertificate`] for `(epoch, view)`.
     ///
-    /// Does not re-verify signatures admitted via [`add_timeout`].
+    /// Does not re-verify signatures admitted via `add_timeout`.
     #[must_use]
     pub fn try_form_certificate(
         &self,

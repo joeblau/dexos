@@ -4,7 +4,7 @@
 //! [`LightClient`] wires the pieces together. It follows one or more shards
 //! (each a [`ShardSync`]), routes ingested checkpoints to the right shard,
 //! caches recent verified checkpoints and account responses under hard bounds,
-//! and answers read RPCs with a [`Verification`]-tagged payload. Every write /
+//! and answers read RPCs with a `Verification`-tagged payload. Every write /
 //! order-entry method returns [`LightClientError::Unsupported`]; nothing is
 //! executed or persisted as a canonical command log.
 

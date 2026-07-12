@@ -52,7 +52,7 @@ pub fn outlier_mask_scalar(vals: &[i64], center: i64, max_dev: i128) -> Vec<bool
     out
 }
 
-/// Vectorized outlier mask. Lane-structured over [`LANES`] elements at a time;
+/// Vectorized outlier mask. Lane-structured over `LANES` elements at a time;
 /// bit-identical to [`outlier_mask_scalar`] because each output element is an
 /// independent, side-effect-free function of one input element.
 #[must_use]

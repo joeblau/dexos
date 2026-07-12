@@ -55,7 +55,7 @@ impl WithdrawalId {
         &self.0
     }
 
-    /// View the id as a [`Hash`] for threshold signing.
+    /// View the id as a `Hash` for threshold signing.
     pub fn to_hash(self) -> Hash {
         Hash::from_bytes(self.0)
     }

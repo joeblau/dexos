@@ -3,7 +3,7 @@
 //! A light node learns which markets exist and which peers serve a shard from
 //! advertised metadata. This metadata is *unverified by nature* — it is a hint
 //! about where to sync from, not a trusted fact — so discovery results are
-//! surfaced with [`Verification::Unverified`] by the client. Discovery storage
+//! surfaced with `Verification::Unverified` by the client. Discovery storage
 //! is bounded: past capacity the oldest advertisements are evicted so a flood of
 //! advertisements cannot grow memory without limit.
 

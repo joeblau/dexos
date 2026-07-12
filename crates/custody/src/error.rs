@@ -41,7 +41,7 @@ pub enum CustodyError {
     CrossAccountReuse,
     /// A genesis master could not be established because the account already has
     /// a binding (its master, and possibly more). Later wallets attach through
-    /// [`WalletRegistry::bind`], which requires the current master's signature.
+    /// `WalletRegistry::bind`, which requires the current master's signature.
     #[error("account already has an established master wallet")]
     AccountAlreadyEstablished,
     /// The genesis (first) binding for an account must designate its master.

@@ -3,11 +3,11 @@
 //! A light client answers balance / position / market queries by verifying an
 //! incremental Merkle proof (produced by the `state-tree` crate) against a
 //! *verified* checkpoint's `state_root`. The returned [`VerifiedValue`] is only
-//! [`Verification::Verified`] when the proof checks against the current tip; a
+//! `Verification::Verified` when the proof checks against the current tip; a
 //! proof that checks only against a superseded root is labeled
-//! [`Verification::Stale`]; anything else — including a tampered leaf, path, or
+//! `Verification::Stale`; anything else — including a tampered leaf, path, or
 //! root, or a query made before any checkpoint verified — is
-//! [`Verification::Unverified`]. There is no path that upgrades a failed proof.
+//! `Verification::Unverified`. There is no path that upgrades a failed proof.
 
 use crypto::hash_node;
 use state_tree::{verify_account, verify_market};

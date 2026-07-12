@@ -32,7 +32,7 @@
 //! checking the HSM-reported key equals the ceremony-published one. A raw seed is
 //! never accepted on the control plane.
 //!
-//! [`SoftSigner`] and [`MockHsm`] are compiled only under the `mock-signers`
+//! `SoftSigner` and `MockHsm` are compiled only under the `mock-signers`
 //! feature (and the crate's own tests). They are the deterministic replay /
 //! simulation backend and are **never** linked into a production build, which
 //! depends on this crate without that feature.
@@ -378,7 +378,7 @@ impl SignerSet<SoftSigner> {
 /// Test / dev only (`mock-signers`). Keys are `provision`ed up front (modeling
 /// an offline key ceremony that generates keys inside the token) and then the
 /// backend is shared read-only. Signatures are byte-identical to a
-/// [`SoftSigner`] over the same seed, so the same replay harness drives the mock
+/// `SoftSigner` over the same seed, so the same replay harness drives the mock
 /// and, one day, a real HSM.
 #[cfg(any(feature = "mock-signers", test))]
 #[derive(Debug, Clone, Default)]

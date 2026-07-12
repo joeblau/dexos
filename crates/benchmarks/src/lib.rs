@@ -11,7 +11,7 @@
 //! - [`alloc`]: a counting global allocator (gated behind the default
 //!   `count-alloc` feature) so `allocations/op` and `bytes/op` can be attributed
 //!   to a benchmarked closure.
-//! - [`harness`]: [`bench`](harness::bench) times a closure over N iterations,
+//! - [`harness`]: [`harness::bench`] times a closure over N iterations,
 //!   collecting nanosecond samples and allocation deltas.
 //! - [`stats`]: integer-only nearest-rank percentiles (p50/p90/p95/p99/p99.9),
 //!   throughput, and the [`BenchStat`] record.

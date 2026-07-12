@@ -1,6 +1,6 @@
 //! The runtime decision-market state machine.
 //!
-//! One [`ContingentMarket`] is spawned per action. Collateral enters only by
+//! One `ContingentMarket` is spawned per action. Collateral enters only by
 //! minting complete sets (one share of every outcome) and leaves only by
 //! redeeming complete sets or at settlement, so the collateral ledger is exact.
 //! Trading transfers shares between accounts without moving collateral.
