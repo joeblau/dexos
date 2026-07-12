@@ -53,6 +53,7 @@ crates/
 bin/
   marketd          the node binary (run/benchmark/replay/inspect/keygen/snapshot/verify)
   market-loadgen   the load generator binary
+  dexos            command-line RPC client (queries + signed control methods)
 ```
 
 **Strict dependency direction.** The deterministic execution core
@@ -121,6 +122,24 @@ timeout or critical-task failure.
 
 Release builds use `panic = "abort"`.
 
+### Client (`dexos`)
+
+`dexos` drives the full system over the node's RPC socket — 18 read-only queries
+and 10 signed control methods, one subcommand per RPC method.
+
+```sh
+cargo build --release --bin dexos
+
+./target/release/dexos --target 127.0.0.1:8080 get-market --market 1
+marketd keygen --output trader.seed
+./target/release/dexos --key trader.seed --nonce 0 \
+  create-market --creator 1 --market-type perpetual --symbol BTC-PERP --outcomes 1
+```
+
+It targets a plaintext listener today (TLS client + `marketd run` binding are
+planned). See [the CLI reference](docs/CLI.md) for the full command table,
+signing model, and status.
+
 ## Demo scripts
 
 ```sh
@@ -139,4 +158,5 @@ panics on untrusted input (typed `thiserror` errors everywhere); bounded queues;
 no benchmark claims without reproducible scripts.
 
 See [architecture](docs/ARCHITECTURE.md), [security status](docs/SECURITY.md),
-[build features](docs/FEATURES.md), and [performance profiling](docs/PERFORMANCE.md).
+[build features](docs/FEATURES.md), [performance profiling](docs/PERFORMANCE.md),
+and the [`dexos` CLI reference](docs/CLI.md).
