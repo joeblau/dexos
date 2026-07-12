@@ -525,6 +525,28 @@ mod tests {
         assert_eq!(engine.committee().leader(6), 0);
     }
 
+    #[test]
+    fn epoch_transition_rejects_noncanonical_validator_set() {
+        let (comm0, kps0) = committee(4, 0);
+        let mut engine = BftEngine::new(comm0);
+
+        // A validator repeated under a second (unchanged) key would let one
+        // signer be counted twice; the fallible builder must reject it at the
+        // boundary instead of panicking the node.
+        let mut dup = validators_of(&kps0);
+        dup.push(dup[0].clone());
+        engine.schedule_update(ValidatorSetUpdate {
+            activation_epoch: 1,
+            validators: dup,
+        });
+        assert!(matches!(
+            engine.activate_epoch(1),
+            Err(BftError::Vote(VoteError::InvalidValidatorSet))
+        ));
+        // Rejection is clean: the engine stays in its original epoch.
+        assert_eq!(engine.epoch(), 0);
+    }
+
     // ---- checkpoints ------------------------------------------------------
 
     fn sample_header(first: u64, last: u64, prev: Hash, new: Hash) -> CheckpointHeader {

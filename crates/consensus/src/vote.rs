@@ -151,6 +151,10 @@ pub enum VoteError {
     /// The committee exceeds the 64-signer bitmap capacity.
     #[error("committee exceeds 64 validators")]
     TooManyValidators,
+    /// The committee membership is not canonical: duplicate public keys,
+    /// zero-weight members, or a weight sum that overflows `u64`.
+    #[error("invalid validator set membership")]
+    InvalidValidatorSet,
     /// A timeout certificate's aggregate does not sign the expected
     /// `(epoch, view)` digest.
     #[error("timeout certificate digest mismatch")]
@@ -256,7 +260,13 @@ pub struct Committee {
 }
 
 impl Committee {
-    /// Build a BFT committee for `epoch`. Rejects empty or oversized sets.
+    /// Build a BFT committee for `epoch`. Rejects empty or oversized sets and
+    /// noncanonical membership (duplicate keys, zero weights, weight overflow).
+    ///
+    /// The membership is validated through the fallible
+    /// [`ValidatorSet::try_new_bft`] builder — never the panicking constructor —
+    /// so an untrusted epoch-boundary [`crate::ValidatorSetUpdate`] can only
+    /// return an error, never abort the node.
     pub fn new_bft(epoch: u64, validators: Vec<Validator>) -> Result<Self, VoteError> {
         if validators.is_empty() {
             return Err(VoteError::EmptyCommittee);
@@ -264,7 +274,8 @@ impl Committee {
         if validators.len() > MAX_VALIDATORS {
             return Err(VoteError::TooManyValidators);
         }
-        let set = ValidatorSet::new_bft(validators.clone());
+        let set = ValidatorSet::try_new_bft(validators.clone())
+            .map_err(|_| VoteError::InvalidValidatorSet)?;
         Ok(Self {
             epoch,
             validators,

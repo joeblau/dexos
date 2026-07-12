@@ -12,11 +12,12 @@ pub mod signature;
 
 pub use hash::{
     hash_domain, hash_leaf, hash_node, keccak256, DOMAIN_ACCOUNT, DOMAIN_COMMAND, DOMAIN_EXECUTION,
-    DOMAIN_LEAF, DOMAIN_MARKET, DOMAIN_NODE, DOMAIN_ORACLE,
+    DOMAIN_LEAF, DOMAIN_MARKET, DOMAIN_NODE, DOMAIN_ORACLE, DOMAIN_VALIDATOR_SET,
 };
 pub use merkle::{merkle_root, verify_proof, MerkleError, MerkleTree};
 pub use quorum::{
     QuorumCertificate, QuorumError, ThresholdSigners, Validator, ValidatorSet, MAX_VALIDATORS,
+    VALIDATOR_SET_VERSION,
 };
 #[allow(deprecated)]
 pub use signature::batch_verify_ed25519;

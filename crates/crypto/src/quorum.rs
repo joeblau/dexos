@@ -1,8 +1,11 @@
 //! Validator sets, quorum certificates, and a deterministic threshold-signer
 //! simulator (ed25519). Production HSM signers implement the same interface.
 
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 
+use crate::hash::{hash_domain, DOMAIN_VALIDATOR_SET};
 use crate::signature::{verify_ed25519, KeyPair};
 use types::Hash;
 
@@ -13,6 +16,11 @@ use types::Hash;
 /// Consensus committees share this operational ceiling (see
 /// `consensus::MAX_VALIDATORS`).
 pub const MAX_VALIDATORS: usize = 64;
+
+/// Version tag of the canonical validator-set encoding used by
+/// [`ValidatorSet::commitment`]. Bumping it changes every commitment, so it is
+/// bound into the hashed preimage and must move whenever the encoding changes.
+pub const VALIDATOR_SET_VERSION: u16 = 1;
 
 /// A quorum / threshold verification failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -38,10 +46,26 @@ pub enum QuorumError {
     /// arithmetic; saturating sums would silently under-count the threshold).
     #[error("validator weight sum overflowed")]
     WeightOverflow,
-    /// The validator set is empty, exceeds [`MAX_VALIDATORS`], or has an
-    /// invalid threshold.
+    /// The validator set is empty or exceeds [`MAX_VALIDATORS`].
     #[error("invalid validator set")]
     InvalidSet,
+    /// Two members share a public key; one signer could otherwise be counted
+    /// more than once toward the threshold.
+    #[error("duplicate validator public key")]
+    DuplicateValidator,
+    /// A member has zero voting weight, which cannot contribute to any quorum
+    /// and inflates the apparent membership count.
+    #[error("validator has zero weight")]
+    ZeroWeight,
+    /// The threshold is zero or exceeds the total weight, so it can never (or
+    /// only trivially) be met.
+    #[error("threshold {threshold} outside 1..={total}")]
+    ThresholdOutOfRange {
+        /// The rejected threshold.
+        threshold: u64,
+        /// Total voting weight it was checked against.
+        total: u64,
+    },
 }
 
 /// A weighted validator.
@@ -53,7 +77,13 @@ pub struct Validator {
     pub weight: u64,
 }
 
-/// A validator set with a fixed weight threshold.
+/// A validated validator set with a fixed weight threshold.
+///
+/// Every constructor is fallible and enforces the same canonical invariants:
+/// nonempty membership no larger than [`MAX_VALIDATORS`], unique public keys,
+/// strictly positive weights, an overflow-checked total, and a threshold in
+/// `1..=total`. These invariants hold for the lifetime of the value, so quorum
+/// verification never has to re-check them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidatorSet {
     validators: Vec<Validator>,
@@ -72,14 +102,16 @@ impl ValidatorSet {
         Self::try_new_bft(validators).expect("invalid BFT validator set")
     }
 
-    /// Fallible BFT constructor: rejects empty sets, sets larger than
-    /// [`MAX_VALIDATORS`], and weight sums that overflow `u64`.
+    /// Fallible canonical BFT constructor.
+    ///
+    /// Rejects empty sets, sets larger than [`MAX_VALIDATORS`], duplicate public
+    /// keys, zero-weight members, and weight sums that overflow `u64`. The
+    /// threshold is the strictly-greater-than-two-thirds quorum
+    /// `floor(2*total/3) + 1`, computed without the `2*total` product so debug
+    /// and release builds behave identically (no overflow panic, no wraparound).
     pub fn try_new_bft(validators: Vec<Validator>) -> Result<Self, QuorumError> {
-        let total = sum_weights(&validators)?;
-        if validators.is_empty() || validators.len() > MAX_VALIDATORS {
-            return Err(QuorumError::InvalidSet);
-        }
-        let threshold = (2 * total) / 3 + 1;
+        let total = validate_membership(&validators)?;
+        let threshold = bft_threshold(total);
         Ok(Self {
             validators,
             total_weight: total,
@@ -96,18 +128,19 @@ impl ValidatorSet {
         Self::try_with_threshold(validators, threshold).expect("invalid validator set")
     }
 
-    /// Fallible explicit-threshold constructor.
+    /// Fallible canonical explicit-threshold constructor.
     ///
-    /// Rejects empty sets, sets larger than [`MAX_VALIDATORS`], weight overflow,
-    /// and a zero threshold.
+    /// Rejects empty sets, sets larger than [`MAX_VALIDATORS`], duplicate public
+    /// keys, zero-weight members, weight overflow, and any threshold outside
+    /// `1..=total`.
     pub fn try_with_threshold(
         validators: Vec<Validator>,
         threshold: u64,
     ) -> Result<Self, QuorumError> {
-        if validators.is_empty() || validators.len() > MAX_VALIDATORS || threshold == 0 {
-            return Err(QuorumError::InvalidSet);
+        let total = validate_membership(&validators)?;
+        if threshold == 0 || threshold > total {
+            return Err(QuorumError::ThresholdOutOfRange { threshold, total });
         }
-        let total = sum_weights(&validators)?;
         Ok(Self {
             validators,
             total_weight: total,
@@ -168,11 +201,68 @@ impl ValidatorSet {
         }
         Ok(())
     }
+
+    /// A canonical, versioned commitment to this set's membership and threshold.
+    ///
+    /// The preimage is domain-separated ([`DOMAIN_VALIDATOR_SET`]), carries
+    /// [`VALIDATOR_SET_VERSION`], and lists members sorted by public key. Because
+    /// members are canonically ordered and duplicates are rejected at
+    /// construction, two sets built from the same members in any input order
+    /// commit to the same hash, while any change to a key, weight, threshold, or
+    /// membership changes it.
+    #[must_use]
+    pub fn commitment(&self) -> Hash {
+        let mut ordered: Vec<&Validator> = self.validators.iter().collect();
+        ordered.sort_unstable_by(|a, b| a.public_key.cmp(&b.public_key));
+
+        let mut buf = Vec::with_capacity(2 + 8 + 8 + 4 + ordered.len() * (32 + 8));
+        buf.extend_from_slice(&VALIDATOR_SET_VERSION.to_le_bytes());
+        buf.extend_from_slice(&self.threshold.to_le_bytes());
+        buf.extend_from_slice(&self.total_weight.to_le_bytes());
+        // Length-prefix the membership so it can never be confused with a
+        // different set whose trailing bytes happen to align.
+        let count = u32::try_from(ordered.len()).unwrap_or(u32::MAX);
+        buf.extend_from_slice(&count.to_le_bytes());
+        for v in ordered {
+            buf.extend_from_slice(&v.public_key);
+            buf.extend_from_slice(&v.weight.to_le_bytes());
+        }
+        hash_domain(DOMAIN_VALIDATOR_SET, &buf)
+    }
 }
 
-fn sum_weights(validators: &[Validator]) -> Result<u64, QuorumError> {
+/// The strictly-greater-than-two-thirds BFT quorum `floor(2*total/3) + 1`.
+///
+/// Computed without forming the `2 * total` product (which overflows `u64` for
+/// `total > u64::MAX / 2`): with `total = 3*q + r` and `r in {0,1,2}`,
+/// `floor(2*total/3) = 2*q + floor(2*r/3)`. Every intermediate fits in `u64`
+/// (`2*q <= 2*(u64::MAX/3) < u64::MAX`), so the result is identical in debug and
+/// release and never panics. For any `total >= 1` the result lies in `1..=total`
+/// and satisfies `3 * threshold > 2 * total`.
+const fn bft_threshold(total: u64) -> u64 {
+    let q = total / 3;
+    let r = total % 3;
+    // `2*q` and the `<= 1` correction cannot overflow; see the doc comment.
+    2 * q + (2 * r) / 3 + 1
+}
+
+/// Validate canonical membership and return the overflow-checked total weight.
+///
+/// Enforces nonempty membership no larger than [`MAX_VALIDATORS`], unique public
+/// keys, strictly positive weights, and a `u64`-checked weight sum.
+fn validate_membership(validators: &[Validator]) -> Result<u64, QuorumError> {
+    if validators.is_empty() || validators.len() > MAX_VALIDATORS {
+        return Err(QuorumError::InvalidSet);
+    }
+    let mut seen: BTreeSet<[u8; 32]> = BTreeSet::new();
     let mut total: u64 = 0;
     for v in validators {
+        if v.weight == 0 {
+            return Err(QuorumError::ZeroWeight);
+        }
+        if !seen.insert(v.public_key) {
+            return Err(QuorumError::DuplicateValidator);
+        }
         total = total
             .checked_add(v.weight)
             .ok_or(QuorumError::WeightOverflow)?;
@@ -360,14 +450,260 @@ mod tests {
     }
 
     #[test]
-    fn try_with_threshold_rejects_zero_threshold() {
-        let v = vec![Validator {
-            public_key: [1u8; 32],
-            weight: 1,
-        }];
+    fn try_with_threshold_rejects_zero_and_over_total() {
+        let v = vec![
+            Validator {
+                public_key: [1u8; 32],
+                weight: 2,
+            },
+            Validator {
+                public_key: [2u8; 32],
+                weight: 3,
+            },
+        ];
+        // total == 5.
         assert_eq!(
-            ValidatorSet::try_with_threshold(v, 0),
-            Err(QuorumError::InvalidSet)
+            ValidatorSet::try_with_threshold(v.clone(), 0),
+            Err(QuorumError::ThresholdOutOfRange {
+                threshold: 0,
+                total: 5
+            })
         );
+        assert_eq!(
+            ValidatorSet::try_with_threshold(v.clone(), 6),
+            Err(QuorumError::ThresholdOutOfRange {
+                threshold: 6,
+                total: 5
+            })
+        );
+        // Boundaries 1 and total both accepted.
+        assert!(ValidatorSet::try_with_threshold(v.clone(), 1).is_ok());
+        assert!(ValidatorSet::try_with_threshold(v, 5).is_ok());
+    }
+
+    #[test]
+    fn rejects_duplicate_keys_and_zero_weights() {
+        let dup = vec![
+            Validator {
+                public_key: [7u8; 32],
+                weight: 1,
+            },
+            Validator {
+                public_key: [7u8; 32],
+                weight: 1,
+            },
+        ];
+        assert_eq!(
+            ValidatorSet::try_new_bft(dup.clone()),
+            Err(QuorumError::DuplicateValidator)
+        );
+        assert_eq!(
+            ValidatorSet::try_with_threshold(dup, 1),
+            Err(QuorumError::DuplicateValidator)
+        );
+
+        let zero = vec![
+            Validator {
+                public_key: [1u8; 32],
+                weight: 1,
+            },
+            Validator {
+                public_key: [2u8; 32],
+                weight: 0,
+            },
+        ];
+        assert_eq!(
+            ValidatorSet::try_new_bft(zero.clone()),
+            Err(QuorumError::ZeroWeight)
+        );
+        assert_eq!(
+            ValidatorSet::try_with_threshold(zero, 1),
+            Err(QuorumError::ZeroWeight)
+        );
+    }
+
+    /// `floor(2*total/3) + 1` reference over `u128`, immune to `u64` overflow.
+    fn bft_threshold_reference(total: u64) -> u64 {
+        let t = u128::from(total);
+        u64::try_from((2 * t) / 3 + 1).expect("BFT threshold always fits in u64")
+    }
+
+    #[test]
+    fn bft_threshold_matches_reference_and_is_overflow_safe() {
+        // A deterministic splitmix64 walk plus exact overflow boundaries. Every
+        // sample must reproduce the u128 reference and never panic.
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut totals: Vec<u64> = vec![
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            u64::MAX,
+            u64::MAX - 1,
+            u64::MAX - 2,
+            u64::MAX / 2,
+            u64::MAX / 2 + 1,
+            u64::MAX / 3,
+            u64::MAX / 3 + 1,
+            (u64::MAX / 3) * 3,
+        ];
+        for _ in 0..20_000 {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            totals.push((z ^ (z >> 31)).max(1));
+        }
+        for total in totals {
+            assert_eq!(
+                bft_threshold(total),
+                bft_threshold_reference(total),
+                "threshold mismatch for total {total}"
+            );
+        }
+    }
+
+    #[test]
+    fn bft_threshold_strictly_exceeds_two_thirds() {
+        // Property: for every valid total, 3*threshold > 2*total (strict), and
+        // threshold stays within 1..=total. Checked over u128 so the comparison
+        // itself cannot overflow.
+        let mut state: u64 = 0x0123_4567_89AB_CDEF;
+        let mut totals: Vec<u64> = vec![1, 2, 3, 4, 5, u64::MAX, u64::MAX - 1, u64::MAX / 3];
+        for _ in 0..50_000 {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            totals.push((z ^ (z >> 31)).max(1));
+        }
+        for total in totals {
+            let threshold = bft_threshold(total);
+            assert!(threshold >= 1, "threshold underflow for total {total}");
+            assert!(threshold <= total, "threshold exceeds total {total}");
+            assert!(
+                3 * u128::from(threshold) > 2 * u128::from(total),
+                "threshold not strictly above two-thirds for total {total}"
+            );
+            // One short of the threshold must be at or below two-thirds.
+            assert!(
+                3 * u128::from(threshold - 1) <= 2 * u128::from(total),
+                "threshold not minimal for total {total}"
+            );
+        }
+    }
+
+    #[test]
+    fn try_new_bft_threshold_within_bounds_for_weighted_sets() {
+        // A weighted set whose total nears the overflow boundary still yields a
+        // valid, in-range threshold (release and debug behave identically).
+        let set = ValidatorSet::try_new_bft(vec![
+            Validator {
+                public_key: [1u8; 32],
+                weight: u64::MAX - 10,
+            },
+            Validator {
+                public_key: [2u8; 32],
+                weight: 10,
+            },
+        ])
+        .expect("near-max weighted BFT set is valid");
+        assert_eq!(set.total_weight(), u64::MAX);
+        assert_eq!(set.threshold(), bft_threshold_reference(u64::MAX));
+        assert!(set.threshold() >= 1 && set.threshold() <= set.total_weight());
+    }
+
+    #[test]
+    fn commitment_is_invariant_to_input_ordering() {
+        let a = Validator {
+            public_key: [3u8; 32],
+            weight: 5,
+        };
+        let b = Validator {
+            public_key: [1u8; 32],
+            weight: 7,
+        };
+        let c = Validator {
+            public_key: [2u8; 32],
+            weight: 9,
+        };
+        let forward =
+            ValidatorSet::try_with_threshold(vec![a.clone(), b.clone(), c.clone()], 12).unwrap();
+        let shuffled = ValidatorSet::try_with_threshold(vec![c, a, b], 12).unwrap();
+        // Same members, weights, and threshold in a different input order ->
+        // identical canonical commitment.
+        assert_eq!(forward.commitment(), shuffled.commitment());
+    }
+
+    #[test]
+    fn commitment_binds_membership_weight_and_threshold() {
+        let base = ValidatorSet::try_with_threshold(
+            vec![
+                Validator {
+                    public_key: [1u8; 32],
+                    weight: 3,
+                },
+                Validator {
+                    public_key: [2u8; 32],
+                    weight: 4,
+                },
+            ],
+            5,
+        )
+        .unwrap();
+        let base_commit = base.commitment();
+
+        // Different threshold.
+        let other_threshold = ValidatorSet::try_with_threshold(
+            vec![
+                Validator {
+                    public_key: [1u8; 32],
+                    weight: 3,
+                },
+                Validator {
+                    public_key: [2u8; 32],
+                    weight: 4,
+                },
+            ],
+            6,
+        )
+        .unwrap();
+        assert_ne!(base_commit, other_threshold.commitment());
+
+        // Different weight.
+        let other_weight = ValidatorSet::try_with_threshold(
+            vec![
+                Validator {
+                    public_key: [1u8; 32],
+                    weight: 3,
+                },
+                Validator {
+                    public_key: [2u8; 32],
+                    weight: 5,
+                },
+            ],
+            5,
+        )
+        .unwrap();
+        assert_ne!(base_commit, other_weight.commitment());
+
+        // Different membership (a key changes).
+        let other_member = ValidatorSet::try_with_threshold(
+            vec![
+                Validator {
+                    public_key: [1u8; 32],
+                    weight: 3,
+                },
+                Validator {
+                    public_key: [9u8; 32],
+                    weight: 4,
+                },
+            ],
+            5,
+        )
+        .unwrap();
+        assert_ne!(base_commit, other_member.commitment());
     }
 }
