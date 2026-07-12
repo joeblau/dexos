@@ -14,6 +14,9 @@ use types::{AccountId, Amount, Hash, MarketId, MarketType, Quantity, SequenceNum
 
 use crate::command::{Authorization, Command, DeterministicEngine, ExecutionReceipt, ReceiptKind};
 use crate::error::ExecutionError;
+use crate::idempotency::{
+    command_binding, derive_withdrawal_id, GuardDecision, KeyDomain, ReplayGuard,
+};
 use crate::ledger::Ledger;
 use crate::session::SessionRegistry;
 
@@ -24,6 +27,12 @@ pub struct EngineConfig {
     pub account_capacity: usize,
     /// Merkle capacity for markets.
     pub market_capacity: usize,
+    /// Number of recent command receipts retained per shard for exact
+    /// idempotent-retry replay. Exactly-once is enforced regardless of this
+    /// bound (the committed per-principal watermark blocks re-execution of an
+    /// evicted key); the window only governs how far back an original receipt
+    /// can still be returned verbatim.
+    pub replay_window: usize,
     /// Risk parameters.
     pub risk: RiskConfig,
 }
@@ -33,6 +42,7 @@ impl Default for EngineConfig {
         Self {
             account_capacity: 4096,
             market_capacity: 256,
+            replay_window: 1 << 16,
             risk: RiskConfig {
                 initial_margin: types::Ratio::from_bps(1000).unwrap_or(types::Ratio::ONE), // 10%
                 maintenance_margin: types::Ratio::from_bps(500).unwrap_or(types::Ratio::ONE), // 5%
@@ -83,9 +93,10 @@ pub struct Engine {
     claims: HashMap<(u32, u32), Vec<Amount>>,
     deposits_seen: HashSet<(u32, Vec<u8>, u32)>,
     withdrawals: HashMap<u64, Withdrawal>,
-    next_withdrawal_id: u64,
     protocol_version: u16,
     wallets: HashMap<u32, WalletBinding>,
+    /// Durable, payload-bound command idempotency (exactly-once retries).
+    replay: ReplayGuard,
     last_seq: Option<u64>,
 }
 
@@ -103,9 +114,9 @@ impl Engine {
             claims: HashMap::new(),
             deposits_seen: HashSet::new(),
             withdrawals: HashMap::new(),
-            next_withdrawal_id: 0,
             protocol_version: 1,
             wallets: HashMap::new(),
+            replay: ReplayGuard::with_window(config.replay_window),
             last_seq: None,
         }
     }
@@ -194,7 +205,33 @@ impl Engine {
                 w.field_i128(v.raw());
             }
         }
+        // Idempotency watermarks: the highest order `client_id` and withdrawal
+        // `nonce` this account has committed. Folding them into the leaf commits
+        // the exactly-once replay boundary into the state root, so a snapshot /
+        // WAL recovery reconstructs it and cannot silently regress it. Each is a
+        // presence flag (0 = none processed) followed by the watermark value.
+        Self::write_watermark(
+            &mut w,
+            self.replay.watermark(account.get(), KeyDomain::Order),
+        );
+        Self::write_watermark(
+            &mut w,
+            self.replay.watermark(account.get(), KeyDomain::Withdrawal),
+        );
         Ok(w.finish())
+    }
+
+    /// Append a `(present, value)` idempotency watermark to a committed leaf.
+    fn write_watermark(w: &mut LeafWriter, watermark: Option<u64>) {
+        match watermark {
+            Some(v) => {
+                w.field_u32(1)
+                    .field_i64(i64::from_le_bytes(v.to_le_bytes()));
+            }
+            None => {
+                w.field_u32(0).field_i64(0);
+            }
+        }
     }
 
     /// A light-client inclusion proof for `account`'s committed leaf against the
@@ -390,10 +427,19 @@ impl Engine {
                 if !matches!(c.auth, Authorization::Master) {
                     return Err(ExecutionError::SessionCannotWithdraw);
                 }
+                // The id is a deterministic, non-wrapping function of the
+                // authenticated request `(account, nonce)`, so an exact replay
+                // (caught upstream by the idempotency guard) resolves to the same
+                // id and the id never depends on a mutable counter a partial
+                // recovery could desynchronise. A pre-existing id for a *distinct*
+                // request can only be a digest collision, which is surfaced rather
+                // than silently overwriting the live withdrawal.
+                let id = derive_withdrawal_id(c.account.get(), c.nonce);
+                if self.withdrawals.contains_key(&id) {
+                    return Err(ExecutionError::WithdrawalIdCollision);
+                }
                 self.ledger.reserve(c.account, c.amount)?;
                 self.risk.debit_collateral(c.account, c.amount)?;
-                let id = self.next_withdrawal_id;
-                self.next_withdrawal_id = self.next_withdrawal_id.wrapping_add(1);
                 self.withdrawals.insert(
                     id,
                     Withdrawal {
@@ -469,7 +515,11 @@ impl Engine {
                     .get_mut(&c.market.get())
                     .ok_or(ExecutionError::UnknownMarket)?;
                 book.set_position(c.account, pos);
-                let result = book.submit(NewOrder {
+                // Idempotency is decided once, durably, at the command layer (see
+                // `execute`), so the book submits through its non-deduplicating
+                // path: a book-local dedup here could replay stale fills that this
+                // handler would then re-apply to both counterparties.
+                let result = book.place(NewOrder {
                     order_id: c.order_id,
                     account: c.account,
                     side: c.side,
@@ -489,6 +539,10 @@ impl Engine {
                 for a in touched {
                     self.commit_account(a)?;
                 }
+                // Always re-commit the order's own account: even an order that
+                // rests without a fill advances this account's committed order
+                // watermark (reserved in `execute` before this handler ran).
+                self.commit_account(c.account)?;
                 self.commit_market(c.market)?;
                 Ok(self.receipt(seq, ReceiptKind::OrderApplied { filled, rested }))
             }
@@ -689,6 +743,12 @@ impl DeterministicEngine for Engine {
                 return Err(ExecutionError::NonMonotonicSequence { last, got: seq });
             }
         }
+        // Durable command-level idempotency, decided *before* any subsystem
+        // mutation. A retried command carries the same idempotency key
+        // (`client_id` / withdrawal `nonce`) but a fresh sequence, so the
+        // monotonic-sequence gate above cannot catch it; this guard does.
+        let binding = command_binding(&command);
+
         // Transaction boundary. Apply the command to a working copy of the whole
         // engine. If any fallible step — fixed-point arithmetic, capacity, the
         // ledger, the risk engine, an order book, or a state-tree write — returns
@@ -700,7 +760,36 @@ impl DeterministicEngine for Engine {
         // consumes its sequence nor mutates any subsystem.
         let mut txn = self.clone();
         txn.last_seq = Some(seq);
+
+        if let Some(binding) = binding.as_ref() {
+            match txn.replay.classify(binding) {
+                GuardDecision::Replay(receipt) => {
+                    // Exactly-once: a byte-identical retry returns the original
+                    // receipt without re-applying any delta. The only state that
+                    // advances is the consumed sequence; ledger, positions, risk,
+                    // book, withdrawals, and the root are left byte-identical.
+                    *self = txn;
+                    return Ok(receipt);
+                }
+                GuardDecision::Conflict => return Err(ExecutionError::IdempotencyConflict),
+                GuardDecision::Expired => return Err(ExecutionError::ReplayExpired),
+                GuardDecision::Fresh => {
+                    // Commit the watermark into the working copy up front so the
+                    // command's own commits fold it into the same state root.
+                    txn.replay.reserve(binding);
+                }
+            }
+        }
+
         let receipt = txn.apply(seq, command)?;
+
+        if let Some(binding) = binding.as_ref() {
+            // Cache the receipt for exact-retry replay. This is a local,
+            // replay-rebuilt cache and does not alter the committed root, so the
+            // receipt's state root (captured in `apply`) stays valid.
+            txn.replay.finalize(binding, receipt.clone());
+        }
+
         *self = txn;
         Ok(receipt)
     }
@@ -730,6 +819,7 @@ mod tests {
         Engine::new(EngineConfig {
             account_capacity,
             market_capacity,
+            replay_window: base.replay_window,
             risk: base.risk,
         })
     }
@@ -845,7 +935,6 @@ mod tests {
             w.field_u32(u32::from(finalized));
         }
         w.field_i128(i128::try_from(e.deposits_seen.len()).unwrap());
-        w.field_i64(i64::from_le_bytes(e.next_withdrawal_id.to_le_bytes()));
         w.field_u32(u32::from(e.protocol_version));
         let mut markets: Vec<(u32, u16, i64, usize)> = e
             .markets
@@ -1284,7 +1373,17 @@ mod tests {
     // prices are only ever set at market creation (never mutated), so every
     // successful command keeps the committed tree fresh and `check_invariants`
     // fully reconciles it.
-    fn random_command(rng: &mut Lcg, tx_counter: &mut u64) -> Command {
+    //
+    // Order `client_id`s and withdrawal `nonce`s are drawn from monotonic
+    // counters so each carries a strictly increasing idempotency key per the
+    // engine contract; `order_id`s stay random so book-level id collisions are
+    // still exercised. Dedicated tests cover the retry/conflict/eviction paths.
+    fn random_command(
+        rng: &mut Lcg,
+        tx_counter: &mut u64,
+        client_seq: &mut u64,
+        nonce_seq: &mut u64,
+    ) -> Command {
         let account = rng.u32_in(0, 5);
         let market = rng.u32_in(0, 2);
         let order_id = u64::from(rng.u32_in(1, 40));
@@ -1305,14 +1404,17 @@ mod tests {
                     i128::from(rng.range(0, 5_000_000)),
                 )
             }
-            2 => Command::RequestWithdrawal(RequestWithdrawal {
-                account: AccountId::new(account),
-                amount: Amount::from_raw(i128::from(rng.range(0, 5_000_000))),
-                nonce: 1,
-                destination_chain: 1,
-                destination_address: vec![1],
-                auth: Authorization::Master,
-            }),
+            2 => {
+                *nonce_seq += 1;
+                Command::RequestWithdrawal(RequestWithdrawal {
+                    account: AccountId::new(account),
+                    amount: Amount::from_raw(i128::from(rng.range(0, 5_000_000))),
+                    nonce: *nonce_seq,
+                    destination_chain: 1,
+                    destination_address: vec![1],
+                    auth: Authorization::Master,
+                })
+            }
             3 => Command::FinalizeWithdrawal(FinalizeWithdrawal {
                 withdrawal_id: rng.next() % 8,
             }),
@@ -1323,7 +1425,22 @@ mod tests {
                 outcomes: 3,
                 mark_price: Price::from_raw(500_000),
             }),
-            6..=8 => place(account, market, order_id, side, price, qty),
+            6..=8 => {
+                *client_seq += 1;
+                Command::PlaceOrder(PlaceOrder {
+                    account: AccountId::new(account),
+                    market: MarketId::new(market),
+                    order_id: OrderId::new(order_id),
+                    side,
+                    order_type: OrderType::Limit,
+                    tif: TimeInForce::Gtc,
+                    price: Price::from_raw(price),
+                    quantity: Quantity::from_raw(qty),
+                    client_id: *client_seq,
+                    reduce_only: false,
+                    auth: Authorization::Master,
+                })
+            }
             9 => Command::CancelOrder(crate::command::CancelOrder {
                 market: MarketId::new(market),
                 account: AccountId::new(account),
@@ -1368,11 +1485,13 @@ mod tests {
         let mut e = engine_with_caps(64, 8);
         let mut rng = Lcg(0xC0FF_EE00_1234_5678);
         let mut tx_counter = 0u64;
+        let mut client_seq = 0u64;
+        let mut nonce_seq = 0u64;
         check_invariants(&e);
         let mut ok = 0u32;
         let mut err = 0u32;
         for n in 1..=1_500u64 {
-            let cmd = random_command(&mut rng, &mut tx_counter);
+            let cmd = random_command(&mut rng, &mut tx_counter, &mut client_seq, &mut nonce_seq);
             let before = fingerprint(&e);
             match e.execute(seq(n), cmd) {
                 Ok(_) => {
@@ -1392,5 +1511,321 @@ mod tests {
         // Sanity: the stream genuinely exercised both branches.
         assert!(ok > 50, "too few successful commands: {ok}");
         assert!(err > 50, "too few failed commands: {err}");
+    }
+
+    // --- Command idempotency: exactly-once retries (issue #324) -------------
+
+    // AC1: retrying a fully-filled order leaves ledger, positions, risk, book,
+    // and root byte-identical. This is the concrete double-apply regression: the
+    // book previously returned cached fills on a dedup hit and the engine
+    // re-applied them to both counterparties.
+    #[test]
+    fn retrying_a_fully_filled_order_is_exactly_once() {
+        let mut e = engine_with_caps(8, 4);
+        e.execute(seq(1), create_account(100_000_000)).unwrap(); // maker 0
+        e.execute(seq(2), create_account(100_000_000)).unwrap(); // taker 1
+        e.execute(seq(3), create_perp(0, 1_000_000)).unwrap();
+        e.execute(seq(4), place(0, 0, 1, Side::Bid, 1_000_000, 2_000_000))
+            .unwrap();
+        let taker = place(1, 0, 2, Side::Ask, 1_000_000, 2_000_000);
+        let r1 = e.execute(seq(5), taker.clone()).unwrap();
+        assert!(matches!(
+            r1.kind,
+            ReceiptKind::OrderApplied { rested: false, .. }
+        ));
+        let committed = fingerprint(&e);
+        let root = e.state_root();
+        check_invariants(&e);
+
+        // Retry the identical order at a fresh, monotonic sequence.
+        let r2 = e.execute(seq(6), taker).unwrap();
+        assert_eq!(r1, r2, "retry must return the original receipt");
+        assert_eq!(fingerprint(&e), committed, "retry duplicated engine state");
+        assert_eq!(e.state_root(), root, "retry moved the committed root");
+        // Positions did not double: taker short 2.0, maker long 2.0.
+        assert_eq!(
+            e.risk
+                .position(AccountId::new(1), MarketId::new(0))
+                .unwrap(),
+            Quantity::from_raw(-2_000_000),
+        );
+        assert_eq!(
+            e.risk
+                .position(AccountId::new(0), MarketId::new(0))
+                .unwrap(),
+            Quantity::from_raw(2_000_000),
+        );
+        check_invariants(&e);
+    }
+
+    // AC1: retrying a partially-filled resting order does not double the fills
+    // nor re-rest the residual.
+    #[test]
+    fn retrying_a_partially_filled_resting_order_is_exactly_once() {
+        let mut e = engine_with_caps(8, 4);
+        e.execute(seq(1), create_account(1_000_000_000)).unwrap();
+        e.execute(seq(2), create_account(1_000_000_000)).unwrap();
+        e.execute(seq(3), create_perp(0, 1_000_000)).unwrap();
+        e.execute(seq(4), place(0, 0, 1, Side::Bid, 1_000_000, 2_000_000))
+            .unwrap();
+        // Taker asks 3.0 @ 1.0: fills 2.0 and rests 1.0.
+        let taker = place(1, 0, 2, Side::Ask, 1_000_000, 3_000_000);
+        let r1 = e.execute(seq(5), taker.clone()).unwrap();
+        assert!(matches!(
+            r1.kind,
+            ReceiptKind::OrderApplied { rested: true, .. }
+        ));
+        assert_eq!(e.market_resting_len(MarketId::new(0)), Some(1));
+        let committed = fingerprint(&e);
+        check_invariants(&e);
+
+        let r2 = e.execute(seq(6), taker).unwrap();
+        assert_eq!(r1, r2);
+        assert_eq!(
+            fingerprint(&e),
+            committed,
+            "partial-fill retry duplicated state"
+        );
+        assert_eq!(
+            e.market_resting_len(MarketId::new(0)),
+            Some(1),
+            "retry re-rested the residual",
+        );
+        check_invariants(&e);
+    }
+
+    // AC2: an exact withdrawal replay returns the original id and does not
+    // reserve funds a second time.
+    #[test]
+    fn exact_withdrawal_replay_returns_original_id_and_reserves_once() {
+        let mut e = engine_with_caps(4, 4);
+        e.execute(seq(1), create_account(1_000_000)).unwrap();
+        let acct = AccountId::new(0);
+        let wd = Command::RequestWithdrawal(RequestWithdrawal {
+            account: acct,
+            amount: Amount::from_raw(400_000),
+            nonce: 7,
+            destination_chain: 1,
+            destination_address: vec![1, 2, 3],
+            auth: Authorization::Master,
+        });
+        let r1 = e.execute(seq(2), wd.clone()).unwrap();
+        let ReceiptKind::WithdrawalRequested(id1) = r1.kind else {
+            panic!("expected a withdrawal id");
+        };
+        assert_eq!(e.ledger.reserved(acct).unwrap(), Amount::from_raw(400_000));
+        let committed = fingerprint(&e);
+
+        // Replay at a fresh sequence.
+        let r2 = e.execute(seq(3), wd).unwrap();
+        let ReceiptKind::WithdrawalRequested(id2) = r2.kind else {
+            panic!("expected a withdrawal id");
+        };
+        assert_eq!(id1, id2, "replay must return the original withdrawal id");
+        assert_eq!(
+            e.ledger.reserved(acct).unwrap(),
+            Amount::from_raw(400_000),
+            "replay reserved a second time",
+        );
+        assert_eq!(
+            e.withdrawals.len(),
+            1,
+            "replay recorded a phantom withdrawal"
+        );
+        assert_eq!(fingerprint(&e), committed);
+        check_invariants(&e);
+    }
+
+    // AC3: the same idempotency key with any changed field is rejected, and
+    // idempotency is decided before the book's own duplicate-id check.
+    #[test]
+    fn same_key_with_changed_field_is_rejected() {
+        let mut e = engine_with_caps(8, 4);
+        e.execute(seq(1), create_account(100_000_000)).unwrap();
+        e.execute(seq(2), create_account(100_000_000)).unwrap();
+        e.execute(seq(3), create_perp(0, 1_000_000)).unwrap();
+        // A resting bid keyed on client_id 5.
+        let ord = |qty: i64| {
+            Command::PlaceOrder(PlaceOrder {
+                account: AccountId::new(0),
+                market: MarketId::new(0),
+                order_id: OrderId::new(1),
+                side: Side::Bid,
+                order_type: OrderType::Limit,
+                tif: TimeInForce::Gtc,
+                price: Price::from_raw(900_000),
+                quantity: Quantity::from_raw(qty),
+                client_id: 5,
+                reduce_only: false,
+                auth: Authorization::Master,
+            })
+        };
+        e.execute(seq(4), ord(1_000_000)).unwrap();
+        let committed = fingerprint(&e);
+        // Same account + client_id 5, different quantity -> conflict, not the
+        // book's DuplicateOrderId (idempotency is decided first).
+        assert_eq!(
+            e.execute(seq(5), ord(2_000_000)),
+            Err(ExecutionError::IdempotencyConflict),
+        );
+        assert_eq!(
+            fingerprint(&e),
+            committed,
+            "rejected conflict mutated state"
+        );
+
+        // Withdrawal nonce reuse with a changed amount is likewise a conflict.
+        let wd = |amount: i128| {
+            Command::RequestWithdrawal(RequestWithdrawal {
+                account: AccountId::new(1),
+                amount: Amount::from_raw(amount),
+                nonce: 3,
+                destination_chain: 1,
+                destination_address: vec![9],
+                auth: Authorization::Master,
+            })
+        };
+        e.execute(seq(6), wd(1_000_000)).unwrap();
+        let committed = fingerprint(&e);
+        assert_eq!(
+            e.execute(seq(7), wd(2_000_000)),
+            Err(ExecutionError::IdempotencyConflict),
+        );
+        assert_eq!(fingerprint(&e), committed);
+        check_invariants(&e);
+    }
+
+    // AC4 (restart): a stream containing a retry reaches the same committed root
+    // as the same stream without the retry, and rebuilding a fresh engine from
+    // the identical log (a restart-via-replay) reproduces it bit-for-bit — so the
+    // exactly-once boundary is committed into the versioned state, not just held
+    // in volatile memory.
+    #[test]
+    fn restart_via_replay_preserves_exactly_once() {
+        let base = vec![
+            create_account(100_000_000),
+            create_account(100_000_000),
+            create_perp(0, 1_000_000),
+            place(0, 0, 1, Side::Bid, 1_000_000, 2_000_000),
+            place(1, 0, 2, Side::Ask, 1_000_000, 2_000_000), // client_id 2, fully fills
+        ];
+        let run_log = |log: &[Command]| {
+            let mut e = engine_with_caps(8, 4);
+            for (i, c) in log.iter().enumerate() {
+                e.execute(seq(i as u64 + 1), c.clone()).unwrap();
+            }
+            e
+        };
+
+        // The stream with a retry of the taker order interleaved.
+        let mut with_retry = base.clone();
+        with_retry.push(place(1, 0, 2, Side::Ask, 1_000_000, 2_000_000)); // retry
+        let a = run_log(&with_retry);
+        // Simulated restart: a fresh engine replays the identical log.
+        let b = run_log(&with_retry);
+        assert_eq!(a.state_root(), b.state_root());
+        assert_eq!(fingerprint(&a), fingerprint(&b));
+
+        // The retry is fully absorbed: same committed root as never retrying.
+        let no_retry = run_log(&base);
+        assert_eq!(
+            a.state_root(),
+            no_retry.state_root(),
+            "the retry was not exactly-once",
+        );
+        assert_eq!(
+            a.risk
+                .position(AccountId::new(1), MarketId::new(0))
+                .unwrap(),
+            Quantity::from_raw(-2_000_000),
+        );
+        check_invariants(&a);
+    }
+
+    // AC4 (bounded eviction): with a replay window of one, an early order's
+    // receipt is evicted, yet the committed watermark still recognises the key as
+    // processed, so a retry is refused (never re-executed).
+    #[test]
+    fn bounded_window_eviction_preserves_exactly_once() {
+        let mut e = Engine::new(EngineConfig {
+            account_capacity: 8,
+            market_capacity: 4,
+            replay_window: 1,
+            risk: EngineConfig::default().risk,
+        });
+        e.execute(seq(1), create_account(1_000_000_000)).unwrap();
+        e.execute(seq(2), create_account(1_000_000_000)).unwrap();
+        e.execute(seq(3), create_perp(0, 1_000_000)).unwrap();
+        e.execute(seq(4), place(0, 0, 1, Side::Bid, 1_000_000, 2_000_000))
+            .unwrap();
+        // Taker order client_id 2 fully fills and enters the size-one window.
+        let taker = place(1, 0, 2, Side::Ask, 1_000_000, 2_000_000);
+        e.execute(seq(5), taker.clone()).unwrap();
+        // A later order (account 0, client_id 3) evicts the taker's receipt.
+        e.execute(seq(6), place(0, 0, 3, Side::Bid, 900_000, 1_000_000))
+            .unwrap();
+        let committed = fingerprint(&e);
+
+        // The evicted taker order is recognised as already-processed and refused.
+        assert_eq!(e.execute(seq(7), taker), Err(ExecutionError::ReplayExpired),);
+        assert_eq!(fingerprint(&e), committed, "expired retry re-applied");
+        assert_eq!(
+            e.risk
+                .position(AccountId::new(1), MarketId::new(0))
+                .unwrap(),
+            Quantity::from_raw(-2_000_000),
+        );
+        check_invariants(&e);
+    }
+
+    // AC5: a retry after every crash point — admission, journal, execution,
+    // receipt, and acknowledgement — applies the command exactly once. Crashes
+    // before execution make the retry the first successful application; crashes
+    // at or after execution make the retry a receipt replay with no second
+    // effect.
+    #[test]
+    fn retry_after_every_crash_point_is_exactly_once() {
+        let setup = |e: &mut Engine| {
+            e.execute(seq(1), create_account(100_000_000)).unwrap();
+            e.execute(seq(2), create_account(100_000_000)).unwrap();
+            e.execute(seq(3), create_perp(0, 1_000_000)).unwrap();
+            e.execute(seq(4), place(0, 0, 1, Side::Bid, 1_000_000, 2_000_000))
+                .unwrap();
+        };
+        let target = place(1, 0, 2, Side::Ask, 1_000_000, 2_000_000);
+
+        // Reference: the command applied exactly once.
+        let mut reference = engine_with_caps(8, 4);
+        setup(&mut reference);
+        let receipt = reference.execute(seq(5), target.clone()).unwrap();
+        let committed = fingerprint(&reference);
+
+        // Crash at admission or in the journal, before execution: the engine
+        // never applied the command, so the retry is its first application.
+        {
+            let mut e = engine_with_caps(8, 4);
+            setup(&mut e);
+            let r = e.execute(seq(5), target.clone()).unwrap();
+            assert_eq!(r, receipt);
+            assert_eq!(fingerprint(&e), committed);
+        }
+
+        // Crash at execution, receipt, or acknowledgement, after the command was
+        // applied: repeated retries (each at a fresh sequence) replay the receipt
+        // and never re-apply the command.
+        {
+            let mut e = engine_with_caps(8, 4);
+            setup(&mut e);
+            e.execute(seq(5), target.clone()).unwrap();
+            for s in 6..=10 {
+                let r = e.execute(seq(s), target.clone()).unwrap();
+                assert_eq!(r, receipt, "retry at stage {s} changed the receipt");
+                assert_eq!(
+                    fingerprint(&e),
+                    committed,
+                    "retry at stage {s} re-applied the command",
+                );
+            }
+        }
     }
 }

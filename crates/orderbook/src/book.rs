@@ -113,6 +113,12 @@ impl OrderBook {
     /// Duplicate submissions (same `account` + `client_id` within the dedup
     /// window) execute **exactly once**; the second and later calls replay the
     /// first result without touching the book.
+    ///
+    /// This book-local dedup is a convenience for callers that drive the book
+    /// directly. Command-level callers that already enforce durable, payload-
+    /// bound, exactly-once semantics (the execution engine) submit through
+    /// [`OrderBook::place`] instead, so idempotency is decided once at the
+    /// command layer rather than replayed a second time here.
     pub fn submit(&mut self, order: NewOrder) -> Result<MatchResult, OrderError> {
         if let Some(cached) = self.dedup.get(order.account, order.client_id) {
             return Ok(cached.clone());
@@ -121,6 +127,17 @@ impl OrderBook {
         self.dedup
             .insert(order.account, order.client_id, result.clone());
         Ok(result)
+    }
+
+    /// Submit a new order **without** book-local client deduplication.
+    ///
+    /// Idempotency for engine-sequenced commands is enforced exactly once, and
+    /// durably, at the command layer (see `execution::Engine`), which binds the
+    /// idempotency key to the full command digest and commits a replay watermark
+    /// into the state root. The engine submits through this path so the book
+    /// never applies a second, weaker dedup that could replay stale fills.
+    pub fn place(&mut self, order: NewOrder) -> Result<MatchResult, OrderError> {
+        self.execute(order)
     }
 
     /// Cancel a resting order in O(1). Errors if the id is unknown.

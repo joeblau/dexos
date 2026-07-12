@@ -69,6 +69,22 @@ pub enum ExecutionError {
         /// Sequence just presented.
         got: u64,
     },
+    /// A retry reused an idempotency key (`client_id` / withdrawal `nonce`) with
+    /// a different canonical payload than the command originally committed under
+    /// that key. Never re-applied: the first command stands.
+    #[error("idempotency conflict: key reused with a different payload")]
+    IdempotencyConflict,
+    /// A retry targeted an idempotency key that was already processed but whose
+    /// receipt has aged out of the bounded replay window (or refers to a stale,
+    /// lower-than-watermark key). The original effect stands and is never
+    /// re-applied; the caller must observe the outcome out of band.
+    #[error("idempotency replay expired: key already processed, receipt evicted")]
+    ReplayExpired,
+    /// Two distinct authenticated withdrawal requests derived the same withdrawal
+    /// id (a digest collision). Surfaced rather than silently overwriting the
+    /// existing withdrawal.
+    #[error("withdrawal id collision")]
+    WithdrawalIdCollision,
     /// Referenced market does not exist.
     #[error("unknown market")]
     UnknownMarket,
