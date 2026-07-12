@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
+use tracing::Instrument;
 
 pub use config::{
     ConfigError, ConfigOverrides, ConsensusSection, LogFormat, NetworkSection, NodeConfig,
@@ -273,8 +274,13 @@ impl Node {
             node_version = identity.version,
             trace_id = %process_trace.to_hex(),
         );
-        let _enter = root.enter();
-        tracing::info!(target: "node", "{}", self.startup_summary());
+        // Never hold an `Entered` guard (`root.enter()`) across an `.await`:
+        // on a multi-threaded runtime the guard pins the span to the worker
+        // thread's current-span slot, so a yield leaves unrelated tasks
+        // attributed to `node.run` and a resume on another worker loses the
+        // span entirely. Synchronous bootstrap sections use `in_scope`; the
+        // awaited tail below is attached via `Instrument` instead.
+        root.in_scope(|| tracing::info!(target: "node", "{}", self.startup_summary()));
 
         // Set once shutdown is intentional so handler completions are not
         // misclassified as unexpected exits.
@@ -326,28 +332,35 @@ impl Node {
         // Bootstrap complete: metrics listener bound (if any), handlers spawned.
         readiness.mark_ready();
         metrics.gauge("node_ready").set(1);
-        tracing::info!(target: "node", "readiness=true (bootstrap complete)");
+        root.in_scope(|| tracing::info!(target: "node", "readiness=true (bootstrap complete)"));
 
-        // Wait for external shutdown OR critical-task failure.
-        let pending_error = tokio::select! {
-            _ = shutdown => {
-                tracing::info!(target: "node", "external shutdown requested");
-                None
-            }
-            maybe = fail_rx.recv() => {
-                match maybe {
-                    Some(err) => {
-                        tracing::error!(target: "node", error = %err, "critical subsystem failed");
-                        Some(err)
-                    }
-                    None => None,
+        // Wait for external shutdown OR critical-task failure, then drain.
+        // This tail awaits, so the root span is attached with `Instrument`,
+        // which re-enters the span on every poll and exits it on every yield —
+        // correct across worker-thread migrations, unlike an `Entered` guard.
+        async move {
+            let pending_error = tokio::select! {
+                _ = shutdown => {
+                    tracing::info!(target: "node", "external shutdown requested");
+                    None
                 }
-            }
-        };
+                maybe = fail_rx.recv() => {
+                    match maybe {
+                        Some(err) => {
+                            tracing::error!(target: "node", error = %err, "critical subsystem failed");
+                            Some(err)
+                        }
+                        None => None,
+                    }
+                }
+            };
 
-        shutting_down.store(true, Ordering::Release);
-        self.finish_shutdown(handles, metrics_task, readiness, metrics, pending_error)
-            .await
+            shutting_down.store(true, Ordering::Release);
+            self.finish_shutdown(handles, metrics_task, readiness, metrics, pending_error)
+                .await
+        }
+        .instrument(root)
+        .await
     }
 
     async fn finish_shutdown(
@@ -618,6 +631,27 @@ mod tests {
         let report = node.run_until(async {}).await.unwrap();
         assert_eq!(report.handlers, 0);
         assert_eq!(report.processed, 0);
+    }
+
+    #[tokio::test]
+    async fn immediate_shutdown_with_roles_drains_preloaded_queue() {
+        // Issue #420: the awaited tail of run_until (select + finish_shutdown)
+        // moved into a span-instrumented future instead of running under an
+        // `Entered` guard held across `.await`. Prove control flow is
+        // unchanged: an already-resolved shutdown future still takes the
+        // external-shutdown select arm, handlers drain the preloaded bounded
+        // queue, and the report carries the totals.
+        let node = Node::new(cfg_with_roles(false, vec![Role::Gateway])).unwrap();
+        let tx = node.sender_for(Role::Gateway).expect("gateway seam");
+
+        const N: u64 = 32;
+        for seq in 0..N {
+            tx.send(Envelope { seq }).await.expect("enqueue");
+        }
+
+        let report = node.run_until(async {}).await.expect("clean shutdown");
+        assert_eq!(report.handlers, 1);
+        assert_eq!(report.processed, N, "preloaded commands must be drained");
     }
 
     #[tokio::test]
