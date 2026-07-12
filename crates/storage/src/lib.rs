@@ -25,6 +25,7 @@
 
 mod crc;
 mod durable;
+mod fsutil;
 mod integrity;
 mod limits;
 mod log;
