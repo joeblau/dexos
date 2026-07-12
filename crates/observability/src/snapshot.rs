@@ -65,8 +65,15 @@ impl Snapshot {
         self.counters.is_empty() && self.gauges.is_empty() && self.histograms.is_empty()
     }
 
-    /// Renders a Prometheus-style text exposition. Every non-comment line is
-    /// `key<space>value`, so it round-trips through [`parse_metric_lines`].
+    /// Renders a **Prometheus text exposition 0.0.4**-compatible body.
+    ///
+    /// - Counters / gauges: `# HELP`, `# TYPE`, then `name value`.
+    /// - Histograms: cumulative `_bucket{le="…"}` lines (including `+Inf`),
+    ///   plus `_count` and `_sum`. Quantile estimates are **not** exported as
+    ///   fake gauges (scrapers must use histogram buckets).
+    ///
+    /// Content-Type for HTTP scrapers:
+    /// `text/plain; version=0.0.4; charset=utf-8`.
     #[must_use]
     pub fn to_text(&self) -> String {
         let mut out = String::new();
@@ -120,7 +127,11 @@ impl Snapshot {
         }
         out
     }
-}
+
+    }
+
+/// Prometheus text exposition Content-Type header value (0.0.4).
+pub const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
 fn push_line(out: &mut String, key: &str, value: i128) {
     out.push_str(key);
@@ -199,6 +210,17 @@ mod tests {
         assert_eq!(map.get("orders_total"), Some(&42));
         assert_eq!(map.get("queue_depth"), Some(&-3));
         assert_eq!(map.get("match_latency_ns_count"), Some(&10));
+    }
+
+    #[test]
+    fn prometheus_histogram_uses_le_buckets_not_quantile_gauges() {
+        let text = sample().to_text();
+        assert!(text.contains("# TYPE match_latency_ns histogram"));
+        assert!(text.contains("match_latency_ns_bucket{le=\""));
+        assert!(text.contains("match_latency_ns_bucket{le=\"+Inf\"}"));
+        // Quantiles must not be exported as separate gauge series.
+        assert!(!text.contains("match_latency_ns_p99"));
+        assert!(!text.contains("_p50 "));
     }
 
     #[test]

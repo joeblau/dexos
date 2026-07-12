@@ -219,7 +219,18 @@ where
                 Err(other) => return Err(other),
             };
         let response = match decode_request(&bytes) {
-            Ok(request) => dispatch(&*backend, mode, request),
+            Ok(request) => {
+                // Correlate the request on the hot path. Callers that have a
+                // TraceId from the client can plumb it into ControlMeta later;
+                // until then we log the request_id for joinability.
+                let span = tracing::debug_span!(
+                    "rpc.request",
+                    request_id = request.request_id,
+                    method = ?request.method,
+                );
+                let _g = span.enter();
+                dispatch(&*backend, mode, request)
+            }
             Err(err) => RpcResponse::new(0, Err(err)),
         };
         let out = encode_response(&response)?;

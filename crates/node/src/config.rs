@@ -191,6 +191,39 @@ pub struct PerformanceSection {
     pub busy_poll: bool,
 }
 
+/// Log line format for the process-wide tracing subscriber.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    /// Human-oriented `fmt` subscriber (default for local dev).
+    #[default]
+    Text,
+    /// Structured JSON lines for production log aggregators.
+    Json,
+}
+
+/// `[observability]` section — logging and metrics scrape endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservabilitySection {
+    /// Log format: `text` (default) or `json` (production).
+    #[serde(default)]
+    pub log_format: LogFormat,
+    /// Optional listen address for Prometheus `/metrics` (and `/livez`).
+    /// Empty string disables the scrape server.
+    #[serde(default)]
+    pub metrics_listen: String,
+}
+
+impl Default for ObservabilitySection {
+    fn default() -> Self {
+        Self {
+            log_format: LogFormat::Text,
+            metrics_listen: String::new(),
+        }
+    }
+}
+
 /// A fully-parsed, validated node configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -213,6 +246,9 @@ pub struct NodeConfig {
     /// `[performance]` section.
     #[serde(default)]
     pub performance: PerformanceSection,
+    /// `[observability]` section.
+    #[serde(default)]
+    pub observability: ObservabilitySection,
 }
 
 /// CLI-supplied overrides that take precedence over file values.
@@ -442,11 +478,15 @@ read_only = false
 [performance]
 pin_threads = false
 busy_poll = false
+
+[observability]
+log_format = "json"
+metrics_listen = "127.0.0.1:9100"
 "#
     }
 
     #[test]
-    fn parses_all_six_sections() {
+    fn parses_all_sections_including_observability() {
         let cfg = NodeConfig::from_toml_str(full_toml()).expect("valid config");
         assert_eq!(cfg.node.name, "tokyo-1");
         assert_eq!(
@@ -457,6 +497,8 @@ busy_poll = false
         assert_eq!(cfg.consensus.epoch_length, 100_000);
         assert_eq!(cfg.storage.segment_size_mb, 1024);
         assert!(!cfg.rpc.read_only);
+        assert_eq!(cfg.observability.log_format, LogFormat::Json);
+        assert_eq!(cfg.observability.metrics_listen, "127.0.0.1:9100");
     }
 
     #[test]

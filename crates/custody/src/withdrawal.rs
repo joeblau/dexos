@@ -15,7 +15,10 @@
 //! A quorum over an unrelated checkpoint cannot authorize a withdrawal: no
 //! inclusion proof exists that binds the request's digest to that root.
 
-use crypto::{hash_domain, keccak256, verify_proof, QuorumCertificate, ValidatorSet};
+use crypto::{
+    hash_domain, verify_proof, QuorumCertificate, ValidatorSet, DOMAIN_WITHDRAWAL_AUTH,
+    DOMAIN_WITHDRAWAL_ID,
+};
 use types::{AccountId, Amount, Hash, SequenceNumber};
 
 use crate::chain::{ChainId, WalletAddress};
@@ -23,14 +26,19 @@ use crate::error::CustodyError;
 use crate::wire::{Reader, Writer};
 
 /// Domain tag mixed into every withdrawal-id preimage.
-pub const WITHDRAWAL_DOMAIN: &[u8] = b"DEXOS/WITHDRAWAL/v1";
+///
+/// Canonical value is [`DOMAIN_WITHDRAWAL_ID`] from the crypto domain registry
+/// — shared with `chain-adapter`. Prefer the `crypto::DOMAIN_*` constants at
+/// new call sites.
+pub const WITHDRAWAL_DOMAIN: &[u8] = DOMAIN_WITHDRAWAL_ID;
 
 /// Domain tag for the consensus-signed withdrawal authorization digest.
 ///
 /// This is the domain-separated commitment that the finalizing checkpoint must
 /// include for a withdrawal to be authorized. It binds the full request, the
 /// confirmations backing the reservation, and the reservation itself.
-pub const WITHDRAWAL_AUTH_DOMAIN: &[u8] = b"DEXOS/WITHDRAWAL-AUTH/v1";
+/// Canonical value is [`DOMAIN_WITHDRAWAL_AUTH`].
+pub const WITHDRAWAL_AUTH_DOMAIN: &[u8] = DOMAIN_WITHDRAWAL_AUTH;
 
 /// A deterministic 32-byte withdrawal identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -98,14 +106,15 @@ impl WithdrawalRequest {
         })
     }
 
-    /// Derive the deterministic withdrawal id: `keccak256(DOMAIN || encode())`.
+    /// Derive the deterministic withdrawal id via length-prefixed
+    /// [`hash_domain`] over [`DOMAIN_WITHDRAWAL_ID`] and the request body.
     ///
-    /// Bit-identical across runs and distinct whenever any field differs.
+    /// Bit-identical across runs and distinct whenever any field differs. Same
+    /// domain tag as `chain_adapter` withdrawal ids so the two crates cannot
+    /// disagree on the namespace.
     pub fn id(&self) -> WithdrawalId {
-        let mut preimage = Vec::with_capacity(WITHDRAWAL_DOMAIN.len() + 64);
-        preimage.extend_from_slice(WITHDRAWAL_DOMAIN);
-        preimage.extend_from_slice(&self.encode());
-        WithdrawalId(keccak256(&preimage))
+        let digest = hash_domain(DOMAIN_WITHDRAWAL_ID, &self.encode());
+        WithdrawalId(*digest.as_bytes())
     }
 }
 
@@ -173,7 +182,7 @@ pub fn withdrawal_authorization_digest(
     w.u32(confirmations);
     w.i128(reserved_amount.raw());
     w.u64(reservation_seq.get());
-    hash_domain(WITHDRAWAL_AUTH_DOMAIN, &w.into_vec())
+    hash_domain(DOMAIN_WITHDRAWAL_AUTH, &w.into_vec())
 }
 
 impl WithdrawalCertificate {

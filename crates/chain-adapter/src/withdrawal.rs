@@ -11,9 +11,14 @@ use serde::{Deserialize, Serialize};
 use types::{AccountId, Amount, Hash};
 
 /// Domain separator for deterministic withdrawal ids.
-pub const DOMAIN_WITHDRAWAL_ID: &[u8] = b"dexos.custody.withdrawal.id";
+///
+/// Canonical value from [`crypto::DOMAIN_WITHDRAWAL_ID`] — shared with
+/// `custody`. Do not redefine a parallel tag.
+pub const DOMAIN_WITHDRAWAL_ID: &[u8] = crypto::DOMAIN_WITHDRAWAL_ID;
 /// Domain separator for withdrawal settlement certificate hashing.
-pub const DOMAIN_WITHDRAWAL_CERT: &[u8] = b"dexos.custody.withdrawal.cert";
+///
+/// Canonical value from [`crypto::DOMAIN_WITHDRAWAL_CERT`].
+pub const DOMAIN_WITHDRAWAL_CERT: &[u8] = crypto::DOMAIN_WITHDRAWAL_CERT;
 /// Maximum destination-address length accepted by the codec.
 pub const MAX_ADDRESS_LEN: usize = 64;
 /// Maximum user-signature length accepted by the codec.
