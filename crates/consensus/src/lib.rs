@@ -42,7 +42,8 @@ pub use bft::{
 pub use checkpoint::{
     build_checkpoint_header, checkpoint_hash, detect_checkpoint_fork, links_to, seal_checkpoint,
     state_root_over_shards, verify_chain, verify_checkpoint, witness_digest, Checkpoint,
-    CheckpointError, CheckpointHeader, WitnessCollector, WitnessReceipt, DOMAIN_CHECKPOINT,
+    CheckpointError, CheckpointHeader, WitnessCollector, WitnessReceipt,
+    DEFAULT_WITNESS_MAX_ENTRIES, DEFAULT_WITNESS_SEQUENCE_HORIZON, DOMAIN_CHECKPOINT,
     DOMAIN_WITNESS,
 };
 pub use sequencer::{detect_gap, CommandRecord, CommandStatus, Sequencer, SequencerError};
@@ -50,7 +51,8 @@ pub use vote::{
     timeout_digest, vote_digest, CollectorWindow, Committee, Equivocation, NoopSlashHook,
     SlashEvidence, SlashHook, SlashKind, TimeoutCertificate, TimeoutCollector, TimeoutVote, Vote,
     VoteCollector, VoteError, VoteOutcome, VotePhase, DEFAULT_EVIDENCE_LIMIT,
-    DEFAULT_HEIGHT_HORIZON, DEFAULT_VIEW_HORIZON, DOMAIN_TIMEOUT, DOMAIN_VOTE, MAX_VALIDATORS,
+    DEFAULT_HEIGHT_HORIZON, DEFAULT_VIEW_HORIZON, DEFAULT_VOTE_QUOTA, DOMAIN_TIMEOUT, DOMAIN_VOTE,
+    MAX_VALIDATORS,
 };
 
 /// Crate identity, used by the node composition root for a startup manifest.
@@ -159,6 +161,26 @@ mod tests {
             first_sequence: first,
             last_sequence: last,
             proposer_index: proposer,
+            signature: kp.sign(d.as_bytes()),
+        }
+    }
+
+    fn signed_receipt(
+        kp: &KeyPair,
+        epoch: u64,
+        first: u64,
+        last: u64,
+        root: Hash,
+        idx: u32,
+    ) -> WitnessReceipt {
+        let d = witness_digest(epoch, ShardId::new(0), first, last, root);
+        WitnessReceipt {
+            epoch,
+            shard_id: ShardId::new(0),
+            first_sequence: first,
+            last_sequence: last,
+            execution_root: root,
+            witness_index: idx,
             signature: kp.sign(d.as_bytes()),
         }
     }
@@ -461,6 +483,127 @@ mod tests {
         assert_eq!(collector.retained_digests(), 0);
     }
 
+    // ---- memory-exhaustion DoS bounds (#424) -------------------------------
+
+    #[test]
+    fn vote_flood_from_one_validator_stays_bounded() {
+        let (comm, kps) = committee(4, 0);
+        let mut window = CollectorWindow::default_for(0);
+        window.vote_quota = 8;
+        let mut collector = VoteCollector::with_window(window);
+
+        // A Byzantine validator floods distinct, validly signed, in-window
+        // votes (one digest per height). Retention stays at the quota; the
+        // excess is rejected fail-closed — never by wiping admitted votes.
+        let mut accepted = 0usize;
+        let mut rejected = 0usize;
+        for height in 0..DEFAULT_HEIGHT_HORIZON {
+            let v = signed_vote(
+                &kps[0],
+                0,
+                0,
+                height,
+                VotePhase::Prepare,
+                Hash::from_bytes([1; 32]),
+                0,
+            );
+            match collector.add_vote(&comm, &v) {
+                Ok(VoteOutcome::Accepted) => accepted += 1,
+                Err(VoteError::QuotaExceeded(0)) => rejected += 1,
+                other => panic!("unexpected outcome {other:?}"),
+            }
+        }
+        assert_eq!(accepted, 8);
+        assert_eq!(
+            rejected,
+            usize::try_from(DEFAULT_HEIGHT_HORIZON).unwrap() - 8
+        );
+        assert_eq!(collector.retained_votes(), 8);
+        assert_eq!(collector.retained_digests(), 8);
+
+        // Honest validators are unaffected by the flooder's quota: a quorum
+        // still forms and verifies.
+        let block = Hash::from_bytes([7; 32]);
+        for i in 1..4u32 {
+            let v = signed_vote(&kps[i as usize], 0, 0, 1, VotePhase::Commit, block, i);
+            assert_eq!(
+                collector.add_vote(&comm, &v).unwrap(),
+                VoteOutcome::Accepted
+            );
+        }
+        let digest = vote_digest(0, 0, 1, VotePhase::Commit, block);
+        let qc = collector.try_form_qc(&comm, digest).unwrap();
+        assert!(comm.validator_set().verify(&qc).is_ok());
+    }
+
+    #[test]
+    fn prune_finalized_evicts_precisely_and_keeps_live_qc() {
+        let (comm, kps) = committee(4, 0);
+        let mut collector = VoteCollector::new();
+        let live_block = Hash::from_bytes([7; 32]);
+        let live_height = 10u64;
+
+        // A live quorum at height 10 plus a spread of stale votes below it.
+        for i in 0..3u32 {
+            let v = signed_vote(
+                &kps[i as usize],
+                0,
+                0,
+                live_height,
+                VotePhase::Commit,
+                live_block,
+                i,
+            );
+            collector.add_vote(&comm, &v).unwrap();
+        }
+        for h in 0..5u64 {
+            let v = signed_vote(
+                &kps[3],
+                0,
+                0,
+                h,
+                VotePhase::Prepare,
+                Hash::from_bytes([1; 32]),
+                3,
+            );
+            collector.add_vote(&comm, &v).unwrap();
+        }
+        assert_eq!(collector.retained_digests(), 6);
+
+        // Prune to the live height: stale digests drop, the live QC survives
+        // (the old destructive path wiped every in-flight vote here).
+        collector.prune_finalized(live_height);
+        assert_eq!(collector.retained_digests(), 1);
+        assert_eq!(collector.retained_votes(), 3);
+        let digest = vote_digest(0, 0, live_height, VotePhase::Commit, live_block);
+        let qc = collector
+            .try_form_qc(&comm, digest)
+            .expect("live QC must survive pruning");
+        assert!(comm.validator_set().verify(&qc).is_ok());
+
+        // Below-watermark votes are now rejected at admission.
+        let stale = signed_vote(
+            &kps[3],
+            0,
+            0,
+            4,
+            VotePhase::Prepare,
+            Hash::from_bytes([1; 32]),
+            3,
+        );
+        assert_eq!(
+            collector.add_vote(&comm, &stale),
+            Err(VoteError::OutsideWindow)
+        );
+
+        // Advancing past the live height evicts it too — precisely, not by
+        // wiping the collector.
+        collector.prune_finalized(live_height + 1);
+        assert_eq!(collector.retained_digests(), 0);
+        assert_eq!(collector.retained_votes(), 0);
+        assert!(collector.try_form_qc(&comm, digest).is_none());
+    }
+
     // ---- pipelining -------------------------------------------------------
 
     #[test]
@@ -732,6 +875,107 @@ mod tests {
             collector3.add_receipt(&comm, &foreign),
             Err(CheckpointError::ForeignWitness(99))
         ));
+    }
+
+    #[test]
+    fn witness_receipts_reject_out_of_epoch_and_out_of_window() {
+        let (comm, kps) = committee(4, 0);
+        let root = Hash::from_bytes([21; 32]);
+        // Watermark 100, horizon 50: admissible ranges sit inside [100, 150].
+        let mut collector = WitnessCollector::with_window(100, 50, 1024);
+
+        // A wrong-epoch receipt, validly signed by a committee member, is
+        // rejected before any signature work.
+        assert_eq!(
+            collector.add_receipt(&comm, &signed_receipt(&kps[0], 7, 100, 109, root, 0)),
+            Err(CheckpointError::EpochMismatch)
+        );
+        // Starts below the watermark.
+        assert_eq!(
+            collector.add_receipt(&comm, &signed_receipt(&kps[0], 0, 90, 109, root, 0)),
+            Err(CheckpointError::OutsideWindow)
+        );
+        // Reaches beyond the horizon.
+        assert_eq!(
+            collector.add_receipt(&comm, &signed_receipt(&kps[0], 0, 100, 151, root, 0)),
+            Err(CheckpointError::OutsideWindow)
+        );
+        // Inverted range.
+        assert!(matches!(
+            collector.add_receipt(&comm, &signed_receipt(&kps[0], 0, 120, 110, root, 0)),
+            Err(CheckpointError::RangeOutOfOrder { .. })
+        ));
+        assert_eq!(collector.retained_entries(), 0);
+
+        // An in-window receipt is admitted.
+        collector
+            .add_receipt(&comm, &signed_receipt(&kps[0], 0, 100, 150, root, 0))
+            .unwrap();
+        assert_eq!(collector.retained_entries(), 1);
+    }
+
+    #[test]
+    fn witness_prune_below_drops_old_and_cap_rejects_new_fail_closed() {
+        let (comm, kps) = committee(4, 0);
+        let root = Hash::from_bytes([21; 32]);
+        let old_digest = witness_digest(0, ShardId::new(0), 0, 9, root);
+        let live_digest = witness_digest(0, ShardId::new(0), 10, 19, root);
+
+        let mut collector = WitnessCollector::new();
+        for i in 0..3u32 {
+            collector
+                .add_receipt(&comm, &signed_receipt(&kps[i as usize], 0, 0, 9, root, i))
+                .unwrap();
+            collector
+                .add_receipt(&comm, &signed_receipt(&kps[i as usize], 0, 10, 19, root, i))
+                .unwrap();
+        }
+        assert_eq!(collector.retained_entries(), 6);
+        assert!(collector.certify(&comm, old_digest).is_ok());
+
+        // Pruning below 10 drops the old range but keeps the live one intact.
+        collector.prune_below(10);
+        assert_eq!(collector.watermark(), 10);
+        assert_eq!(collector.retained_entries(), 3);
+        assert!(matches!(
+            collector.certify(&comm, old_digest),
+            Err(CheckpointError::BelowThreshold)
+        ));
+        let qc = collector.certify(&comm, live_digest).unwrap();
+        assert!(comm.validator_set().verify(&qc).is_ok());
+        // Re-presenting a pruned (now stale) receipt is refused at the window,
+        // so pruned garbage cannot be re-inserted.
+        assert_eq!(
+            collector.add_receipt(&comm, &signed_receipt(&kps[0], 0, 0, 9, root, 0)),
+            Err(CheckpointError::OutsideWindow)
+        );
+
+        // A tiny cap bounds total entries fail-closed: the excess receipt is
+        // refused while everything already admitted stays (no clearing).
+        let mut capped = WitnessCollector::with_window(0, 1000, 2);
+        capped
+            .add_receipt(&comm, &signed_receipt(&kps[0], 0, 0, 9, root, 0))
+            .unwrap();
+        capped
+            .add_receipt(&comm, &signed_receipt(&kps[1], 0, 0, 9, root, 1))
+            .unwrap();
+        assert_eq!(
+            capped.add_receipt(&comm, &signed_receipt(&kps[2], 0, 0, 9, root, 2)),
+            Err(CheckpointError::AtCapacity)
+        );
+        assert_eq!(capped.retained_entries(), 2);
+        // Idempotent duplicates of an admitted receipt still succeed at the cap.
+        capped
+            .add_receipt(&comm, &signed_receipt(&kps[0], 0, 0, 9, root, 0))
+            .unwrap();
+        assert_eq!(capped.retained_entries(), 2);
+        // Pruning frees capacity for new, live receipts.
+        capped.prune_below(10);
+        assert_eq!(capped.retained_entries(), 0);
+        capped
+            .add_receipt(&comm, &signed_receipt(&kps[2], 0, 10, 19, root, 2))
+            .unwrap();
+        assert_eq!(capped.retained_entries(), 1);
     }
 
     // ---- determinism property test (LCG) ---------------------------------
