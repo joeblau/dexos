@@ -134,8 +134,16 @@ impl RiskEngine {
         mode: MarginMode,
     ) -> Result<(), RiskError> {
         let i = self.active_index(account)?;
+        let prev = self.margin_mode[i];
         self.margin_mode[i] = mode;
-        self.recompute(i)
+        if let Err(e) = self.recompute(i) {
+            // Restore the prior mode on a recompute overflow. `recompute` commits
+            // the cached columns only after a successful computation, so no cache
+            // rollback is needed — undoing the mode leaves the account identical.
+            self.margin_mode[i] = prev;
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Credit (deposit) collateral into an account.
@@ -148,8 +156,8 @@ impl RiskEngine {
             return Err(RiskError::NegativeAmount);
         }
         let i = self.active_index(account)?;
-        self.collateral[i] = self.collateral[i].checked_add(amount)?;
-        self.recompute(i)
+        let updated = self.collateral[i].checked_add(amount)?;
+        self.set_collateral_checked(i, updated)
     }
 
     /// Debit (withdraw) collateral, refusing to drop the account below its
@@ -167,15 +175,15 @@ impl RiskEngine {
         if amount.raw() > free.raw() {
             return Err(RiskError::InsufficientCollateral);
         }
-        self.collateral[i] = self.collateral[i].checked_sub(amount)?;
-        self.recompute(i)
+        let updated = self.collateral[i].checked_sub(amount)?;
+        self.set_collateral_checked(i, updated)
     }
 
     /// Apply signed funding to an account's collateral (positive = received).
     pub fn apply_funding(&mut self, account: AccountId, amount: Amount) -> Result<(), RiskError> {
         let i = self.active_index(account)?;
-        self.collateral[i] = self.collateral[i].checked_add(amount)?;
-        self.recompute(i)
+        let updated = self.collateral[i].checked_add(amount)?;
+        self.set_collateral_checked(i, updated)
     }
 
     /// Charge a non-negative fee against an account's collateral (may push it
@@ -185,8 +193,8 @@ impl RiskEngine {
             return Err(RiskError::NegativeAmount);
         }
         let i = self.active_index(account)?;
-        self.collateral[i] = self.collateral[i].checked_sub(fee)?;
-        self.recompute(i)
+        let updated = self.collateral[i].checked_sub(fee)?;
+        self.set_collateral_checked(i, updated)
     }
 
     // ------------------------------------------------------------------- market
@@ -195,16 +203,28 @@ impl RiskEngine {
     pub fn set_mark_price(&mut self, market: MarketId, price: Price) -> Result<(), RiskError> {
         let mi = market.index()?;
         self.grow_market(mi);
+        let prev = self.marks[mi];
         self.marks[mi] = Some(price);
-        self.recompute_all()
+        if let Err(e) = self.recompute_all() {
+            // `recompute_all` is all-or-none, so on overflow no account column was
+            // written; restoring the prior mark leaves the engine byte-identical.
+            self.marks[mi] = prev;
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Assign a market to a cross-margin risk group (default group == market id).
     pub fn set_risk_group(&mut self, market: MarketId, group: u32) -> Result<(), RiskError> {
         let mi = market.index()?;
         self.grow_market(mi);
+        let prev = self.risk_group[mi];
         self.risk_group[mi] = Some(group);
-        self.recompute_all()
+        if let Err(e) = self.recompute_all() {
+            self.risk_group[mi] = prev;
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Set a per-market notional cap.
@@ -245,6 +265,12 @@ impl RiskEngine {
     /// Apply a signed fill to the account at slab index `i`. Shared by the public
     /// [`RiskEngine::apply_fill`] and the internal auto-deleverage path, which
     /// operates on already-resolved indices.
+    ///
+    /// Atomic: if any fallible step (the position arithmetic, the realized-PnL
+    /// settlement, or the recompute) overflows, the account's collateral and perp
+    /// book are rolled back to their exact pre-fill state, so a rejected fill
+    /// leaves no partial mutation behind. The rollback data is entirely `Copy`
+    /// (`PerpPosition` and `Amount`), so the steady-state path stays allocation-free.
     fn fill_index(
         &mut self,
         i: usize,
@@ -252,7 +278,37 @@ impl RiskEngine {
         signed_qty: Quantity,
         price: Price,
     ) -> Result<(), RiskError> {
+        let len_before = self.perp[i].len();
         let pos_idx = self.position_slot(i, market);
+        // `position_slot` appends a fresh flat slot for a market not yet held.
+        let pushed = self.perp[i].len() != len_before;
+        let saved_pos = self.perp[i][pos_idx];
+        let saved_collateral = self.collateral[i];
+        if let Err(e) = self.fill_apply(i, pos_idx, signed_qty, price) {
+            self.collateral[i] = saved_collateral;
+            if pushed {
+                // Discard the slot `position_slot` appended for this fill.
+                self.perp[i].truncate(len_before);
+            } else if self.perp[i].len() == pos_idx {
+                // The success path popped the (now-flat) trailing slot; put it back.
+                self.perp[i].push(saved_pos);
+            } else {
+                self.perp[i][pos_idx] = saved_pos;
+            }
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// The mutating body of a fill against the already-resolved slot `pos_idx`.
+    /// Every step is fallible; [`RiskEngine::fill_index`] rolls back on `Err`.
+    fn fill_apply(
+        &mut self,
+        i: usize,
+        pos_idx: usize,
+        signed_qty: Quantity,
+        price: Price,
+    ) -> Result<(), RiskError> {
         let realized = self.perp[i][pos_idx].apply_fill(signed_qty, price)?;
         self.collateral[i] = self.collateral[i].checked_add(realized)?;
         // Drop a flattened position to keep scans tight (only when at the end).
@@ -799,13 +855,22 @@ impl RiskEngine {
 
     /// Recompute every account's cached columns from scratch. Definitionally
     /// equal to the incremental path; used after bulk changes and in tests.
+    ///
+    /// All-or-none: every account's columns are computed first (the fallible
+    /// phase); only once the whole pass succeeds are they committed. A mid-pass
+    /// overflow therefore leaves the cached state byte-identical, which is what
+    /// makes [`RiskEngine::set_mark_price`] and [`RiskEngine::set_risk_group`]
+    /// atomic.
     pub fn recompute_all(&mut self) -> Result<(), RiskError> {
-        // Recompute every slot (unused slots are empty and fold to zero, so the
-        // pass is idempotent). The loop body indexes no single slice, avoiding a
-        // needless-range-loop rewrite that the `&mut self` borrow would forbid.
         let n = self.used.len();
+        // Fallible phase: compute (unused slots are empty and fold to zero).
+        let mut computed: Vec<CachedColumns> = Vec::with_capacity(n);
         for i in 0..n {
-            self.recompute(i)?;
+            computed.push(self.compute_columns(i)?);
+        }
+        // Infallible phase: commit.
+        for (i, cols) in computed.iter().enumerate() {
+            self.write_columns(i, cols);
         }
         Ok(())
     }
@@ -836,19 +901,61 @@ impl RiskEngine {
     // --------------------------------------------------------------- internals
 
     fn recompute(&mut self, i: usize) -> Result<(), RiskError> {
+        let cols = self.compute_columns(i)?;
+        self.write_columns(i, &cols);
+        Ok(())
+    }
+
+    /// Compute account `i`'s cached columns without committing them. Fallible
+    /// (fixed-point overflow); because it mutates nothing, a caller can compute
+    /// first and commit only on success — the basis for the atomic single-account
+    /// mutators ([`RiskEngine::set_collateral_checked`]) and the bulk
+    /// [`RiskEngine::recompute_all`].
+    fn compute_columns(&self, i: usize) -> Result<CachedColumns, RiskError> {
         let (equity, exposure, scenario) = self.compute(i)?;
-        self.cached_equity[i] = equity;
-        self.cached_exposure[i] = exposure;
-        self.cached_scenario[i] = scenario;
         // Perp margin is a fraction of notional; payout margin is the full
         // worst-case scenario liability (settlement is certain to realize some
         // outcome, so no volatility haircut applies). Both requirements add.
-        self.cached_im[i] = exposure
+        let im = exposure
             .mul_ratio(self.config.initial_margin)?
             .checked_add(scenario)?;
-        self.cached_mm[i] = exposure
+        let mm = exposure
             .mul_ratio(self.config.maintenance_margin)?
             .checked_add(scenario)?;
+        Ok(CachedColumns {
+            equity,
+            exposure,
+            scenario,
+            im,
+            mm,
+        })
+    }
+
+    /// Commit precomputed cached columns for account `i` (infallible).
+    fn write_columns(&mut self, i: usize, cols: &CachedColumns) {
+        self.cached_equity[i] = cols.equity;
+        self.cached_exposure[i] = cols.exposure;
+        self.cached_scenario[i] = cols.scenario;
+        self.cached_im[i] = cols.im;
+        self.cached_mm[i] = cols.mm;
+    }
+
+    /// Set account `i`'s collateral to `new_collateral` and refresh its cached
+    /// columns, restoring the prior collateral if the recompute overflows. Since
+    /// [`RiskEngine::recompute`] commits the columns only after a successful
+    /// (fallible) computation, a failure never writes a cache, so restoring
+    /// collateral alone makes the update atomic.
+    fn set_collateral_checked(
+        &mut self,
+        i: usize,
+        new_collateral: Amount,
+    ) -> Result<(), RiskError> {
+        let prev = self.collateral[i];
+        self.collateral[i] = new_collateral;
+        if let Err(e) = self.recompute(i) {
+            self.collateral[i] = prev;
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -990,6 +1097,17 @@ impl RiskEngine {
             self.market_limit.resize(n, None);
         }
     }
+}
+
+/// One account's cached risk columns, computed together so they can be committed
+/// atomically after the (fallible) computation succeeds.
+#[derive(Debug, Clone, Copy)]
+struct CachedColumns {
+    equity: Amount,
+    exposure: Amount,
+    scenario: Amount,
+    im: Amount,
+    mm: Amount,
 }
 
 /// FNV-1a fold of one `i128` (little-endian) into a running hash.
@@ -1355,6 +1473,66 @@ mod tests {
         let a = build_engine_from_seed(0x5151_5151);
         let b = build_engine_from_seed(0x5151_5151);
         assert_eq!(a.state_root(), b.state_root());
+    }
+
+    // Atomicity: a fill that mutates the position and then overflows while settling
+    // realized PnL is rolled back to its exact pre-fill state.
+    #[test]
+    fn fill_index_rolls_back_on_realized_overflow() {
+        let mut e = engine();
+        // Collateral one step short of the maximum, so realizing any positive PnL
+        // overflows the collateral add.
+        e.open_account(acct(1), Amount::from_raw(i128::MAX - 1_000))
+            .unwrap();
+        e.set_mark_price(mkt(1), price(1)).unwrap();
+        // Open long 2 @ 1.0 (realized 0, collateral unchanged).
+        e.apply_fill(acct(1), mkt(1), qty(2), price(1)).unwrap();
+        let root_before = e.state_root();
+        let pos_before = e.position(acct(1), mkt(1)).unwrap();
+        let collateral_before = e.collateral(acct(1)).unwrap();
+        // Reduce 1 @ a huge price: `apply_fill` mutates net_qty, then settling the
+        // large positive realized PnL into near-max collateral overflows.
+        assert!(matches!(
+            e.apply_fill(
+                acct(1),
+                mkt(1),
+                Quantity::from_raw(-Q),
+                Price::from_raw(i64::MAX)
+            ),
+            Err(RiskError::Arith(_))
+        ));
+        // No partial mutation survived: position, collateral, and root are identical.
+        assert_eq!(e.state_root(), root_before);
+        assert_eq!(e.position(acct(1), mkt(1)).unwrap(), pos_before);
+        assert_eq!(e.collateral(acct(1)).unwrap(), collateral_before);
+        // The restored book still accepts a well-scaled fill.
+        e.apply_fill(acct(1), mkt(1), qty(-1), price(1)).unwrap();
+        assert_eq!(e.position(acct(1), mkt(1)).unwrap(), qty(1));
+    }
+
+    // Atomicity: a mark-price update whose all-accounts recompute overflows leaves
+    // both the mark and every cached column byte-identical.
+    #[test]
+    fn set_mark_price_rolls_back_on_recompute_overflow() {
+        let mut e = engine();
+        e.open_account(acct(1), Amount::from_raw(i128::MAX - 1_000))
+            .unwrap();
+        e.set_mark_price(mkt(1), price(1)).unwrap();
+        // Long 1 @ 1.0: at mark 1.0 unrealized is 0, so equity fits.
+        e.apply_fill(acct(1), mkt(1), qty(1), price(1)).unwrap();
+        let root_before = e.state_root();
+        // A huge mark makes unrealized (huge - 1) * 1 a large positive amount;
+        // folding it into near-max collateral overflows equity.
+        assert!(matches!(
+            e.set_mark_price(mkt(1), Price::from_raw(i64::MAX)),
+            Err(RiskError::Arith(_))
+        ));
+        assert_eq!(e.state_root(), root_before);
+        // The prior mark is still in force: equity is unchanged.
+        assert_eq!(
+            e.equity(acct(1)).unwrap(),
+            Amount::from_raw(i128::MAX - 1_000)
+        );
     }
 
     #[test]
