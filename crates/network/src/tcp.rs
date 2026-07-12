@@ -37,7 +37,6 @@
 //! channels with the same bounded backpressure as the loopback transport.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use codec::Frame;
@@ -57,24 +56,18 @@ use crate::transport::Transport;
 /// Domain separation tag for handshake signatures.
 const HS_DOMAIN: &[u8] = b"dexos-network-handshake-v1";
 
-/// Monotonic counter mixed into handshake nonces for freshness.
-static NONCE_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// Derive a 32-byte handshake nonce from wall-clock time, a process counter, and
-/// the local public key. Not a security-critical RNG, but unique per handshake;
-/// a production deployment would seed this from an OS CSPRNG.
-fn make_nonce(public_key: &[u8; 32]) -> [u8; 32] {
-    let counter = NONCE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let mut buf = Vec::with_capacity(32 + 16 + 8);
-    buf.extend_from_slice(public_key);
-    buf.extend_from_slice(&now.to_le_bytes());
-    buf.extend_from_slice(&counter.to_le_bytes());
-    let digest: types::Hash = crypto::hash_leaf(&buf);
-    *digest.as_bytes()
+/// Draw a fresh 32-byte handshake nonce from the OS CSPRNG.
+///
+/// The nonce guards handshake freshness and replay resistance, so it must be
+/// unpredictable. It comes straight from the platform secure RNG (`getrandom`)
+/// — the same source [`Ephemeral::generate`] uses for session keys — rather
+/// than a wall-clock/counter mixer an on-path attacker could predict. If the OS
+/// CSPRNG is unavailable we fail the handshake instead of proceeding with weak
+/// randomness.
+fn make_nonce() -> Result<[u8; 32], TransportError> {
+    let mut nonce = [0u8; 32];
+    getrandom::getrandom(&mut nonce).map_err(|_| TransportError::HandshakeFailed)?;
+    Ok(nonce)
 }
 
 /// The signed handshake transcript.
@@ -111,7 +104,7 @@ pub(crate) async fn mutual_handshake(
     is_initiator: bool,
 ) -> Result<(PeerId, Session), TransportError> {
     let our_pub = keypair.public();
-    let our_nonce = make_nonce(&our_pub);
+    let our_nonce = make_nonce()?;
     let ephemeral = Ephemeral::generate()?;
     let our_eph = ephemeral.public();
 
@@ -466,6 +459,16 @@ mod tests {
             );
         }
         let _kept_alive = sender.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn nonces_are_csprng_drawn_and_distinct() {
+        // Fresh draws from the OS CSPRNG must differ and must not be all-zero,
+        // proving the nonce is no longer a predictable time/counter derivation.
+        let a = make_nonce().unwrap();
+        let b = make_nonce().unwrap();
+        assert_ne!(a, b, "two CSPRNG nonces collided");
+        assert_ne!(a, [0u8; 32], "nonce was all zero");
     }
 
     #[tokio::test]

@@ -749,6 +749,7 @@ dependencies = [
  "benchmarks",
  "clap",
  "crypto",
+ "getrandom",
  "node",
 ]
 

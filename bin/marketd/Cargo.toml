@@ -19,3 +19,4 @@ benchmarks = { path = "../../crates/benchmarks" }
 crypto = { path = "../../crates/crypto" }
 clap.workspace = true
 anyhow.workspace = true
+getrandom.workspace = true

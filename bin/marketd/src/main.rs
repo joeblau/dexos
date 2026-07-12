@@ -189,17 +189,27 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Keygen(a) => {
             let mut seed = [0u8; 32];
-            read_entropy(&mut seed);
+            fill_entropy(&mut seed)?;
             let keypair = crypto::KeyPair::from_seed(&seed);
             let public_hex = to_hex(&keypair.public());
+            let seed_hex = to_hex(&seed);
             match &a.output {
                 Some(path) => {
-                    std::fs::write(path, to_hex(&seed))
+                    write_secret_file(path, &seed_hex)
                         .map_err(|e| anyhow::anyhow!("writing {}: {e}", path.display()))?;
                     println!("public_key: {public_hex}");
-                    println!("wrote private seed to {}", path.display());
+                    println!("wrote private seed to {} (owner-only)", path.display());
                 }
-                None => println!("public_key: {public_hex}"),
+                None => {
+                    // The seed is never silently discarded: with no --output we
+                    // print it to stdout and warn on stderr that it is secret.
+                    println!("public_key: {public_hex}");
+                    println!("private_seed: {seed_hex}");
+                    eprintln!(
+                        "warning: private seed printed to stdout — keep it secret. \
+                         Re-run with --output <PATH> to write it to an owner-only file instead."
+                    );
+                }
             }
             Ok(())
         }
@@ -233,29 +243,42 @@ fn to_hex(bytes: &[u8]) -> String {
     s
 }
 
-/// Fill `buf` with entropy from the OS CSPRNG, falling back to a time-seeded
-/// mixer only if `/dev/urandom` is unavailable.
-fn read_entropy(buf: &mut [u8; 32]) {
-    use std::io::Read;
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        if f.read_exact(buf).is_ok() {
-            return;
-        }
+/// Fill `buf` with cryptographically secure random bytes from the OS CSPRNG.
+///
+/// Uses `getrandom`, which reads the platform secure RNG (`getrandom(2)` /
+/// `getentropy` on Linux, `SecRandomCopyBytes`/`arc4random` on macOS, etc.), so
+/// it is portable and does not assume a `/dev/urandom` device node. If the OS
+/// CSPRNG is unavailable we fail hard — there is no time-seeded LCG fallback,
+/// which would produce a predictable and therefore forgeable private key.
+fn fill_entropy(buf: &mut [u8]) -> anyhow::Result<()> {
+    getrandom::getrandom(buf)
+        .map_err(|e| anyhow::anyhow!("OS CSPRNG unavailable; refusing to generate a weak key: {e}"))
+}
+
+/// Write `contents` to `path`, restricting the file to owner read/write (`0600`)
+/// on Unix so a private seed is never left group- or world-readable. On non-Unix
+/// platforms the file is created with the default permissions.
+fn write_secret_file(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
     }
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let mut state = u64::try_from(nanos % u128::from(u64::MAX))
-        .unwrap_or(1)
-        .max(1);
-    for chunk in buf.chunks_mut(8) {
-        state = state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        let bytes = state.to_le_bytes();
-        chunk.copy_from_slice(&bytes[..chunk.len()]);
+    let mut f = opts.open(path)?;
+    // Narrow permissions explicitly as well, so an already-existing file that was
+    // created with wider bits is tightened rather than left as-is.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
+    f.write_all(contents.as_bytes())?;
+    f.flush()?;
+    Ok(())
 }
 
 fn main() -> ExitCode {
@@ -358,5 +381,71 @@ mod tests {
             panic!("expected run");
         };
         assert!(resolve_config(&args).is_err());
+    }
+
+    #[test]
+    fn fill_entropy_yields_distinct_nonzero_seeds() {
+        // On any supported platform the OS CSPRNG is available, so `fill_entropy`
+        // succeeds and produces fresh, non-degenerate bytes each call. This
+        // proves the LCG/time fallback is gone: two draws differ overwhelmingly.
+        let mut a = [0u8; 32];
+        let mut b = [0u8; 32];
+        fill_entropy(&mut a).expect("OS CSPRNG must be available");
+        fill_entropy(&mut b).expect("OS CSPRNG must be available");
+        assert_ne!(a, [0u8; 32], "seed was all zero");
+        assert_ne!(a, b, "two CSPRNG seeds collided");
+    }
+
+    #[test]
+    fn keygen_public_key_is_deterministic_from_seed() {
+        // The public key is a pure function of the seed, so a written seed can
+        // always be reloaded to recover the identity — the seed is never lost.
+        let seed = [7u8; 32];
+        let a = to_hex(&crypto::KeyPair::from_seed(&seed).public());
+        let b = to_hex(&crypto::KeyPair::from_seed(&seed).public());
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 64, "32-byte public key hex-encodes to 64 chars");
+    }
+
+    #[test]
+    fn write_secret_file_round_trips_contents() {
+        let path = unique_temp_path("roundtrip");
+        write_secret_file(&path, "deadbeef").expect("write should succeed");
+        let read_back = std::fs::read_to_string(&path).expect("read should succeed");
+        assert_eq!(read_back, "deadbeef");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_secret_file_is_owner_only_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = unique_temp_path("mode");
+        // Pre-create a world-readable file to prove we tighten, not just create.
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_secret_file(&path, "secret-seed").expect("write should succeed");
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "seed file must be owner read/write only"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A unique, per-invocation temp path so parallel tests never collide.
+    #[cfg(test)]
+    fn unique_temp_path(tag: &str) -> std::path::PathBuf {
+        let mut salt = [0u8; 8];
+        fill_entropy(&mut salt).expect("OS CSPRNG must be available");
+        std::env::temp_dir().join(format!(
+            "marketd-keygen-{tag}-{}-{}.seed",
+            std::process::id(),
+            to_hex(&salt)
+        ))
     }
 }
