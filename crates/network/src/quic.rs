@@ -21,6 +21,15 @@
 //! so network-id / wire-version / capability negotiation and PeerId binding stay
 //! identical across transports.
 //!
+//! # Concurrent acceptance (#405)
+//!
+//! Like [`crate::TcpTransport`], inbound admission is pumped: an internal task
+//! drains the endpoint's incoming queue continuously and runs each handshake
+//! on its own task, gated non-blockingly by the handshake semaphore. On
+//! exhaustion new attempts are refused immediately (fail-closed shed) instead
+//! of stalling admission, so a slow or half-open peer never delays a
+//! well-behaved peer's acceptance.
+//!
 //! # TCP fallback
 //!
 //! When QUIC is not configured, operators may still use [`crate::TcpTransport`].
@@ -39,9 +48,11 @@ use codec::{Frame, TrafficClass, FRAME_HEADER_LEN, MAX_FRAME_PAYLOAD};
 use crypto::KeyPair;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{
-    ClientConfig, Connection as QuinnConnection, Endpoint, RecvStream, SendStream, ServerConfig,
+    ClientConfig, Connection as QuinnConnection, Endpoint, Incoming, RecvStream, SendStream,
+    ServerConfig,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::{mpsc, Semaphore};
 use tokio::time::timeout;
 
@@ -526,6 +537,22 @@ async fn open_class_streams_responder(
     Ok((sends, recvs))
 }
 
+/// Shared state each accepted-connection handshake task needs. All fields are
+/// cheap shared handles (or `Copy`), so per-connection clones are O(1).
+#[derive(Clone)]
+struct AcceptCtx {
+    keypair: Arc<KeyPair>,
+    cfg: TransportConfig,
+    node_budget: Arc<ByteBudget>,
+    disconnects: Arc<DisconnectMetrics>,
+    membership: Arc<Mutex<Membership>>,
+    peer_dedup: Arc<Mutex<PeerDedup>>,
+    conn_counts: Arc<Mutex<HashMap<PeerId, usize>>>,
+    epoch_counter: Arc<AtomicU64>,
+    /// When false, datagram channels are not wired (fail-closed vs silent no-op).
+    enable_datagrams: bool,
+}
+
 /// A QUIC transport bound to a local UDP address, with fixed node identity.
 pub struct QuicTransport {
     id: PeerId,
@@ -536,14 +563,19 @@ pub struct QuicTransport {
     disconnects: Arc<DisconnectMetrics>,
     membership: Arc<Mutex<Membership>>,
     peer_dedup: Arc<Mutex<PeerDedup>>,
+    /// Handshake concurrency limiter: awaited by dials, taken non-blockingly
+    /// (fail-closed refusal) by the accept pump.
     handshake_sem: Arc<Semaphore>,
-    epoch_counter: AtomicU64,
+    /// Monotonic epoch counter for outbound sessions (shared with the pump).
+    epoch_counter: Arc<AtomicU64>,
     /// Live connection counts per peer (connection budget). Shared with the
     /// [`ConnSlot`] guards owned by live [`Connection`]s, which release their
     /// reservation on drop.
     conn_counts: Arc<Mutex<HashMap<PeerId, usize>>>,
     /// When false, datagram channels are not wired (fail-closed vs silent no-op).
     enable_datagrams: bool,
+    /// Completed handshake results fed by the accept pump (see [`accept_pump`]).
+    accepted_rx: AsyncMutex<mpsc::Receiver<Result<Connection, TransportError>>>,
 }
 
 impl QuicTransport {
@@ -557,6 +589,10 @@ impl QuicTransport {
     }
 
     /// Bind with explicit membership and datagram enablement.
+    ///
+    /// Spawns the internal accept pump: inbound handshakes run concurrently
+    /// (bounded by [`TransportConfig::max_concurrent_handshakes`]) and
+    /// [`Transport::accept`] yields each result as it completes.
     pub async fn bind_with_options(
         addr: SocketAddr,
         keypair: Arc<KeyPair>,
@@ -573,7 +609,8 @@ impl QuicTransport {
 
         let id = PeerId::from(keypair.public());
         let max_hs = cfg.max_concurrent_handshakes.max(1);
-        Ok(Self {
+        let (accepted_tx, accepted_rx) = mpsc::channel(cfg.accept_queue_capacity.max(1));
+        let transport = Self {
             id,
             keypair,
             endpoint,
@@ -587,10 +624,33 @@ impl QuicTransport {
             disconnects: Arc::new(DisconnectMetrics::default()),
             membership: Arc::new(Mutex::new(membership)),
             handshake_sem: Arc::new(Semaphore::new(max_hs)),
-            epoch_counter: AtomicU64::new(1),
+            epoch_counter: Arc::new(AtomicU64::new(1)),
             conn_counts: Arc::new(Mutex::new(HashMap::new())),
             enable_datagrams,
-        })
+            accepted_rx: AsyncMutex::new(accepted_rx),
+        };
+        tokio::spawn(accept_pump(
+            transport.endpoint.clone(),
+            transport.handshake_sem.clone(),
+            transport.accept_ctx(),
+            accepted_tx,
+        ));
+        Ok(transport)
+    }
+
+    /// Assemble the shared state the accept pump's handshake tasks need.
+    fn accept_ctx(&self) -> AcceptCtx {
+        AcceptCtx {
+            keypair: self.keypair.clone(),
+            cfg: self.cfg,
+            node_budget: self.node_budget.clone(),
+            disconnects: self.disconnects.clone(),
+            membership: self.membership.clone(),
+            peer_dedup: self.peer_dedup.clone(),
+            conn_counts: self.conn_counts.clone(),
+            epoch_counter: self.epoch_counter.clone(),
+            enable_datagrams: self.enable_datagrams,
+        }
     }
 
     /// This node's authenticated identity.
@@ -626,128 +686,180 @@ impl QuicTransport {
 
     /// Reserve one connection slot for `peer` against the per-peer budget.
     ///
-    /// Returns a [`ConnSlot`] guard that releases the reservation when dropped,
-    /// so the budget tracks live connections rather than lifetime totals. A
-    /// refused reservation never inserts an entry, keeping the map bounded.
+    /// Test-only surface over [`ConnSlot::reserve`]; production paths reserve
+    /// through [`finish_session`], which shares the same counts map.
+    #[cfg(test)]
     fn reserve_conn_slot(&self, peer: PeerId) -> Result<ConnSlot, TransportError> {
-        let mut counts = self
-            .conn_counts
+        ConnSlot::reserve(&self.conn_counts, self.cfg.connection_budget_per_peer, peer)
+    }
+}
+
+/// Run the authenticated control-stream handshake on an established QUIC
+/// connection, apply the membership check, reserve the connection slot
+/// (post-handshake, so failed handshakes consume no slot), open the per-class
+/// streams, and wire the finished [`Connection`].
+///
+/// Concurrency gating is the caller's job: dials await the handshake
+/// semaphore, while the accept pump's tasks hold a `try_acquire`d permit.
+async fn finish_session(
+    ctx: &AcceptCtx,
+    quinn_conn: QuinnConnection,
+    expected: Option<PeerId>,
+    is_initiator: bool,
+    local_epoch: u64,
+) -> Result<Connection, TransportError> {
+    let fut = async {
+        // Control stream: mutual ed25519 handshake + negotiation.
+        let (mut control_send, mut control_recv) = if is_initiator {
+            quinn_conn
+                .open_bi()
+                .await
+                .map_err(|e| TransportError::Io(e.to_string()))?
+        } else {
+            quinn_conn
+                .accept_bi()
+                .await
+                .map_err(|e| TransportError::Io(e.to_string()))?
+        };
+
+        // Combined read/write surface for mutual_handshake.
+        let mut control = ControlStream {
+            send: control_send,
+            recv: control_recv,
+        };
+        let (hs, session) = mutual_handshake(
+            &mut control,
+            &ctx.keypair,
+            expected,
+            is_initiator,
+            &ctx.cfg,
+            local_epoch,
+        )
+        .await?;
+        // Keep control stream open but unused (or finish send half).
+        let ControlStream { send, recv } = control;
+        control_send = send;
+        control_recv = recv;
+        let _ = control_send.finish();
+        drop(control_recv);
+        let _ = session; // QUIC/TLS already encrypts; app AEAD unused on this path.
+
+        let (sends, recvs) = if is_initiator {
+            open_class_streams_initiator(&quinn_conn).await?
+        } else {
+            open_class_streams_responder(&quinn_conn).await?
+        };
+
+        Ok::<_, TransportError>((hs, sends, recvs))
+    };
+
+    let (hs, sends, recvs) = match timeout(ctx.cfg.handshake_timeout, fut).await {
+        Ok(result) => result?,
+        Err(_) => {
+            ctx.disconnects.record(DisconnectReason::Authentication);
+            return Err(TransportError::HandshakeTimeout);
+        }
+    };
+
+    let role = {
+        let m = ctx
+            .membership
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let count = counts.get(&peer).copied().unwrap_or(0);
-        if count >= self.cfg.connection_budget_per_peer {
-            return Err(TransportError::Backpressure {
-                class: TrafficClass::Sync,
-            });
+        match m.role_of(&hs.peer) {
+            Some(role) => role,
+            None => {
+                // Permissioned membership: reject unknown peers on both sides.
+                ctx.disconnects.record(DisconnectReason::Authentication);
+                return Err(TransportError::NotInMembership);
+            }
         }
-        counts.insert(peer, count + 1);
-        drop(counts);
-        Ok(ConnSlot::new(peer, self.conn_counts.clone()))
-    }
+    };
 
-    async fn finish_session(
-        &self,
-        quinn_conn: QuinnConnection,
-        expected: Option<PeerId>,
-        is_initiator: bool,
-        local_epoch: u64,
-    ) -> Result<Connection, TransportError> {
-        let _permit = self
-            .handshake_sem
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| TransportError::HandshakeFailed)?;
+    let conn_slot = ConnSlot::reserve(
+        &ctx.conn_counts,
+        ctx.cfg.connection_budget_per_peer,
+        hs.peer,
+    )?;
+    let opts = ConnectionOpts {
+        epoch: hs.epoch,
+        role,
+        wire_version: hs.wire_version,
+        capabilities: hs.capabilities,
+        peer_dedup: Some(ctx.peer_dedup.clone()),
+        conn_slot: Some(conn_slot),
+    };
 
-        let fut = async {
-            // Control stream: mutual ed25519 handshake + negotiation.
-            let (mut control_send, mut control_recv) = if is_initiator {
-                quinn_conn
-                    .open_bi()
-                    .await
-                    .map_err(|e| TransportError::Io(e.to_string()))?
-            } else {
-                quinn_conn
-                    .accept_bi()
-                    .await
-                    .map_err(|e| TransportError::Io(e.to_string()))?
-            };
+    Ok(spawn_quic_connection(
+        quinn_conn,
+        hs.peer,
+        &ctx.cfg,
+        &ctx.node_budget,
+        ctx.disconnects.clone(),
+        opts,
+        sends,
+        recvs,
+        ctx.enable_datagrams,
+    ))
+}
 
-            // Combined read/write surface for mutual_handshake.
-            let mut control = ControlStream {
-                send: control_send,
-                recv: control_recv,
-            };
-            let (hs, session) = mutual_handshake(
-                &mut control,
-                &self.keypair,
-                expected,
-                is_initiator,
-                &self.cfg,
-                local_epoch,
-            )
-            .await?;
-            // Keep control stream open but unused (or finish send half).
-            let ControlStream { send, recv } = control;
-            control_send = send;
-            control_recv = recv;
-            let _ = control_send.finish();
-            drop(control_recv);
-            let _ = session; // QUIC/TLS already encrypts; app AEAD unused on this path.
+/// Everything `accept` does after a raw incoming connection attempt is
+/// admitted: the QUIC/TLS establishment and the full authenticated session
+/// setup, each bounded by the handshake timeout. Runs on its own task so one
+/// slow or half-open peer never delays another peer's admission.
+async fn accept_one(incoming: Incoming, ctx: &AcceptCtx) -> Result<Connection, TransportError> {
+    let quinn_conn = timeout(ctx.cfg.handshake_timeout, incoming)
+        .await
+        .map_err(|_| TransportError::HandshakeTimeout)?
+        .map_err(|e| TransportError::Io(e.to_string()))?;
+    let local_epoch = ctx.epoch_counter.fetch_add(1, Ordering::Relaxed);
+    finish_session(ctx, quinn_conn, None, false, local_epoch).await
+}
 
-            let (sends, recvs) = if is_initiator {
-                open_class_streams_initiator(&quinn_conn).await?
-            } else {
-                open_class_streams_responder(&quinn_conn).await?
-            };
-
-            Ok::<_, TransportError>((hs, sends, recvs))
+/// Accept pump: drains the endpoint's incoming queue independently of any
+/// in-flight handshake (#405).
+///
+/// Each incoming connection attempt is gated by a **non-blocking**
+/// `try_acquire_owned` on the handshake semaphore — on exhaustion it is
+/// refused immediately (fail-closed shed, recorded as
+/// [`DisconnectReason::Backpressure`]) so a saturated semaphore can never
+/// stall admission — and each surviving attempt's handshake runs on its own
+/// task holding the permit. Results (ready [`Connection`]s and per-connection
+/// failures alike) are handed to [`QuicTransport::accept`] through a bounded
+/// channel. The pump exits when the endpoint closes or the owning transport
+/// (the channel receiver) is dropped.
+async fn accept_pump(
+    endpoint: Endpoint,
+    handshake_sem: Arc<Semaphore>,
+    ctx: AcceptCtx,
+    results: mpsc::Sender<Result<Connection, TransportError>>,
+) {
+    loop {
+        let incoming = tokio::select! {
+            // The transport was dropped: stop pumping.
+            () = results.closed() => return,
+            incoming = endpoint.accept() => incoming,
         };
-
-        let (hs, sends, recvs) = match timeout(self.cfg.handshake_timeout, fut).await {
-            Ok(result) => result?,
-            Err(_) => {
-                self.disconnects.record(DisconnectReason::Authentication);
-                return Err(TransportError::HandshakeTimeout);
-            }
+        // `None` means the endpoint is closed: no further connections will
+        // arrive. Dropping the pump's sender lets pending `accept()` callers
+        // observe `ConnectionClosed` once in-flight handshakes drain.
+        let Some(incoming) = incoming else { return };
+        // Fail-closed shed: never await the semaphore here — a half-open
+        // flood pinning every permit must not stop admission draining.
+        let Ok(permit) = handshake_sem.clone().try_acquire_owned() else {
+            ctx.disconnects.record(DisconnectReason::Backpressure);
+            incoming.refuse();
+            continue;
         };
-
-        let role = {
-            let m = self
-                .membership
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            match m.role_of(&hs.peer) {
-                Some(role) => role,
-                None => {
-                    // Permissioned membership: reject unknown peers on both sides.
-                    self.disconnects.record(DisconnectReason::Authentication);
-                    return Err(TransportError::NotInMembership);
-                }
-            }
-        };
-
-        let conn_slot = self.reserve_conn_slot(hs.peer)?;
-        let opts = ConnectionOpts {
-            epoch: hs.epoch,
-            role,
-            wire_version: hs.wire_version,
-            capabilities: hs.capabilities,
-            peer_dedup: Some(self.peer_dedup.clone()),
-            conn_slot: Some(conn_slot),
-        };
-
-        Ok(spawn_quic_connection(
-            quinn_conn,
-            hs.peer,
-            &self.cfg,
-            &self.node_budget,
-            self.disconnects.clone(),
-            opts,
-            sends,
-            recvs,
-            self.enable_datagrams,
-        ))
+        let task_ctx = ctx.clone();
+        let task_results = results.clone();
+        tokio::spawn(async move {
+            // The permit spans the handshake and the result handoff, bounding
+            // concurrently pinned connections/tasks under a half-open flood.
+            let _permit = permit;
+            let result = accept_one(incoming, &task_ctx).await;
+            let _ = task_results.send(result).await;
+        });
     }
 }
 
@@ -838,23 +950,37 @@ impl Transport for QuicTransport {
             .map_err(|_| TransportError::HandshakeTimeout)?
             .map_err(|e| TransportError::Io(e.to_string()))?;
         let local_epoch = self.epoch_counter.fetch_add(1, Ordering::Relaxed);
-        self.finish_session(quinn_conn, Some(peer.id), true, local_epoch)
+        // Dialer-side handshake concurrency limit. Awaiting here (unlike the
+        // accept pump's fail-closed try-acquire) only delays our own outbound
+        // dial, never another peer's admission.
+        let _permit = self
+            .handshake_sem
+            .clone()
+            .acquire_owned()
             .await
+            .map_err(|_| TransportError::HandshakeFailed)?;
+        finish_session(
+            &self.accept_ctx(),
+            quinn_conn,
+            Some(peer.id),
+            true,
+            local_epoch,
+        )
+        .await
     }
 
+    /// Yield the next completed inbound handshake result from the accept pump.
+    ///
+    /// Handshakes run concurrently on their own tasks (see `accept_pump`), so
+    /// this never blocks on any single slow or half-open peer. Errors are
+    /// per-connection: a failed handshake (timeout, membership rejection, ...)
+    /// surfaces here exactly as it did when accept ran the handshake inline.
     async fn accept(&self) -> Result<Connection, TransportError> {
-        let incoming = self
-            .endpoint
-            .accept()
-            .await
-            .ok_or(TransportError::ConnectionClosed)?;
-        let quinn_conn = timeout(self.cfg.handshake_timeout, incoming)
-            .await
-            .map_err(|_| TransportError::HandshakeTimeout)?
-            .map_err(|e| TransportError::Io(e.to_string()))?;
-        let local_epoch = self.epoch_counter.fetch_add(1, Ordering::Relaxed);
-        self.finish_session(quinn_conn, None, false, local_epoch)
-            .await
+        match self.accepted_rx.lock().await.recv().await {
+            Some(result) => result,
+            // Pump gone (endpoint closed or transport shutting down).
+            None => Err(TransportError::ConnectionClosed),
+        }
     }
 }
 
@@ -1309,5 +1435,134 @@ mod tests {
             matches!(accept_result, Err(TransportError::NotInMembership)) || client_result.is_err(),
             "unknown peer must be rejected: accept={accept_result:?} client={client_result:?}"
         );
+    }
+
+    /// A raw quinn client endpoint that completes QUIC/TLS but never runs the
+    /// authenticated application handshake — a half-open peer from the
+    /// transport's point of view.
+    fn raw_client_endpoint() -> Endpoint {
+        let (cert, key) = make_tls_cert().unwrap();
+        let mut endpoint = Endpoint::client("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
+        endpoint.set_default_client_config(make_client_config(cert, key).unwrap());
+        endpoint
+    }
+
+    /// Regression for #405: acceptance must be concurrent. A half-open peer
+    /// that completes QUIC/TLS but never starts the control-stream handshake
+    /// used to pin the (serialized) accept path for the full 5 s handshake
+    /// timeout, stalling every other peer. With the accept pump, the
+    /// well-behaved peer must be admitted while the half-open handshake is
+    /// still pending.
+    #[tokio::test]
+    async fn half_open_peer_does_not_block_other_accepts() {
+        let server = bound(180).await;
+        let client = bound(181).await;
+        let server_addr = server.local_addr().unwrap();
+        let server_id = server.id();
+
+        // Half-open peer: QUIC established, control stream never opened. Keep
+        // the connection alive so its handshake task stays pending server-side.
+        let half_open = raw_client_endpoint();
+        let stalled = half_open
+            .connect(server_addr, TLS_SERVER_NAME)
+            .unwrap()
+            .await
+            .unwrap();
+        // Let the pump admit the half-open attempt first, so its handshake is
+        // already in flight when the well-behaved peer arrives.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let acceptor = {
+            let server = server.clone();
+            tokio::spawn(async move { server.accept().await })
+        };
+        // Both bounds are far below the 5 s handshake timeout that used to
+        // serialize acceptance behind the half-open peer.
+        let client_conn = to(
+            Duration::from_secs(2),
+            client.connect(&Peer::dial(server_id, server_addr)),
+        )
+        .await
+        .expect("well-behaved connect must not wait behind a half-open peer")
+        .unwrap();
+        let server_conn = to(Duration::from_secs(2), acceptor)
+            .await
+            .expect("accept() must yield the ready peer while the half-open handshake is pending")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(client_conn.peer_id(), server_id);
+        assert_eq!(server_conn.peer_id(), client.id());
+        drop(stalled);
+    }
+
+    /// Regression for #405 (fail-closed shed): when every handshake permit is
+    /// pinned by half-open peers, excess incoming connections must be refused
+    /// immediately — never parked behind the stalled handshakes — and
+    /// acceptance must recover once the stalled handshakes time out and
+    /// release their permits.
+    #[tokio::test]
+    async fn saturated_handshake_budget_refuses_excess_conns_without_stalling() {
+        let mut c = cfg();
+        c.max_concurrent_handshakes = 1;
+        c.handshake_timeout = Duration::from_millis(400);
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server = Arc::new(QuicTransport::bind(addr, kp(190), c).await.unwrap());
+        let server_addr = server.local_addr().unwrap();
+
+        // One half-open connection pins the only handshake permit. The permit
+        // is taken at admission, before QUIC/TLS completes, so once this
+        // connect resolves the budget is saturated.
+        let raw = raw_client_endpoint();
+        let _pinned = raw
+            .connect(server_addr, TLS_SERVER_NAME)
+            .unwrap()
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Budget exhausted: the next attempt is refused fail-closed. A prompt
+        // (refused) resolution proves the pump kept draining incoming attempts
+        // rather than stalling on the saturated semaphore.
+        let refused = to(
+            Duration::from_secs(2),
+            raw.connect(server_addr, TLS_SERVER_NAME).unwrap(),
+        )
+        .await
+        .expect("shed must be prompt — a saturated semaphore must not stall the accept pump");
+        assert!(
+            refused.is_err(),
+            "excess connection must be refused, got a connection"
+        );
+        assert!(
+            server
+                .disconnect_metrics()
+                .get(DisconnectReason::Backpressure)
+                >= 1,
+            "fail-closed shed must be recorded as a Backpressure disconnect"
+        );
+
+        // Once the pinned handshake times out and releases its permit, a
+        // well-behaved peer is admitted again.
+        let client = bound(191).await;
+        let mut recovered = None;
+        for _ in 0..8 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            match to(
+                Duration::from_secs(2),
+                client.connect(&Peer::dial(server.id(), server_addr)),
+            )
+            .await
+            {
+                Ok(Ok(conn)) => {
+                    recovered = Some(conn);
+                    break;
+                }
+                Ok(Err(_)) | Err(_) => continue,
+            }
+        }
+        let conn =
+            recovered.expect("acceptance must recover after the half-open handshake times out");
+        assert_eq!(conn.peer_id(), server.id());
     }
 }

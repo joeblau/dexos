@@ -21,8 +21,20 @@
 //!
 //! The dialer additionally checks the peer's public key equals the *expected*
 //! [`PeerId`]. When membership is configured, the accepter rejects unknown
-//! peers. Stalled handshakes are bounded by a timeout and a concurrency
-//! semaphore so half-open floods cannot pin FDs indefinitely.
+//! peers.
+//!
+//! # Concurrent acceptance (#405)
+//!
+//! Inbound admission is pumped: an internal task drains the raw listener
+//! backlog continuously and runs **each** handshake on its own task, bounded
+//! by [`TransportConfig::handshake_timeout`]. The handshake concurrency
+//! semaphore is taken *non-blockingly* at admission — when all permits are
+//! pinned by in-flight (possibly half-open) handshakes, new sockets are shed
+//! immediately (fail-closed, recorded as [`DisconnectReason::Backpressure`])
+//! instead of stalling the pump. [`Transport::accept`] then simply yields the
+//! next handshake result, so one slow or half-open peer can never delay a
+//! well-behaved peer's acceptance, and half-open floods cannot pin FDs
+//! indefinitely.
 //!
 //! # Encryption / keepalive / idle
 //!
@@ -40,6 +52,7 @@ use codec::Frame;
 use crypto::KeyPair;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::{mpsc, Semaphore};
 use tokio::time::{timeout, MissedTickBehavior};
 
@@ -507,25 +520,157 @@ fn spawn_connection(
     )
 }
 
+/// Shared state each accepted-connection handshake task needs. All fields are
+/// cheap shared handles (or `Copy`), so per-connection clones are O(1).
+#[derive(Clone)]
+struct AcceptCtx {
+    keypair: Arc<KeyPair>,
+    cfg: TransportConfig,
+    node_budget: Arc<ByteBudget>,
+    disconnects: Arc<DisconnectMetrics>,
+    membership: Arc<Mutex<Membership>>,
+    peer_dedup: Arc<Mutex<PeerDedup>>,
+    conn_counts: Arc<Mutex<HashMap<PeerId, usize>>>,
+    epoch_counter: Arc<AtomicU64>,
+}
+
+/// Everything `accept` does after the raw socket is admitted: the bounded
+/// authenticated handshake, the membership check, the connection-slot
+/// reservation (post-handshake, so failed handshakes consume no slot), and
+/// wiring the finished [`Connection`]. Runs on its own task so one slow or
+/// half-open peer never delays another peer's admission.
+async fn accept_one(mut stream: TcpStream, ctx: &AcceptCtx) -> Result<Connection, TransportError> {
+    configure_socket(&stream, &ctx.cfg)?;
+    let local_epoch = ctx.epoch_counter.fetch_add(1, Ordering::Relaxed);
+    let fut = mutual_handshake(
+        &mut stream,
+        &ctx.keypair,
+        None,
+        false,
+        &ctx.cfg,
+        local_epoch,
+    );
+    let (hs, session) = match timeout(ctx.cfg.handshake_timeout, fut).await {
+        Ok(result) => result?,
+        Err(_) => {
+            ctx.disconnects.record(DisconnectReason::Authentication);
+            return Err(TransportError::HandshakeTimeout);
+        }
+    };
+    // Membership / allowlist check on accept.
+    let role = {
+        let m = ctx
+            .membership
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match m.role_of(&hs.peer) {
+            Some(role) => role,
+            None => {
+                ctx.disconnects.record(DisconnectReason::Authentication);
+                return Err(TransportError::NotInMembership);
+            }
+        }
+    };
+    let conn_slot = ConnSlot::reserve(
+        &ctx.conn_counts,
+        ctx.cfg.connection_budget_per_peer,
+        hs.peer,
+    )?;
+    let opts = ConnectionOpts {
+        epoch: hs.epoch,
+        role,
+        wire_version: hs.wire_version,
+        capabilities: hs.capabilities,
+        peer_dedup: Some(ctx.peer_dedup.clone()),
+        conn_slot: Some(conn_slot),
+    };
+    Ok(spawn_connection(
+        stream,
+        hs.peer,
+        session,
+        &ctx.cfg,
+        &ctx.node_budget,
+        ctx.disconnects.clone(),
+        opts,
+    ))
+}
+
+/// Accept pump: drains the kernel backlog independently of any in-flight
+/// handshake (#405).
+///
+/// Each admitted socket is gated by a **non-blocking** `try_acquire_owned` on
+/// the handshake semaphore — on exhaustion the socket is dropped immediately
+/// (fail-closed shed, recorded as [`DisconnectReason::Backpressure`]) so a
+/// saturated semaphore can never stall draining the backlog — and each
+/// surviving socket's handshake runs on its own task holding the permit.
+/// Results (ready [`Connection`]s and per-connection failures alike) are
+/// handed to [`TcpTransport::accept`] through a bounded channel. The pump
+/// exits when the owning transport (the channel receiver) is dropped.
+async fn accept_pump(
+    listener: TcpListener,
+    handshake_sem: Arc<Semaphore>,
+    ctx: AcceptCtx,
+    results: mpsc::Sender<Result<Connection, TransportError>>,
+) {
+    loop {
+        let admitted = tokio::select! {
+            // The transport was dropped: release the listener socket.
+            () = results.closed() => return,
+            admitted = listener.accept() => admitted,
+        };
+        let (stream, _remote) = match admitted {
+            Ok(pair) => pair,
+            Err(e) => {
+                // Surface the listener failure to the caller. The bounded
+                // channel also paces a persistent error to consumption rate.
+                if results.send(Err(e.into())).await.is_err() {
+                    return;
+                }
+                continue;
+            }
+        };
+        // Fail-closed shed: never await the semaphore here — a half-open
+        // flood pinning every permit must not stop the backlog from draining.
+        let Ok(permit) = handshake_sem.clone().try_acquire_owned() else {
+            ctx.disconnects.record(DisconnectReason::Backpressure);
+            drop(stream);
+            continue;
+        };
+        let task_ctx = ctx.clone();
+        let task_results = results.clone();
+        tokio::spawn(async move {
+            // The permit spans the handshake and the result handoff, bounding
+            // concurrently pinned FDs/tasks under a half-open flood.
+            let _permit = permit;
+            let result = accept_one(stream, &task_ctx).await;
+            let _ = task_results.send(result).await;
+        });
+    }
+}
+
 /// A TCP transport bound to a local address, with a fixed node identity.
 pub struct TcpTransport {
     id: PeerId,
     keypair: Arc<KeyPair>,
-    listener: TcpListener,
+    /// Resolved listen address; the listener itself is owned by the accept pump.
+    local_addr: SocketAddr,
     cfg: TransportConfig,
     node_budget: Arc<ByteBudget>,
     disconnects: Arc<DisconnectMetrics>,
     membership: Arc<Mutex<Membership>>,
     /// Shared multipath PeerDedup across all connections.
     peer_dedup: Arc<Mutex<PeerDedup>>,
-    /// Handshake concurrency limiter.
+    /// Handshake concurrency limiter: awaited by dials, taken non-blockingly
+    /// (fail-closed shed) by the accept pump.
     handshake_sem: Arc<Semaphore>,
-    /// Monotonic epoch counter for outbound sessions.
-    epoch_counter: AtomicU64,
+    /// Monotonic epoch counter for outbound sessions (shared with the pump).
+    epoch_counter: Arc<AtomicU64>,
     /// Live connection counts per peer (connection budget). Shared with the
     /// [`ConnSlot`] guards owned by live [`Connection`]s, which release their
     /// reservation on drop.
     conn_counts: Arc<Mutex<HashMap<PeerId, usize>>>,
+    /// Completed handshake results fed by the accept pump (see [`accept_pump`]).
+    accepted_rx: AsyncMutex<mpsc::Receiver<Result<Connection, TransportError>>>,
 }
 
 impl TcpTransport {
@@ -539,6 +684,10 @@ impl TcpTransport {
     }
 
     /// Bind with an explicit membership allowlist.
+    ///
+    /// Spawns the internal accept pump: inbound handshakes run concurrently
+    /// (bounded by [`TransportConfig::max_concurrent_handshakes`]) and
+    /// [`Transport::accept`] yields each result as it completes.
     pub async fn bind_with_membership(
         addr: SocketAddr,
         keypair: Arc<KeyPair>,
@@ -546,12 +695,14 @@ impl TcpTransport {
         membership: Membership,
     ) -> Result<Self, TransportError> {
         let listener = TcpListener::bind(addr).await?;
+        let local_addr = listener.local_addr()?;
         let id = PeerId::from(keypair.public());
         let max_hs = cfg.max_concurrent_handshakes.max(1);
-        Ok(Self {
+        let (accepted_tx, accepted_rx) = mpsc::channel(cfg.accept_queue_capacity.max(1));
+        let transport = Self {
             id,
             keypair,
-            listener,
+            local_addr,
             peer_dedup: Arc::new(Mutex::new(PeerDedup::with_max_jump(
                 cfg.dedup_window,
                 cfg.max_seq_jump,
@@ -562,9 +713,31 @@ impl TcpTransport {
             disconnects: Arc::new(DisconnectMetrics::default()),
             membership: Arc::new(Mutex::new(membership)),
             handshake_sem: Arc::new(Semaphore::new(max_hs)),
-            epoch_counter: AtomicU64::new(1),
+            epoch_counter: Arc::new(AtomicU64::new(1)),
             conn_counts: Arc::new(Mutex::new(HashMap::new())),
-        })
+            accepted_rx: AsyncMutex::new(accepted_rx),
+        };
+        tokio::spawn(accept_pump(
+            listener,
+            transport.handshake_sem.clone(),
+            transport.accept_ctx(),
+            accepted_tx,
+        ));
+        Ok(transport)
+    }
+
+    /// Assemble the shared state the accept pump's handshake tasks need.
+    fn accept_ctx(&self) -> AcceptCtx {
+        AcceptCtx {
+            keypair: self.keypair.clone(),
+            cfg: self.cfg,
+            node_budget: self.node_budget.clone(),
+            disconnects: self.disconnects.clone(),
+            membership: self.membership.clone(),
+            peer_dedup: self.peer_dedup.clone(),
+            conn_counts: self.conn_counts.clone(),
+            epoch_counter: self.epoch_counter.clone(),
+        }
     }
 
     /// This node's authenticated identity.
@@ -574,7 +747,7 @@ impl TcpTransport {
 
     /// The bound local address (resolves the ephemeral port after `bind`).
     pub fn local_addr(&self) -> Result<SocketAddr, TransportError> {
-        Ok(self.listener.local_addr()?)
+        Ok(self.local_addr)
     }
 
     /// Node-wide reliable bytes currently retained across every peer.
@@ -675,19 +848,7 @@ impl TcpTransport {
     /// so the budget tracks live connections rather than lifetime totals. A
     /// refused reservation never inserts an entry, keeping the map bounded.
     fn reserve_conn_slot(&self, peer: PeerId) -> Result<ConnSlot, TransportError> {
-        let mut counts = self
-            .conn_counts
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let count = counts.get(&peer).copied().unwrap_or(0);
-        if count >= self.cfg.connection_budget_per_peer {
-            return Err(TransportError::Backpressure {
-                class: codec::TrafficClass::Sync,
-            });
-        }
-        counts.insert(peer, count + 1);
-        drop(counts);
-        Ok(ConnSlot::new(peer, self.conn_counts.clone()))
+        ConnSlot::reserve(&self.conn_counts, self.cfg.connection_budget_per_peer, peer)
     }
 }
 
@@ -726,45 +887,18 @@ impl Transport for TcpTransport {
         ))
     }
 
+    /// Yield the next completed inbound handshake result from the accept pump.
+    ///
+    /// Handshakes run concurrently on their own tasks (see `accept_pump`), so
+    /// this never blocks on any single slow or half-open peer. Errors are
+    /// per-connection: a failed handshake (timeout, membership rejection, ...)
+    /// surfaces here exactly as it did when accept ran the handshake inline.
     async fn accept(&self) -> Result<Connection, TransportError> {
-        let (mut stream, _remote) = self.listener.accept().await?;
-        configure_socket(&stream, &self.cfg)?;
-        let local_epoch = self.epoch_counter.fetch_add(1, Ordering::Relaxed);
-        let (hs, session) = self
-            .handshake_gated(&mut stream, None, false, local_epoch)
-            .await?;
-        // Membership / allowlist check on accept.
-        let role = {
-            let m = self
-                .membership
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            match m.role_of(&hs.peer) {
-                Some(role) => role,
-                None => {
-                    self.disconnects.record(DisconnectReason::Authentication);
-                    return Err(TransportError::NotInMembership);
-                }
-            }
-        };
-        let conn_slot = self.reserve_conn_slot(hs.peer)?;
-        let opts = ConnectionOpts {
-            epoch: hs.epoch,
-            role,
-            wire_version: hs.wire_version,
-            capabilities: hs.capabilities,
-            peer_dedup: Some(self.peer_dedup.clone()),
-            conn_slot: Some(conn_slot),
-        };
-        Ok(spawn_connection(
-            stream,
-            hs.peer,
-            session,
-            &self.cfg,
-            &self.node_budget,
-            self.disconnects.clone(),
-            opts,
-        ))
+        match self.accepted_rx.lock().await.recv().await {
+            Some(result) => result,
+            // Pump gone and channel drained: the transport is shutting down.
+            None => Err(TransportError::ConnectionClosed),
+        }
     }
 }
 
@@ -1322,5 +1456,105 @@ mod tests {
         assert_eq!(m.role_of(&b), None);
         let open = Membership::open();
         assert_eq!(open.role_of(&b), Some(PeerRole::Validator));
+    }
+
+    /// Regression for #405: acceptance must be concurrent. A half-open client
+    /// that completes the TCP connect but never sends a handshake byte used to
+    /// pin the (serialized) accept path for the full 5 s handshake timeout,
+    /// stalling every other peer. With the accept pump, the well-behaved peer
+    /// must be admitted while the half-open handshake is still pending.
+    #[tokio::test]
+    async fn half_open_peer_does_not_block_other_accepts() {
+        use tokio::time::timeout as to;
+
+        let server = bound(70).await;
+        let client = bound(71).await;
+        let server_addr = server.local_addr().unwrap();
+        let server_id = server.id();
+
+        // Half-open peer: raw TCP connect, then silence. Keep the socket open
+        // for the whole test so its handshake task stays pending server-side.
+        let stalled = TcpStream::connect(server_addr).await.unwrap();
+        // Let the pump admit the half-open socket first, so its handshake is
+        // already in flight when the well-behaved peer arrives.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let acceptor = {
+            let server = server.clone();
+            tokio::spawn(async move { server.accept().await })
+        };
+        // Both bounds are far below the 5 s handshake timeout that used to
+        // serialize acceptance behind the half-open peer.
+        let client_conn = to(
+            Duration::from_secs(2),
+            client.connect(&Peer::dial(server_id, server_addr)),
+        )
+        .await
+        .expect("well-behaved connect must not wait behind a half-open peer")
+        .unwrap();
+        let server_conn = to(Duration::from_secs(2), acceptor)
+            .await
+            .expect("accept() must yield the ready peer while the half-open handshake is pending")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(client_conn.peer_id(), server_id);
+        assert_eq!(server_conn.peer_id(), client.id());
+        drop(stalled);
+    }
+
+    /// Regression for #405 (fail-closed shed): when every handshake permit is
+    /// pinned by half-open peers, excess sockets must be admitted from the
+    /// kernel backlog and dropped immediately — never left pending behind the
+    /// stalled handshakes — and acceptance must recover once the stalled
+    /// handshakes time out and release their permits.
+    #[tokio::test]
+    async fn saturated_handshake_budget_sheds_excess_sockets_without_stalling() {
+        use tokio::time::timeout as to;
+
+        let mut c = cfg();
+        c.max_concurrent_handshakes = 2;
+        c.handshake_timeout = Duration::from_millis(400);
+        let server = Arc::new(
+            TcpTransport::bind("127.0.0.1:0".parse().unwrap(), kp(72), c)
+                .await
+                .unwrap(),
+        );
+        let server_addr = server.local_addr().unwrap();
+
+        // Two half-open sockets pin both handshake permits.
+        let _pinned_a = TcpStream::connect(server_addr).await.unwrap();
+        let _pinned_b = TcpStream::connect(server_addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Budget exhausted: the next socket is shed fail-closed. Observing EOF
+        // proves the pump kept draining the backlog (accepted + dropped) rather
+        // than stalling on the saturated semaphore.
+        let mut shed = TcpStream::connect(server_addr).await.unwrap();
+        let mut buf = [0u8; 1];
+        let n = to(Duration::from_secs(2), shed.read(&mut buf))
+            .await
+            .expect("shed must be prompt — a saturated semaphore must not stall the accept pump")
+            .unwrap();
+        assert_eq!(n, 0, "shed socket must see EOF, not handshake bytes");
+        assert!(
+            server
+                .disconnect_metrics()
+                .get(DisconnectReason::Backpressure)
+                >= 1,
+            "fail-closed shed must be recorded as a Backpressure disconnect"
+        );
+
+        // Once the pinned handshakes time out and release their permits, a
+        // well-behaved peer is admitted again.
+        let client = bound(73).await;
+        let client_conn = to(
+            Duration::from_secs(10),
+            client.connect_with_backoff(&Peer::dial(server.id(), server_addr), 8),
+        )
+        .await
+        .expect("acceptance must recover after the half-open handshakes time out")
+        .unwrap();
+        assert_eq!(client_conn.peer_id(), server.id());
     }
 }
