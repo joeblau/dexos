@@ -32,6 +32,8 @@ SKIP_SYSTEM=0
 # PATH; the completion hint then shows the direct-path invocation.
 DX_SHADOWED=0
 CARGO_DX="${CARGO_HOME:-$HOME/.cargo}/bin/dx"
+# Set by check_toolchain_shadow when a non-rustup cargo/rustc wins on PATH.
+TOOLCHAIN_SHADOWED=0
 for arg in "$@"; do
     case "$arg" in
         --no-frontend) WANT_FRONTEND=0 ;;
@@ -73,6 +75,12 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 OS="$(uname -s)"
+
+# How cargo/rustc resolve in the *invoking* shell, captured before install_rust
+# may prepend ~/.cargo/bin for this run only. The toolchain-shadow guard checks
+# these so it reflects the user's real shells, not the script's transient PATH.
+ORIG_CARGO="$(command -v cargo 2>/dev/null || true)"
+ORIG_RUSTC="$(command -v rustc 2>/dev/null || true)"
 
 # ---------------------------------------------------------------------------
 # 1. System packages (per OS / distro)
@@ -194,6 +202,38 @@ install_rust() {
     rustup component add rustfmt clippy >/dev/null 2>&1 || true
 }
 
+# Warn if a non-rustup cargo/rustc (commonly Homebrew's) shadows the rustup shims
+# in the user's shells. Such a toolchain ignores rust-toolchain.toml, so the
+# pinned channel — and targets added to it like wasm32 — are NOT used, and web
+# builds fail confusingly with "Missing rust target wasm32-unknown-unknown" even
+# though `rustup target list` shows it installed. Checked against the pre-install
+# resolution (ORIG_*), since install_rust may have prepended ~/.cargo/bin for
+# this run only.
+check_toolchain_shadow() {
+    local rustup_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
+    local shadow=""
+    case "$ORIG_CARGO" in
+        ""|"$rustup_bin"/*) ;;
+        *) shadow="$ORIG_CARGO" ;;
+    esac
+    if [ -z "$shadow" ]; then
+        case "$ORIG_RUSTC" in
+            ""|"$rustup_bin"/*) ;;
+            *) shadow="$ORIG_RUSTC" ;;
+        esac
+    fi
+    [ -z "$shadow" ] && return 0
+
+    TOOLCHAIN_SHADOWED=1
+    warn "your shell's cargo/rustc ($shadow) is NOT the rustup shim in $rustup_bin."
+    warn "a non-rustup toolchain ignores rust-toolchain.toml, so this repo's pinned"
+    warn "channel and its wasm32 target are not used — web builds then fail with"
+    warn "\"Missing rust target wasm32-unknown-unknown\". Put ~/.cargo/bin first:"
+    warn '    export PATH="$HOME/.cargo/bin:$PATH"'
+    warn "add that to your shell rc (after any 'brew shellenv' line), open a new shell,"
+    warn "and confirm with: cargo --version   (should NOT say 'Homebrew')."
+}
+
 # ---------------------------------------------------------------------------
 # 3. Frontend build prerequisites (wasm target + Dioxus CLI)
 # ---------------------------------------------------------------------------
@@ -265,6 +305,7 @@ fi
 
 step "Setting up the Rust toolchain"
 install_rust
+check_toolchain_shadow
 
 if [ "$WANT_FRONTEND" -eq 1 ]; then
     step "Setting up the frontend toolchain (wasm target + Dioxus CLI)"
@@ -293,7 +334,12 @@ if [ "$WANT_FRONTEND" -eq 1 ]; then
     info "Run the desktop app:    cargo run -p dexos-desktop"
 fi
 info "Run all PR gates:       ./scripts/preflight.sh"
-if ! have cargo; then
+if [ "$TOOLCHAIN_SHADOWED" -eq 1 ] || [ "$DX_SHADOWED" -eq 1 ]; then
+    warn "ACTION NEEDED: a non-rustup toolchain and/or a foreign 'dx' shadow the"
+    warn "rustup binaries on your PATH (details above). Until you put ~/.cargo/bin"
+    warn "first and open a new shell, builds may fail with \"Missing rust target\"."
+    warn "    export PATH=\"\$HOME/.cargo/bin:\$PATH\""
+elif ! have cargo; then
     info "PATH: open a new shell (or 'source \"\$HOME/.cargo/env\"') so cargo/dx resolve."
 fi
 printf '%s✓ ready%s\n' "$GRN" "$RST"
