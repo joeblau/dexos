@@ -7,13 +7,13 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 echo "==> execution: deterministic replay yields identical state roots"
-cargo test -p execution --quiet deterministic_replay
+cargo test -p execution --quiet --locked deterministic_replay
 
 echo "==> state-tree: incremental root equals from-scratch recomputation"
-cargo test -p state-tree --quiet incremental 2>/dev/null || cargo test -p state-tree --quiet
+cargo test -p state-tree --quiet --locked incremental
 
 echo "==> simulation: surviving honest nodes agree on finalized state roots"
-cargo test -p simulation --quiet
+cargo test -p simulation --quiet --locked
 
 echo
 echo "==> state-root agreement verified across deterministic replay + multi-node simulation."
