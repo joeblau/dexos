@@ -13,6 +13,9 @@ workspace = true
 types = { path = "../types" }
 codec = { path = "../codec" }
 crypto = { path = "../crypto" }
+# Lock-free counters/gauges for the flood-facing shed paths (rpc is an edge
+# crate, not the deterministic core; metrics are pure side state).
+observability = { path = "../observability" }
 serde.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }

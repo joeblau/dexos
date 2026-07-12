@@ -17,6 +17,7 @@
 //! - [`backend`] — the [`RpcBackend`] trait and [`dispatch`].
 //! - [`transport`] — framing into [`codec::Frame`]s.
 //! - [`server`] — the async TCP/TLS server with isolated blocking dispatch.
+//! - [`metrics`] — pre-registered counters/gauge for the server's shed paths.
 //! - [`limits`] — connection admission control (per-IP caps and rate limits).
 //! - [`work`] — process/per-connection in-flight request and byte budgets.
 //! - [`idempotency`] — bounded TTL/LRU exactly-once store.
@@ -30,6 +31,7 @@ pub mod command;
 pub mod error;
 pub mod idempotency;
 pub mod limits;
+pub mod metrics;
 pub mod request;
 pub mod response;
 pub mod server;
@@ -54,11 +56,12 @@ pub use command::{
 pub use error::RpcError;
 pub use idempotency::{IdempotencyConfig, IdempotencyStore};
 pub use limits::RateLimit;
+pub use metrics::RpcMetrics;
 pub use request::{RpcMethod, RpcRequest};
 pub use response::{RpcOk, RpcResponse, RpcResult};
 pub use server::{
-    handle_connection, handle_connection_with, serve, serve_with_config, serve_with_shutdown,
-    ServerConfig, ServerError, TlsMode,
+    handle_connection, handle_connection_with, serve, serve_with_config, serve_with_metrics,
+    serve_with_shutdown, ServerConfig, ServerError, TlsMode,
 };
 pub use session::{
     authorize_private_topic, session_may_read, Session, SessionBinding, SessionLookup,

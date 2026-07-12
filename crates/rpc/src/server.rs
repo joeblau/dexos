@@ -27,6 +27,14 @@
 //!   descriptors, and only unclassified errors are fatal; and
 //! - `TCP_NODELAY` on every accepted socket.
 //!
+//! # Observability (#416)
+//! Every shed path above is countable: [`serve_with_metrics`] threads optional
+//! pre-registered [`RpcMetrics`] handles through the accept loop and each
+//! connection, recording read/idle timeouts, oversize frames, dispatch
+//! timeouts, work-budget backpressure, accept-time rejections, and the live
+//! connection count. All other entry points default to `None` — no metric is
+//! touched — so instrumentation is strictly opt-in and off the happy path.
+//!
 //! # TLS
 //! Production config ([`ServerConfig::production`]) requires TLS 1.3 via
 //! rustls/tokio-rustls. Local tests may use [`TlsMode::Disabled`].
@@ -44,6 +52,7 @@ use tokio_rustls::TlsAcceptor;
 use crate::backend::{dispatch, RpcBackend};
 use crate::error::RpcError;
 use crate::limits::{ConnectionLimiter, RateLimit};
+use crate::metrics::RpcMetrics;
 use crate::response::RpcResponse;
 use crate::transport::{decode_request, encode_response};
 use crate::wire::RpcMode;
@@ -292,7 +301,7 @@ where
     // The sender guard lives across the await below, so the stop flag can never
     // fire for callers of the non-shutdown-aware API.
     let (_stop_tx, stop_rx) = watch::channel(false);
-    handle_connection_stoppable(stream, backend, mode, config, work_budget, stop_rx).await
+    handle_connection_stoppable(stream, backend, mode, config, work_budget, None, stop_rx).await
 }
 
 /// Resolves once the stop flag reads `true`.
@@ -310,12 +319,19 @@ async fn stop_requested(stop: &mut watch::Receiver<bool>) {
 /// (clean FIN) after its current request instead of reading another. A request
 /// whose frame has not yet fully arrived is abandoned — nothing has been
 /// dispatched, so no committed work is lost.
+///
+/// When `metrics` is present, the shed paths below record onto its
+/// pre-registered counters (read/idle timeout, oversize frame, dispatch
+/// timeout, work-budget backpressure); `None` keeps every path metric-free —
+/// the happy path never consults metrics at all, and the shed paths pay only
+/// an `Option` branch.
 async fn handle_connection_stoppable<S>(
     mut stream: S,
     backend: Arc<dyn RpcBackend>,
     mode: RpcMode,
     config: &ServerConfig,
     work_budget: Option<Arc<WorkBudget>>,
+    metrics: Option<Arc<RpcMetrics>>,
     mut stop: watch::Receiver<bool>,
 ) -> Result<(), ServerError>
 where
@@ -340,10 +356,21 @@ where
         };
         let bytes = match read {
             Ok(bytes) => bytes,
-            // A clean EOF/reset or a stalled-client timeout ends the session
-            // without a hard error.
-            Err(ServerError::Io(_)) | Err(ServerError::Timeout) => return Ok(()),
+            // A clean EOF/reset ends the session without a hard error.
+            Err(ServerError::Io(_)) => return Ok(()),
+            // A stalled-client (slowloris) eviction also ends the session
+            // cleanly, but is counted: a flood of stalls surfaces as a rising
+            // `rpc_read_timeouts_total` instead of silently shed connections.
+            Err(ServerError::Timeout) => {
+                if let Some(m) = &metrics {
+                    m.record_read_timeout();
+                }
+                return Ok(());
+            }
             Err(ServerError::Oversize) => {
+                if let Some(m) = &metrics {
+                    m.record_oversize();
+                }
                 // Size violations are not admission pressure — use the
                 // dedicated error so clients can distinguish retries.
                 let resp = RpcResponse::new(0, Err(RpcError::MessageTooLarge));
@@ -401,6 +428,9 @@ where
                                 // reflects in-flight work; the per-connection
                                 // permit dies with this connection, which is
                                 // failed closed after the reply below.
+                                if let Some(m) = &metrics {
+                                    m.record_dispatch_timeout();
+                                }
                                 tokio::spawn(async move {
                                     let _proc_permit = proc_permit;
                                     let _ = join.await;
@@ -426,6 +456,9 @@ where
             }
             _ => {
                 // Not admitted: command was never submitted to the backend.
+                if let Some(m) = &metrics {
+                    m.record_backpressure();
+                }
                 RpcResponse::new(0, Err(RpcError::Backpressure))
             }
         };
@@ -580,6 +613,33 @@ pub async fn serve_with_shutdown(
     backend: Arc<dyn RpcBackend>,
     mode: RpcMode,
     config: ServerConfig,
+    stop: watch::Receiver<bool>,
+) -> Result<u64, ServerError> {
+    serve_with_metrics(listener, backend, mode, config, None, stop).await
+}
+
+/// [`serve_with_shutdown`], plus observability (#416): when `metrics` is
+/// present, the flood-facing shed paths record onto its pre-registered,
+/// lock-free handles so brown-outs are visible instead of silent:
+///
+/// - `rpc_accept_rejections_total` — a connection refused at accept time by
+///   the global or per-IP admission budget;
+/// - `rpc_connections_active` — incremented when a connection is admitted and
+///   decremented when its task ends (any exit path, including a drain-deadline
+///   abort, via a drop guard);
+/// - per-connection shed counters (`rpc_read_timeouts_total`,
+///   `rpc_oversize_total`, `rpc_dispatch_timeouts_total`,
+///   `rpc_backpressure_total`) — recorded inside the connection loop.
+///
+/// Build the handles once at startup with
+/// [`RpcMetrics::register`]. Passing `None`
+/// is exactly [`serve_with_shutdown`]: no metric is touched anywhere.
+pub async fn serve_with_metrics(
+    listener: TcpListener,
+    backend: Arc<dyn RpcBackend>,
+    mode: RpcMode,
+    config: ServerConfig,
+    metrics: Option<Arc<RpcMetrics>>,
     mut stop: watch::Receiver<bool>,
 ) -> Result<u64, ServerError> {
     let config = Arc::new(config);
@@ -641,6 +701,9 @@ pub async fn serve_with_shutdown(
         let global_permit = match Arc::clone(&global).try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
+                if let Some(m) = &metrics {
+                    m.record_accept_rejection();
+                }
                 tasks.spawn(send_rejection(stream, write_timeout));
                 continue;
             }
@@ -653,6 +716,9 @@ pub async fn serve_with_shutdown(
                 // Release the global permit before rejecting so it is not tied up
                 // for the connection we are refusing.
                 drop(global_permit);
+                if let Some(m) = &metrics {
+                    m.record_accept_rejection();
+                }
                 tasks.spawn(send_rejection(stream, write_timeout));
                 continue;
             }
@@ -664,7 +730,15 @@ pub async fn serve_with_shutdown(
         let work_budget = Arc::clone(&work_budget);
         let tls = tls.clone();
         let conn_stop = stop.clone();
+        let conn_metrics = metrics.clone();
+        // Admitted: charge the active-connections gauge now, restore it when
+        // the connection task ends (its drop guard runs on every exit path,
+        // including a drain-deadline abort).
+        let active = metrics.as_ref().map(|m| m.track_connection());
         tasks.spawn(async move {
+            // Declared first so it drops last: the gauge must not read zero
+            // while the admission permits below are still held.
+            let _active = active;
             // The permits live for the connection's lifetime and are released on
             // task exit, freeing the global and per-IP slots.
             let _global_permit = global_permit;
@@ -677,6 +751,7 @@ pub async fn serve_with_shutdown(
                         mode,
                         &config,
                         Some(work_budget),
+                        conn_metrics,
                         conn_stop,
                     )
                     .await;
@@ -696,6 +771,7 @@ pub async fn serve_with_shutdown(
                                 mode,
                                 &config,
                                 Some(work_budget),
+                                conn_metrics,
                                 conn_stop,
                             )
                             .await;
