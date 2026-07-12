@@ -46,6 +46,24 @@ pub enum RiskError {
     /// The requested amount was negative where only non-negative is allowed.
     #[error("amount must be non-negative")]
     NegativeAmount,
+    /// An account or market identifier lies at or beyond the engine's configured
+    /// dense-slot capacity; admitting it would demand an unbounded allocation, so
+    /// the id is rejected before any column is grown.
+    #[error("identifier index {index} exceeds configured capacity {capacity}")]
+    CapacityExceeded {
+        /// The slab index derived from the offending identifier.
+        index: usize,
+        /// The configured capacity the index met or exceeded.
+        capacity: usize,
+    },
+    /// A configured capacity was zero or above the engine's hard resource budget.
+    #[error("configured capacity {requested} outside permitted range 1..={budget}")]
+    CapacityConfig {
+        /// The requested capacity.
+        requested: usize,
+        /// The hard resource-budget ceiling.
+        budget: usize,
+    },
     /// A fixed-point arithmetic step overflowed or divided by zero.
     #[error("fixed-point arithmetic error: {0}")]
     Arith(#[from] ArithError),

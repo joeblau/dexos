@@ -27,7 +27,9 @@
 
 use types::{AccountId, Amount, MarketId, PayoutVector, Price, Quantity};
 
-use crate::config::{MarginMode, OrderPriority, RiskConfig};
+use crate::config::{
+    MarginMode, OrderPriority, RiskConfig, MAX_ACCOUNT_CAPACITY, MAX_MARKET_CAPACITY,
+};
 use crate::error::RiskError;
 use crate::liquidation::{AdlFill, InsuranceFund, LiquidationOutcome, LiquidationQueue};
 use crate::math::{abs_amount, neg_amount, neg_i64};
@@ -38,6 +40,13 @@ use crate::scenario::PayoutPosition;
 #[derive(Debug, Clone)]
 pub struct RiskEngine {
     config: RiskConfig,
+
+    // Effective dense-slot capacities, clamped to the hard resource budget
+    // ([`MAX_ACCOUNT_CAPACITY`] / [`MAX_MARKET_CAPACITY`]) at construction. An
+    // identifier whose slab index reaches one of these bounds is rejected before
+    // any dense column is grown, so a sparse external id costs O(1) memory.
+    max_accounts: usize,
+    max_markets: usize,
 
     // --- Structure-of-Arrays account state (indexed by account slab index) ---
     used: Vec<bool>,
@@ -73,8 +82,16 @@ impl RiskEngine {
     /// A fresh engine with the given static risk parameters and an empty
     /// insurance fund.
     pub fn new(config: RiskConfig) -> Self {
+        // Clamp the declared capacities into `[1, budget]` so that even a config
+        // built by struct literal (bypassing `RiskConfig::with_capacities`) can
+        // never drive a dense column past the hard resource budget, and a
+        // degenerate zero capacity still admits at least id 0.
+        let max_accounts = config.max_accounts.clamp(1, MAX_ACCOUNT_CAPACITY);
+        let max_markets = config.max_markets.clamp(1, MAX_MARKET_CAPACITY);
         Self {
             config,
+            max_accounts,
+            max_markets,
             used: Vec::new(),
             open: Vec::new(),
             margin_mode: Vec::new(),
@@ -114,7 +131,7 @@ impl RiskEngine {
             return Err(RiskError::NegativeAmount);
         }
         let i = account.index()?;
-        self.grow_accounts(i);
+        self.grow_accounts(i)?;
         if self.used[i] {
             return Err(RiskError::AccountExists);
         }
@@ -202,7 +219,7 @@ impl RiskEngine {
     /// Set (or update) a market's mark price and refresh every account.
     pub fn set_mark_price(&mut self, market: MarketId, price: Price) -> Result<(), RiskError> {
         let mi = market.index()?;
-        self.grow_market(mi);
+        self.grow_market(mi)?;
         let prev = self.marks[mi];
         self.marks[mi] = Some(price);
         if let Err(e) = self.recompute_all() {
@@ -217,7 +234,7 @@ impl RiskEngine {
     /// Assign a market to a cross-margin risk group (default group == market id).
     pub fn set_risk_group(&mut self, market: MarketId, group: u32) -> Result<(), RiskError> {
         let mi = market.index()?;
-        self.grow_market(mi);
+        self.grow_market(mi)?;
         let prev = self.risk_group[mi];
         self.risk_group[mi] = Some(group);
         if let Err(e) = self.recompute_all() {
@@ -233,7 +250,7 @@ impl RiskEngine {
             return Err(RiskError::NegativeAmount);
         }
         let mi = market.index()?;
-        self.grow_market(mi);
+        self.grow_market(mi)?;
         self.market_limit[mi] = Some(cap);
         Ok(())
     }
@@ -1072,7 +1089,17 @@ impl RiskEngine {
         }
     }
 
-    fn grow_accounts(&mut self, i: usize) {
+    /// Ensure the account slab can address index `i`, growing the dense columns
+    /// on demand. Rejects any index at or beyond the configured capacity *before*
+    /// allocating, so an out-of-range identifier costs O(1) memory and mutates
+    /// nothing.
+    fn grow_accounts(&mut self, i: usize) -> Result<(), RiskError> {
+        if i >= self.max_accounts {
+            return Err(RiskError::CapacityExceeded {
+                index: i,
+                capacity: self.max_accounts,
+            });
+        }
         if i >= self.used.len() {
             let n = i + 1;
             self.used.resize(n, false);
@@ -1087,15 +1114,27 @@ impl RiskEngine {
             self.cached_im.resize(n, Amount::ZERO);
             self.cached_mm.resize(n, Amount::ZERO);
         }
+        Ok(())
     }
 
-    fn grow_market(&mut self, mi: usize) {
+    /// Ensure the market slab can address index `mi`, growing the dense columns
+    /// on demand. Rejects any index at or beyond the configured capacity *before*
+    /// allocating, so an out-of-range identifier costs O(1) memory and mutates
+    /// nothing.
+    fn grow_market(&mut self, mi: usize) -> Result<(), RiskError> {
+        if mi >= self.max_markets {
+            return Err(RiskError::CapacityExceeded {
+                index: mi,
+                capacity: self.max_markets,
+            });
+        }
         if mi >= self.marks.len() {
             let n = mi + 1;
             self.marks.resize(n, None);
             self.risk_group.resize(n, None);
             self.market_limit.resize(n, None);
         }
+        Ok(())
     }
 }
 
@@ -1863,5 +1902,205 @@ mod tests {
                 let _ = step;
             }
         }
+    }
+
+    // --------------------------------------------------- external-id capacity
+
+    #[test]
+    fn with_capacities_validates_against_resource_budget() {
+        let base = cfg();
+        // Zero admits no ids; above the hard ceiling would permit an unbounded
+        // allocation. Both are rejected at config time.
+        assert_eq!(
+            base.with_capacities(0, 8),
+            Err(RiskError::CapacityConfig {
+                requested: 0,
+                budget: MAX_ACCOUNT_CAPACITY,
+            })
+        );
+        assert_eq!(
+            base.with_capacities(8, 0),
+            Err(RiskError::CapacityConfig {
+                requested: 0,
+                budget: MAX_MARKET_CAPACITY,
+            })
+        );
+        assert_eq!(
+            base.with_capacities(MAX_ACCOUNT_CAPACITY + 1, 8),
+            Err(RiskError::CapacityConfig {
+                requested: MAX_ACCOUNT_CAPACITY + 1,
+                budget: MAX_ACCOUNT_CAPACITY,
+            })
+        );
+        assert_eq!(
+            base.with_capacities(8, MAX_MARKET_CAPACITY + 1),
+            Err(RiskError::CapacityConfig {
+                requested: MAX_MARKET_CAPACITY + 1,
+                budget: MAX_MARKET_CAPACITY,
+            })
+        );
+        let ok = base.with_capacities(1_000, 200).unwrap();
+        assert_eq!(ok.max_accounts, 1_000);
+        assert_eq!(ok.max_markets, 200);
+    }
+
+    #[test]
+    fn open_account_rejects_ids_at_or_beyond_capacity() {
+        const CAP_A: usize = 16;
+        let mut e = RiskEngine::new(cfg().with_capacities(CAP_A, 8).unwrap());
+        // The last in-range slot is admissible.
+        let last = u32::try_from(CAP_A - 1).unwrap();
+        e.open_account(acct(last), amt(100)).unwrap();
+
+        let root = e.state_root();
+        let count = e.account_count();
+        // The first out-of-range id, an arbitrary sparse id, and u32::MAX all
+        // reject with a typed error and touch nothing (constant memory).
+        for id in [
+            u32::try_from(CAP_A).unwrap(),
+            1_000_000,
+            u32::MAX / 2,
+            u32::MAX,
+        ] {
+            assert_eq!(
+                e.open_account(acct(id), amt(100)),
+                Err(RiskError::CapacityExceeded {
+                    index: usize::try_from(id).unwrap(),
+                    capacity: CAP_A,
+                })
+            );
+            assert_eq!(e.state_root(), root, "rejection mutated the state root");
+            assert_eq!(e.account_count(), count, "rejection changed account count");
+        }
+    }
+
+    #[test]
+    fn market_setters_reject_ids_at_or_beyond_capacity() {
+        const CAP_M: usize = 8;
+        let mut e = RiskEngine::new(cfg().with_capacities(64, CAP_M).unwrap());
+        // An in-range market accepts every setter.
+        let last = u32::try_from(CAP_M - 1).unwrap();
+        e.set_mark_price(mkt(last), price(100)).unwrap();
+        e.set_risk_group(mkt(last), 3).unwrap();
+        e.set_market_limit(mkt(last), amt(1_000)).unwrap();
+
+        let root = e.state_root();
+        for id in [u32::try_from(CAP_M).unwrap(), 777_777, u32::MAX] {
+            let idx = usize::try_from(id).unwrap();
+            let err = Err(RiskError::CapacityExceeded {
+                index: idx,
+                capacity: CAP_M,
+            });
+            assert_eq!(e.set_mark_price(mkt(id), price(100)), err);
+            assert_eq!(e.set_risk_group(mkt(id), 1), err);
+            assert_eq!(e.set_market_limit(mkt(id), amt(10)), err);
+            assert_eq!(e.state_root(), root, "rejection mutated the state root");
+        }
+        // A valid market op still works after the rejections.
+        e.set_mark_price(mkt(0), price(50)).unwrap();
+    }
+
+    #[test]
+    fn u32_max_ids_rejected_under_default_capacity_without_huge_allocation() {
+        // The default capacities sit far below u32::MAX, so a maximal id must be
+        // rejected in O(1) rather than resizing a multi-billion-element column.
+        // Without the capacity guard this test would exhaust memory.
+        let mut e = engine();
+        let before = e.state_root();
+        assert_eq!(
+            e.open_account(acct(u32::MAX), amt(100)),
+            Err(RiskError::CapacityExceeded {
+                index: usize::try_from(u32::MAX).unwrap(),
+                capacity: crate::config::DEFAULT_MAX_ACCOUNTS,
+            })
+        );
+        assert!(matches!(
+            e.set_mark_price(mkt(u32::MAX), price(100)),
+            Err(RiskError::CapacityExceeded {
+                capacity, ..
+            }) if capacity == crate::config::DEFAULT_MAX_MARKETS
+        ));
+        assert_eq!(e.account_count(), 0);
+        assert_eq!(e.state_root(), before);
+    }
+
+    #[test]
+    fn fuzz_external_id_to_index_conversions_are_bounded() {
+        // Deterministic sweep (no rand/proptest) exercising every dense
+        // external-id-to-index conversion — account opens and all three market
+        // setters — with a mix of in-range, boundary, and sparse maximal ids
+        // across the whole u32 space. Each conversion must either take effect
+        // (in range) or reject with a typed `CapacityExceeded` that leaves the
+        // fingerprint untouched (out of range); it must never allocate unboundedly
+        // nor panic.
+        const CAP_A: usize = 48;
+        const CAP_M: usize = 24;
+        let mut e = RiskEngine::new(cfg().with_capacities(CAP_A, CAP_M).unwrap());
+        let mut r = Lcg(0x0342_C0DE);
+
+        for step in 0..4_000u32 {
+            let id: u32 = match step % 3 {
+                // Dense draws around the account boundary.
+                0 => u32::try_from(r.range(0, i64::try_from(CAP_A + 4).unwrap())).unwrap(),
+                // Explicit boundary / extreme ids.
+                1 => [
+                    0,
+                    u32::try_from(CAP_A).unwrap(),
+                    u32::try_from(CAP_M).unwrap(),
+                    u32::MAX - 1,
+                    u32::MAX,
+                ][usize::try_from(r.range(0, 4)).unwrap()],
+                // Uniform sparse id across the full u32 range.
+                _ => u32::try_from(r.next() & u64::from(u32::MAX)).unwrap(),
+            };
+            let idx = usize::try_from(id).unwrap();
+
+            // account conversion: open_account -> grow_accounts.
+            let root = e.state_root();
+            let count = e.account_count();
+            match e.open_account(acct(id), amt(10)) {
+                Ok(()) => {
+                    assert!(idx < CAP_A, "admitted account id {id} beyond capacity");
+                    assert_eq!(e.account_count(), count + 1);
+                }
+                Err(RiskError::AccountExists) => {
+                    assert!(idx < CAP_A);
+                    assert_eq!(e.state_root(), root);
+                    assert_eq!(e.account_count(), count);
+                }
+                Err(RiskError::CapacityExceeded { index, capacity }) => {
+                    assert_eq!(index, idx);
+                    assert_eq!(capacity, CAP_A);
+                    assert!(idx >= CAP_A);
+                    assert_eq!(e.state_root(), root, "account rejection mutated state");
+                    assert_eq!(e.account_count(), count);
+                }
+                other => panic!("unexpected open_account result: {other:?}"),
+            }
+
+            // market conversions: mark / risk-group / limit -> grow_market.
+            let root = e.state_root();
+            for res in [
+                e.set_mark_price(mkt(id), price(100)),
+                e.set_risk_group(mkt(id), step),
+                e.set_market_limit(mkt(id), amt(1_000)),
+            ] {
+                match res {
+                    Ok(()) => assert!(idx < CAP_M, "admitted market id {id} beyond capacity"),
+                    Err(RiskError::CapacityExceeded { index, capacity }) => {
+                        assert_eq!(index, idx);
+                        assert_eq!(capacity, CAP_M);
+                        assert!(idx >= CAP_M);
+                    }
+                    other => panic!("unexpected market setter result: {other:?}"),
+                }
+            }
+            if idx >= CAP_M {
+                assert_eq!(e.state_root(), root, "market rejection mutated state");
+            }
+        }
+        // Only in-range accounts were ever admitted, so the dense column never
+        // grew past the configured capacity.
+        assert!(e.account_count() <= CAP_A);
     }
 }

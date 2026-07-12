@@ -47,7 +47,10 @@ mod math;
 mod position;
 mod scenario;
 
-pub use config::{MarginMode, OrderPriority, RiskConfig};
+pub use config::{
+    MarginMode, OrderPriority, RiskConfig, DEFAULT_MAX_ACCOUNTS, DEFAULT_MAX_MARKETS,
+    MAX_ACCOUNT_CAPACITY, MAX_MARKET_CAPACITY,
+};
 pub use engine::RiskEngine;
 pub use error::RiskError;
 pub use liquidation::{AdlFill, InsuranceFund, LiquidationOutcome, LiquidationQueue};

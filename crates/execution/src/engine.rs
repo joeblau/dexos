@@ -47,6 +47,12 @@ impl Default for EngineConfig {
                 initial_margin: types::Ratio::from_bps(1000).unwrap_or(types::Ratio::ONE), // 10%
                 maintenance_margin: types::Ratio::from_bps(500).unwrap_or(types::Ratio::ONE), // 5%
                 max_leverage: types::Ratio::from_raw(20 * types::RATIO_SCALE),
+                // Generous, budget-bounded dense-slot caps: the committed state
+                // tree remains the tight per-deployment capacity gate, while
+                // these bound the risk engine's Structure-of-Arrays against an
+                // out-of-range external id demanding an unbounded allocation.
+                max_accounts: risk::DEFAULT_MAX_ACCOUNTS,
+                max_markets: risk::DEFAULT_MAX_MARKETS,
             },
         }
     }

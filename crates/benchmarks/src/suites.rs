@@ -363,6 +363,8 @@ fn default_risk_config() -> RiskConfig {
         initial_margin: Ratio::ONE,
         maintenance_margin: Ratio::ONE,
         max_leverage: Ratio::ONE,
+        max_accounts: risk::DEFAULT_MAX_ACCOUNTS,
+        max_markets: risk::DEFAULT_MAX_MARKETS,
     })
 }
 
