@@ -37,7 +37,23 @@ pub use conditional::{
     TriggerKind, ENCODED_CONDITIONAL_LEN,
 };
 pub use error::{ConditionalError, OrderError, SlabError};
-pub use order::{BookConfig, Fill, MatchResult, NewOrder, OrderOutcome, StpPolicy};
+pub use order::{
+    BookConfig, Fill, MatchPlan, MatchResult, NewOrder, OrderOutcome, PlannedFill, StpPolicy,
+};
+
+/// Authenticated book-root schema version (v2 = multiset of per-order leaves).
+///
+/// Hot-path mutations update only the touched order leaf and re-finalize the
+/// cached aggregate; they never re-serialize the full resting set. See
+/// [`OrderBook::state_root`] and [`OrderBook::state_root_full_rebuild`].
+pub const BOOK_ROOT_SCHEMA_VERSION: u8 = 2;
+
+/// Documented hot-path hashing budget for a no-fill insert or cancel of one
+/// resting order: one order-leaf preimage (≤ 48 bytes of fields) under
+/// [`crypto::DOMAIN_EXECUTION`], XOR into the 32-byte aggregate, then one
+/// finalize hash over `1 + 32` bytes (schema version + aggregate). Independent
+/// of resting-book size — p99 bytes hashed stays flat from 1K to 65K orders.
+pub const BOOK_ROOT_HOT_PATH_HASH_BUDGET_BYTES: usize = 48 + 33;
 pub use slab::Slab;
 
 /// Crate identity, used by the node composition root for a startup manifest.

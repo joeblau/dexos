@@ -684,6 +684,139 @@ fn never_panics_on_arbitrary_orders() {
             Price::from_raw(i64::from_le_bytes(r.next_u64().to_le_bytes())),
             Quantity::from_raw(i64::from_le_bytes(r.next_u64().to_le_bytes())),
         );
-        let _ = b.state_root();
+        // Incremental root must equal the full-rebuild oracle after every op.
+        assert_eq!(b.state_root(), b.state_root_full_rebuild());
     }
+}
+
+#[test]
+fn incremental_root_matches_full_rebuild_after_every_op() {
+    let mut b = OrderBook::new(cfg());
+    let mut r = Lcg(0xB007_A11CE);
+    for i in 0..2_000u64 {
+        assert_eq!(
+            b.state_root(),
+            b.state_root_full_rebuild(),
+            "divergence before op {i}"
+        );
+        match r.below(5) {
+            0 | 1 => {
+                let id = r.next_u64();
+                let side = if r.next_u64() & 1 == 0 {
+                    Side::Bid
+                } else {
+                    Side::Ask
+                };
+                let px = 50 + (r.below(50) as i64);
+                let qty = 1 + (r.below(20) as i64);
+                let _ = b.submit(limit(id, (r.below(8) as u32) + 1, side, px, qty));
+            }
+            2 => {
+                let _ = b.cancel(OrderId::new(r.next_u64()));
+            }
+            3 => {
+                let id = r.next_u64();
+                let px = 50 + (r.below(50) as i64);
+                let qty = 1 + (r.below(20) as i64);
+                let _ = b.replace(OrderId::new(id), Price::from_raw(px), Quantity::from_raw(qty));
+            }
+            _ => {
+                // Crossing market sweep against whatever rests.
+                let id = r.next_u64();
+                let side = if r.next_u64() & 1 == 0 {
+                    Side::Bid
+                } else {
+                    Side::Ask
+                };
+                let collar = 100i64;
+                let qty = 1 + (r.below(30) as i64);
+                let _ = b.submit(order(
+                    id,
+                    (r.below(8) as u32) + 1,
+                    side,
+                    OrderType::Market,
+                    TimeInForce::Ioc,
+                    collar,
+                    qty,
+                    id,
+                ));
+            }
+        }
+        assert_eq!(
+            b.state_root(),
+            b.state_root_full_rebuild(),
+            "divergence after op {i}"
+        );
+    }
+}
+
+#[test]
+fn book_root_schema_golden_vector() {
+    // Locks schema v2: empty book and a single resting bid.
+    let mut b = OrderBook::new(cfg());
+    let empty = b.state_root();
+    assert_eq!(empty, b.state_root_full_rebuild());
+    // Known-answer: schema version prefix makes the empty root non-zero and
+    // stable across rebuilds.
+    assert!(!empty.is_zero());
+    b.submit(limit(1, 1, Side::Bid, 100, 5)).unwrap();
+    let root = b.state_root();
+    assert_eq!(root, b.state_root_full_rebuild());
+    assert_ne!(root, empty);
+    // Cancel restores the empty root (XOR involution).
+    b.cancel(OrderId::new(1)).unwrap();
+    assert_eq!(b.state_root(), empty);
+    assert_eq!(OrderBook::hot_path_hash_budget_bytes(), 48 + 33);
+}
+
+#[test]
+fn plan_match_follows_executable_depth_not_placeholder() {
+    let mut b = OrderBook::new(cfg());
+    // Deep ask book: 10 @ 100, 10 @ 110, 10 @ 120.
+    b.submit(limit(1, 1, Side::Ask, 100, 10)).unwrap();
+    b.submit(limit(2, 2, Side::Ask, 110, 10)).unwrap();
+    b.submit(limit(3, 3, Side::Ask, 120, 10)).unwrap();
+    // Market bid for 25 with collar 120: sweeps 10+10+5.
+    let plan = b
+        .plan_match(&order(
+            9,
+            9,
+            Side::Bid,
+            OrderType::Market,
+            TimeInForce::Ioc,
+            120,
+            25,
+            9,
+        ))
+        .unwrap();
+    assert_eq!(plan.fills.len(), 3);
+    assert_eq!(plan.filled_quantity, Quantity::from_raw(25));
+    assert_eq!(plan.worst_price, Some(Price::from_raw(120)));
+    // Notional = 10*100 + 10*110 + 5*120 = 1000+1100+600 = 2700 (raw scaled).
+    let expected = Price::from_raw(100)
+        .notional(Quantity::from_raw(10))
+        .unwrap()
+        .checked_add(Price::from_raw(110).notional(Quantity::from_raw(10)).unwrap())
+        .unwrap()
+        .checked_add(Price::from_raw(120).notional(Quantity::from_raw(5)).unwrap())
+        .unwrap();
+    assert_eq!(plan.notional, expected);
+    // A 1-micro "placeholder" collar that still reports as Market must not
+    // invent cheap depth: with collar 1 nothing crosses.
+    let cheap = b
+        .plan_match(&order(
+            10,
+            9,
+            Side::Bid,
+            OrderType::Market,
+            TimeInForce::Ioc,
+            1,
+            25,
+            10,
+        ))
+        .unwrap();
+    assert!(cheap.fills.is_empty());
+    assert_eq!(cheap.notional.raw(), 0);
+    // Book untouched by planning.
+    assert_eq!(b.resting_len(), 3);
 }

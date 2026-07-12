@@ -4,13 +4,16 @@
 
 use std::collections::HashMap;
 
-use types::{AccountId, Hash, OrderId, OrderType, Price, Quantity, Side, TimeInForce};
+use types::{AccountId, Amount, Hash, OrderId, OrderType, Price, Quantity, Side, TimeInForce};
 
 use crate::dedup::DedupCache;
 use crate::error::OrderError;
 use crate::level::{crosses, SideBook};
-use crate::order::{BookConfig, Fill, MatchResult, NewOrder, Node, OrderOutcome, StpPolicy};
+use crate::order::{
+    BookConfig, Fill, MatchPlan, MatchResult, NewOrder, Node, OrderOutcome, PlannedFill, StpPolicy,
+};
 use crate::slab::Slab;
+use crate::{BOOK_ROOT_SCHEMA_VERSION, BOOK_ROOT_HOT_PATH_HASH_BUDGET_BYTES};
 
 /// Where a resting order lives, for O(1) lookup on cancel / replace.
 #[derive(Debug, Clone, Copy)]
@@ -42,6 +45,9 @@ pub struct OrderBook {
     account_orders: HashMap<AccountId, Vec<OrderId>>,
     positions: HashMap<AccountId, Quantity>,
     dedup: DedupCache,
+    /// Running XOR of every resting order-leaf digest (pre-finalize aggregate).
+    /// Updated only for touched orders so the hot path never rehashes the book.
+    order_leaf_xor: [u8; 32],
 }
 
 impl OrderBook {
@@ -56,8 +62,16 @@ impl OrderBook {
             account_orders: HashMap::new(),
             positions: HashMap::new(),
             dedup: DedupCache::with_capacity(config.dedup_capacity),
+            order_leaf_xor: [0u8; 32],
             config,
         }
+    }
+
+    /// Documented hot-path hash budget (bytes) for a single no-fill insert or
+    /// cancel. Exposed for tests and operators; see crate-level constant.
+    #[must_use]
+    pub const fn hot_path_hash_budget_bytes() -> usize {
+        BOOK_ROOT_HOT_PATH_HASH_BUDGET_BYTES
     }
 
     /// Best (highest) resting bid price, if any.
@@ -255,15 +269,128 @@ impl OrderBook {
         Ok(out)
     }
 
-    /// A deterministic 32-byte commitment over all resting orders. Identical
-    /// book states produce identical roots; any resting-order difference (price,
-    /// quantity, ownership, or FIFO order) produces a different root.
+    /// Incremental authenticated commitment over all resting orders.
+    ///
+    /// Schema v2: each resting order contributes a domain-separated leaf over
+    /// `(order_id, account, side, price, remaining, client_id)`. The book
+    /// aggregate is the XOR of every leaf, finalized under
+    /// [`crypto::DOMAIN_EXECUTION`] with a schema-version prefix. Insert, cancel,
+    /// and partial-fill paths update only the touched leaf (constant bytes
+    /// hashed — see [`Self::hot_path_hash_budget_bytes`]), never the full book.
+    ///
+    /// Bit-identical to [`Self::state_root_full_rebuild`] for every reachable
+    /// state; the full rebuild is retained as a differential oracle in tests.
     #[must_use]
     pub fn state_root(&self) -> Hash {
-        let mut buf: Vec<u8> = Vec::new();
-        self.serialize_side(&self.bids, &mut buf);
-        self.serialize_side(&self.asks, &mut buf);
-        crypto::hash_domain(crypto::DOMAIN_EXECUTION, &buf)
+        Self::finalize_root(&self.order_leaf_xor)
+    }
+
+    /// Canonical full rebuild of the book root from every resting order.
+    /// Differential oracle for the incremental path — not used on the hot path.
+    #[must_use]
+    pub fn state_root_full_rebuild(&self) -> Hash {
+        let mut acc = [0u8; 32];
+        self.bids.for_each_canonical(&self.slab, |n| {
+            Self::xor_in(&mut acc, Self::order_leaf(n));
+        });
+        self.asks.for_each_canonical(&self.slab, |n| {
+            Self::xor_in(&mut acc, Self::order_leaf(n));
+        });
+        Self::finalize_root(&acc)
+    }
+
+    /// Deterministic dry-run of matching `order` against current depth.
+    ///
+    /// Does not mutate the book. Honors STP, price collars (including market
+    /// protection prices), and the requested quantity. Used by pre-trade risk
+    /// so market-order margin is derived from executable depth.
+    pub fn plan_match(&self, order: &NewOrder) -> Result<MatchPlan, OrderError> {
+        if order.quantity.raw() <= 0 {
+            return Err(OrderError::NonPositiveQuantity);
+        }
+        let is_market = matches!(order.order_type, OrderType::Market);
+        if !is_market && order.price.raw() <= 0 {
+            return Err(OrderError::NonPositivePrice);
+        }
+        let mut fills = Vec::new();
+        let mut remaining = order.quantity.raw();
+        let maker_side = order.side.opposite();
+        let book = match maker_side {
+            Side::Bid => &self.bids,
+            Side::Ask => &self.asks,
+        };
+
+        // Walk levels best-first; for bids of the maker book iterate high→low.
+        let mut level_prices: Vec<Price> = Vec::new();
+        book.for_each_level_price(|p| level_prices.push(p));
+        // for_each_level_price yields ascending; maker bids need descending.
+        if matches!(maker_side, Side::Bid) {
+            level_prices.reverse();
+        }
+
+        'levels: for price in level_prices {
+            if remaining <= 0 {
+                break;
+            }
+            if !crosses(order.side, is_market, order.price, price) {
+                break;
+            }
+            let head = match book.head_at(price) {
+                Some(h) => h,
+                None => continue,
+            };
+            let mut cur = head;
+            while cur != crate::slab::NIL && remaining > 0 {
+                let maker = match self.slab.get(cur) {
+                    Some(n) => *n,
+                    None => break,
+                };
+                if maker.account == order.account {
+                    match self.config.stp {
+                        StpPolicy::CancelMaker => {
+                            cur = maker.next;
+                            continue;
+                        }
+                        StpPolicy::CancelTaker | StpPolicy::CancelBoth => break 'levels,
+                    }
+                }
+                let fill_qty = remaining.min(maker.remaining.raw());
+                fills.push(PlannedFill {
+                    maker_order: maker.order_id,
+                    maker_account: maker.account,
+                    price: maker.price,
+                    quantity: Quantity::from_raw(fill_qty),
+                });
+                remaining = remaining.saturating_sub(fill_qty);
+                cur = maker.next;
+            }
+        }
+
+        let mut notional = Amount::ZERO;
+        let mut notional_ceil = Amount::ZERO;
+        let mut filled = Quantity::ZERO;
+        let mut worst: Option<Price> = None;
+        for f in &fills {
+            filled = filled.saturating_add(f.quantity);
+            notional = notional.checked_add(f.price.notional(f.quantity)?)?;
+            notional_ceil = notional_ceil.checked_add(f.price.notional_ceil(f.quantity)?)?;
+            worst = Some(match worst {
+                None => f.price,
+                Some(w) => match order.side {
+                    // Bid: worst is highest pay; Ask: worst is lowest receive.
+                    Side::Bid if f.price.raw() > w.raw() => f.price,
+                    Side::Ask if f.price.raw() < w.raw() => f.price,
+                    _ => w,
+                },
+            });
+        }
+        Ok(MatchPlan {
+            fills,
+            filled_quantity: filled,
+            worst_price: worst,
+            notional,
+            notional_ceil,
+        })
     }
 
     /// Total resting quantity across both sides, for tests / introspection.
@@ -286,18 +413,54 @@ impl OrderBook {
 
     // ----- internals -------------------------------------------------------
 
-    fn serialize_side(&self, book: &SideBook, buf: &mut Vec<u8>) {
-        book.for_each_canonical(&self.slab, |n| {
-            buf.extend_from_slice(&n.order_id.get().to_le_bytes());
-            buf.extend_from_slice(&n.account.get().to_le_bytes());
-            buf.push(match n.side {
-                Side::Bid => 0,
-                Side::Ask => 1,
-            });
-            buf.extend_from_slice(&n.price.raw().to_le_bytes());
-            buf.extend_from_slice(&n.remaining.raw().to_le_bytes());
-            buf.extend_from_slice(&n.client_id.to_le_bytes());
-        });
+    fn order_leaf(n: &Node) -> Hash {
+        let mut buf = [0u8; 48];
+        buf[0..8].copy_from_slice(&n.order_id.get().to_le_bytes());
+        buf[8..12].copy_from_slice(&n.account.get().to_le_bytes());
+        buf[12] = match n.side {
+            Side::Bid => 0,
+            Side::Ask => 1,
+        };
+        buf[13..21].copy_from_slice(&n.price.raw().to_le_bytes());
+        buf[21..29].copy_from_slice(&n.remaining.raw().to_le_bytes());
+        buf[29..37].copy_from_slice(&n.client_id.to_le_bytes());
+        // bytes 37..48 reserved (zero) for schema expansion without reshuffle.
+        crypto::hash_domain(crypto::DOMAIN_EXECUTION, &buf)
+    }
+
+    fn xor_in(acc: &mut [u8; 32], leaf: Hash) {
+        let b = leaf.as_bytes();
+        for i in 0..32 {
+            acc[i] ^= b[i];
+        }
+    }
+
+    fn finalize_root(acc: &[u8; 32]) -> Hash {
+        let mut preimage = [0u8; 33];
+        preimage[0] = BOOK_ROOT_SCHEMA_VERSION;
+        preimage[1..].copy_from_slice(acc);
+        crypto::hash_domain(crypto::DOMAIN_EXECUTION, &preimage)
+    }
+
+    fn auth_insert(&mut self, n: &Node) {
+        Self::xor_in(&mut self.order_leaf_xor, Self::order_leaf(n));
+    }
+
+    fn auth_remove(&mut self, n: &Node) {
+        // XOR is involutive: removing a leaf is identical to inserting it again.
+        Self::xor_in(&mut self.order_leaf_xor, Self::order_leaf(n));
+    }
+
+    fn auth_update_remaining(&mut self, slot: u32, new_remaining: Quantity) {
+        if let Some(n) = self.slab.get(slot).copied() {
+            self.auth_remove(&n);
+            if let Some(m) = self.slab.get_mut(slot) {
+                m.remaining = new_remaining;
+            }
+            if let Some(n2) = self.slab.get(slot).copied() {
+                self.auth_insert(&n2);
+            }
+        }
     }
 
     fn execute(&mut self, order: NewOrder) -> Result<MatchResult, OrderError> {
@@ -529,9 +692,8 @@ impl OrderBook {
                 if new_rem.raw() == 0 {
                     self.remove_resting(maker_side, head);
                 } else {
-                    if let Some(n) = self.slab.get_mut(head) {
-                        n.remaining = new_rem;
-                    }
+                    // Partial fill: update authenticated leaf for the new remaining.
+                    self.auth_update_remaining(head, new_rem);
                     let book = match maker_side {
                         Side::Bid => &mut self.bids,
                         Side::Ask => &mut self.asks,
@@ -562,6 +724,10 @@ impl OrderBook {
             Side::Ask => &mut self.asks,
         };
         book.push_back(&mut self.slab, slot);
+        // Authenticate after the node is in the slab so leaf bytes match storage.
+        if let Some(n) = self.slab.get(slot).copied() {
+            self.auth_insert(&n);
+        }
         self.id_index.insert(
             order.order_id,
             Locator {
@@ -578,10 +744,11 @@ impl OrderBook {
 
     /// Unlink and free a resting order in O(1), keeping the id index consistent.
     fn remove_resting(&mut self, side: Side, slot: u32) {
-        let (oid, account) = match self.slab.get(slot) {
-            Some(n) => (n.order_id, n.account),
+        let (oid, account, leaf_node) = match self.slab.get(slot) {
+            Some(n) => (n.order_id, n.account, *n),
             None => return,
         };
+        self.auth_remove(&leaf_node);
         let book = match side {
             Side::Bid => &mut self.bids,
             Side::Ask => &mut self.asks,

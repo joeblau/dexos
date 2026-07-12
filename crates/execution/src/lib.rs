@@ -16,7 +16,8 @@ pub use command::{
     ApplyFundingEpoch, Authorization, AuthorizeSession, BindWallet, CancelAll, CancelOrder, Command,
     CompleteSetOp, CreateAccount, CreateMarket, DepositCredit, DeterministicEngine, ExecutionReceipt,
     FinalizeWithdrawal, Liquidate, PlaceOrder, ProtocolUpgrade, ReceiptKind, ReplaceOrder,
-    RequestWithdrawal, RevokeSession, SetMarkPrice, SetMarketLifecycle, SetOracleHealth, Timestamp,
+    RequestWithdrawal, ResolveMarket, RevokeSession, SetMarkPrice, SetMarketLifecycle,
+    SetOracleHealth, SettleMarket, Timestamp,
 };
 pub use engine::{Engine, EngineConfig, WalletBinding};
 pub use error::ExecutionError;
@@ -59,6 +60,7 @@ mod tests {
                 quantity: Quantity::from_raw(qty),
                 client_id: order_id,
                 reduce_only: false,
+                instrument: 0,
                 auth: Authorization::Master,
             })
         };
@@ -320,6 +322,7 @@ mod tests {
                 quantity: Quantity::from_raw(1_000_000),
                 client_id: 1,
                 reduce_only: false,
+                instrument: 0,
                 auth: Authorization::Master,
             }),
         )
@@ -338,6 +341,7 @@ mod tests {
                     quantity: Quantity::from_raw(1_000_000),
                     client_id: 2,
                     reduce_only: false,
+                    instrument: 0,
                     auth: Authorization::Master,
                 }),
             )
@@ -383,6 +387,7 @@ mod tests {
                 quantity: Quantity::from_raw(1_000_000),
                 client_id,
                 reduce_only: false,
+                instrument: 0,
                 auth: Authorization::Master,
             })
         };
@@ -427,6 +432,7 @@ mod tests {
                 quantity: Quantity::from_raw(2_000_000),
                 client_id: 1,
                 reduce_only: false,
+                instrument: 0,
                 auth: Authorization::Master,
             }),
             Command::PlaceOrder(PlaceOrder {
@@ -440,6 +446,7 @@ mod tests {
                 quantity: Quantity::from_raw(1_000_000),
                 client_id: 2,
                 reduce_only: false,
+                instrument: 0,
                 auth: Authorization::Master,
             }),
             Command::DepositCredit(DepositCredit {
@@ -537,6 +544,7 @@ mod tests {
                 quantity: Quantity::from_raw(2_000_000),
                 client_id: 1,
                 reduce_only: false,
+                instrument: 0,
                 auth: Authorization::Master,
             }),
         )
@@ -554,6 +562,7 @@ mod tests {
                 quantity: Quantity::from_raw(2_000_000),
                 client_id: 2,
                 reduce_only: false,
+                instrument: 0,
                 auth: Authorization::Master,
             }),
         )
@@ -806,6 +815,7 @@ mod tests {
             quantity: Quantity::from_raw(qty),
             client_id: order_id,
             reduce_only: false,
+            instrument: 0,
             auth,
         })
     }
@@ -1144,6 +1154,7 @@ mod tests {
                 quantity: Quantity::from_raw(qty),
                 client_id: order_id,
                 reduce_only: false,
+                instrument: 0,
                 auth: Authorization::Master,
             })
         };
@@ -1356,6 +1367,7 @@ mod tests {
                 quantity: Quantity::from_raw(50_000_000),
                 client_id: 1,
                 reduce_only: false,
+                instrument: 0,
                 auth: Authorization::Master,
             }),
         )
@@ -1379,6 +1391,7 @@ mod tests {
                     quantity: Quantity::from_raw(51_000_000),
                     client_id: 2,
                     reduce_only: false,
+                    instrument: 0,
                     auth: Authorization::Master,
                 }),
             ),
@@ -1435,6 +1448,7 @@ mod tests {
                 quantity: Quantity::from_raw(1_000_000),
                 client_id: 1,
                 reduce_only: false,
+                instrument: 0,
                 auth: Authorization::Master,
             }),
         )
@@ -1503,6 +1517,7 @@ mod tests {
                 quantity: Quantity::from_raw(2_000_000),
                 client_id: 1,
                 reduce_only: false,
+                instrument: 0,
                 auth: Authorization::Master,
             }),
         )
@@ -1520,6 +1535,7 @@ mod tests {
                 quantity: Quantity::from_raw(2_000_000),
                 client_id: 2,
                 reduce_only: false,
+                instrument: 0,
                 auth: Authorization::Master,
             }),
         )
@@ -1545,6 +1561,7 @@ mod tests {
                 quantity: Quantity::from_raw(5_000_000),
                 client_id: 3,
                 reduce_only: false,
+                instrument: 0,
                 auth: Authorization::Master,
             }),
         )
@@ -1563,6 +1580,7 @@ mod tests {
                     quantity: Quantity::from_raw(5_000_000),
                     client_id: 4,
                     reduce_only: true,
+                    instrument: 0,
                     auth: Authorization::Master,
                 }),
             )
@@ -1622,6 +1640,7 @@ mod tests {
                 quantity: Quantity::from_raw(2_000_000),
                 client_id: 1,
                 reduce_only: false,
+                instrument: 0,
                 auth: Authorization::Master,
             }),
         )
@@ -1639,6 +1658,7 @@ mod tests {
                 quantity: Quantity::from_raw(2_000_000),
                 client_id: 2,
                 reduce_only: false,
+                instrument: 0,
                 auth: Authorization::Master,
             }),
         )
@@ -1673,5 +1693,444 @@ mod tests {
             ),
             Err(ExecutionError::FundingEpochConflict)
         );
+    }
+
+    /// #325: mint → sell outcome → resolve → settle pays the current holder
+    /// and conserves collateral. Non-perp fills never create PerpPosition.
+    #[test]
+    fn prediction_mint_sell_resolve_settle_pays_holder() {
+        let mut e = engine();
+        let market = MarketId::new(0);
+        // Seller (acct0) and buyer (acct1).
+        e.execute(
+            seq(1),
+            Command::CreateAccount(CreateAccount {
+                initial_collateral: amt(1_000_000),
+            }),
+        )
+        .unwrap();
+        e.execute(
+            seq(2),
+            Command::CreateAccount(CreateAccount {
+                initial_collateral: amt(1_000_000),
+            }),
+        )
+        .unwrap();
+        e.execute(
+            seq(3),
+            Command::CreateMarket(CreateMarket {
+                market,
+                market_type: MarketType::BinaryPrediction,
+                outcomes: 2,
+                mark_price: Price::from_raw(500_000),
+            }),
+        )
+        .unwrap();
+        let (seller, buyer) = (AccountId::new(0), AccountId::new(1));
+        // Mint 100 complete sets on seller.
+        e.execute(
+            seq(4),
+            Command::MintCompleteSet(CompleteSetOp {
+                account: seller,
+                market,
+                count: amt(100),
+            }),
+        )
+        .unwrap();
+        assert_eq!(e.claim_balance(seller, market, 0), amt(100));
+        assert_eq!(e.claim_balance(seller, market, 1), amt(100));
+        assert_eq!(e.ledger().locked(seller).unwrap(), amt(100));
+        // Seller offers outcome 0 @ 0.40; buyer takes it.
+        e.execute(
+            seq(5),
+            Command::PlaceOrder(PlaceOrder {
+                account: seller,
+                market,
+                order_id: OrderId::new(1),
+                side: Side::Ask,
+                order_type: OrderType::Limit,
+                tif: TimeInForce::Gtc,
+                price: Price::from_raw(400_000),
+                quantity: Quantity::from_raw(100),
+                client_id: 1,
+                reduce_only: false,
+                instrument: 0,
+                auth: Authorization::Master,
+            }),
+        )
+        .unwrap();
+        e.execute(
+            seq(6),
+            Command::PlaceOrder(PlaceOrder {
+                account: buyer,
+                market,
+                order_id: OrderId::new(2),
+                side: Side::Bid,
+                order_type: OrderType::Limit,
+                tif: TimeInForce::Gtc,
+                price: Price::from_raw(400_000),
+                quantity: Quantity::from_raw(100),
+                client_id: 2,
+                reduce_only: false,
+                instrument: 0,
+                auth: Authorization::Master,
+            }),
+        )
+        .unwrap();
+        // Claims transferred; no perp positions created.
+        assert_eq!(e.claim_balance(seller, market, 0), amt(0));
+        assert_eq!(e.claim_balance(buyer, market, 0), amt(100));
+        assert_eq!(e.claim_balance(seller, market, 1), amt(100));
+        assert!(e.risk().perp_positions(seller).unwrap().is_empty());
+        assert!(e.risk().perp_positions(buyer).unwrap().is_empty());
+        // Premium 0.40 * 100 = 40 moved seller←buyer.
+        assert_eq!(e.ledger().available(seller).unwrap(), amt(1_000_000 - 100 + 40));
+        assert_eq!(e.ledger().available(buyer).unwrap(), amt(1_000_000 - 40));
+        assert!(e.ledger().conservation_holds());
+        // Resolve outcome 0 wins; settle pays buyer 100 from locked pool.
+        e.execute(
+            seq(7),
+            Command::ResolveMarket(ResolveMarket {
+                market,
+                winning_outcome: 0,
+            }),
+        )
+        .unwrap();
+        let root_after_resolve = e.state_root();
+        e.execute(seq(8), Command::SettleMarket(SettleMarket { market }))
+            .unwrap();
+        assert_eq!(e.claim_balance(buyer, market, 0), amt(0));
+        assert_eq!(e.ledger().locked(seller).unwrap(), amt(0));
+        // Buyer received 100 settlement; seller (losing outcome 1) received 0.
+        assert_eq!(
+            e.ledger().available(buyer).unwrap(),
+            amt(1_000_000 - 40 + 100)
+        );
+        assert_eq!(
+            e.ledger().available(seller).unwrap(),
+            amt(1_000_000 - 100 + 40)
+        );
+        assert!(e.ledger().conservation_holds());
+        // Replay identical command stream → identical roots.
+        let mut e2 = engine();
+        for (i, cmd) in [
+            Command::CreateAccount(CreateAccount {
+                initial_collateral: amt(1_000_000),
+            }),
+            Command::CreateAccount(CreateAccount {
+                initial_collateral: amt(1_000_000),
+            }),
+            Command::CreateMarket(CreateMarket {
+                market,
+                market_type: MarketType::BinaryPrediction,
+                outcomes: 2,
+                mark_price: Price::from_raw(500_000),
+            }),
+            Command::MintCompleteSet(CompleteSetOp {
+                account: seller,
+                market,
+                count: amt(100),
+            }),
+            Command::PlaceOrder(PlaceOrder {
+                account: seller,
+                market,
+                order_id: OrderId::new(1),
+                side: Side::Ask,
+                order_type: OrderType::Limit,
+                tif: TimeInForce::Gtc,
+                price: Price::from_raw(400_000),
+                quantity: Quantity::from_raw(100),
+                client_id: 1,
+                reduce_only: false,
+                instrument: 0,
+                auth: Authorization::Master,
+            }),
+            Command::PlaceOrder(PlaceOrder {
+                account: buyer,
+                market,
+                order_id: OrderId::new(2),
+                side: Side::Bid,
+                order_type: OrderType::Limit,
+                tif: TimeInForce::Gtc,
+                price: Price::from_raw(400_000),
+                quantity: Quantity::from_raw(100),
+                client_id: 2,
+                reduce_only: false,
+                instrument: 0,
+                auth: Authorization::Master,
+            }),
+            Command::ResolveMarket(ResolveMarket {
+                market,
+                winning_outcome: 0,
+            }),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            e2.execute(seq(i as u64 + 1), cmd).unwrap();
+        }
+        assert_eq!(e2.state_root(), root_after_resolve);
+        e2.execute(seq(8), Command::SettleMarket(SettleMarket { market }))
+            .unwrap();
+        assert_eq!(e2.state_root(), e.state_root());
+        assert_eq!(
+            e2.ledger().available(buyer).unwrap(),
+            e.ledger().available(buyer).unwrap()
+        );
+    }
+
+    #[test]
+    fn perpetual_rejects_complete_set_mint() {
+        let mut e = engine();
+        e.execute(
+            seq(1),
+            Command::CreateAccount(CreateAccount {
+                initial_collateral: amt(1_000_000),
+            }),
+        )
+        .unwrap();
+        e.execute(
+            seq(2),
+            Command::CreateMarket(CreateMarket {
+                market: MarketId::new(0),
+                market_type: MarketType::Perpetual,
+                outcomes: 1,
+                mark_price: Price::from_raw(1_000_000),
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            e.execute(
+                seq(3),
+                Command::MintCompleteSet(CompleteSetOp {
+                    account: AccountId::new(0),
+                    market: MarketId::new(0),
+                    count: amt(100),
+                }),
+            ),
+            Err(ExecutionError::IncompatibleMarketType)
+        );
+    }
+
+    #[test]
+    fn lifecycle_gates_reject_orders_when_not_open() {
+        let mut e = engine();
+        e.execute(
+            seq(1),
+            Command::CreateAccount(CreateAccount {
+                initial_collateral: amt(100_000_000),
+            }),
+        )
+        .unwrap();
+        e.execute(
+            seq(2),
+            Command::CreateMarket(CreateMarket {
+                market: MarketId::new(0),
+                market_type: MarketType::Perpetual,
+                outcomes: 1,
+                mark_price: Price::from_raw(1_000_000),
+            }),
+        )
+        .unwrap();
+        for (i, life) in [
+            types::MarketLifecycle::Draft,
+            types::MarketLifecycle::Halted,
+            types::MarketLifecycle::Closed,
+            types::MarketLifecycle::Resolved,
+            types::MarketLifecycle::Archived,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            e.execute(
+                seq(3 + i as u64 * 2),
+                Command::SetMarketLifecycle(SetMarketLifecycle {
+                    market: MarketId::new(0),
+                    lifecycle: life,
+                }),
+            )
+            .unwrap();
+            assert_eq!(
+                e.execute(
+                    seq(4 + i as u64 * 2),
+                    Command::PlaceOrder(PlaceOrder {
+                        account: AccountId::new(0),
+                        market: MarketId::new(0),
+                        order_id: OrderId::new(100 + i as u64),
+                        side: Side::Bid,
+                        order_type: OrderType::Limit,
+                        tif: TimeInForce::Gtc,
+                        price: Price::from_raw(1_000_000),
+                        quantity: Quantity::from_raw(1_000_000),
+                        client_id: 100 + i as u64,
+                        reduce_only: false,
+                        instrument: 0,
+                        auth: Authorization::Master,
+                    }),
+                ),
+                Err(ExecutionError::MarketNotOpen),
+                "lifecycle {life:?} must reject orders"
+            );
+        }
+    }
+
+    /// #326: market-order margin is derived from executable depth / collar,
+    /// never a 1-micro placeholder price. Insufficient collateral rejects
+    /// before any maker quantity changes.
+    #[test]
+    fn market_order_risk_from_depth_not_placeholder() {
+        let mut e = engine();
+        e.execute(
+            seq(1),
+            Command::CreateAccount(CreateAccount {
+                initial_collateral: amt(100_000_000),
+            }),
+        )
+        .unwrap();
+        // Thin collateral for the taker — enough for a 1-micro notional lie,
+        // nowhere near the deep book at price 1.0.
+        e.execute(
+            seq(2),
+            Command::CreateAccount(CreateAccount {
+                initial_collateral: amt(50_000), // 0.05
+            }),
+        )
+        .unwrap();
+        e.execute(
+            seq(3),
+            Command::CreateMarket(CreateMarket {
+                market: MarketId::new(0),
+                market_type: MarketType::Perpetual,
+                outcomes: 1,
+                mark_price: Price::from_raw(1_000_000),
+            }),
+        )
+        .unwrap();
+        let (maker, taker) = (AccountId::new(0), AccountId::new(1));
+        // Rest 1.0 base @ 1.0 quote.
+        e.execute(
+            seq(4),
+            Command::PlaceOrder(PlaceOrder {
+                account: maker,
+                market: MarketId::new(0),
+                order_id: OrderId::new(1),
+                side: Side::Ask,
+                order_type: OrderType::Limit,
+                tif: TimeInForce::Gtc,
+                price: Price::from_raw(1_000_000),
+                quantity: Quantity::from_raw(1_000_000),
+                client_id: 1,
+                reduce_only: false,
+                instrument: 0,
+                auth: Authorization::Master,
+            }),
+        )
+        .unwrap();
+        let resting_before = e.market_resting_len(MarketId::new(0)).unwrap();
+        // Market bid with 1-micro collar: book will not cross (collar below ask).
+        // Still requires positive collar; admission uses collar notional.
+        let err = e
+            .execute(
+                seq(5),
+                Command::PlaceOrder(PlaceOrder {
+                    account: taker,
+                    market: MarketId::new(0),
+                    order_id: OrderId::new(2),
+                    side: Side::Bid,
+                    order_type: OrderType::Market,
+                    tif: TimeInForce::Ioc,
+                    price: Price::from_raw(1), // placeholder
+                    quantity: Quantity::from_raw(1_000_000),
+                    client_id: 2,
+                    reduce_only: false,
+                    instrument: 0,
+                    auth: Authorization::Master,
+                }),
+            )
+            .err();
+        // Either rejected for margin (collar*qty still may pass with tiny IM) or
+        // accepted as empty market — but maker qty must be unchanged.
+        let _ = err;
+        assert_eq!(
+            e.market_resting_len(MarketId::new(0)).unwrap(),
+            resting_before,
+            "placeholder market order must not consume makers"
+        );
+        // Market order with no collar rejected.
+        assert_eq!(
+            e.execute(
+                seq(6),
+                Command::PlaceOrder(PlaceOrder {
+                    account: taker,
+                    market: MarketId::new(0),
+                    order_id: OrderId::new(3),
+                    side: Side::Bid,
+                    order_type: OrderType::Market,
+                    tif: TimeInForce::Ioc,
+                    price: Price::from_raw(0),
+                    quantity: Quantity::from_raw(1_000_000),
+                    client_id: 3,
+                    reduce_only: false,
+                    instrument: 0,
+                    auth: Authorization::Master,
+                }),
+            ),
+            Err(ExecutionError::MarketOrderCollarRequired)
+        );
+        // Market order with full collar but insufficient collateral for depth
+        // notional must reject before maker qty changes.
+        let err = e.execute(
+            seq(7),
+            Command::PlaceOrder(PlaceOrder {
+                account: taker,
+                market: MarketId::new(0),
+                order_id: OrderId::new(4),
+                side: Side::Bid,
+                order_type: OrderType::Market,
+                tif: TimeInForce::Ioc,
+                price: Price::from_raw(1_000_000),
+                quantity: Quantity::from_raw(1_000_000),
+                client_id: 4,
+                reduce_only: false,
+                instrument: 0,
+                auth: Authorization::Master,
+            }),
+        );
+        assert!(err.is_err(), "under-collateralized market sweep must fail");
+        assert_eq!(
+            e.market_resting_len(MarketId::new(0)).unwrap(),
+            resting_before
+        );
+        // Well-funded taker can sweep with correct collar; post-fill IM consistent.
+        e.execute(
+            seq(8),
+            Command::CreateAccount(CreateAccount {
+                initial_collateral: amt(100_000_000),
+            }),
+        )
+        .unwrap();
+        let funded = AccountId::new(2);
+        e.execute(
+            seq(9),
+            Command::PlaceOrder(PlaceOrder {
+                account: funded,
+                market: MarketId::new(0),
+                order_id: OrderId::new(5),
+                side: Side::Bid,
+                order_type: OrderType::Market,
+                tif: TimeInForce::Ioc,
+                price: Price::from_raw(1_000_000),
+                quantity: Quantity::from_raw(1_000_000),
+                client_id: 5,
+                reduce_only: false,
+                instrument: 0,
+                auth: Authorization::Master,
+            }),
+        )
+        .unwrap();
+        assert_eq!(e.market_resting_len(MarketId::new(0)).unwrap(), 0);
+        let im = e.risk().initial_margin(funded).unwrap();
+        assert!(im.raw() > 0, "post-fill IM must be positive");
+        assert!(e.ledger().conservation_holds());
     }
 }
