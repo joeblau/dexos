@@ -44,6 +44,24 @@ pub enum SponsorError {
     /// The failure kind is not objectively measurable, so slashing is refused.
     #[error("fault kind is not objectively slashable")]
     NonSlashableFault,
+    /// Typed slash evidence failed objective verification.
+    #[error("slash evidence failed verification")]
+    InvalidEvidence,
+    /// Evidence does not domain-bind the claimed market, sponsor, deployment, or epoch.
+    #[error("slash evidence domain binding mismatch")]
+    EvidenceDomainMismatch,
+    /// Evidence signatures are malformed, mismatched, or do not verify.
+    #[error("slash evidence signature invalid")]
+    EvidenceSignatureInvalid,
+    /// Messages do not conflict / do not prove the claimed fault.
+    #[error("slash evidence nonconflicting or incomplete")]
+    EvidenceNonconflicting,
+    /// Evidence names an unsupported protocol version.
+    #[error("slash evidence protocol version mismatch")]
+    EvidenceProtocolMismatch,
+    /// Fraud evidence names a finalized payout that the market does not carry.
+    #[error("slash evidence finalized payout mismatch")]
+    EvidenceFinalizedMismatch,
     /// A fixed-point arithmetic failure.
     #[error("arithmetic error: {0}")]
     Arith(#[from] ArithError),

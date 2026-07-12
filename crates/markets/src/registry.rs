@@ -27,7 +27,7 @@ use crate::resolution::{
     Challenge, ChallengeBook, ResolutionCertificate, ResolutionPhase, ResolutionPolicy,
     MAX_CHALLENGES,
 };
-use crate::sponsor::{SlashableFault, SponsorSet};
+use crate::sponsor::{AppliedSlash, SlashEvidence, SlashVerifyContext, SponsorSet};
 
 /// The immutable-once-created definition of a market.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,7 +218,10 @@ pub struct MarketRegistry {
     markets: BTreeMap<MarketId, MarketRecord>,
     events: Vec<LifecycleEvent>,
     next_seq: SequenceNumber,
+    /// Domain-bound evidence ids already applied (replay protection).
     applied_evidence: BTreeSet<Hash>,
+    /// Portable audit log of verified, applied slashes.
+    slash_log: Vec<AppliedSlash>,
     ledger: EscrowLedger,
 }
 
@@ -1259,39 +1262,115 @@ impl MarketRegistry {
 
     // ---- slashing ---------------------------------------------------------
 
-    /// Slash a sponsor for an objective `fault`, crediting the slashed stake to
-    /// the insurance backstop. `evidence_hash` deduplicates: a record already
-    /// applied cannot double-slash. If aggregate stake falls below the
-    /// requirement on an active market, it deterministically transitions to
-    /// `Halted`.
+    /// Slash a sponsor only after objective [`SlashEvidence`] verifies.
+    ///
+    /// Order of effects (same transaction):
+    /// 1. Verify typed evidence (signatures, domain binding, fault predicates).
+    /// 2. Reject replays via the domain-bound [`SlashEvidence::evidence_id`].
+    /// 3. Reduce sponsor stake, debit escrow into insurance, then mark the
+    ///    evidence applied and append a portable audit record.
+    ///
+    /// Invalid evidence leaves stake, insurance, lifecycle, and replay state
+    /// unchanged. If aggregate stake falls below the requirement on an active
+    /// market, it deterministically transitions to `Halted`.
     ///
     /// # Errors
+    /// [`MarketError::Sponsor`] (including evidence failures),
     /// [`MarketError::Resolution`] with `DuplicateEvidence`,
-    /// [`MarketError::Sponsor`], or [`MarketError::UnknownMarket`].
+    /// [`MarketError::UnknownMarket`], or escrow errors.
     pub fn slash_sponsor(
         &mut self,
         market_id: MarketId,
         sponsor_id: SponsorId,
-        fault: SlashableFault,
-        evidence_hash: Hash,
+        evidence: &SlashEvidence,
     ) -> Result<Amount, MarketError> {
-        if self.applied_evidence.contains(&evidence_hash) {
+        // Fraud-against-state needs the market's finalized payout commitment.
+        let finalized = self
+            .markets
+            .get(&market_id)
+            .and_then(|r| r.resolution.as_ref())
+            .map(finalized_payout_commitment);
+        let ctx = SlashVerifyContext {
+            finalized_payout_hash: finalized,
+        };
+
+        // 1. Verify first — no stake, escrow, or replay mutation on failure.
+        evidence.verify(market_id, sponsor_id, ctx)?;
+
+        let evidence_id = evidence.evidence_id(market_id, sponsor_id);
+        // 2. Replay check before any economic move.
+        if self.applied_evidence.contains(&evidence_id) {
             return Err(MarketError::Resolution(ResolutionError::DuplicateEvidence));
         }
+
+        let fault = evidence.fault();
+        let deployment = evidence.deployment();
+        let epoch = evidence.epoch();
+
+        // Ensure the sponsor is present and escrow can cover the penalty before
+        // mutating either side (keeps ledger + sponsor set locked together).
+        let record = self
+            .markets
+            .get(&market_id)
+            .ok_or(MarketError::UnknownMarket)?;
+        let stake = record
+            .definition
+            .sponsor_set
+            .share(sponsor_id)
+            .ok_or(MarketError::Sponsor(crate::error::SponsorError::UnknownSponsor))?
+            .stake;
+        // Preview the penalty without mutating, using the same bps math as slash.
+        let ratio = types::Ratio::from_bps(i64::from(fault.penalty_bps()))?;
+        let mut expected = stake.mul_ratio(ratio)?;
+        if expected.raw() > stake.raw() {
+            expected = stake;
+        }
+        let escrowed = self.ledger.sponsor_stake(market_id, sponsor_id);
+        if escrowed.raw() < expected.raw() {
+            // Should be unreachable when reconciles() holds; refuse rather than
+            // partially apply.
+            return Err(MarketError::Escrow(EscrowError::InsufficientEscrow));
+        }
+
+        // 3. Apply stake reduction, then escrow debit, then mark replay.
         let record = self.record_mut(market_id)?;
         let slashed = record.definition.sponsor_set.slash(sponsor_id, fault)?;
+        debug_assert_eq!(slashed, expected);
         let below = record.definition.sponsor_set.total_stake().raw()
             < record.definition.stake_requirement.raw();
         let current = record.lifecycle;
-        self.applied_evidence.insert(evidence_hash);
-        // Move the slashed stake out of the sponsor's escrow and into the
-        // insurance backstop: value is transferred, never created.
+
         self.ledger
             .slash_sponsor_stake(market_id, sponsor_id, slashed)?;
+
+        // Mark replay + audit only after both economic mutations succeeded.
+        self.applied_evidence.insert(evidence_id);
+        self.slash_log.push(AppliedSlash {
+            evidence_id,
+            market_id,
+            sponsor_id,
+            fault,
+            deployment,
+            epoch,
+            amount: slashed,
+        });
+
         if below && lifecycle::is_legal_transition(current, MarketLifecycle::Halted) {
             self.transition(market_id, MarketLifecycle::Halted)?;
         }
         Ok(slashed)
+    }
+
+    /// Portable audit log of verified, applied sponsor slashes.
+    #[must_use]
+    pub fn slash_log(&self) -> &[AppliedSlash] {
+        &self.slash_log
+    }
+
+    /// Whether a domain-bound evidence id has already been applied.
+    #[must_use]
+    pub fn evidence_applied(&self, evidence_id: Hash) -> bool {
+        self.applied_evidence.contains(&evidence_id)
     }
 
     // ---- command replay ---------------------------------------------------
@@ -1349,6 +1428,7 @@ impl MarketRegistry {
             self.next_seq.get(),
             &self.ledger,
             &self.applied_evidence,
+            &self.slash_log,
         );
         match postcard::to_allocvec(&snapshot) {
             Ok(bytes) => hash_domain(DOMAIN_MARKET, &bytes),
@@ -1357,13 +1437,25 @@ impl MarketRegistry {
     }
 }
 
+/// Canonical commitment over a finalized payout vector for fraud evidence.
+fn finalized_payout_commitment(payout: &PayoutVector) -> Hash {
+    let mut buf = Vec::with_capacity(payout.len() * 16);
+    for v in payout.values() {
+        buf.extend_from_slice(&v.raw().to_le_bytes());
+    }
+    hash_domain(crate::sponsor::SPONSOR_MESSAGE_DOMAIN, &buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::payout::winner_takes_all;
     use crate::resolution::resolution_message;
-    use crate::sponsor::SponsorShare;
-    use crypto::ThresholdSigners;
+    use crate::sponsor::{
+        config_payload_hash, resolution_payload_hash, sponsor_msg_kind, SignedSponsorMessage,
+        SponsorShare,
+    };
+    use crypto::{KeyPair, ThresholdSigners};
     use types::Ratio;
 
     fn risk_cfg() -> RiskConfig {
@@ -1982,23 +2074,118 @@ mod tests {
         );
     }
 
+    fn sponsor_key() -> KeyPair {
+        KeyPair::from_seed(&[0x51u8; 32])
+    }
+
+    fn double_sign_evidence(
+        key: &KeyPair,
+        market: MarketId,
+        sponsor: SponsorId,
+        deployment: u64,
+        epoch: u64,
+        a: u8,
+        b: u8,
+    ) -> SlashEvidence {
+        let first = SignedSponsorMessage::sign(
+            key,
+            deployment,
+            market,
+            sponsor,
+            epoch,
+            sponsor_msg_kind::GENERIC,
+            Hash::from_bytes([a; 32]),
+        );
+        let second = SignedSponsorMessage::sign(
+            key,
+            deployment,
+            market,
+            sponsor,
+            epoch,
+            sponsor_msg_kind::GENERIC,
+            Hash::from_bytes([b; 32]),
+        );
+        SlashEvidence::DoubleSign {
+            deployment,
+            epoch,
+            first,
+            second,
+        }
+    }
+
+    fn fraud_conflicting_evidence(
+        key: &KeyPair,
+        market: MarketId,
+        sponsor: SponsorId,
+        deployment: u64,
+        epoch: u64,
+    ) -> SlashEvidence {
+        let claim = SignedSponsorMessage::sign(
+            key,
+            deployment,
+            market,
+            sponsor,
+            epoch,
+            sponsor_msg_kind::RESOLUTION,
+            resolution_payload_hash(Hash::from_bytes([1u8; 32])),
+        );
+        let other = SignedSponsorMessage::sign(
+            key,
+            deployment,
+            market,
+            sponsor,
+            epoch,
+            sponsor_msg_kind::RESOLUTION,
+            resolution_payload_hash(Hash::from_bytes([2u8; 32])),
+        );
+        SlashEvidence::FraudulentResolution {
+            deployment,
+            epoch,
+            claim,
+            conflicting_claim: Some(other),
+            finalized_payout_hash: None,
+        }
+    }
+
+    fn invalid_config_evidence(
+        key: &KeyPair,
+        market: MarketId,
+        sponsor: SponsorId,
+        deployment: u64,
+        epoch: u64,
+        revenue_bps: u32,
+        sponsor_count: u32,
+    ) -> SlashEvidence {
+        let attestation = SignedSponsorMessage::sign(
+            key,
+            deployment,
+            market,
+            sponsor,
+            epoch,
+            sponsor_msg_kind::CONFIG,
+            config_payload_hash(revenue_bps, sponsor_count),
+        );
+        SlashEvidence::InvalidConfig {
+            deployment,
+            epoch,
+            attestation,
+            revenue_bps,
+            sponsor_count,
+        }
+    }
+
     #[test]
     fn slash_only_objective_and_halts_below_requirement() {
         let mut reg = MarketRegistry::new();
         reg.create_market(definition(1)).unwrap();
         let m = MarketId::new(1);
+        let sponsor = SponsorId::new(1);
         drive_to_open(&mut reg, 1);
         let insurance_before = reg.insurance();
+        let key = sponsor_key();
         // Fraud is a total slash: drops stake to 0 < requirement -> Halted.
-        let ev = Hash::from_bytes([1u8; 32]);
-        let slashed = reg
-            .slash_sponsor(
-                m,
-                SponsorId::new(1),
-                SlashableFault::FraudulentResolution,
-                ev,
-            )
-            .unwrap();
+        let evidence = fraud_conflicting_evidence(&key, m, sponsor, 1, 7);
+        let slashed = reg.slash_sponsor(m, sponsor, &evidence).unwrap();
         assert_eq!(slashed, Amount::from_raw(1_000_000));
         assert_eq!(
             reg.insurance(),
@@ -2006,22 +2193,69 @@ mod tests {
         );
         // The slash moved escrow, not minted value: the sponsor's stake escrow
         // is now empty and the ledger still reconciles.
-        assert_eq!(
-            reg.ledger().sponsor_stake(m, SponsorId::new(1)),
-            Amount::ZERO
-        );
+        assert_eq!(reg.ledger().sponsor_stake(m, sponsor), Amount::ZERO);
         assert!(reg.reconciles());
         assert_eq!(reg.get_market_status(m), Some(MarketLifecycle::Halted));
+        assert_eq!(reg.slash_log().len(), 1);
         // Replayed evidence cannot double-slash.
         assert_eq!(
-            reg.slash_sponsor(
-                m,
-                SponsorId::new(1),
-                SlashableFault::FraudulentResolution,
-                ev
-            )
-            .unwrap_err(),
+            reg.slash_sponsor(m, sponsor, &evidence).unwrap_err(),
             MarketError::Resolution(ResolutionError::DuplicateEvidence)
+        );
+    }
+
+    #[test]
+    fn valid_double_sign_slashes_once_and_invalid_leaves_state() {
+        let mut reg = MarketRegistry::new();
+        reg.create_market(definition(1)).unwrap();
+        let m = MarketId::new(1);
+        let sponsor = SponsorId::new(1);
+        drive_to_open(&mut reg, 1);
+        let key = sponsor_key();
+        let root_before = reg.state_root();
+        let stake_before = reg.ledger().sponsor_stake(m, sponsor);
+        let insurance_before = reg.insurance();
+        let lifecycle_before = reg.get_market_status(m);
+
+        // Random / nonconflicting messages cannot slash.
+        let nonconflict = double_sign_evidence(&key, m, sponsor, 1, 1, 5, 5);
+        assert!(reg.slash_sponsor(m, sponsor, &nonconflict).is_err());
+        // Wrong market binding.
+        let wrong_market = double_sign_evidence(&key, MarketId::new(99), sponsor, 1, 1, 1, 2);
+        assert!(reg.slash_sponsor(m, sponsor, &wrong_market).is_err());
+        // State fully unchanged after invalid attempts.
+        assert_eq!(reg.state_root(), root_before);
+        assert_eq!(reg.ledger().sponsor_stake(m, sponsor), stake_before);
+        assert_eq!(reg.insurance(), insurance_before);
+        assert_eq!(reg.get_market_status(m), lifecycle_before);
+        assert!(reg.slash_log().is_empty());
+        assert!(!reg.evidence_applied(nonconflict.evidence_id(m, sponsor)));
+
+        // Valid double-sign: total slash, escrow moves, exactly once.
+        let evidence = double_sign_evidence(&key, m, sponsor, 1, 1, 1, 2);
+        let slashed = reg.slash_sponsor(m, sponsor, &evidence).unwrap();
+        assert_eq!(slashed, stake_before);
+        assert_eq!(reg.ledger().sponsor_stake(m, sponsor), Amount::ZERO);
+        assert_eq!(
+            reg.insurance(),
+            insurance_before.checked_add(slashed).unwrap()
+        );
+        assert!(reg.evidence_applied(evidence.evidence_id(m, sponsor)));
+        assert_eq!(
+            reg.slash_sponsor(m, sponsor, &evidence).unwrap_err(),
+            MarketError::Resolution(ResolutionError::DuplicateEvidence)
+        );
+        // Same signed payloads under another deployment/epoch are distinct ids
+        // but still fail domain checks if rebound — construct peer market replay.
+        let mut reg2 = MarketRegistry::new();
+        reg2.create_market(definition(2)).unwrap();
+        drive_to_open(&mut reg2, 2);
+        let m2 = MarketId::new(2);
+        // Evidence bound to market 1 cannot slash market 2.
+        assert!(reg2.slash_sponsor(m2, sponsor, &evidence).is_err());
+        assert_eq!(
+            reg2.ledger().sponsor_stake(m2, sponsor),
+            Amount::from_raw(1_000_000)
         );
     }
 
@@ -2381,10 +2615,12 @@ mod tests {
         assert_eq!(reg.get_market_status(m), Some(MarketLifecycle::Open));
 
         // Partial slash (20% of 2.0 = 0.4) funds insurance; 1.6 >= 1.0 so the
-        // market stays Open.
-        let ev = Hash::from_bytes([9u8; 32]);
+        // market stays Open. Invalid-config evidence uses an over-bps attestation.
+        let key = sponsor_key();
+        let evidence =
+            invalid_config_evidence(&key, m, SponsorId::new(1), 1, 3, 12_000, 1);
         let slashed = reg
-            .slash_sponsor(m, SponsorId::new(1), SlashableFault::InvalidConfig, ev)
+            .slash_sponsor(m, SponsorId::new(1), &evidence)
             .unwrap();
         assert_eq!(slashed, Amount::from_raw(400_000));
         assert_eq!(reg.get_market_status(m), Some(MarketLifecycle::Open));
