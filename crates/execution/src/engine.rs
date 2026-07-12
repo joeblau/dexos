@@ -858,6 +858,34 @@ impl Engine {
                     .ok_or(ExecutionError::UnknownMarket)?;
                 meta.mark_price = c.price;
                 self.risk.set_mark_price(c.market, c.price)?;
+                // set_mark_price recomputes every holder's equity/IM/MM, and those
+                // values fold into the committed account leaf (see account_leaf).
+                // Re-commit each holder's leaf so the state root matches live
+                // account state — otherwise verify_account fails after a mark move.
+                // Mirrors ApplyFundingEpoch. Collect first to avoid the
+                // &self.risk / &mut self borrow conflict, and commit in ascending
+                // index order for determinism. This stays inside the working-copy
+                // transaction, so a commit failure rolls the whole command back.
+                let holders: Vec<AccountId> = {
+                    let n = self.risk.account_count();
+                    let mut v = Vec::new();
+                    for i in 0..n {
+                        if let Ok(a) = AccountId::from_index(i) {
+                            if self
+                                .risk
+                                .position(a, c.market)
+                                .map(|q| q.raw() != 0)
+                                .unwrap_or(false)
+                            {
+                                v.push(a);
+                            }
+                        }
+                    }
+                    v
+                };
+                for a in &holders {
+                    self.commit_account(*a)?;
+                }
                 self.commit_market(c.market)?;
                 Ok(self.receipt(seq, ReceiptKind::MarketUpdated(c.market)))
             }
@@ -1959,6 +1987,47 @@ mod tests {
             );
         }
         assert_eq!(fingerprint(&e), before);
+        check_invariants(&e);
+    }
+
+    #[test]
+    fn set_mark_price_recommits_holder_leaves() {
+        // The committed account leaf folds risk equity/IM/MM, which recompute when
+        // the mark moves. After opening a real perp position and moving the mark,
+        // every holder's committed leaf must still verify against the state root —
+        // otherwise SetMarkPrice leaves stale leaves and check_invariants (which
+        // calls verify_account for every account) fails.
+        let mut e = engine_with_caps(8, 4);
+        e.execute(seq(1), create_account(1_000_000_000_000))
+            .unwrap(); // maker 0
+        e.execute(seq(2), create_account(1_000_000_000_000))
+            .unwrap(); // taker 1
+        e.execute(seq(3), create_perp(0, 1_000_000)).unwrap();
+        // Maker rests a bid at 1.0; taker crosses with an ask -> both open a
+        // non-zero perp position whose equity depends on the mark.
+        e.execute(seq(4), place(0, 0, 1, Side::Bid, 1_000_000, 1_000_000))
+            .unwrap();
+        e.execute(seq(5), place(1, 0, 2, Side::Ask, 1_000_000, 1_000_000))
+            .unwrap();
+        for a in [0u32, 1] {
+            assert_ne!(
+                e.risk
+                    .position(AccountId::new(a), MarketId::new(0))
+                    .unwrap_or(Quantity::ZERO),
+                Quantity::ZERO,
+                "account {a} should hold a position",
+            );
+        }
+        // Move the mark up 20%: both holders' equity/IM/MM change.
+        e.execute(
+            seq(6),
+            Command::SetMarkPrice(SetMarkPrice {
+                market: MarketId::new(0),
+                price: Price::from_raw(1_200_000),
+            }),
+        )
+        .unwrap();
+        // Without re-committing holder leaves, verify_account fails here.
         check_invariants(&e);
     }
 
