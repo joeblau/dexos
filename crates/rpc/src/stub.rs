@@ -454,16 +454,20 @@ impl RpcBackend for StubBackend {
         let state_root = g.tree.root();
         let leaf_index =
             u64::try_from(index).map_err(|_| RpcError::Internal("index overflow".into()))?;
-        let mut proof = AccountProof {
+        let proof = AccountProof {
             account_id: account,
             leaf,
             leaf_index,
             siblings,
             checkpoint_height: g.latest_height,
             state_root,
-            verification_status: VerificationStatus::Unverified,
         };
-        proof.verification_status = proof.verify_against(state_root);
+        // Producer self-check only: nothing on the wire asserts validity.
+        // Clients must fetch a quorum-certified root and re-verify locally.
+        debug_assert_eq!(
+            proof.verify_against(state_root),
+            VerificationStatus::ProofValid
+        );
         Ok(proof)
     }
 
@@ -687,5 +691,43 @@ impl StubBackend {
     pub fn session_bound_to(&self, session_pubkey: &[u8; 32], account: AccountId) -> bool {
         self.lookup_session(session_pubkey)
             .is_some_and(|b| b.account == account)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Issue #426: an [`AccountProof`] carries no server-asserted status, so
+    /// the client-side [`AccountProof::verify_against`] call is the only gate.
+    /// A produced proof verifies against the correct root and fails against
+    /// any other root — nothing a malicious server puts on the wire can flip
+    /// that outcome.
+    #[test]
+    fn client_side_verify_against_is_the_only_proof_gate() {
+        let backend = StubBackend::new(RpcMode::Full);
+        backend
+            .insert_account(fixture_account(1, Amount::ONE))
+            .unwrap();
+        let proof = backend.get_account_proof(AccountId::new(1)).unwrap();
+
+        // The client verifies locally against the trusted (quorum-certified)
+        // root and accepts.
+        assert_eq!(
+            proof.verify_against(backend.state_root()),
+            VerificationStatus::ProofValid
+        );
+
+        // The identical wire payload fails against any other root: validity
+        // is derived from local verification, never from a server field.
+        let wrong_root = Hash::from_bytes([0xEE; 32]);
+        assert_ne!(
+            proof.verify_against(wrong_root),
+            VerificationStatus::ProofValid
+        );
+        assert_eq!(
+            proof.verify_against(wrong_root),
+            VerificationStatus::ProofInvalid
+        );
     }
 }
