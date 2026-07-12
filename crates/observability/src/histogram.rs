@@ -31,7 +31,7 @@ pub const BUCKET_COUNT: usize = 41;
 /// Upper bound (exclusive-ish representative) of bucket `k`, used as the
 /// quantile estimate. Bucket `0` reports `0`; bucket `k` reports `2^k - 1`.
 #[must_use]
-fn bucket_upper_bound(k: usize) -> u64 {
+pub fn bucket_upper_bound(k: usize) -> u64 {
     if k == 0 {
         0
     } else {
@@ -104,9 +104,9 @@ impl Histogram {
     #[inline]
     pub fn record(&self, v: u64) {
         let idx = bucket_index(v);
-        self.buckets[idx].fetch_add(1, Ordering::Relaxed);
-        self.count.fetch_add(1, Ordering::Relaxed);
-        self.sum.fetch_add(v, Ordering::Relaxed);
+        saturating_add(&self.buckets[idx], 1);
+        saturating_add(&self.count, 1);
+        saturating_add(&self.sum, v);
         self.max.fetch_max(v, Ordering::Relaxed);
     }
 
@@ -170,6 +170,13 @@ impl Histogram {
             p999: self.quantile_permille(999),
         }
     }
+}
+
+#[inline]
+fn saturating_add(value: &AtomicU64, delta: u64) {
+    let _ = value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+        Some(old.saturating_add(delta))
+    });
 }
 
 /// A stage of the command-processing pipeline, used to key per-stage latency
@@ -292,6 +299,18 @@ impl StageHistograms {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn record_counters_and_sum_saturate() {
+        let h = Histogram::new();
+        h.count.store(u64::MAX, Ordering::Relaxed);
+        h.sum.store(u64::MAX - 1, Ordering::Relaxed);
+        h.buckets[0].store(u64::MAX, Ordering::Relaxed);
+        h.record(7);
+        assert_eq!(h.count(), u64::MAX);
+        assert_eq!(h.sum(), u64::MAX);
+        assert_eq!(h.bucket_counts()[3], 1);
+    }
 
     #[test]
     fn bucket_index_is_bit_length() {

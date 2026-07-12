@@ -43,8 +43,7 @@ impl QueueMetrics {
     #[inline]
     pub fn try_push(&self) -> bool {
         let cap = i64::try_from(self.capacity).unwrap_or(i64::MAX);
-        if self.depth.get() < cap {
-            self.depth.inc();
+        if self.depth.try_inc_below(cap) {
             true
         } else {
             self.dropped.inc();
@@ -55,9 +54,7 @@ impl QueueMetrics {
     /// Records a dequeue, decrementing depth but never going below zero.
     #[inline]
     pub fn pop(&self) {
-        if self.depth.get() > 0 {
-            self.depth.dec();
-        }
+        self.depth.try_dec_positive();
     }
 
     /// Directly sets the reported depth (for callers that own the real count).
@@ -181,6 +178,31 @@ mod tests {
         let q = queue(2);
         q.pop();
         q.pop();
+        assert_eq!(q.depth(), 0);
+    }
+
+    #[test]
+    fn concurrent_depth_stays_bounded() {
+        use std::thread;
+        let q = queue(7);
+        thread::scope(|scope| {
+            for _ in 0..16 {
+                let q = q.clone();
+                scope.spawn(move || {
+                    for _ in 0..10_000 {
+                        if q.try_push() {
+                            q.pop();
+                        } else {
+                            q.pop();
+                        }
+                    }
+                });
+            }
+        });
+        assert!((0..=7).contains(&q.depth()));
+        for _ in 0..100 {
+            q.pop();
+        }
         assert_eq!(q.depth(), 0);
     }
 

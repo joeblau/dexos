@@ -1,11 +1,8 @@
 //! Runtime CPU-feature detection and backend selection.
 //!
-//! Every kernel in this crate is written in two forms: a plain **scalar
-//! reference** and a lane-structured **vectorized** implementation that the
-//! optimizer can auto-vectorize (no `unsafe`, no `core::arch` intrinsics). The
-//! two forms are *bit-identical* by construction — the vectorized reductions use
-//! only associative-and-commutative integer operations, so lane striding cannot
-//! change the result.
+//! Backends other than scalar are experimental compatibility seams. They are
+//! not production controls and must not be interpreted as proof that a distinct
+//! vector instruction kernel executed.
 //!
 //! [`Backend`] names the family of kernel a call will run. [`detect`] probes the
 //! host once and returns the best backend actually available; callers may also
@@ -43,10 +40,16 @@ impl Backend {
         }
     }
 
+    /// True only for production-supported, measured implementations.
+    #[must_use]
+    pub const fn is_production(self) -> bool {
+        matches!(self, Backend::Scalar)
+    }
+
     /// True when this backend selects the vectorized kernel path.
     #[must_use]
     pub const fn is_vectorized(self) -> bool {
-        !matches!(self, Backend::Scalar)
+        false
     }
 
     /// Whether the *running host* actually provides this backend's features.
@@ -87,37 +90,14 @@ fn has_avx512() -> bool {
     false
 }
 
-/// Probe the host and return the widest backend actually available.
+/// Select the only production-qualified backend.
 ///
 /// Preference on x86-64 is AVX-512 → AVX2 → scalar; aarch64 always reports
 /// [`Backend::Neon`] (mandatory in the base ISA); every other architecture
 /// reports [`Backend::Scalar`]. The result is always a valid, runnable backend.
 ///
-/// The per-architecture bodies live in `detect_impl` (selected by `cfg`) so each
-/// arm is an unambiguous tail expression with no unreachable-code edge cases.
 #[must_use]
 pub fn detect() -> Backend {
-    detect_impl()
-}
-
-#[cfg(target_arch = "x86_64")]
-fn detect_impl() -> Backend {
-    if has_avx512() {
-        Backend::Avx512
-    } else if has_avx2() {
-        Backend::Avx2
-    } else {
-        Backend::Scalar
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-fn detect_impl() -> Backend {
-    Backend::Neon
-}
-
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-fn detect_impl() -> Backend {
     Backend::Scalar
 }
 
@@ -140,9 +120,11 @@ mod tests {
     fn scalar_is_always_available_and_not_vectorized() {
         assert!(Backend::Scalar.is_available());
         assert!(!Backend::Scalar.is_vectorized());
-        assert!(Backend::Avx2.is_vectorized());
-        assert!(Backend::Avx512.is_vectorized());
-        assert!(Backend::Neon.is_vectorized());
+        assert!(!Backend::Avx2.is_vectorized());
+        assert!(!Backend::Avx512.is_vectorized());
+        assert!(!Backend::Neon.is_vectorized());
+        assert!(Backend::Scalar.is_production());
+        assert!(!Backend::Avx2.is_production());
     }
 
     #[test]

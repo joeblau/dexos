@@ -31,4 +31,3 @@ read_only = true
 [performance]
 pin_threads = false
 busy_poll = false
-simd = "auto"

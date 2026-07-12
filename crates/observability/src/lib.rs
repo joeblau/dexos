@@ -47,7 +47,7 @@ pub mod trace;
 pub use counter::{Counter, Gauge};
 pub use health::{age_ticks, sequence_lag, PeerMetrics, QueueMetrics};
 pub use histogram::{Histogram, Quantiles, Stage, StageHistograms, BUCKET_COUNT};
-pub use registry::MetricsRegistry;
+pub use registry::{MetricKind, MetricsRegistry, RegistrationError};
 pub use snapshot::{
     parse_metric_lines, CounterSnapshot, GaugeSnapshot, HistogramSnapshot, Snapshot,
 };
@@ -170,7 +170,7 @@ mod tests {
         let map: std::collections::HashMap<_, _> = pairs.into_iter().collect();
         assert_eq!(map.get("cmds"), Some(&i128::from(expected_c)));
         assert!(map.contains_key("lat_count"));
-        assert!(map.contains_key("lat_p99"));
+        assert!(text.contains("lat_bucket{le=\"+Inf\"} 1000"));
     }
 
     #[test]

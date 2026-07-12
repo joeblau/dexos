@@ -32,13 +32,17 @@ impl Counter {
     /// Increments the counter by one. Single relaxed atomic add.
     #[inline]
     pub fn inc(&self) {
-        self.value.fetch_add(1, Ordering::Relaxed);
+        self.add(1);
     }
 
     /// Increments the counter by `n`. Single relaxed atomic add.
     #[inline]
     pub fn add(&self, n: u64) {
-        self.value.fetch_add(n, Ordering::Relaxed);
+        let _ = self
+            .value
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_add(n))
+            });
     }
 
     /// Reads the current value. Not a synchronization point.
@@ -110,6 +114,26 @@ impl Gauge {
     pub fn get(&self) -> i64 {
         self.value.load(Ordering::Relaxed)
     }
+
+    /// Atomically increments when the current value is below `upper`.
+    #[inline]
+    pub fn try_inc_below(&self, upper: i64) -> bool {
+        self.value
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                (v < upper).then(|| v.saturating_add(1))
+            })
+            .is_ok()
+    }
+
+    /// Atomically decrements when the current value is positive.
+    #[inline]
+    pub fn try_dec_positive(&self) -> bool {
+        self.value
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                (v > 0).then(|| v - 1)
+            })
+            .is_ok()
+    }
 }
 
 #[cfg(test)]
@@ -123,6 +147,16 @@ mod tests {
         c.inc();
         c.add(9);
         assert_eq!(c.get(), 10);
+    }
+
+    #[test]
+    fn counter_saturates_at_u64_max() {
+        let c = Counter::new();
+        c.value.store(u64::MAX - 1, Ordering::Relaxed);
+        c.add(10);
+        assert_eq!(c.get(), u64::MAX);
+        c.inc();
+        assert_eq!(c.get(), u64::MAX);
     }
 
     #[test]

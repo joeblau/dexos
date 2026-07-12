@@ -19,7 +19,7 @@ use tokio::task::JoinHandle;
 
 pub use config::{
     ConfigError, ConfigOverrides, ConsensusSection, NetworkSection, NodeConfig, NodeSection,
-    PerformanceSection, Role, RpcSection, SimdMode, StorageSection,
+    PerformanceSection, Role, RpcSection, StorageSection,
 };
 pub use error::NodeError;
 
