@@ -151,6 +151,58 @@ impl Ledger {
         Ok(())
     }
 
+    /// Remove `amount` from locked without crediting available (settlement pool).
+    /// Conservation is restored when the caller credits winners' available.
+    pub fn consume_locked(
+        &mut self,
+        account: AccountId,
+        amount: Amount,
+    ) -> Result<(), ExecutionError> {
+        non_negative(amount)?;
+        let i = self.idx(account)?;
+        if self.locked[i] < amount {
+            return Err(ExecutionError::InsufficientReserved);
+        }
+        self.locked[i] = self.locked[i].checked_sub(amount)?;
+        Ok(())
+    }
+
+    /// Move `amount` of available stablecoin from `from` to `to` (premium cash).
+    pub fn transfer_available(
+        &mut self,
+        from: AccountId,
+        to: AccountId,
+        amount: Amount,
+    ) -> Result<(), ExecutionError> {
+        non_negative(amount)?;
+        if amount.raw() == 0 {
+            return Ok(());
+        }
+        let i = self.idx(from)?;
+        let j = self.idx(to)?;
+        if self.available[i] < amount {
+            return Err(ExecutionError::InsufficientAvailable {
+                required: amount.raw(),
+                available: self.available[i].raw(),
+            });
+        }
+        self.available[i] = self.available[i].checked_sub(amount)?;
+        self.available[j] = self.available[j].checked_add(amount)?;
+        Ok(())
+    }
+
+    /// Credit available without changing total supply (settlement from locked pool).
+    pub fn credit_available(
+        &mut self,
+        account: AccountId,
+        amount: Amount,
+    ) -> Result<(), ExecutionError> {
+        non_negative(amount)?;
+        let i = self.idx(account)?;
+        self.available[i] = self.available[i].checked_add(amount)?;
+        Ok(())
+    }
+
     /// Settle a finalized withdrawal: remove `amount` from reserved, leaving the
     /// system. Decreases total supply.
     pub fn settle_withdrawal(

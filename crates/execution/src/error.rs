@@ -129,4 +129,25 @@ pub enum ExecutionError {
     /// Funding epoch was already applied or is not sequential.
     #[error("funding epoch not sequential")]
     FundingEpochConflict,
+    /// Operation is incompatible with the market's committed instrument type.
+    #[error("operation incompatible with market type")]
+    IncompatibleMarketType,
+    /// Instrument / outcome coordinate is out of range for the market.
+    #[error("instrument out of range for market")]
+    InvalidInstrument,
+    /// Seller lacks sufficient outcome claims for the fill.
+    #[error("insufficient outcome claims")]
+    InsufficientClaims,
+    /// Market order is missing a positive protection collar / notional cap.
+    #[error("market order requires a positive protection price collar")]
+    MarketOrderCollarRequired,
+    /// Executable depth notional exceeds the market order's protection collar.
+    #[error("market order depth exceeds protection collar notional")]
+    MarketOrderDepthExceeded,
+    /// Market is not in a state that accepts this lifecycle operation.
+    #[error("market lifecycle rejects operation")]
+    LifecycleRejected,
+    /// Market has no committed resolution to settle.
+    #[error("market is not resolved")]
+    MarketNotResolved,
 }

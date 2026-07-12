@@ -227,7 +227,8 @@ fn place_order_digest(c: &PlaceOrder) -> Hash {
         .field_i64(c.price.raw())
         .field_i64(c.quantity.raw())
         .field_i64(i64::from_le_bytes(c.client_id.to_le_bytes()))
-        .field_u32(u32::from(c.reduce_only));
+        .field_u32(u32::from(c.reduce_only))
+        .field_u32(u32::from(c.instrument));
     crypto::hash_domain(crypto::DOMAIN_COMMAND, &w.finish())
 }
 
@@ -396,6 +397,7 @@ mod tests {
             quantity: Quantity::from_raw(2_000_000),
             client_id: 5,
             reduce_only: false,
+            instrument: 0,
             auth: crate::command::Authorization::Master,
         };
         let d = place_order_digest(&base);

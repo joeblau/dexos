@@ -52,6 +52,37 @@ pub struct Fill {
     pub taker_side: Side,
 }
 
+/// One planned (not yet applied) maker fill from a dry-run depth scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlannedFill {
+    /// Resting (maker) order id.
+    pub maker_order: OrderId,
+    /// Account that owns the resting order.
+    pub maker_account: AccountId,
+    /// Execution price (resting maker's price).
+    pub price: Price,
+    /// Quantity that would execute against this maker.
+    pub quantity: Quantity,
+}
+
+/// Deterministic match plan built from executable depth without mutating the book.
+///
+/// Used by pre-trade risk so market orders are margined from worst executable
+/// prices inside the caller's collar, never from an ignored placeholder price.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MatchPlan {
+    /// Planned fills in deterministic match order (best price, then FIFO).
+    pub fills: Vec<PlannedFill>,
+    /// Total quantity that would fill.
+    pub filled_quantity: Quantity,
+    /// Worst (least favorable for the taker) price among planned fills.
+    pub worst_price: Option<Price>,
+    /// Sum of `price.notional(qty)` over planned fills (toward zero).
+    pub notional: types::Amount,
+    /// Sum of `price.notional_ceil(qty)` — conservative margin base.
+    pub notional_ceil: types::Amount,
+}
+
 /// The disposition of a submitted order after matching.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OrderOutcome {

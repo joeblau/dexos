@@ -17,10 +17,15 @@ use crate::order::{Node, StpPolicy};
 use crate::slab::{Slab, NIL};
 
 /// True if a taker at `(taker_side, taker_price)` crosses an opposite level at
-/// `opp`. Market takers cross unconditionally. Boundary (equal price) crosses.
+/// `opp`. Boundary (equal price) crosses.
+///
+/// Market orders with a positive protection price honor that price as a collar
+/// (identical inequalities to a limit). Market orders with a non-positive price
+/// cross every opposite level — the execution engine rejects that form so
+/// pre-trade risk cannot be gamed with a placeholder.
 #[inline]
 pub(crate) fn crosses(taker_side: Side, is_market: bool, taker_price: Price, opp: Price) -> bool {
-    if is_market {
+    if is_market && taker_price.raw() <= 0 {
         return true;
     }
     match taker_side {
@@ -292,6 +297,13 @@ impl SideBook {
                     break;
                 }
             }
+        }
+    }
+
+    /// Visit every price level in ascending price order.
+    pub(crate) fn for_each_level_price<F: FnMut(Price)>(&self, mut f: F) {
+        for price in self.levels.keys() {
+            f(*price);
         }
     }
 }

@@ -165,7 +165,8 @@ pub struct PlaceOrder {
     pub order_type: OrderType,
     /// Time in force.
     pub tif: TimeInForce,
-    /// Limit price.
+    /// Limit price. For [`OrderType::Market`] this is the protection collar
+    /// (worst acceptable price); it is required and must be strictly positive.
     pub price: Price,
     /// Quantity.
     pub quantity: Quantity,
@@ -173,6 +174,13 @@ pub struct PlaceOrder {
     pub client_id: u64,
     /// Reduce-only flag.
     pub reduce_only: bool,
+    /// Instrument / outcome coordinate within the market.
+    ///
+    /// Perpetuals use `0`. Prediction, scalar, sports, and decision markets use
+    /// the committed outcome (or claim) index so fills route to the correct
+    /// claim ledger rather than a perpetual position.
+    #[serde(default)]
+    pub instrument: u16,
     /// Authorization (master key or scoped session key).
     pub auth: Authorization,
 }
@@ -278,6 +286,22 @@ pub struct ApplyFundingEpoch {
     pub rate: Ratio,
 }
 
+/// Resolve a non-perpetual market to a winning outcome index.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolveMarket {
+    /// Market id.
+    pub market: MarketId,
+    /// Winning outcome / claim coordinate.
+    pub winning_outcome: u16,
+}
+
+/// Settle a resolved market: pay current claim holders and clear the book.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettleMarket {
+    /// Market id.
+    pub market: MarketId,
+}
+
 /// The deterministic command set applied by the engine.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Command {
@@ -321,6 +345,10 @@ pub enum Command {
     SetOracleHealth(SetOracleHealth),
     /// Apply a perpetual funding epoch.
     ApplyFundingEpoch(ApplyFundingEpoch),
+    /// Resolve a claim market to a winning outcome.
+    ResolveMarket(ResolveMarket),
+    /// Settle a resolved claim market.
+    SettleMarket(SettleMarket),
 }
 
 impl Command {
@@ -347,6 +375,8 @@ impl Command {
             Command::SetMarketLifecycle(_) => 18,
             Command::SetOracleHealth(_) => 19,
             Command::ApplyFundingEpoch(_) => 20,
+            Command::ResolveMarket(_) => 21,
+            Command::SettleMarket(_) => 22,
         }
     }
 }
@@ -396,6 +426,20 @@ pub enum ReceiptKind {
         market: MarketId,
         /// Epoch index.
         epoch: u64,
+    },
+    /// A market was resolved to a winning outcome.
+    MarketResolved {
+        /// Market.
+        market: MarketId,
+        /// Winning outcome index.
+        winning_outcome: u16,
+    },
+    /// A resolved market was settled; `paid` is total collateral paid to holders.
+    MarketSettled {
+        /// Market.
+        market: MarketId,
+        /// Total collateral distributed.
+        paid: types::Amount,
     },
 }
 

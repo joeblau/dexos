@@ -7,15 +7,17 @@
 
 use std::collections::{HashMap, HashSet};
 
-use orderbook::{BookConfig, NewOrder, OrderBook, OrderOutcome};
+use orderbook::{BookConfig, MatchPlan, NewOrder, OrderBook, OrderOutcome};
 use risk::{RiskConfig, RiskEngine};
 use state_tree::{LeafWriter, StateTree};
 use types::{
-    AccountId, Amount, Hash, MarketId, MarketLifecycle, MarketType, OracleHealth, Quantity,
-    SequenceNumber, Side,
+    AccountId, Amount, Hash, MarketId, MarketLifecycle, MarketType, OracleHealth, OrderType,
+    Quantity, SequenceNumber, Side,
 };
 
-use crate::command::{Authorization, Command, DeterministicEngine, ExecutionReceipt, ReceiptKind};
+use crate::command::{
+    Authorization, Command, DeterministicEngine, ExecutionReceipt, ReceiptKind,
+};
 use crate::error::ExecutionError;
 use crate::idempotency::{
     command_binding, derive_withdrawal_id, GuardDecision, KeyDomain, ReplayGuard,
@@ -74,6 +76,22 @@ struct MarketMeta {
     taker_fee_bps: i32,
     /// Last applied funding epoch (0 = none).
     last_funding_epoch: u64,
+    /// Winning outcome once resolved.
+    winning_outcome: Option<u16>,
+}
+
+/// True when fills transfer outcome claims + premium cash rather than perps.
+fn is_claim_market(market_type: MarketType) -> bool {
+    !matches!(market_type, MarketType::Perpetual)
+}
+
+/// Number of instrument books a market exposes (one per outcome for claims).
+fn instrument_count(market_type: MarketType, outcomes: u16) -> u16 {
+    if is_claim_market(market_type) {
+        outcomes.max(2)
+    } else {
+        1
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -104,11 +122,15 @@ pub struct Engine {
     sessions: SessionRegistry,
     risk: RiskEngine,
     tree: StateTree,
-    books: HashMap<u32, OrderBook>,
+    /// Per-(market, instrument) order books.
+    books: HashMap<(u32, u16), OrderBook>,
     markets: HashMap<u32, MarketMeta>,
-    /// Resting-order notional reserved against free collateral: (market, order_id) -> notional.
-    order_reserves: HashMap<(u32, u64), (AccountId, Amount)>,
+    /// Resting-order notional reserved: (market, instrument, order_id) -> notional.
+    order_reserves: HashMap<(u32, u16, u64), (AccountId, Amount)>,
+    /// Outcome claims: (account, market) -> per-outcome balances.
     claims: HashMap<(u32, u32), Vec<Amount>>,
+    /// Locked complete-set collateral still attributed to a minter: (account, market).
+    mint_locked: HashMap<(u32, u32), Amount>,
     deposits_seen: HashSet<(u32, Vec<u8>, u32)>,
     withdrawals: HashMap<u64, Withdrawal>,
     protocol_version: u16,
@@ -130,6 +152,7 @@ impl Engine {
             markets: HashMap::new(),
             order_reserves: HashMap::new(),
             claims: HashMap::new(),
+            mint_locked: HashMap::new(),
             deposits_seen: HashSet::new(),
             withdrawals: HashMap::new(),
             protocol_version: 1,
@@ -159,11 +182,33 @@ impl Engine {
         &self.risk
     }
 
-    /// Number of orders currently resting in `market`'s book, or `None` if the
-    /// market is unknown. Used to observe that liquidation cancelled an account's
-    /// resting orders.
+    /// Number of orders currently resting across all instruments of `market`,
+    /// or `None` if the market is unknown.
     pub fn market_resting_len(&self, market: MarketId) -> Option<usize> {
-        self.books.get(&market.get()).map(OrderBook::resting_len)
+        if !self.markets.contains_key(&market.get()) {
+            return None;
+        }
+        let mut total = 0usize;
+        for ((m, _), book) in &self.books {
+            if *m == market.get() {
+                total = total.saturating_add(book.resting_len());
+            }
+        }
+        Some(total)
+    }
+
+    /// Outcome-claim balance for `account` in `market` at `instrument`, or zero.
+    pub fn claim_balance(
+        &self,
+        account: AccountId,
+        market: MarketId,
+        instrument: u16,
+    ) -> Amount {
+        self.claims
+            .get(&(account.get(), market.get()))
+            .and_then(|v| v.get(usize::from(instrument)))
+            .copied()
+            .unwrap_or(Amount::ZERO)
     }
 
     /// Single source of truth for reduce-only: the risk engine's position.
@@ -209,14 +254,15 @@ impl Engine {
     fn release_order_reserve(
         &mut self,
         market: MarketId,
+        instrument: u16,
         order_id: types::OrderId,
         account: AccountId,
     ) -> Result<(), ExecutionError> {
-        if let Some((owner, notional)) = self.order_reserves.remove(&(market.get(), order_id.get())) {
+        let key = (market.get(), instrument, order_id.get());
+        if let Some((owner, notional)) = self.order_reserves.remove(&key) {
             if owner != account {
                 // Put it back; wrong owner should not release.
-                self.order_reserves
-                    .insert((market.get(), order_id.get()), (owner, notional));
+                self.order_reserves.insert(key, (owner, notional));
                 return Err(ExecutionError::OrderNotOwned);
             }
             self.risk.release_resting(account, notional)?;
@@ -227,6 +273,7 @@ impl Engine {
     fn reserve_order(
         &mut self,
         market: MarketId,
+        instrument: u16,
         order_id: types::OrderId,
         account: AccountId,
         notional: Amount,
@@ -236,8 +283,24 @@ impl Engine {
         }
         self.risk.reserve_resting(account, notional)?;
         self.order_reserves
-            .insert((market.get(), order_id.get()), (account, notional));
+            .insert((market.get(), instrument, order_id.get()), (account, notional));
         Ok(())
+    }
+
+    fn validate_instrument(
+        &self,
+        market: MarketId,
+        instrument: u16,
+    ) -> Result<&MarketMeta, ExecutionError> {
+        let meta = self
+            .markets
+            .get(&market.get())
+            .ok_or(ExecutionError::UnknownMarket)?;
+        let n = instrument_count(meta.market_type, meta.outcomes);
+        if instrument >= n {
+            return Err(ExecutionError::InvalidInstrument);
+        }
+        Ok(meta)
     }
 
     /// The full committed leaf for `account`: settlement ledger balances, auth
@@ -342,11 +405,9 @@ impl Engine {
             .markets
             .get(&market.get())
             .ok_or(ExecutionError::UnknownMarket)?;
-        let book_root = self
-            .books
-            .get(&market.get())
-            .map(|b| b.state_root())
-            .unwrap_or(Hash::ZERO);
+        // Compose instrument book roots in ascending instrument order.
+        let n = instrument_count(meta.market_type, meta.outcomes);
+        let mut w = LeafWriter::new();
         let type_tag: u32 = match meta.market_type {
             MarketType::Perpetual => 0,
             MarketType::BinaryPrediction => 1,
@@ -356,12 +417,25 @@ impl Engine {
             MarketType::Scalar => 5,
             MarketType::CustomPayoutVector => 6,
         };
-        Ok(LeafWriter::new()
-            .field_u32(type_tag)
+        w.field_u32(type_tag)
             .field_u32(u32::from(meta.outcomes))
             .field_i64(meta.mark_price.raw())
-            .field_bytes(book_root.as_bytes())
-            .finish())
+            .field_u32(u32::from(n));
+        for inst in 0..n {
+            let book_root = self
+                .books
+                .get(&(market.get(), inst))
+                .map(|b| b.state_root())
+                .unwrap_or(Hash::ZERO);
+            w.field_u32(u32::from(inst))
+                .field_bytes(book_root.as_bytes());
+        }
+        if let Some(win) = meta.winning_outcome {
+            w.field_u32(1).field_u32(u32::from(win));
+        } else {
+            w.field_u32(0).field_u32(0);
+        }
+        Ok(w.finish())
     }
 
     fn commit_market(&mut self, market: MarketId) -> Result<(), ExecutionError> {
@@ -380,24 +454,31 @@ impl Engine {
     fn apply_fills(
         &mut self,
         market: MarketId,
+        instrument: u16,
         result: &orderbook::MatchResult,
     ) -> Result<Vec<AccountId>, ExecutionError> {
-        let (maker_bps, taker_bps) = self
+        let meta = self
             .markets
             .get(&market.get())
-            .map(|m| (m.maker_fee_bps, m.taker_fee_bps))
-            .unwrap_or((0, 0));
+            .ok_or(ExecutionError::UnknownMarket)?
+            .clone();
+        let (maker_bps, taker_bps) = (meta.maker_fee_bps, meta.taker_fee_bps);
         let mut touched = Vec::new();
         for fill in &result.fills {
-            let taker_signed = Self::signed(fill.taker_side, fill.quantity)?;
-            let maker_signed = Self::signed(fill.taker_side.opposite(), fill.quantity)?;
-            self.risk
-                .apply_fill(fill.taker_account, market, taker_signed, fill.price)?;
-            self.risk
-                .apply_fill(fill.maker_account, market, maker_signed, fill.price)?;
+            if is_claim_market(meta.market_type) {
+                self.apply_claim_fill(market, instrument, fill)?;
+            } else {
+                // Perpetual fills update position / PnL only.
+                let taker_signed = Self::signed(fill.taker_side, fill.quantity)?;
+                let maker_signed = Self::signed(fill.taker_side.opposite(), fill.quantity)?;
+                self.risk
+                    .apply_fill(fill.taker_account, market, taker_signed, fill.price)?;
+                self.risk
+                    .apply_fill(fill.maker_account, market, maker_signed, fill.price)?;
+            }
             // Release reserved IM on the filled portion of the resting maker.
             let fill_notional = fill.price.notional(fill.quantity)?;
-            let key = (market.get(), fill.maker_order.get());
+            let key = (market.get(), instrument, fill.maker_order.get());
             if let Some((owner, reserved)) = self.order_reserves.get(&key).copied() {
                 let release = if fill_notional.raw() > reserved.raw() {
                     reserved
@@ -438,6 +519,129 @@ impl Engine {
         touched.sort_by_key(|a| a.get());
         touched.dedup();
         Ok(touched)
+    }
+
+    /// Transfer outcome claims and premium cash for a non-perpetual fill.
+    ///
+    /// The ask side sells claims; the bid side buys them. Premium
+    /// (`price * quantity`) moves available stablecoin + risk collateral from
+    /// buyer to seller. Never opens a [`risk::PerpPosition`].
+    fn apply_claim_fill(
+        &mut self,
+        market: MarketId,
+        instrument: u16,
+        fill: &orderbook::Fill,
+    ) -> Result<(), ExecutionError> {
+        let meta = self
+            .markets
+            .get(&market.get())
+            .ok_or(ExecutionError::UnknownMarket)?;
+        let outcomes = usize::from(instrument_count(meta.market_type, meta.outcomes));
+        let inst = usize::from(instrument);
+        if inst >= outcomes {
+            return Err(ExecutionError::InvalidInstrument);
+        }
+        let (seller, buyer) = match fill.taker_side {
+            Side::Bid => (fill.maker_account, fill.taker_account),
+            Side::Ask => (fill.taker_account, fill.maker_account),
+        };
+        let qty = Amount::from_raw(i128::from(fill.quantity.raw()));
+        if qty.raw() <= 0 {
+            return Err(ExecutionError::NegativeAmount);
+        }
+        // Debit seller claims; credit buyer claims.
+        {
+            let entry = self
+                .claims
+                .entry((seller.get(), market.get()))
+                .or_insert_with(|| vec![Amount::ZERO; outcomes]);
+            if entry.len() < outcomes {
+                entry.resize(outcomes, Amount::ZERO);
+            }
+            if entry[inst] < qty {
+                return Err(ExecutionError::InsufficientClaims);
+            }
+            entry[inst] = entry[inst].checked_sub(qty)?;
+        }
+        {
+            let entry = self
+                .claims
+                .entry((buyer.get(), market.get()))
+                .or_insert_with(|| vec![Amount::ZERO; outcomes]);
+            if entry.len() < outcomes {
+                entry.resize(outcomes, Amount::ZERO);
+            }
+            entry[inst] = entry[inst].checked_add(qty)?;
+        }
+        // Premium cash: buyer pays seller (zero-sum ledger + risk).
+        let premium = fill.price.notional(fill.quantity)?;
+        if premium.raw() > 0 {
+            self.ledger
+                .transfer_available(buyer, seller, premium)?;
+            self.risk.debit_collateral(buyer, premium)?;
+            self.risk.credit_collateral(seller, premium)?;
+        }
+        Ok(())
+    }
+
+    /// Pre-trade notional for risk / session checks.
+    ///
+    /// Limit orders use the limit price. Market orders **never** use a
+    /// placeholder caller price for margin: they require a positive protection
+    /// collar, build a deterministic match plan from executable depth, and
+    /// margin the planned (ceil) notional capped by the collar worst-case.
+    fn pretrade_notional(
+        &self,
+        market: MarketId,
+        instrument: u16,
+        order: &NewOrder,
+        reduce_only: bool,
+    ) -> Result<(Amount, MatchPlan), ExecutionError> {
+        let meta = self.validate_instrument(market, instrument)?;
+        let book = self
+            .books
+            .get(&(market.get(), instrument))
+            .ok_or(ExecutionError::UnknownMarket)?;
+        let plan = book.plan_match(order)?;
+        if matches!(order.order_type, OrderType::Market) {
+            if order.price.raw() <= 0 {
+                return Err(ExecutionError::MarketOrderCollarRequired);
+            }
+            // Worst-case notional within the collar: max(planned ceil notional,
+            // collar price * requested qty) so a sparse book cannot under-margin
+            // a market order that later rests nothing (markets are IOC) but still
+            // cannot be gamed by a 1-micro placeholder.
+            let collar_cap = order.price.notional_ceil(order.quantity)?;
+            let from_depth = if plan.filled_quantity.raw() > 0 {
+                plan.notional_ceil
+            } else {
+                // No depth: reject later at match, but margin the collar so the
+                // admission check is never cheaper than a limit at the collar.
+                collar_cap
+            };
+            // Use the max so placeholders cannot reduce IM, and depth above the
+            // collar is impossible (collar limits the plan). Cap at collar_cap.
+            let notional = if from_depth.raw() > collar_cap.raw() {
+                return Err(ExecutionError::MarketOrderDepthExceeded);
+            } else if plan.filled_quantity.raw() == 0 {
+                collar_cap
+            } else {
+                // Planned depth notional; still at least the worst planned price
+                // times filled qty (already in plan.notional_ceil).
+                from_depth
+            };
+            // Also ensure a pure placeholder (price=1) against deep expensive book
+            // is impossible: plan honors collar so fills empty if book above collar.
+            let _ = reduce_only;
+            let _ = meta;
+            return Ok((notional, plan));
+        }
+        let notional = if order.price.raw() > 0 {
+            order.price.notional_ceil(order.quantity)?
+        } else {
+            meta.mark_price.notional_ceil(order.quantity)?
+        };
+        Ok((notional, plan))
     }
 
     fn markets_fill_fee(notional: Amount, bps: i32) -> Result<Amount, ExecutionError> {
@@ -607,21 +811,32 @@ impl Engine {
                 if self.markets.contains_key(&c.market.get()) {
                     return Err(ExecutionError::MarketExists);
                 }
+                let outcomes = if is_claim_market(c.market_type) {
+                    c.outcomes.max(2)
+                } else {
+                    c.outcomes.max(1)
+                };
                 self.markets.insert(
                     c.market.get(),
                     MarketMeta {
                         market_type: c.market_type,
-                        outcomes: c.outcomes,
+                        outcomes,
                         mark_price: c.mark_price,
                         lifecycle: MarketLifecycle::Open,
                         oracle_health: OracleHealth::Normal,
                         maker_fee_bps: 0,
                         taker_fee_bps: 0,
                         last_funding_epoch: 0,
+                        winning_outcome: None,
                     },
                 );
-                self.books
-                    .insert(c.market.get(), OrderBook::new(BookConfig::default()));
+                let n = instrument_count(c.market_type, outcomes);
+                for inst in 0..n {
+                    self.books.insert(
+                        (c.market.get(), inst),
+                        OrderBook::new(BookConfig::default()),
+                    );
+                }
                 self.risk.set_mark_price(c.market, c.mark_price)?;
                 self.commit_market(c.market)?;
                 Ok(self.receipt(seq, ReceiptKind::MarketUpdated(c.market)))
@@ -637,36 +852,11 @@ impl Engine {
                 Ok(self.receipt(seq, ReceiptKind::MarketUpdated(c.market)))
             }
             Command::PlaceOrder(c) => {
-                // Lifecycle + oracle gates: closed/halted markets and frozen
-                // oracles reject new risk before any book/risk mutation.
+                // Lifecycle + oracle gates: draft/halted/closed/resolved/archived
+                // and frozen oracles reject new risk before any book/risk mutation.
                 self.gate_new_risk(c.market)?;
-                let meta = self
-                    .markets
-                    .get(&c.market.get())
-                    .ok_or(ExecutionError::UnknownMarket)?
-                    .clone();
-                let notional = if c.price.raw() > 0 {
-                    c.price.notional(c.quantity)?
-                } else {
-                    meta.mark_price.notional(c.quantity)?
-                };
-                // Authenticate before any business logic so a rejected order
-                // leaves no state behind.
-                self.authorize(c.account, c.market, notional, &c.auth)?;
-                self.risk
-                    .check_order_in_market(c.account, c.market, notional, c.reduce_only)?;
-                // Reduce-only clamps against the risk engine position.
-                let pos = self.position(c.account, c.market);
-                let book = self
-                    .books
-                    .get_mut(&c.market.get())
-                    .ok_or(ExecutionError::UnknownMarket)?;
-                book.set_position(c.account, pos);
-                // Idempotency is decided once, durably, at the command layer (see
-                // `execute`), so the book submits through its non-deduplicating
-                // path: a book-local dedup here could replay stale fills that this
-                // handler would then re-apply to both counterparties.
-                let result = book.place(NewOrder {
+                self.validate_instrument(c.market, c.instrument)?;
+                let new_order = NewOrder {
                     order_id: c.order_id,
                     account: c.account,
                     side: c.side,
@@ -676,23 +866,78 @@ impl Engine {
                     quantity: c.quantity,
                     client_id: c.client_id,
                     reduce_only: c.reduce_only,
-                })?;
+                };
+                // Market orders: collar required; notional from executable depth.
+                let (notional, _plan) =
+                    self.pretrade_notional(c.market, c.instrument, &new_order, c.reduce_only)?;
+                // Authenticate before any business logic so a rejected order
+                // leaves no state behind.
+                self.authorize(c.account, c.market, notional, &c.auth)?;
+                // Reject insufficient collateral / claims BEFORE any maker qty change.
+                let meta_type = self
+                    .markets
+                    .get(&c.market.get())
+                    .ok_or(ExecutionError::UnknownMarket)?
+                    .market_type;
+                if is_claim_market(meta_type) {
+                    match c.side {
+                        Side::Bid => {
+                            // Buyer posts premium: require free collateral ≥ notional.
+                            self.risk.check_order(c.account, notional, false)?;
+                        }
+                        Side::Ask => {
+                            // Seller must already hold the claims being offered.
+                            let held = self.claim_balance(c.account, c.market, c.instrument);
+                            let need = Amount::from_raw(i128::from(c.quantity.raw()));
+                            if held < need {
+                                return Err(ExecutionError::InsufficientClaims);
+                            }
+                        }
+                    }
+                } else {
+                    self.risk.check_order_in_market(
+                        c.account,
+                        c.market,
+                        notional,
+                        c.reduce_only,
+                    )?;
+                }
+                // Reduce-only clamps against the risk engine position (perps).
+                let pos = self.position(c.account, c.market);
+                let book = self
+                    .books
+                    .get_mut(&(c.market.get(), c.instrument))
+                    .ok_or(ExecutionError::UnknownMarket)?;
+                book.set_position(c.account, pos);
+                // Idempotency is decided once, durably, at the command layer (see
+                // `execute`), so the book submits through its non-deduplicating
+                // path: a book-local dedup here could replay stale fills that this
+                // handler would then re-apply to both counterparties.
+                let result = book.place(new_order)?;
                 let filled = result.filled_quantity();
                 let rested = matches!(
                     result.outcome,
                     OrderOutcome::Resting { .. } | OrderOutcome::PartiallyFilledResting { .. }
                 );
-                let touched = self.apply_fills(c.market, &result)?;
+                let touched = self.apply_fills(c.market, c.instrument, &result)?;
                 // Reserve IM for any residual that rests on the book.
                 if rested {
                     let rest_notional = Self::residual_notional(&result, c.price, c.quantity)?;
                     // Limit orders use their limit price; market residuals do not rest.
-                    let rest_notional = if c.price.raw() > 0 {
+                    let rest_notional = if !matches!(c.order_type, OrderType::Market)
+                        && c.price.raw() > 0
+                    {
                         rest_notional
                     } else {
                         Amount::ZERO
                     };
-                    self.reserve_order(c.market, c.order_id, c.account, rest_notional)?;
+                    self.reserve_order(
+                        c.market,
+                        c.instrument,
+                        c.order_id,
+                        c.account,
+                        rest_notional,
+                    )?;
                 }
                 for a in touched {
                     self.commit_account(a)?;
@@ -705,51 +950,61 @@ impl Engine {
                 Ok(self.receipt(seq, ReceiptKind::OrderApplied { filled, rested }))
             }
             Command::CancelOrder(c) => {
-                let owner = self
-                    .books
+                // Locate the order across instruments of this market.
+                let mut found: Option<(u16, AccountId)> = None;
+                let meta = self
+                    .markets
                     .get(&c.market.get())
-                    .ok_or(ExecutionError::UnknownMarket)?
-                    .owner(c.order_id);
-                // Defense in depth: a caller may only cancel its own resting
-                // orders.
-                if matches!(owner, Some(o) if o != c.account) {
+                    .ok_or(ExecutionError::UnknownMarket)?;
+                let n = instrument_count(meta.market_type, meta.outcomes);
+                for inst in 0..n {
+                    if let Some(book) = self.books.get(&(c.market.get(), inst)) {
+                        if let Some(owner) = book.owner(c.order_id) {
+                            found = Some((inst, owner));
+                            break;
+                        }
+                    }
+                }
+                let (instrument, owner) = match found {
+                    Some(v) => v,
+                    None => {
+                        // Unknown order: authorize then no-op cancel count 0.
+                        self.authorize(c.account, c.market, Amount::ZERO, &c.auth)?;
+                        return Ok(self.receipt(seq, ReceiptKind::Cancelled(0)));
+                    }
+                };
+                if owner != c.account {
                     return Err(ExecutionError::OrderNotOwned);
                 }
-                // Cancellation carries no notional, but still requires an
-                // in-scope, unexpired, non-replayed session (or the master key).
                 self.authorize(c.account, c.market, Amount::ZERO, &c.auth)?;
                 let book = self
                     .books
-                    .get_mut(&c.market.get())
+                    .get_mut(&(c.market.get(), instrument))
                     .ok_or(ExecutionError::UnknownMarket)?;
-                let count = match book.cancel(c.order_id) {
-                    Ok(()) => 1,
-                    Err(orderbook::OrderError::UnknownOrder) => 0,
-                    Err(e) => return Err(e.into()),
-                };
-                if count == 1 {
-                    self.release_order_reserve(c.market, c.order_id, c.account)?;
-                    self.commit_account(c.account)?;
-                }
+                book.cancel(c.order_id)?;
+                self.release_order_reserve(c.market, instrument, c.order_id, c.account)?;
+                self.commit_account(c.account)?;
                 self.commit_market(c.market)?;
-                Ok(self.receipt(seq, ReceiptKind::Cancelled(count)))
+                Ok(self.receipt(seq, ReceiptKind::Cancelled(1)))
             }
             Command::CancelAll(c) => {
-                // Ensure the market exists before authorizing.
-                if !self.books.contains_key(&c.market.get()) {
-                    return Err(ExecutionError::UnknownMarket);
-                }
-                self.authorize(c.account, c.market, Amount::ZERO, &c.auth)?;
-                let book = self
-                    .books
-                    .get_mut(&c.market.get())
+                let meta = self
+                    .markets
+                    .get(&c.market.get())
                     .ok_or(ExecutionError::UnknownMarket)?;
-                let count = book.cancel_all(c.account);
+                let n = instrument_count(meta.market_type, meta.outcomes);
+                self.authorize(c.account, c.market, Amount::ZERO, &c.auth)?;
+                let mut count = 0u32;
+                for inst in 0..n {
+                    if let Some(book) = self.books.get_mut(&(c.market.get(), inst)) {
+                        count = count.saturating_add(book.cancel_all(c.account));
+                    }
+                }
                 // Release every resting reservation for this account in the market.
-                let keys: Vec<(u32, u64)> = self
+                let keys: Vec<(u32, u16, u64)> = self
                     .order_reserves
                     .iter()
-                    .filter(|((m, _), (a, _))| *m == c.market.get() && *a == c.account)
+                    .filter(|((m, _, _), (a, _))| *m == c.market.get() && *a == c.account)
                     .map(|(k, _)| *k)
                     .collect();
                 for key in keys {
@@ -763,32 +1018,36 @@ impl Engine {
             }
             Command::ReplaceOrder(c) => {
                 self.gate_new_risk(c.market)?;
-                let owner = self
-                    .books
+                // Find which instrument book holds this order.
+                let meta = self
+                    .markets
                     .get(&c.market.get())
-                    .ok_or(ExecutionError::UnknownMarket)?
-                    .owner(c.order_id);
-                // Defense in depth: a caller may only replace its own resting
-                // orders.
-                if matches!(owner, Some(o) if o != c.account) {
-                    return Err(ExecutionError::OrderNotOwned);
+                    .ok_or(ExecutionError::UnknownMarket)?;
+                let n = instrument_count(meta.market_type, meta.outcomes);
+                let mut instrument = None;
+                for inst in 0..n {
+                    if let Some(book) = self.books.get(&(c.market.get(), inst)) {
+                        if let Some(owner) = book.owner(c.order_id) {
+                            if owner != c.account {
+                                return Err(ExecutionError::OrderNotOwned);
+                            }
+                            instrument = Some(inst);
+                            break;
+                        }
+                    }
                 }
-                // A replace re-establishes an order, so it is bounded by the
-                // session's per-order notional cap like a fresh placement.
-                let notional = c.price.notional(c.quantity)?;
+                let instrument = instrument.ok_or(ExecutionError::Order(orderbook::OrderError::UnknownOrder))?;
+                let notional = c.price.notional_ceil(c.quantity)?;
                 self.authorize(c.account, c.market, notional, &c.auth)?;
-                // Release prior reservation, re-check risk for the new notional,
-                // then re-reserve residual after the replace — all inside the
-                // transactional working copy so failure is atomic.
-                self.release_order_reserve(c.market, c.order_id, c.account)?;
+                self.release_order_reserve(c.market, instrument, c.order_id, c.account)?;
                 self.risk
                     .check_order_in_market(c.account, c.market, notional, false)?;
                 let book = self
                     .books
-                    .get_mut(&c.market.get())
+                    .get_mut(&(c.market.get(), instrument))
                     .ok_or(ExecutionError::UnknownMarket)?;
                 let result = book.replace(c.order_id, c.price, c.quantity)?;
-                let touched = self.apply_fills(c.market, &result)?;
+                let touched = self.apply_fills(c.market, instrument, &result)?;
                 let filled = result.filled_quantity();
                 let rested = matches!(
                     result.outcome,
@@ -796,7 +1055,13 @@ impl Engine {
                 );
                 if rested {
                     let rest_notional = Self::residual_notional(&result, c.price, c.quantity)?;
-                    self.reserve_order(c.market, c.order_id, c.account, rest_notional)?;
+                    self.reserve_order(
+                        c.market,
+                        instrument,
+                        c.order_id,
+                        c.account,
+                        rest_notional,
+                    )?;
                 }
                 for a in touched {
                     self.commit_account(a)?;
@@ -810,19 +1075,47 @@ impl Engine {
                     .markets
                     .get(&c.market.get())
                     .ok_or(ExecutionError::UnknownMarket)?;
-                let outcomes = usize::from(meta.outcomes.max(2));
+                if !is_claim_market(meta.market_type) {
+                    return Err(ExecutionError::IncompatibleMarketType);
+                }
+                if !matches!(meta.lifecycle, MarketLifecycle::Open) {
+                    return Err(ExecutionError::LifecycleRejected);
+                }
+                let outcomes = usize::from(instrument_count(meta.market_type, meta.outcomes));
                 self.ledger.lock(c.account, c.count)?;
+                // Keep risk collateral aligned with locked settlement funds.
+                self.risk.debit_collateral(c.account, c.count)?;
                 let entry = self
                     .claims
                     .entry((c.account.get(), c.market.get()))
                     .or_insert_with(|| vec![Amount::ZERO; outcomes]);
+                if entry.len() < outcomes {
+                    entry.resize(outcomes, Amount::ZERO);
+                }
                 for v in entry.iter_mut() {
                     *v = v.checked_add(c.count)?;
                 }
+                let key = (c.account.get(), c.market.get());
+                let prev = self.mint_locked.get(&key).copied().unwrap_or(Amount::ZERO);
+                self.mint_locked
+                    .insert(key, prev.checked_add(c.count)?);
                 self.commit_account(c.account)?;
                 Ok(self.receipt(seq, ReceiptKind::CompleteSet(c.count)))
             }
             Command::RedeemCompleteSet(c) => {
+                let meta = self
+                    .markets
+                    .get(&c.market.get())
+                    .ok_or(ExecutionError::UnknownMarket)?;
+                if !is_claim_market(meta.market_type) {
+                    return Err(ExecutionError::IncompatibleMarketType);
+                }
+                if !matches!(
+                    meta.lifecycle,
+                    MarketLifecycle::Open | MarketLifecycle::Halted | MarketLifecycle::Closed
+                ) {
+                    return Err(ExecutionError::LifecycleRejected);
+                }
                 let entry = self
                     .claims
                     .get_mut(&(c.account.get(), c.market.get()))
@@ -834,6 +1127,18 @@ impl Engine {
                     *v = v.checked_sub(c.count)?;
                 }
                 self.ledger.unlock(c.account, c.count)?;
+                self.risk.credit_collateral(c.account, c.count)?;
+                let key = (c.account.get(), c.market.get());
+                let prev = self.mint_locked.get(&key).copied().unwrap_or(Amount::ZERO);
+                if prev < c.count {
+                    return Err(ExecutionError::IncompleteSet);
+                }
+                let next = prev.checked_sub(c.count)?;
+                if next.raw() == 0 {
+                    self.mint_locked.remove(&key);
+                } else {
+                    self.mint_locked.insert(key, next);
+                }
                 self.commit_account(c.account)?;
                 Ok(self.receipt(seq, ReceiptKind::CompleteSet(c.count)))
             }
@@ -858,14 +1163,18 @@ impl Engine {
                     return Err(ExecutionError::AccountNotLiquidatable);
                 }
                 // Phase 1: cancel every resting order the account holds, across
-                // all markets, so a dead account leaves nothing on the books.
-                let market_ids: Vec<u32> = {
-                    let mut ids: Vec<u32> = self.books.keys().copied().collect();
+                // all markets/instruments, so a dead account leaves nothing on
+                // the books.
+                let book_keys: Vec<(u32, u16)> = {
+                    let mut ids: Vec<(u32, u16)> = self.books.keys().copied().collect();
                     ids.sort_unstable();
                     ids
                 };
-                for m in &market_ids {
-                    if let Some(book) = self.books.get_mut(m) {
+                let mut market_ids: Vec<u32> = book_keys.iter().map(|(m, _)| *m).collect();
+                market_ids.sort_unstable();
+                market_ids.dedup();
+                for key in &book_keys {
+                    if let Some(book) = self.books.get_mut(key) {
                         book.cancel_all(c.account);
                     }
                 }
@@ -885,7 +1194,7 @@ impl Engine {
                 affected.sort_by_key(|a| a.get());
                 affected.dedup();
                 // Drop any resting reservations for the liquidated account.
-                let drop_keys: Vec<(u32, u64)> = self
+                let drop_keys: Vec<(u32, u16, u64)> = self
                     .order_reserves
                     .iter()
                     .filter(|(_, (a, _))| *a == c.account)
@@ -936,6 +1245,9 @@ impl Engine {
                     .markets
                     .get_mut(&c.market.get())
                     .ok_or(ExecutionError::UnknownMarket)?;
+                if is_claim_market(meta.market_type) {
+                    return Err(ExecutionError::IncompatibleMarketType);
+                }
                 let expected = meta.last_funding_epoch.saturating_add(1);
                 if c.epoch != expected {
                     return Err(ExecutionError::FundingEpochConflict);
@@ -977,6 +1289,151 @@ impl Engine {
                     ReceiptKind::FundingApplied {
                         market: c.market,
                         epoch: c.epoch,
+                    },
+                ))
+            }
+            Command::ResolveMarket(c) => {
+                let meta = self
+                    .markets
+                    .get_mut(&c.market.get())
+                    .ok_or(ExecutionError::UnknownMarket)?;
+                if !is_claim_market(meta.market_type) {
+                    return Err(ExecutionError::IncompatibleMarketType);
+                }
+                if !matches!(
+                    meta.lifecycle,
+                    MarketLifecycle::Open
+                        | MarketLifecycle::Closed
+                        | MarketLifecycle::PendingResolution
+                        | MarketLifecycle::Disputed
+                ) {
+                    return Err(ExecutionError::LifecycleRejected);
+                }
+                let n = instrument_count(meta.market_type, meta.outcomes);
+                if c.winning_outcome >= n {
+                    return Err(ExecutionError::InvalidInstrument);
+                }
+                meta.winning_outcome = Some(c.winning_outcome);
+                meta.lifecycle = MarketLifecycle::Resolved;
+                // Cancel all resting books so no post-resolve trading residue.
+                for inst in 0..n {
+                    if let Some(book) = self.books.get_mut(&(c.market.get(), inst)) {
+                        // Drain by canceling every account that has orders: collect
+                        // accounts from order_reserves for this market.
+                        let _ = book; // cancelled via reserves keys below
+                    }
+                }
+                let reserve_keys: Vec<(u32, u16, u64)> = self
+                    .order_reserves
+                    .keys()
+                    .copied()
+                    .filter(|(m, _, _)| *m == c.market.get())
+                    .collect();
+                for key in reserve_keys {
+                    if let Some((owner, notional)) = self.order_reserves.remove(&key) {
+                        let _ = self.risk.release_resting(owner, notional);
+                        if let Some(book) = self.books.get_mut(&(key.0, key.1)) {
+                            let _ = book.cancel(types::OrderId::new(key.2));
+                        }
+                    }
+                }
+                // Cancel any remaining orders on every instrument book.
+                for inst in 0..n {
+                    if let Some(book) = self.books.get_mut(&(c.market.get(), inst)) {
+                        // cancel_all for every account that still has resting orders
+                        // by repeatedly canceling known ids via a snapshot clone.
+                        let snapshot = book.clone();
+                        // Use cancel_all on accounts present in the book's account index
+                        // via total — walk resting by cloning and canceling all via
+                        // a public API: cancel_all needs account. Use resting_len loop
+                        // is not available; cancel by scanning reserves already done.
+                        let _ = snapshot;
+                        // Full drain: create a throwaway list of owners by probing
+                        // order ids is hard; instead re-create empty books.
+                        *book = OrderBook::new(BookConfig::default());
+                    }
+                }
+                self.commit_market(c.market)?;
+                Ok(self.receipt(
+                    seq,
+                    ReceiptKind::MarketResolved {
+                        market: c.market,
+                        winning_outcome: c.winning_outcome,
+                    },
+                ))
+            }
+            Command::SettleMarket(c) => {
+                let meta = self
+                    .markets
+                    .get(&c.market.get())
+                    .ok_or(ExecutionError::UnknownMarket)?
+                    .clone();
+                if !is_claim_market(meta.market_type) {
+                    return Err(ExecutionError::IncompatibleMarketType);
+                }
+                if !matches!(meta.lifecycle, MarketLifecycle::Resolved) {
+                    return Err(ExecutionError::MarketNotResolved);
+                }
+                let winner = meta
+                    .winning_outcome
+                    .ok_or(ExecutionError::MarketNotResolved)?;
+                let win_idx = usize::from(winner);
+                // Drain mint locks into a settlement pool, then pay claim holders.
+                let minters: Vec<(u32, Amount)> = self
+                    .mint_locked
+                    .iter()
+                    .filter(|((_, m), _)| *m == c.market.get())
+                    .map(|((a, _), amt)| (*a, *amt))
+                    .collect();
+                let mut pool = Amount::ZERO;
+                for (acct, amt) in &minters {
+                    let account = AccountId::new(*acct);
+                    self.ledger.consume_locked(account, *amt)?;
+                    pool = pool.checked_add(*amt)?;
+                    self.mint_locked.remove(&(*acct, c.market.get()));
+                }
+                let holders: Vec<(u32, Vec<Amount>)> = self
+                    .claims
+                    .iter()
+                    .filter(|((_, m), _)| *m == c.market.get())
+                    .map(|((a, _), v)| (*a, v.clone()))
+                    .collect();
+                let mut paid = Amount::ZERO;
+                let mut touched: Vec<AccountId> = Vec::new();
+                for (acct, balances) in holders {
+                    let account = AccountId::new(acct);
+                    let payout = balances.get(win_idx).copied().unwrap_or(Amount::ZERO);
+                    self.claims.remove(&(acct, c.market.get()));
+                    if payout.raw() > 0 {
+                        if pool < payout {
+                            return Err(ExecutionError::IncompleteSet);
+                        }
+                        pool = pool.checked_sub(payout)?;
+                        self.ledger.credit_available(account, payout)?;
+                        self.risk.credit_collateral(account, payout)?;
+                        paid = paid.checked_add(payout)?;
+                    }
+                    touched.push(account);
+                }
+                // Any residual pool (should be zero under complete-set invariant)
+                // is burned from supply only if non-zero — treat as error.
+                if pool.raw() != 0 {
+                    return Err(ExecutionError::IncompleteSet);
+                }
+                if let Some(meta) = self.markets.get_mut(&c.market.get()) {
+                    meta.lifecycle = MarketLifecycle::Settled;
+                }
+                touched.sort_by_key(|a| a.get());
+                touched.dedup();
+                for a in touched {
+                    self.commit_account(a)?;
+                }
+                self.commit_market(c.market)?;
+                Ok(self.receipt(
+                    seq,
+                    ReceiptKind::MarketSettled {
+                        market: c.market,
+                        paid,
                     },
                 ))
             }
@@ -1119,6 +1576,7 @@ mod tests {
             quantity: Quantity::from_raw(qty),
             client_id: order_id,
             reduce_only: false,
+            instrument: 0,
             auth: Authorization::Master,
         })
     }
@@ -1202,12 +1660,13 @@ mod tests {
             .markets
             .iter()
             .map(|(&m, meta)| {
-                (
-                    m,
-                    meta.outcomes,
-                    meta.mark_price.raw(),
-                    e.books.get(&m).map(OrderBook::resting_len).unwrap_or(0),
-                )
+                let resting = e
+                    .books
+                    .iter()
+                    .filter(|((mk, _), _)| *mk == m)
+                    .map(|(_, b)| b.resting_len())
+                    .sum();
+                (m, meta.outcomes, meta.mark_price.raw(), resting)
             })
             .collect();
         markets.sort_unstable();
@@ -1386,7 +1845,7 @@ mod tests {
             Err(ExecutionError::State(_))
         ));
         assert!(!e.markets.contains_key(&1));
-        assert!(!e.books.contains_key(&1));
+        assert!(!e.books.contains_key(&(1, 0)));
         assert_eq!(fingerprint(&e), before);
         check_invariants(&e);
     }
@@ -1686,6 +2145,7 @@ mod tests {
                     quantity: Quantity::from_raw(qty),
                     client_id: *client_seq,
                     reduce_only: false,
+                    instrument: 0,
                     auth: Authorization::Master,
                 })
             }
@@ -1905,6 +2365,7 @@ mod tests {
                 quantity: Quantity::from_raw(qty),
                 client_id: 5,
                 reduce_only: false,
+                instrument: 0,
                 auth: Authorization::Master,
             })
         };
