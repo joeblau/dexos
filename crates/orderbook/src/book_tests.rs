@@ -437,6 +437,36 @@ fn basket_at_capacity_succeeds_when_all_legs_fully_fill() {
     );
 }
 
+/// Cloning the book preserves its eager capacity reservations (slab backing
+/// storage, id index) in addition to logical state, so books produced by
+/// `Clone` — the engine's per-command copy and the basket snapshot/restore
+/// path — keep the documented warm-path no-allocation guarantee. A derived
+/// clone would shrink the reservations to the current entry count.
+#[test]
+fn clone_and_basket_rollback_preserve_eager_reservations() {
+    let config = cfg();
+    let mut b = OrderBook::new(config);
+    b.submit(limit(1, 1, Side::Bid, 1, i64::MAX)).unwrap();
+    b.submit(limit(2, 2, Side::Ask, 1_000, 5)).unwrap();
+
+    let cloned = b.clone();
+    // Logical state is bit-identical...
+    assert_eq!(cloned.state_root(), b.state_root());
+    assert_eq!(cloned.resting_len(), b.resting_len());
+    // ...and the eager reservations survive the clone.
+    assert_eq!(cloned.slab.capacity(), config.capacity);
+    assert!(cloned.id_index.capacity() >= config.capacity);
+
+    // End-to-end through the production rollback path: a failing leg restores
+    // the snapshot clone, which must carry the reservations too. Leg 11
+    // overflows the price-1 bid level (the maker rests i64::MAX there),
+    // erroring only after leg 10 already mutated the book.
+    let legs = [limit(10, 3, Side::Bid, 2, 1), limit(11, 3, Side::Bid, 1, 1)];
+    assert!(b.submit_basket(&legs).is_err());
+    assert_eq!(b.resting_len(), 2);
+    assert!(b.id_index.capacity() >= config.capacity);
+}
+
 /// Property: every `Err` returned by `submit` or `submit_basket` leaves the book
 /// bit-identical to its pre-command state. Run against a deliberately small book
 /// so capacity exhaustion is exercised constantly.

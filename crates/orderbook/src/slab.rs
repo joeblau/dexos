@@ -27,13 +27,35 @@ enum Entry<T> {
 /// A fixed-capacity arena with O(1) insert and remove and deterministic reuse.
 ///
 /// [`Clone`] produces a bit-identical arena (same slots, same free list), which
-/// the order book relies on to snapshot and roll back speculative work.
-#[derive(Clone)]
+/// the order book relies on to snapshot and roll back speculative work. The
+/// clone re-reserves the full `capacity` eagerly, so cloned slabs keep the
+/// no-allocation guarantee on the warm insert path.
 pub struct Slab<T> {
     entries: Vec<Entry<T>>,
     free_head: u32,
     len: usize,
     capacity: usize,
+}
+
+impl<T: Clone> Clone for Slab<T> {
+    fn clone(&self) -> Self {
+        // `#[derive(Clone)]` would clone `entries` with capacity == len,
+        // silently dropping the eager reservation made by
+        // [`Slab::with_capacity`]; subsequent inserts into the clone would then
+        // reallocate, voiding the "no heap allocation on the warm insert path"
+        // contract for snapshot / transaction copies of the book. Rebuild the
+        // backing `Vec` at full capacity instead. This is deterministic: slot
+        // indices depend only on `entries.len()` and the copied free list, and
+        // `Vec` capacity is not part of logical state.
+        let mut entries = Vec::with_capacity(self.capacity);
+        entries.extend(self.entries.iter().cloned());
+        Slab {
+            entries,
+            free_head: self.free_head,
+            len: self.len,
+            capacity: self.capacity,
+        }
+    }
 }
 
 impl<T> Slab<T> {
@@ -246,6 +268,42 @@ mod tests {
             trace
         }
         assert_eq!(run(), run());
+    }
+
+    #[test]
+    fn clone_preserves_reserved_capacity() {
+        let mut s: Slab<u64> = Slab::with_capacity(64);
+        for i in 0..8u64 {
+            s.insert(i).unwrap();
+        }
+        let c = s.clone();
+        assert_eq!(c.capacity(), 64);
+        assert_eq!(c.len(), s.len());
+        // The backing Vec must keep the eager reservation, not shrink to len.
+        assert!(c.entries.capacity() >= 64);
+        // A clone of a completely empty slab keeps its reservation too.
+        let empty: Slab<u64> = Slab::with_capacity(16);
+        assert!(empty.clone().entries.capacity() >= 16);
+    }
+
+    #[test]
+    fn warm_inserts_into_clone_never_reallocate() {
+        let mut s: Slab<u64> = Slab::with_capacity(32);
+        for i in 0..4u64 {
+            s.insert(i).unwrap();
+        }
+        s.remove(1).unwrap();
+        let mut c = s.clone();
+        let base = c.entries.as_ptr();
+        // Free-list state survives the clone: the freed slot is reused first.
+        assert_eq!(c.insert(99).unwrap(), 1);
+        // Filling the clone to capacity must stay within the pre-reserved
+        // allocation: the backing buffer never moves (no realloc).
+        while !c.is_full() {
+            c.insert(100).unwrap();
+        }
+        assert_eq!(c.len(), c.capacity());
+        assert_eq!(c.entries.as_ptr(), base);
     }
 
     #[test]
