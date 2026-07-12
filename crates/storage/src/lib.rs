@@ -1,41 +1,61 @@
-//! `storage` — a deterministic, in-memory-backed command log and snapshot store
-//! for the DexOS exchange kernel.
+//! `storage` — deterministic command log and snapshot store for the DexOS
+//! exchange kernel.
 //!
-//! The crate provides three cooperating pieces:
+//! The crate provides cooperating pieces:
 //!
-//! * [`Record`] — checksummed framing for an opaque command payload.
-//! * [`SegmentedLog`] — an append-only log split into byte-bounded [`Segment`]s,
-//!   with checksum verification, gap/reorder detection, and crash-consistent
-//!   [`SegmentedLog::truncate_after`] truncation.
-//! * [`Snapshot`] — a versioned, self-verifying state checkpoint, and the
-//!   [`replay`] driver that reconstructs engine state from a snapshot plus the
-//!   log tail.
-//!
-//! Everything is pure and integer-only (no floating point, no async, no I/O):
-//! the byte layouts are fixed and little-endian, so logs and snapshots are
-//! bit-reproducible across machines. All decoding paths are total — arbitrary,
-//! truncated, or corrupt bytes always produce a typed error, never a panic.
+//! * [`Record`] / [`RecordRef`] — checksummed framing for opaque command
+//!   payloads, with operational size caps that reject hostile lengths before
+//!   allocation.
+//! * [`SegmentedLog`] — in-memory append-only log with sparse indexes, segment
+//!   binary search, and suffix-scaled truncation (useful for pure tests and
+//!   engines that stage commands before durability).
+//! * [`DurableLog`] — OS-backed segmented WAL with configurable
+//!   [`SyncPolicy`] (`fdatasync` after ack under [`SyncPolicy::Always`], RPO=0),
+//!   chain-hash segment integrity beyond CRC-32, crash recovery of torn tails,
+//!   and deterministic index rebuild.
+//! * [`Snapshot`] — versioned, self-verifying state checkpoint with
+//!   [`Snapshot::install_atomic`] (temp → fsync → rename).
+//! * [`replay`] — reconstruct engine state from a snapshot plus the log tail.
 //!
 //! The storage layer never interprets payloads; the engine supplies the `apply`
 //! transition to [`replay`], keeping this crate dependent only on `types` and
-//! `crypto`.
+//! `crypto` (plus `std` for the durable path).
 
 #![forbid(unsafe_code)]
 
 mod crc;
+mod durable;
+mod integrity;
+mod limits;
 mod log;
 mod record;
 mod replay;
 mod snapshot;
 
 pub use crc::crc32;
+pub use durable::{DurableConfig, DurableError, DurableLog, DurableRecords, SyncPolicy};
+pub use integrity::{chain_genesis, chain_mix, chain_over_records, DOMAIN_WAL_CHAIN};
+pub use limits::{
+    DEFAULT_INDEX_STRIDE, DEFAULT_MAX_RECORD_BYTES, DEFAULT_MAX_SNAPSHOT_STATE_BYTES,
+    INTEGRITY_CHAIN_HASH, SEGMENT_TRAILER_LEN, SEGMENT_TRAILER_MAGIC, SEGMENT_TRAILER_VERSION,
+};
 pub use log::{LogError, Records, Segment, SegmentedLog, DEFAULT_SEGMENT_BYTES};
-pub use record::{Record, RecordError, FRAME_OVERHEAD, PROTOCOL_VERSION};
+pub use record::{
+    decode_ref_bounded, peek_declared_len, Record, RecordError, RecordRef, FRAME_OVERHEAD,
+    PROTOCOL_VERSION,
+};
 pub use replay::replay;
 pub use snapshot::{Snapshot, SnapshotError, SNAPSHOT_VERSION};
 
 /// Crate identity, used by the node composition root for a startup manifest.
 pub const CRATE_NAME: &str = "storage";
+
+/// Documented recovery-point objective for [`SyncPolicy::Always`].
+///
+/// After a successful [`DurableLog::append`] under `Always`, the record has been
+/// `fdatasync`'d. Process crash or `kill -9` after that return cannot lose the
+/// acknowledged record (RPO = 0 for acks).
+pub const RPO_ALWAYS_SYNC: &str = "RPO=0 for acknowledged appends under SyncPolicy::Always (fdatasync per append)";
 
 #[cfg(test)]
 mod tests {
@@ -219,6 +239,36 @@ mod tests {
         replay(&log, None, |rec| recovered = mix(recovered, &rec.payload)).unwrap();
         assert_eq!(recovered, pre_crash);
         assert_eq!(log.last_sequence(), Some(6));
+    }
+
+    #[test]
+    fn allocation_gates_cover_record_size_classes() {
+        // 64 B, 4 KiB, and 1 MiB payload classes encode under the default max;
+        // one byte over the max is rejected without requiring a successful
+        // multi-gig decode path.
+        for payload_len in [64usize, 4 * 1024, 1024 * 1024 - FRAME_OVERHEAD] {
+            let payload = vec![0xABu8; payload_len];
+            let rec = Record {
+                protocol_version: PROTOCOL_VERSION,
+                sequence: 1,
+                timestamp: 0,
+                command_type: 1,
+                payload,
+            };
+            let bytes = rec.encode().unwrap();
+            assert!(bytes.len() <= DEFAULT_MAX_RECORD_BYTES);
+            let (back, n) = Record::decode(&bytes).unwrap();
+            assert_eq!(n, bytes.len());
+            assert_eq!(back.payload.len(), payload_len);
+        }
+        // Hostile length at the u32 max is rejected as ExceedsMax before any
+        // attempt to allocate that many payload bytes.
+        let mut hostile = vec![0u8; FRAME_OVERHEAD];
+        hostile[0..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(
+            Record::decode(&hostile),
+            Err(RecordError::ExceedsMax { .. })
+        ));
     }
 
     /// Deterministic state-mixing function standing in for an engine transition.

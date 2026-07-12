@@ -25,6 +25,7 @@ simd = []
 node = { path = "../../crates/node" }
 benchmarks = { path = "../../crates/benchmarks", optional = true }
 crypto = { path = "../../crates/crypto" }
+storage = { path = "../../crates/storage" }
 clap.workspace = true
 anyhow.workspace = true
 getrandom.workspace = true

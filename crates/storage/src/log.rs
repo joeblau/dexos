@@ -8,8 +8,14 @@
 //! Reads re-decode and re-verify every record's checksum, so corruption on disk
 //! (modelled here as a mutated byte buffer) is caught at read time and surfaced
 //! as a typed [`LogError`] rather than silently applied.
+//!
+//! Find uses binary search over segment metadata plus a sparse per-segment
+//! offset index; truncation drops/truncates only the removed suffix rather than
+//! rebuilding the retained prefix. For OS-backed durability see
+//! [`crate::DurableLog`].
 
-use crate::record::{Record, RecordError};
+use crate::limits::{DEFAULT_INDEX_STRIDE, DEFAULT_MAX_RECORD_BYTES};
+use crate::record::{decode_ref_bounded, Record, RecordError, FRAME_OVERHEAD};
 
 /// Default per-segment byte budget: 64 MiB.
 pub const DEFAULT_SEGMENT_BYTES: usize = 64 * 1024 * 1024;
@@ -44,6 +50,13 @@ pub enum LogError {
     NotFound(u64),
 }
 
+/// Sparse index: sequence at a byte offset within the segment.
+#[derive(Debug, Clone, Copy)]
+struct IndexPoint {
+    sequence: u64,
+    offset: usize,
+}
+
 /// A single append-only segment: a contiguous buffer of framed records.
 #[derive(Debug, Clone, Default)]
 pub struct Segment {
@@ -57,6 +70,8 @@ pub struct Segment {
     count: usize,
     /// Concatenated framed record bytes.
     bytes: Vec<u8>,
+    /// Sparse (sequence, offset) points for bounded local find scans.
+    index_points: Vec<IndexPoint>,
 }
 
 impl Segment {
@@ -94,7 +109,7 @@ impl Segment {
 
     /// Size of this segment's byte buffer.
     #[must_use]
-    pub const fn byte_len(&self) -> usize {
+    pub fn byte_len(&self) -> usize {
         self.bytes.len()
     }
 
@@ -116,6 +131,8 @@ impl Segment {
 pub struct SegmentedLog {
     segments: Vec<Segment>,
     segment_max_bytes: usize,
+    max_record_bytes: usize,
+    index_stride: usize,
     last_sequence: Option<u64>,
     total_records: usize,
 }
@@ -136,6 +153,8 @@ impl SegmentedLog {
         Self {
             segments: Vec::new(),
             segment_max_bytes,
+            max_record_bytes: DEFAULT_MAX_RECORD_BYTES,
+            index_stride: DEFAULT_INDEX_STRIDE,
             last_sequence: None,
             total_records: 0,
         }
@@ -145,6 +164,20 @@ impl SegmentedLog {
     #[must_use]
     pub fn with_segment_size_mb(mb: usize) -> Self {
         Self::new(mb.saturating_mul(BYTES_PER_MB))
+    }
+
+    /// Override the maximum encoded record size accepted on append/decode.
+    #[must_use]
+    pub fn with_max_record_bytes(mut self, n: usize) -> Self {
+        self.max_record_bytes = n.max(FRAME_OVERHEAD);
+        self
+    }
+
+    /// Override the sparse index stride.
+    #[must_use]
+    pub fn with_index_stride(mut self, n: usize) -> Self {
+        self.index_stride = n.max(1);
+        self
     }
 
     /// Append a command to the log.
@@ -174,6 +207,14 @@ impl SegmentedLog {
             }
         }
 
+        let framed_len = Record::encoded_len(payload.len());
+        if framed_len > self.max_record_bytes {
+            return Err(LogError::Record(RecordError::ExceedsMax {
+                declared: framed_len,
+                max: self.max_record_bytes,
+            }));
+        }
+
         let record = Record {
             protocol_version: crate::record::PROTOCOL_VERSION,
             sequence,
@@ -181,7 +222,8 @@ impl SegmentedLog {
             command_type,
             payload: payload.to_vec(),
         };
-        let framed = record.encode()?;
+        let mut framed = Vec::with_capacity(framed_len);
+        record.encode_into(&mut framed)?;
 
         let need_new_segment = match self.segments.last() {
             None => true,
@@ -199,17 +241,26 @@ impl SegmentedLog {
                 last_sequence: None,
                 count: 0,
                 bytes: Vec::new(),
+                index_points: Vec::new(),
             });
         }
 
         // Safe: we just ensured there is at least one segment.
+        let stride = self.index_stride.max(1);
         let seg = self
             .segments
             .last_mut()
             .ok_or(LogError::NotFound(sequence))?;
+        let offset = seg.bytes.len();
         seg.bytes.extend_from_slice(&framed);
         seg.count += 1;
+        if seg.count == 1 {
+            seg.base_sequence = sequence;
+        }
         seg.last_sequence = Some(sequence);
+        if seg.count == 1 || seg.count % stride == 1 {
+            seg.index_points.push(IndexPoint { sequence, offset });
+        }
         self.last_sequence = Some(sequence);
         self.total_records += 1;
         Ok(())
@@ -254,6 +305,7 @@ impl SegmentedLog {
     pub fn iter(&self) -> Records<'_> {
         Records {
             segments: &self.segments,
+            max_record_bytes: self.max_record_bytes,
             seg_idx: 0,
             offset: 0,
             done: false,
@@ -281,18 +333,26 @@ impl SegmentedLog {
 
     /// Find and decode the record with the given `sequence`.
     ///
+    /// Uses binary search over segment `[base, last]` ranges, then a sparse
+    /// offset index with a bounded local scan.
+    ///
     /// # Errors
     /// Returns [`LogError::NotFound`] if no such record exists, or a
     /// [`LogError::Record`] if the matching record is corrupt.
     pub fn find(&self, sequence: u64) -> Result<Record, LogError> {
-        for item in self.iter() {
-            let rec = item?;
-            if rec.sequence == sequence {
-                return Ok(rec);
+        let seg_idx = self.segment_index_for(sequence).ok_or(LogError::NotFound(sequence))?;
+        let seg = &self.segments[seg_idx];
+        let mut off = sparse_seek(&seg.index_points, sequence).unwrap_or(0);
+        while off < seg.bytes.len() {
+            let (rref, consumed) =
+                decode_ref_bounded(&seg.bytes[off..], self.max_record_bytes)?;
+            if rref.sequence == sequence {
+                return Ok(rref.to_owned());
             }
-            if rec.sequence > sequence {
+            if rref.sequence > sequence {
                 break;
             }
+            off += consumed;
         }
         Err(LogError::NotFound(sequence))
     }
@@ -300,31 +360,115 @@ impl SegmentedLog {
     /// Truncate the log so that only records with `sequence <= keep_through`
     /// survive, discarding everything after it.
     ///
-    /// This is the crash-recovery / checkpoint primitive: after a torn write or
-    /// a finalized checkpoint, records beyond `keep_through` are dropped and the
-    /// remaining prefix is crash-consistent and independently replayable. The
-    /// log is rebuilt from the surviving records, so segment boundaries are
-    /// re-derived but record contents and order are preserved exactly.
+    /// Work scales with the removed suffix: later segments are dropped and the
+    /// cut segment is byte-truncated at the record boundary. The retained prefix
+    /// is not re-encoded.
     ///
     /// # Errors
     /// Returns a [`LogError`] if a surviving record fails to decode (the log was
     /// already corrupt before truncation).
     pub fn truncate_after(&mut self, keep_through: u64) -> Result<(), LogError> {
-        let mut kept: Vec<Record> = Vec::new();
-        for item in self.iter() {
-            let rec = item?;
-            if rec.sequence <= keep_through {
-                kept.push(rec);
+        while let Some(last) = self.segments.last() {
+            if last.base_sequence > keep_through {
+                self.total_records = self.total_records.saturating_sub(last.count);
+                self.segments.pop();
+                continue;
             }
+            break;
         }
 
-        let mut rebuilt = SegmentedLog::new(self.segment_max_bytes);
-        for rec in kept {
-            rebuilt.append(rec.sequence, rec.timestamp, rec.command_type, &rec.payload)?;
+        if self.segments.is_empty() {
+            self.last_sequence = None;
+            return Ok(());
         }
-        *self = rebuilt;
+
+        let seg = self.segments.last_mut().expect("non-empty");
+        if seg.last_sequence.is_some_and(|ls| ls <= keep_through) {
+            self.last_sequence = seg.last_sequence;
+            return Ok(());
+        }
+
+        // Scan the cut segment only (suffix work relative to retained history).
+        let mut off = 0usize;
+        let mut kept = 0usize;
+        let mut last_seq = None;
+        let mut index_points = Vec::new();
+        let stride = self.index_stride.max(1);
+        let mut base = seg.base_sequence;
+        let max = self.max_record_bytes;
+
+        while off < seg.bytes.len() {
+            let (rref, consumed) = decode_ref_bounded(&seg.bytes[off..], max)?;
+            if rref.sequence > keep_through {
+                break;
+            }
+            if kept == 0 {
+                base = rref.sequence;
+            }
+            kept += 1;
+            last_seq = Some(rref.sequence);
+            if kept == 1 || kept % stride == 1 {
+                index_points.push(IndexPoint {
+                    sequence: rref.sequence,
+                    offset: off,
+                });
+            }
+            off += consumed;
+        }
+
+        let removed = seg.count.saturating_sub(kept);
+        self.total_records = self.total_records.saturating_sub(removed);
+
+        if kept == 0 {
+            self.segments.pop();
+            self.last_sequence = self.segments.last().and_then(|s| s.last_sequence);
+            return Ok(());
+        }
+
+        seg.bytes.truncate(off);
+        seg.count = kept;
+        seg.last_sequence = last_seq;
+        seg.base_sequence = base;
+        seg.index_points = index_points;
+        self.last_sequence = last_seq;
         Ok(())
     }
+
+    fn segment_index_for(&self, sequence: u64) -> Option<usize> {
+        let mut lo = 0usize;
+        let mut hi = self.segments.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let seg = &self.segments[mid];
+            let last = seg.last_sequence.unwrap_or(seg.base_sequence);
+            if sequence < seg.base_sequence {
+                hi = mid;
+            } else if sequence > last {
+                lo = mid + 1;
+            } else {
+                return Some(mid);
+            }
+        }
+        None
+    }
+}
+
+fn sparse_seek(points: &[IndexPoint], sequence: u64) -> Option<usize> {
+    if points.is_empty() {
+        return Some(0);
+    }
+    let mut lo = 0usize;
+    let mut hi = points.len();
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if points[mid].sequence <= sequence {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    let idx = lo.saturating_sub(1);
+    Some(points[idx].offset)
 }
 
 /// Classify a sequence mismatch as a forward gap or a backward reorder.
@@ -344,6 +488,7 @@ fn gap_or_order(expected: u64, got: u64) -> LogError {
 /// Yields `Err` and then stops on the first structural or checksum failure.
 pub struct Records<'a> {
     segments: &'a [Segment],
+    max_record_bytes: usize,
     seg_idx: usize,
     offset: usize,
     done: bool,
@@ -364,10 +509,10 @@ impl Iterator for Records<'_> {
                 continue;
             }
             let rest = &seg.as_bytes()[self.offset..];
-            return match Record::decode(rest) {
-                Ok((rec, consumed)) => {
+            return match decode_ref_bounded(rest, self.max_record_bytes) {
+                Ok((rref, consumed)) => {
                     self.offset += consumed;
-                    Some(Ok(rec))
+                    Some(Ok(rref.to_owned()))
                 }
                 Err(err) => {
                     self.done = true;
@@ -381,7 +526,6 @@ impl Iterator for Records<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::record::RecordError;
 
     fn drain(log: &SegmentedLog) -> Vec<Record> {
         log.iter().map(|r| r.unwrap()).collect()
@@ -488,7 +632,7 @@ mod tests {
 
     #[test]
     fn find_returns_record_or_not_found() {
-        let mut log = SegmentedLog::default();
+        let mut log = SegmentedLog::default().with_index_stride(2);
         for seq in 1..=4u64 {
             log.append(seq, 0, 1, format!("v{seq}").as_bytes()).unwrap();
         }
@@ -522,5 +666,37 @@ mod tests {
         }
         log.truncate_after(100).unwrap();
         assert_eq!(log.len(), 3);
+    }
+
+    #[test]
+    fn truncate_does_not_rebuild_prefix_bytes() {
+        // After truncate, retained segment bytes are a prefix of the original
+        // (suffix truncate), not a re-encoded copy with different layout.
+        let mut log = SegmentedLog::new(4096).with_index_stride(1);
+        for seq in 1..=8u64 {
+            log.append(seq, 0, 1, format!("body-{seq}").as_bytes())
+                .unwrap();
+        }
+        let prefix_before: Vec<u8> = {
+            // Encode the first 5 records independently for comparison length.
+            let mut tmp = SegmentedLog::new(4096);
+            for seq in 1..=5u64 {
+                tmp.append(seq, 0, 1, format!("body-{seq}").as_bytes())
+                    .unwrap();
+            }
+            tmp.segments[0].bytes.clone()
+        };
+        log.truncate_after(5).unwrap();
+        assert_eq!(log.segments[0].bytes, prefix_before);
+    }
+
+    #[test]
+    fn max_record_bytes_gate() {
+        let mut log = SegmentedLog::new(1024).with_max_record_bytes(40);
+        let big = vec![0u8; 64];
+        assert!(matches!(
+            log.append(1, 0, 1, &big),
+            Err(LogError::Record(RecordError::ExceedsMax { .. }))
+        ));
     }
 }
