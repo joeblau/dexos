@@ -78,6 +78,37 @@ pub enum PayoutError {
     Arith(#[from] ArithError),
 }
 
+/// An escrow-ledger failure: the canonical ledger refused an economic move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum EscrowError {
+    /// The funding (or refund) account has never been funded.
+    #[error("unknown ledger account")]
+    UnknownAccount,
+    /// The funding account cannot cover the requested lock.
+    #[error("insufficient available balance: required {required}, available {available}")]
+    InsufficientAvailable {
+        /// Amount the operation required.
+        required: i128,
+        /// Amount the account actually held.
+        available: i128,
+    },
+    /// Less value is escrowed than the release / slash asked to move.
+    #[error("insufficient escrowed balance")]
+    InsufficientEscrow,
+    /// A negative amount was supplied to a ledger operation.
+    #[error("amount must be non-negative")]
+    NegativeAmount,
+    /// A market definition tried to inject caller-constructed funded state.
+    #[error("market definition carries pre-funded sponsor stake")]
+    PrefundedStake,
+    /// A committed total failed to reconcile against escrow.
+    #[error("registry total does not reconcile to ledger escrow")]
+    Reconciliation,
+    /// A fixed-point arithmetic failure.
+    #[error("arithmetic error: {0}")]
+    Arith(#[from] ArithError),
+}
+
 /// A perpetual funding / mark / settlement failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum PerpError {
@@ -148,6 +179,9 @@ pub enum MarketError {
     /// A resolution error.
     #[error(transparent)]
     Resolution(#[from] ResolutionError),
+    /// An escrow-ledger error.
+    #[error(transparent)]
+    Escrow(#[from] EscrowError),
     /// A fixed-point arithmetic failure.
     #[error("arithmetic error: {0}")]
     Arith(#[from] ArithError),

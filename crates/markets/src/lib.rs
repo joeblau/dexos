@@ -24,6 +24,7 @@
 
 pub mod config;
 pub mod error;
+pub mod escrow;
 pub mod lifecycle;
 pub mod payout;
 pub mod perpetual;
@@ -33,8 +34,9 @@ pub mod sponsor;
 
 pub use config::{FeeSchedule, LifecycleConfig, OracleConfig, ResolverConfig, MAX_BPS};
 pub use error::{
-    LifecycleError, MarketError, PayoutError, PerpError, ResolutionError, SponsorError,
+    EscrowError, LifecycleError, MarketError, PayoutError, PerpError, ResolutionError, SponsorError,
 };
+pub use escrow::EscrowLedger;
 pub use lifecycle::{
     accepts_orders, advance, is_legal_transition, is_terminal, ALL_LIFECYCLE_STATES,
 };

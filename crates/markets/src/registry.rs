@@ -13,12 +13,13 @@ use crypto::{hash_domain, DOMAIN_MARKET};
 use risk::RiskConfig;
 use serde::{Deserialize, Serialize};
 use types::{
-    Amount, Hash, MarketId, MarketLifecycle, MarketType, OracleHealth, PayoutVector, Price,
-    SequenceNumber, SponsorId,
+    AccountId, Amount, Hash, MarketId, MarketLifecycle, MarketType, OracleHealth, PayoutVector,
+    Price, SequenceNumber, SponsorId,
 };
 
 use crate::config::{FeeSchedule, LifecycleConfig, OracleConfig, ResolverConfig, MAX_BPS};
-use crate::error::{MarketError, PayoutError, ResolutionError};
+use crate::error::{EscrowError, MarketError, PayoutError, ResolutionError};
+use crate::escrow::EscrowLedger;
 use crate::lifecycle;
 use crate::payout::{invalid_refund, CompleteSetPool, PayoutRule, Settlement};
 use crate::perpetual::PerpMarketState;
@@ -76,7 +77,7 @@ pub struct LifecycleEvent {
 }
 
 /// The internal per-market registry record.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct MarketRecord {
     definition: MarketDefinition,
     lifecycle: MarketLifecycle,
@@ -93,23 +94,37 @@ struct MarketRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MarketCommand {
+    /// Credit a deposit into a funding account's available balance. The only
+    /// way value enters the market escrow ledger.
+    Deposit {
+        /// Account to credit.
+        account: AccountId,
+        /// Amount deposited.
+        amount: Amount,
+    },
     /// Create a new market in `Draft`.
     CreateMarket(Box<MarketDefinition>),
-    /// Post sponsor stake; auto-advances `Draft -> Staked` at the requirement.
+    /// Post sponsor stake from a funding account; auto-advances
+    /// `Draft -> Staked` at the requirement.
     StakeMarket {
         /// Target market.
         market_id: MarketId,
         /// Sponsor posting stake.
         sponsor_id: SponsorId,
+        /// Funding account debited for the stake.
+        funding_account: AccountId,
         /// Amount posted.
         amount: Amount,
     },
     /// Advance `Staked -> Bootstrapping`.
     ActivateMarket(MarketId),
-    /// Add bootstrap liquidity; auto-advances `Bootstrapping -> Open`.
+    /// Add bootstrap liquidity from a funding account; auto-advances
+    /// `Bootstrapping -> Open`.
     AddBootstrapLiquidity {
         /// Target market.
         market_id: MarketId,
+        /// Funding account debited for the liquidity.
+        funding_account: AccountId,
         /// Liquidity added.
         amount: Amount,
     },
@@ -126,17 +141,23 @@ pub enum MarketCommand {
     },
     /// Advance `Closed -> PendingResolution`.
     BeginResolution(MarketId),
-    /// Mint `units` complete sets (market must be `Open`).
+    /// Mint `units` complete sets against locked collateral (market must be
+    /// `Open`).
     MintCompleteSet {
         /// Target market.
         market_id: MarketId,
+        /// Funding account debited for the collateral.
+        funding_account: AccountId,
         /// Complete sets to mint.
         units: Amount,
     },
-    /// Redeem `units` complete sets (market must be `Open`).
+    /// Redeem `units` complete sets, returning collateral (market must be
+    /// `Open`).
     RedeemCompleteSet {
         /// Target market.
         market_id: MarketId,
+        /// Account credited with the released collateral.
+        recipient: AccountId,
         /// Complete sets to redeem.
         units: Amount,
     },
@@ -145,13 +166,19 @@ pub enum MarketCommand {
 }
 
 /// The market registry.
-#[derive(Debug, Clone, Default)]
+///
+/// Every unit of economic value it reports — sponsor stake, bootstrap
+/// liquidity, complete-set collateral, insurance, protocol, and dust — is
+/// backed one-for-one by the canonical [`EscrowLedger`]. The registry never
+/// accepts caller-constructed funded state; totals are derived from committed
+/// escrow ([`MarketRegistry::reconciles`]).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MarketRegistry {
     markets: BTreeMap<MarketId, MarketRecord>,
     events: Vec<LifecycleEvent>,
     next_seq: SequenceNumber,
     applied_evidence: BTreeSet<Hash>,
-    insurance: Amount,
+    ledger: EscrowLedger,
 }
 
 impl MarketRegistry {
@@ -199,19 +226,111 @@ impl MarketRegistry {
         &self.events
     }
 
-    /// The insurance / backstop balance accumulated from slashing and dust.
+    /// The insurance / backstop balance accumulated from slashing.
     #[must_use]
     pub fn insurance(&self) -> Amount {
-        self.insurance
+        self.ledger.insurance()
+    }
+
+    /// The settlement-payable protocol balance.
+    #[must_use]
+    pub fn protocol(&self) -> Amount {
+        self.ledger.protocol()
+    }
+
+    /// The accumulated settlement rounding-dust balance.
+    #[must_use]
+    pub fn dust(&self) -> Amount {
+        self.ledger.dust()
+    }
+
+    /// The canonical escrow ledger backing every reported total.
+    #[must_use]
+    pub fn ledger(&self) -> &EscrowLedger {
+        &self.ledger
+    }
+
+    /// Available (spendable) balance of a funding account.
+    ///
+    /// # Errors
+    /// [`MarketError::Escrow`] if the account was never funded.
+    pub fn available(&self, account: AccountId) -> Result<Amount, MarketError> {
+        Ok(self.ledger.available(account)?)
+    }
+
+    /// Credit a deposit into a funding account. The sole entry point for value
+    /// into the market escrow ledger.
+    ///
+    /// # Errors
+    /// [`MarketError::Escrow`] on a negative amount or overflow.
+    pub fn deposit(&mut self, account: AccountId, amount: Amount) -> Result<(), MarketError> {
+        self.ledger.deposit(account, amount)?;
+        Ok(())
+    }
+
+    /// Whether every registry total reconciles to committed escrow and the
+    /// ledger's global conservation invariant holds. True after every command,
+    /// snapshot restore, and settlement.
+    #[must_use]
+    pub fn reconciles(&self) -> bool {
+        if !self.ledger.conservation_holds() {
+            return false;
+        }
+        for (id, record) in &self.markets {
+            if self.ledger.sponsor_stake_total(*id) != record.definition.sponsor_set.total_stake() {
+                return false;
+            }
+            if self.ledger.bootstrap(*id) != record.bootstrapped {
+                return false;
+            }
+            // A settled market's collateral has been drained from escrow into
+            // the protocol/dust accounts, while the pool retains its historical
+            // locked figure for idempotent re-settlement.
+            let expected = if record.settled {
+                Amount::ZERO
+            } else {
+                record
+                    .pool
+                    .as_ref()
+                    .map_or(Amount::ZERO, CompleteSetPool::locked_collateral)
+            };
+            if self.ledger.complete_set(*id) != expected {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Serialize the full registry (markets, events, evidence, escrow) into a
+    /// canonical snapshot.
+    ///
+    /// # Errors
+    /// [`MarketError::Escrow`] if encoding fails.
+    pub fn snapshot(&self) -> Result<Vec<u8>, MarketError> {
+        postcard::to_allocvec(self).map_err(|_| MarketError::Escrow(EscrowError::Reconciliation))
+    }
+
+    /// Restore a registry from a [`MarketRegistry::snapshot`].
+    ///
+    /// # Errors
+    /// [`MarketError::Escrow`] if the bytes do not decode.
+    pub fn restore(bytes: &[u8]) -> Result<Self, MarketError> {
+        postcard::from_bytes(bytes).map_err(|_| MarketError::Escrow(EscrowError::Reconciliation))
     }
 
     // ---- lifecycle handlers ----------------------------------------------
 
     /// Create a market in `Draft`, enforcing id uniqueness and config bounds.
     ///
+    /// The definition may not carry pre-funded sponsor stake: all stake must be
+    /// posted through [`MarketRegistry::stake_market`], which debits the
+    /// canonical ledger. A founding set with any non-zero stake is rejected.
+    ///
     /// # Errors
-    /// [`MarketError::DuplicateMarket`], or [`MarketError::ParameterOutOfRange`]
-    /// on an invalid fee schedule or negative stake requirement.
+    /// [`MarketError::DuplicateMarket`]; [`MarketError::ParameterOutOfRange`] on
+    /// an invalid fee schedule or negative stake requirement; or
+    /// [`MarketError::Escrow`] with [`EscrowError::PrefundedStake`] if any
+    /// sponsor arrives already funded.
     pub fn create_market(&mut self, definition: MarketDefinition) -> Result<(), MarketError> {
         if self.markets.contains_key(&definition.market_id) {
             return Err(MarketError::DuplicateMarket);
@@ -222,6 +341,14 @@ impl MarketRegistry {
             || definition.stake_requirement.is_negative()
         {
             return Err(MarketError::ParameterOutOfRange);
+        }
+        if definition
+            .sponsor_set
+            .shares()
+            .iter()
+            .any(|s| s.stake != Amount::ZERO)
+        {
+            return Err(MarketError::Escrow(EscrowError::PrefundedStake));
         }
         let pool = definition
             .payout_rule
@@ -273,17 +400,33 @@ impl MarketRegistry {
             .ok_or(MarketError::UnknownMarket)
     }
 
-    /// Post sponsor stake. Auto-advances `Draft -> Staked` once the aggregate
-    /// stake reaches the requirement.
+    /// Post sponsor stake, locking `amount` of `funding_account`'s available
+    /// balance into the sponsor's stake escrow. Auto-advances `Draft -> Staked`
+    /// once the aggregate stake reaches the requirement.
+    ///
+    /// The stake fails outright if the funding account cannot cover it; no
+    /// counter is ever incremented against value that does not exist.
     ///
     /// # Errors
-    /// [`MarketError::UnknownMarket`], or a wrapped [`crate::SponsorError`].
+    /// [`MarketError::UnknownMarket`], a wrapped [`crate::SponsorError`], or
+    /// [`MarketError::Escrow`] if the funding account lacks the balance.
     pub fn stake_market(
         &mut self,
         market_id: MarketId,
         sponsor_id: SponsorId,
+        funding_account: AccountId,
         amount: Amount,
     ) -> Result<Amount, MarketError> {
+        let record = self.record_mut(market_id)?;
+        // Reject unknown sponsors before touching the ledger.
+        if record.definition.sponsor_set.share(sponsor_id).is_none() {
+            return Err(MarketError::Sponsor(crate::SponsorError::UnknownSponsor));
+        }
+        // Lock funds first: an unfunded stake fails here, leaving the sponsor
+        // set untouched. The escrow mirrors the sponsor stake exactly, so the
+        // subsequent `add_stake` cannot diverge or overflow.
+        self.ledger
+            .lock_sponsor_stake(market_id, sponsor_id, funding_account, amount)?;
         let record = self.record_mut(market_id)?;
         let new_stake = record
             .definition
@@ -298,6 +441,52 @@ impl MarketRegistry {
         Ok(new_stake)
     }
 
+    /// Admit an additional sponsor to a market with zero initial stake; stake is
+    /// posted afterwards via [`MarketRegistry::stake_market`].
+    ///
+    /// # Errors
+    /// [`MarketError::UnknownMarket`], a wrapped [`crate::SponsorError`], or
+    /// [`MarketError::Escrow`] with [`EscrowError::PrefundedStake`] if `share`
+    /// carries stake.
+    pub fn add_sponsor(
+        &mut self,
+        market_id: MarketId,
+        share: crate::SponsorShare,
+    ) -> Result<(), MarketError> {
+        if share.stake != Amount::ZERO {
+            return Err(MarketError::Escrow(EscrowError::PrefundedStake));
+        }
+        let record = self.record_mut(market_id)?;
+        record.definition.sponsor_set.add_sponsor(share)?;
+        Ok(())
+    }
+
+    /// Remove a sponsor, refunding its escrowed stake to `refund_account`.
+    /// Moves existing escrow; never mints value.
+    ///
+    /// # Errors
+    /// [`MarketError::UnknownMarket`], a wrapped [`crate::SponsorError`]
+    /// (owner / empty-set / requirement breach), or [`MarketError::Escrow`].
+    pub fn remove_sponsor(
+        &mut self,
+        market_id: MarketId,
+        sponsor_id: SponsorId,
+        refund_account: AccountId,
+    ) -> Result<Amount, MarketError> {
+        let record = self.record(market_id)?;
+        let enforce = record.lifecycle != MarketLifecycle::Draft;
+        let min_required = record.definition.stake_requirement;
+        let record = self.record_mut(market_id)?;
+        let refunded =
+            record
+                .definition
+                .sponsor_set
+                .remove_sponsor(sponsor_id, min_required, enforce)?;
+        self.ledger
+            .release_sponsor_stake(market_id, sponsor_id, refund_account, refunded)?;
+        Ok(refunded)
+    }
+
     /// Advance `Staked -> Bootstrapping`.
     ///
     /// # Errors
@@ -306,21 +495,27 @@ impl MarketRegistry {
         self.transition(market_id, MarketLifecycle::Bootstrapping)
     }
 
-    /// Add bootstrap liquidity. Auto-advances `Bootstrapping -> Open` once the
-    /// configured threshold is met.
+    /// Add bootstrap liquidity, locking `amount` of `funding_account`'s
+    /// available balance into the market's bootstrap escrow. Auto-advances
+    /// `Bootstrapping -> Open` once the configured threshold is met.
     ///
     /// # Errors
-    /// [`MarketError::UnknownMarket`], [`MarketError::WrongLifecycleState`], or
+    /// [`MarketError::UnknownMarket`], [`MarketError::WrongLifecycleState`],
+    /// [`MarketError::Escrow`] if the funding account lacks the balance, or
     /// arithmetic overflow.
     pub fn add_bootstrap_liquidity(
         &mut self,
         market_id: MarketId,
+        funding_account: AccountId,
         amount: Amount,
     ) -> Result<(), MarketError> {
-        let record = self.record_mut(market_id)?;
+        let record = self.record(market_id)?;
         if record.lifecycle != MarketLifecycle::Bootstrapping {
             return Err(MarketError::WrongLifecycleState);
         }
+        self.ledger
+            .lock_bootstrap(market_id, funding_account, amount)?;
+        let record = self.record_mut(market_id)?;
         record.bootstrapped = record.bootstrapped.checked_add(amount)?;
         let met = record.bootstrapped.raw()
             >= record
@@ -412,34 +607,51 @@ impl MarketRegistry {
 
     // ---- complete sets ----------------------------------------------------
 
-    /// Mint `units` complete sets. Requires an `Open` market with an enumerable
-    /// payout rule.
+    /// Mint `units` complete sets, locking `units` of `funding_account`'s
+    /// available balance as collateral. Requires an `Open` market with an
+    /// enumerable payout rule.
     ///
     /// # Errors
     /// [`MarketError::WrongLifecycleState`] if not `Open`; [`MarketError::Payout`]
-    /// for a non-enumerable rule or a bad unit count.
+    /// for a non-enumerable rule or a non-positive unit count;
+    /// [`MarketError::Escrow`] if the funding account lacks the collateral.
     pub fn mint_complete_set(
         &mut self,
         market_id: MarketId,
+        funding_account: AccountId,
         units: Amount,
     ) -> Result<(), MarketError> {
-        let record = self.record_mut(market_id)?;
+        let record = self.record(market_id)?;
         if record.lifecycle != MarketLifecycle::Open {
             return Err(MarketError::WrongLifecycleState);
         }
+        if record.pool.is_none() {
+            return Err(MarketError::Payout(PayoutError::NonEnumerable));
+        }
+        // Reject a non-positive count before locking; the escrow lock must
+        // mirror exactly the collateral the pool commits.
+        if units.raw() <= 0 {
+            return Err(MarketError::Payout(PayoutError::NonPositiveUnits));
+        }
+        self.ledger
+            .lock_complete_set(market_id, funding_account, units)?;
+        let record = self.record_mut(market_id)?;
         let pool = record.pool.as_mut().ok_or(PayoutError::NonEnumerable)?;
         pool.mint(units)?;
         Ok(())
     }
 
-    /// Redeem `units` complete sets. Requires an `Open` market.
+    /// Redeem `units` complete sets, releasing the collateral to `recipient`.
+    /// Requires an `Open` market.
     ///
     /// # Errors
-    /// As [`MarketRegistry::mint_complete_set`], plus insufficient-balance
-    /// payout errors.
+    /// As [`MarketRegistry::mint_complete_set`], plus insufficient-claim /
+    /// insufficient-collateral payout errors. Escrow is only moved once the
+    /// pool has accepted the burn, so a rejected redeem never touches balances.
     pub fn redeem_complete_set(
         &mut self,
         market_id: MarketId,
+        recipient: AccountId,
         units: Amount,
     ) -> Result<(), MarketError> {
         let record = self.record_mut(market_id)?;
@@ -448,6 +660,8 @@ impl MarketRegistry {
         }
         let pool = record.pool.as_mut().ok_or(PayoutError::NonEnumerable)?;
         pool.redeem(units)?;
+        self.ledger
+            .release_complete_set(market_id, recipient, units)?;
         Ok(())
     }
 
@@ -514,15 +728,17 @@ impl MarketRegistry {
         self.transition(market_id, MarketLifecycle::Disputed)
     }
 
-    /// Settle a `Resolved`/`Invalid` market, distributing collateral across
-    /// outstanding claims and routing dust to the insurance backstop.
+    /// Settle a `Resolved`/`Invalid` market: drain the complete-set collateral
+    /// escrow, routing the credited total to the protocol settlement-payable
+    /// account and the rounding dust to the dust account.
     ///
     /// Idempotent: re-invoking after settlement recomputes the same
-    /// [`Settlement`] without mutating state.
+    /// [`Settlement`] without mutating state or the ledger.
     ///
     /// # Errors
     /// [`MarketError::WrongLifecycleState`] if not settleable;
-    /// [`MarketError::Payout`] if no resolution outcome / non-enumerable pool.
+    /// [`MarketError::Payout`] if no resolution outcome / non-enumerable pool;
+    /// [`MarketError::Escrow`] if the escrow fails to reconcile.
     pub fn settle_market(&mut self, market_id: MarketId) -> Result<Settlement, MarketError> {
         let record = self.record(market_id)?;
         // Idempotent no-op once settled.
@@ -536,11 +752,13 @@ impl MarketRegistry {
             return Err(MarketError::WrongLifecycleState);
         }
         let settlement = self.compute_settlement(market_id)?;
-        let dust = settlement.dust;
+        // Move existing collateral escrow into protocol/dust before committing
+        // the transition; a reconciliation failure aborts without side effects.
+        self.ledger
+            .settle_complete_set(market_id, settlement.total_credited, settlement.dust)?;
         self.transition(market_id, MarketLifecycle::Settled)?;
         let record = self.record_mut(market_id)?;
         record.settled = true;
-        self.insurance = self.insurance.checked_add(dust)?;
         Ok(settlement)
     }
 
@@ -607,7 +825,10 @@ impl MarketRegistry {
             < record.definition.stake_requirement.raw();
         let current = record.lifecycle;
         self.applied_evidence.insert(evidence_hash);
-        self.insurance = self.insurance.checked_add(slashed)?;
+        // Move the slashed stake out of the sponsor's escrow and into the
+        // insurance backstop: value is transferred, never created.
+        self.ledger
+            .slash_sponsor_stake(market_id, sponsor_id, slashed)?;
         if below && lifecycle::is_legal_transition(current, MarketLifecycle::Halted) {
             self.transition(market_id, MarketLifecycle::Halted)?;
         }
@@ -622,26 +843,36 @@ impl MarketRegistry {
     /// The command's underlying handler error.
     pub fn apply(&mut self, command: MarketCommand) -> Result<(), MarketError> {
         match command {
+            MarketCommand::Deposit { account, amount } => self.deposit(account, amount),
             MarketCommand::CreateMarket(def) => self.create_market(*def),
             MarketCommand::StakeMarket {
                 market_id,
                 sponsor_id,
+                funding_account,
                 amount,
-            } => self.stake_market(market_id, sponsor_id, amount).map(|_| ()),
+            } => self
+                .stake_market(market_id, sponsor_id, funding_account, amount)
+                .map(|_| ()),
             MarketCommand::ActivateMarket(id) => self.activate_market(id),
-            MarketCommand::AddBootstrapLiquidity { market_id, amount } => {
-                self.add_bootstrap_liquidity(market_id, amount)
-            }
+            MarketCommand::AddBootstrapLiquidity {
+                market_id,
+                funding_account,
+                amount,
+            } => self.add_bootstrap_liquidity(market_id, funding_account, amount),
             MarketCommand::HaltMarket(id) => self.halt_market(id),
             MarketCommand::ResumeMarket(id) => self.resume_market(id),
             MarketCommand::CloseMarket { market_id, now } => self.close_market(market_id, now),
             MarketCommand::BeginResolution(id) => self.begin_resolution(id),
-            MarketCommand::MintCompleteSet { market_id, units } => {
-                self.mint_complete_set(market_id, units)
-            }
-            MarketCommand::RedeemCompleteSet { market_id, units } => {
-                self.redeem_complete_set(market_id, units)
-            }
+            MarketCommand::MintCompleteSet {
+                market_id,
+                funding_account,
+                units,
+            } => self.mint_complete_set(market_id, funding_account, units),
+            MarketCommand::RedeemCompleteSet {
+                market_id,
+                recipient,
+                units,
+            } => self.redeem_complete_set(market_id, recipient, units),
             MarketCommand::ArchiveMarket(id) => self.archive_market(id),
         }
     }
@@ -655,7 +886,7 @@ impl MarketRegistry {
         let snapshot = (
             &self.markets,
             self.next_seq.get(),
-            self.insurance,
+            &self.ledger,
             &self.applied_evidence,
         );
         match postcard::to_allocvec(&snapshot) {
@@ -701,15 +932,27 @@ mod tests {
         }
     }
 
+    fn acct(n: u32) -> AccountId {
+        AccountId::new(n)
+    }
+
+    /// The shared funding account used by the lifecycle helpers.
+    const TREASURY: u32 = 100;
+
+    /// Fund the treasury, stake to `Staked`, activate, and bootstrap to `Open`,
+    /// leaving every reported total reconciled to committed escrow.
     fn drive_to_open(reg: &mut MarketRegistry, id: u32) {
         let m = MarketId::new(id);
-        reg.stake_market(m, SponsorId::new(1), Amount::from_raw(1_000_000))
+        let t = acct(TREASURY);
+        reg.deposit(t, Amount::from_raw(100_000_000)).unwrap();
+        reg.stake_market(m, SponsorId::new(1), t, Amount::from_raw(1_000_000))
             .unwrap();
         assert_eq!(reg.get_market_status(m), Some(MarketLifecycle::Staked));
         reg.activate_market(m).unwrap();
-        reg.add_bootstrap_liquidity(m, Amount::from_raw(5_000_000))
+        reg.add_bootstrap_liquidity(m, t, Amount::from_raw(5_000_000))
             .unwrap();
         assert_eq!(reg.get_market_status(m), Some(MarketLifecycle::Open));
+        assert!(reg.reconciles());
     }
 
     #[test]
@@ -771,25 +1014,28 @@ mod tests {
         let mut reg = MarketRegistry::new();
         reg.create_market(definition(1)).unwrap();
         let m = MarketId::new(1);
-        reg.stake_market(m, SponsorId::new(1), Amount::from_raw(1_000_000))
+        let t = acct(TREASURY);
+        reg.deposit(t, Amount::from_raw(10_000_000)).unwrap();
+        reg.stake_market(m, SponsorId::new(1), t, Amount::from_raw(1_000_000))
             .unwrap();
         reg.activate_market(m).unwrap();
         // Below the 5.0 threshold stays in Bootstrapping and rejects minting.
-        reg.add_bootstrap_liquidity(m, Amount::from_raw(1_000_000))
+        reg.add_bootstrap_liquidity(m, t, Amount::from_raw(1_000_000))
             .unwrap();
         assert_eq!(
             reg.get_market_status(m),
             Some(MarketLifecycle::Bootstrapping)
         );
         assert_eq!(
-            reg.mint_complete_set(m, Amount::from_raw(1_000_000))
+            reg.mint_complete_set(m, t, Amount::from_raw(1_000_000))
                 .unwrap_err(),
             MarketError::WrongLifecycleState
         );
         // Crossing the threshold opens it.
-        reg.add_bootstrap_liquidity(m, Amount::from_raw(4_000_000))
+        reg.add_bootstrap_liquidity(m, t, Amount::from_raw(4_000_000))
             .unwrap();
         assert_eq!(reg.get_market_status(m), Some(MarketLifecycle::Open));
+        assert!(reg.reconciles());
     }
 
     #[test]
@@ -825,7 +1071,7 @@ mod tests {
         reg.create_market(definition(1)).unwrap();
         let m = MarketId::new(1);
         drive_to_open(&mut reg, 1);
-        reg.mint_complete_set(m, Amount::from_raw(3_000_000))
+        reg.mint_complete_set(m, acct(TREASURY), Amount::from_raw(3_000_000))
             .unwrap();
         reg.close_market(m, 1_000).unwrap();
         reg.begin_resolution(m).unwrap();
@@ -841,15 +1087,25 @@ mod tests {
         reg.resolve_market(m, &cert, &rule).unwrap();
         assert_eq!(reg.get_market_status(m), Some(MarketLifecycle::Resolved));
 
+        // Escrow before settlement holds exactly the minted collateral.
+        assert_eq!(reg.ledger().complete_set(m), Amount::from_raw(3_000_000));
         let s1 = reg.settle_market(m).unwrap();
         assert_eq!(reg.get_market_status(m), Some(MarketLifecycle::Settled));
         // 3 complete sets, outcome 0 pays 1.0 each -> 3.0 credited, no dust.
         assert_eq!(s1.total_credited, Amount::from_raw(3_000_000));
         assert_eq!(s1.dust, Amount::ZERO);
-        // Idempotent re-settle: same result, still Settled.
+        // Settlement moved the collateral escrow into the protocol account; the
+        // dust account stayed empty; nothing was created.
+        assert_eq!(reg.ledger().complete_set(m), Amount::ZERO);
+        assert_eq!(reg.protocol(), Amount::from_raw(3_000_000));
+        assert_eq!(reg.dust(), Amount::ZERO);
+        assert!(reg.reconciles());
+        // Idempotent re-settle: same result, still Settled, ledger untouched.
         let s2 = reg.settle_market(m).unwrap();
         assert_eq!(s1, s2);
         assert_eq!(reg.get_market_status(m), Some(MarketLifecycle::Settled));
+        assert_eq!(reg.protocol(), Amount::from_raw(3_000_000));
+        assert!(reg.reconciles());
     }
 
     #[test]
@@ -889,6 +1145,13 @@ mod tests {
             reg.insurance(),
             insurance_before.checked_add(slashed).unwrap()
         );
+        // The slash moved escrow, not minted value: the sponsor's stake escrow
+        // is now empty and the ledger still reconciles.
+        assert_eq!(
+            reg.ledger().sponsor_stake(m, SponsorId::new(1)),
+            Amount::ZERO
+        );
+        assert!(reg.reconciles());
         assert_eq!(reg.get_market_status(m), Some(MarketLifecycle::Halted));
         // Replayed evidence cannot double-slash.
         assert_eq!(
@@ -919,24 +1182,33 @@ mod tests {
 
     fn command_log() -> Vec<MarketCommand> {
         let m = MarketId::new(1);
+        let t = acct(TREASURY);
         vec![
+            MarketCommand::Deposit {
+                account: t,
+                amount: Amount::from_raw(100_000_000),
+            },
             MarketCommand::CreateMarket(Box::new(definition(1))),
             MarketCommand::StakeMarket {
                 market_id: m,
                 sponsor_id: SponsorId::new(1),
+                funding_account: t,
                 amount: Amount::from_raw(1_000_000),
             },
             MarketCommand::ActivateMarket(m),
             MarketCommand::AddBootstrapLiquidity {
                 market_id: m,
+                funding_account: t,
                 amount: Amount::from_raw(5_000_000),
             },
             MarketCommand::MintCompleteSet {
                 market_id: m,
+                funding_account: t,
                 units: Amount::from_raw(2_000_000),
             },
             MarketCommand::RedeemCompleteSet {
                 market_id: m,
+                recipient: t,
                 units: Amount::from_raw(1_000_000),
             },
             MarketCommand::CloseMarket {
@@ -976,23 +1248,31 @@ mod tests {
             let mut log = Vec::new();
             for _ in 0..60 {
                 let m = MarketId::new(u32::try_from(r.next_u64() % 3).unwrap());
-                let cmd = match r.next_u64() % 8 {
+                let account = acct(u32::try_from(r.next_u64() % 3).unwrap() + 200);
+                let cmd = match r.next_u64() % 9 {
                     0 => MarketCommand::CreateMarket(Box::new(definition(m.get()))),
                     1 => MarketCommand::StakeMarket {
                         market_id: m,
                         sponsor_id: SponsorId::new(1),
+                        funding_account: account,
                         amount: Amount::from_raw(i128::from(r.next_u64() % 3_000_000)),
                     },
                     2 => MarketCommand::ActivateMarket(m),
                     3 => MarketCommand::AddBootstrapLiquidity {
                         market_id: m,
+                        funding_account: account,
                         amount: Amount::from_raw(i128::from(r.next_u64() % 6_000_000)),
                     },
                     4 => MarketCommand::HaltMarket(m),
                     5 => MarketCommand::ResumeMarket(m),
                     6 => MarketCommand::MintCompleteSet {
                         market_id: m,
+                        funding_account: account,
                         units: Amount::from_raw(i128::from(r.next_u64() % 2_000_000)),
+                    },
+                    7 => MarketCommand::Deposit {
+                        account,
+                        amount: Amount::from_raw(i128::from(r.next_u64() % 8_000_000)),
                     },
                     _ => MarketCommand::CloseMarket {
                         market_id: m,
@@ -1003,12 +1283,268 @@ mod tests {
             }
             for c in &log {
                 let _ = a.apply(c.clone());
+                // The ledger reconciles to registry totals after every command,
+                // whether it committed or was rejected.
+                assert!(a.reconciles());
             }
             for c in &log {
                 let _ = b.apply(c.clone());
             }
             assert_eq!(a.state_root(), b.state_root());
         }
+    }
+
+    #[test]
+    fn create_rejects_prefunded_sponsor_stake() {
+        let mut reg = MarketRegistry::new();
+        let mut def = definition(1);
+        // A founder arriving already funded is caller-constructed state -> reject.
+        def.sponsor_set = SponsorSet::new(SponsorShare::new(
+            SponsorId::new(1),
+            Amount::from_raw(1),
+            0,
+            0,
+        ))
+        .unwrap();
+        assert_eq!(
+            reg.create_market(def).unwrap_err(),
+            MarketError::Escrow(EscrowError::PrefundedStake)
+        );
+        // Admitting a pre-funded sponsor is likewise refused.
+        reg.create_market(definition(2)).unwrap();
+        assert_eq!(
+            reg.add_sponsor(
+                MarketId::new(2),
+                SponsorShare::new(SponsorId::new(9), Amount::from_raw(5), 0, 0)
+            )
+            .unwrap_err(),
+            MarketError::Escrow(EscrowError::PrefundedStake)
+        );
+    }
+
+    #[test]
+    fn stake_bootstrap_mint_fail_without_available_balance() {
+        let mut reg = MarketRegistry::new();
+        reg.create_market(definition(1)).unwrap();
+        let m = MarketId::new(1);
+        let t = acct(TREASURY);
+        // An unfunded (never-seen) account cannot stake.
+        assert!(matches!(
+            reg.stake_market(m, SponsorId::new(1), t, Amount::from_raw(1)),
+            Err(MarketError::Escrow(EscrowError::UnknownAccount))
+        ));
+        // Fund 0.5 but try to stake 1.0 -> InsufficientAvailable, no mutation.
+        reg.deposit(t, Amount::from_raw(500_000)).unwrap();
+        assert!(matches!(
+            reg.stake_market(m, SponsorId::new(1), t, Amount::from_raw(1_000_000)),
+            Err(MarketError::Escrow(
+                EscrowError::InsufficientAvailable { .. }
+            ))
+        ));
+        assert_eq!(reg.get_market_status(m), Some(MarketLifecycle::Draft));
+        assert_eq!(
+            reg.get_market(m).unwrap().sponsor_set.total_stake(),
+            Amount::ZERO
+        );
+        assert!(reg.reconciles());
+
+        // Stake within balance; requirement (1.0) not yet met -> still Draft.
+        reg.stake_market(m, SponsorId::new(1), t, Amount::from_raw(500_000))
+            .unwrap();
+        assert_eq!(reg.get_market_status(m), Some(MarketLifecycle::Draft));
+        reg.deposit(t, Amount::from_raw(500_000)).unwrap();
+        reg.stake_market(m, SponsorId::new(1), t, Amount::from_raw(500_000))
+            .unwrap();
+        assert_eq!(reg.get_market_status(m), Some(MarketLifecycle::Staked));
+
+        reg.activate_market(m).unwrap();
+        // Bootstrap with no available funds fails.
+        assert!(matches!(
+            reg.add_bootstrap_liquidity(m, t, Amount::from_raw(5_000_000)),
+            Err(MarketError::Escrow(
+                EscrowError::InsufficientAvailable { .. }
+            ))
+        ));
+        assert_eq!(
+            reg.get_market_status(m),
+            Some(MarketLifecycle::Bootstrapping)
+        );
+        assert!(reg.reconciles());
+
+        reg.deposit(t, Amount::from_raw(5_000_000)).unwrap();
+        reg.add_bootstrap_liquidity(m, t, Amount::from_raw(5_000_000))
+            .unwrap();
+        assert_eq!(reg.get_market_status(m), Some(MarketLifecycle::Open));
+        // Minting with a drained account fails; the pool never grows.
+        assert!(matches!(
+            reg.mint_complete_set(m, t, Amount::from_raw(1_000_000)),
+            Err(MarketError::Escrow(
+                EscrowError::InsufficientAvailable { .. }
+            ))
+        ));
+        assert_eq!(reg.ledger().complete_set(m), Amount::ZERO);
+        assert!(reg.reconciles());
+    }
+
+    #[test]
+    fn operations_lock_exactly_reported_collateral() {
+        let mut reg = MarketRegistry::new();
+        reg.create_market(definition(1)).unwrap();
+        let m = MarketId::new(1);
+        let t = acct(TREASURY);
+        reg.deposit(t, Amount::from_raw(100_000_000)).unwrap();
+        let start = reg.available(t).unwrap();
+
+        reg.stake_market(m, SponsorId::new(1), t, Amount::from_raw(1_000_000))
+            .unwrap();
+        assert_eq!(
+            reg.ledger().sponsor_stake(m, SponsorId::new(1)),
+            Amount::from_raw(1_000_000)
+        );
+        assert_eq!(
+            reg.ledger().sponsor_stake_total(m),
+            reg.get_market(m).unwrap().sponsor_set.total_stake()
+        );
+
+        reg.activate_market(m).unwrap();
+        reg.add_bootstrap_liquidity(m, t, Amount::from_raw(5_000_000))
+            .unwrap();
+        assert_eq!(reg.ledger().bootstrap(m), Amount::from_raw(5_000_000));
+
+        reg.mint_complete_set(m, t, Amount::from_raw(4_000_000))
+            .unwrap();
+        assert_eq!(reg.ledger().complete_set(m), Amount::from_raw(4_000_000));
+
+        // Exactly the reported collateral left the funding account.
+        let locked = Amount::from_raw(1_000_000 + 5_000_000 + 4_000_000);
+        assert_eq!(
+            reg.available(t).unwrap(),
+            start.checked_sub(locked).unwrap()
+        );
+        assert!(reg.reconciles());
+    }
+
+    #[test]
+    fn redeem_and_remove_move_existing_escrow_not_value() {
+        let mut reg = MarketRegistry::new();
+        reg.create_market(definition(1)).unwrap();
+        let m = MarketId::new(1);
+        let t = acct(TREASURY);
+        // A second sponsor so the removable one is not the owner-founder.
+        reg.add_sponsor(
+            m,
+            SponsorShare::new(SponsorId::new(2), Amount::ZERO, 1_000, 10),
+        )
+        .unwrap();
+        drive_to_open(&mut reg, 1);
+        let supply = reg.ledger().total_supply();
+
+        // Stake sponsor 2, then remove it: escrow refunds to a fresh account.
+        reg.stake_market(m, SponsorId::new(2), t, Amount::from_raw(2_000_000))
+            .unwrap();
+        assert_eq!(
+            reg.ledger().sponsor_stake(m, SponsorId::new(2)),
+            Amount::from_raw(2_000_000)
+        );
+        let refund = acct(300);
+        let refunded = reg.remove_sponsor(m, SponsorId::new(2), refund).unwrap();
+        assert_eq!(refunded, Amount::from_raw(2_000_000));
+        assert_eq!(reg.available(refund).unwrap(), Amount::from_raw(2_000_000));
+        assert_eq!(
+            reg.ledger().sponsor_stake(m, SponsorId::new(2)),
+            Amount::ZERO
+        );
+        assert!(reg
+            .get_market(m)
+            .unwrap()
+            .sponsor_set
+            .share(SponsorId::new(2))
+            .is_none());
+
+        // Mint then redeem: the released collateral returns to the recipient.
+        reg.mint_complete_set(m, t, Amount::from_raw(3_000_000))
+            .unwrap();
+        let before = reg.available(t).unwrap();
+        reg.redeem_complete_set(m, t, Amount::from_raw(1_000_000))
+            .unwrap();
+        assert_eq!(
+            reg.available(t).unwrap(),
+            before.checked_add(Amount::from_raw(1_000_000)).unwrap()
+        );
+        assert_eq!(reg.ledger().complete_set(m), Amount::from_raw(2_000_000));
+
+        // Every move above was a transfer; total supply is unchanged.
+        assert_eq!(reg.ledger().total_supply(), supply);
+        assert!(reg.reconciles());
+    }
+
+    #[test]
+    fn snapshot_restore_reconciles_and_preserves_state_root() {
+        let mut reg = MarketRegistry::new();
+        reg.create_market(definition(1)).unwrap();
+        let m = MarketId::new(1);
+        drive_to_open(&mut reg, 1);
+        reg.mint_complete_set(m, acct(TREASURY), Amount::from_raw(2_000_000))
+            .unwrap();
+        let root = reg.state_root();
+
+        let bytes = reg.snapshot().unwrap();
+        let restored = MarketRegistry::restore(&bytes).unwrap();
+        assert!(restored.reconciles());
+        assert_eq!(restored.state_root(), root);
+        assert_eq!(
+            restored.ledger().complete_set(m),
+            Amount::from_raw(2_000_000)
+        );
+    }
+
+    #[test]
+    fn conservation_spans_protocol_sponsor_insurance_and_dust() {
+        let mut reg = MarketRegistry::new();
+        // A 3-outcome market whose invalid refund leaves rounding dust, with a
+        // stake requirement low enough that a partial slash keeps it Open.
+        let mut def = definition(1);
+        def.payout_rule = PayoutRule::Vector(winner_takes_all(3, 0).unwrap());
+        def.stake_requirement = Amount::from_raw(1_000_000);
+        reg.create_market(def).unwrap();
+        let m = MarketId::new(1);
+        let t = acct(TREASURY);
+        reg.deposit(t, Amount::from_raw(100_000_000)).unwrap();
+
+        reg.stake_market(m, SponsorId::new(1), t, Amount::from_raw(2_000_000))
+            .unwrap();
+        reg.activate_market(m).unwrap();
+        reg.add_bootstrap_liquidity(m, t, Amount::from_raw(5_000_000))
+            .unwrap();
+        assert_eq!(reg.get_market_status(m), Some(MarketLifecycle::Open));
+
+        // Partial slash (20% of 2.0 = 0.4) funds insurance; 1.6 >= 1.0 so the
+        // market stays Open.
+        let ev = Hash::from_bytes([9u8; 32]);
+        let slashed = reg
+            .slash_sponsor(m, SponsorId::new(1), SlashableFault::InvalidConfig, ev)
+            .unwrap();
+        assert_eq!(slashed, Amount::from_raw(400_000));
+        assert_eq!(reg.get_market_status(m), Some(MarketLifecycle::Open));
+
+        // An odd collateral over three outcomes yields sub-unit settlement dust.
+        reg.mint_complete_set(m, t, Amount::from_raw(1_000_001))
+            .unwrap();
+        reg.close_market(m, 1_000).unwrap();
+        reg.begin_resolution(m).unwrap();
+        reg.invalidate_market(m).unwrap();
+        let s = reg.settle_market(m).unwrap();
+        assert_eq!(s.dust, Amount::from_raw(1));
+
+        // All four conservation accounts carry value simultaneously.
+        assert!(reg.ledger().sponsor_stake(m, SponsorId::new(1)).raw() > 0);
+        assert!(reg.insurance().raw() > 0);
+        assert!(reg.protocol().raw() > 0);
+        assert!(reg.dust().raw() > 0);
+        assert!(reg.ledger().conservation_holds());
+        assert!(reg.reconciles());
+        // Supply never moved: only the single 100.0 deposit ever entered.
+        assert_eq!(reg.ledger().total_supply(), Amount::from_raw(100_000_000));
     }
 
     #[test]
