@@ -146,9 +146,66 @@ impl ScalarOutcome {
 }
 
 /// A payout vector: the settlement value of one claim under each possible outcome.
+///
+/// Deserialization is bounded: the `values` field decodes through
+/// `deserialize_bounded_values`, which enforces the same `Empty` /
+/// [`MAX_OUTCOMES`] bounds as [`PayoutVector::new`] *during* decoding, so
+/// untrusted wire or persisted bytes can never construct an out-of-bounds
+/// vector (or drive an unbounded allocation) by bypassing the constructor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PayoutVector {
+    #[serde(deserialize_with = "deserialize_bounded_values")]
     values: Vec<Amount>,
+}
+
+/// Bounded serde decoder for the `values` field of [`PayoutVector`] (mirrors
+/// the `sig_vec` adapter in the `crypto` crate's quorum module).
+///
+/// The derived `Deserialize` for `Vec<Amount>` would trust the wire's length
+/// prefix and accept any element count, bypassing [`PayoutVector::new`]. This
+/// visitor instead:
+///
+/// 1. caps the initial capacity at `min(size_hint, MAX_OUTCOMES)` so a forged
+///    length prefix cannot drive a large pre-allocation,
+/// 2. fails with [`PayoutVectorError::TooManyOutcomes`] the moment an element
+///    would push past [`MAX_OUTCOMES`], before decoding any further elements,
+/// 3. fails with [`PayoutVectorError::Empty`] if the sequence has no elements.
+///
+/// Serialization stays derived: postcard encodes the field as a bare
+/// length-prefixed `Vec<Amount>` either way, so the wire format is unchanged.
+fn deserialize_bounded_values<'de, D>(deserializer: D) -> Result<Vec<Amount>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{Error, SeqAccess, Visitor};
+    use std::fmt;
+
+    struct BoundedVisitor;
+    impl<'de> Visitor<'de> for BoundedVisitor {
+        type Value = Vec<Amount>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "a sequence of 1..={MAX_OUTCOMES} payout amounts")
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            // Never trust the wire's claimed length for pre-allocation.
+            let hint = seq.size_hint().unwrap_or(0).min(MAX_OUTCOMES);
+            let mut out: Vec<Amount> = Vec::with_capacity(hint);
+            while let Some(value) = seq.next_element::<Amount>()? {
+                if out.len() >= MAX_OUTCOMES {
+                    return Err(A::Error::custom(PayoutVectorError::TooManyOutcomes));
+                }
+                out.push(value);
+            }
+            if out.is_empty() {
+                return Err(A::Error::custom(PayoutVectorError::Empty));
+            }
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedVisitor)
 }
 
 /// Payout-vector construction / validation failure.
@@ -398,5 +455,87 @@ mod tests {
     fn side_opposite_is_involutive() {
         assert_eq!(Side::Bid.opposite(), Side::Ask);
         assert_eq!(Side::Ask.opposite().opposite(), Side::Ask);
+    }
+
+    #[test]
+    fn payout_vector_decode_rejects_oversized_sequence() {
+        // A raw postcard sequence of MAX_OUTCOMES + 1 amounts: the derived
+        // Deserialize used to accept this, bypassing PayoutVector::new.
+        let oversized: Vec<Amount> = vec![Amount::ZERO; MAX_OUTCOMES + 1];
+        let bytes = postcard::to_allocvec(&oversized).unwrap();
+        let err = postcard::from_bytes::<PayoutVector>(&bytes).unwrap_err();
+        // postcard collapses serde custom errors (the TooManyOutcomes message)
+        // into SerdeDeCustom; the message itself is asserted below through a
+        // message-preserving deserializer.
+        assert_eq!(err, postcard::Error::SerdeDeCustom);
+    }
+
+    #[test]
+    fn payout_vector_decode_fails_early_on_forged_length_prefix() {
+        // Adversarial payload: a varint length prefix claiming 2^30 elements,
+        // followed by MAX_OUTCOMES + 1 actual zero amounts. The visitor must
+        // fail the moment element MAX_OUTCOMES + 1 appears (capacity already
+        // capped at MAX_OUTCOMES), not allocate for the claimed length.
+        let mut bytes = vec![0x80, 0x80, 0x80, 0x80, 0x04]; // varint(1 << 30)
+        bytes.extend(std::iter::repeat_n(0u8, MAX_OUTCOMES + 1)); // zigzag(0) per element
+        let err = postcard::from_bytes::<PayoutVector>(&bytes).unwrap_err();
+        assert_eq!(err, postcard::Error::SerdeDeCustom);
+    }
+
+    #[test]
+    fn payout_vector_decode_rejects_empty_sequence() {
+        let empty: Vec<Amount> = vec![];
+        let bytes = postcard::to_allocvec(&empty).unwrap();
+        assert_eq!(bytes, vec![0x00]);
+        let err = postcard::from_bytes::<PayoutVector>(&bytes).unwrap_err();
+        assert_eq!(err, postcard::Error::SerdeDeCustom);
+    }
+
+    #[test]
+    fn payout_vector_bounded_decoder_reports_typed_error_flavors() {
+        use serde::de::value::{Error as ValueError, SeqDeserializer};
+
+        // MAX_OUTCOMES + 1 elements -> TooManyOutcomes, surfaced the moment
+        // the element past the cap is seen.
+        let too_many =
+            SeqDeserializer::<_, ValueError>::new(std::iter::repeat_n(0i128, MAX_OUTCOMES + 1));
+        let err = deserialize_bounded_values(too_many).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            PayoutVectorError::TooManyOutcomes.to_string()
+        );
+
+        // Zero elements -> Empty.
+        let empty = SeqDeserializer::<_, ValueError>::new(std::iter::empty::<i128>());
+        let err = deserialize_bounded_values(empty).unwrap_err();
+        assert_eq!(err.to_string(), PayoutVectorError::Empty.to_string());
+
+        // Exactly MAX_OUTCOMES elements decode fine.
+        let max = SeqDeserializer::<_, ValueError>::new(std::iter::repeat_n(0i128, MAX_OUTCOMES));
+        let values = deserialize_bounded_values(max).unwrap();
+        assert_eq!(values.len(), MAX_OUTCOMES);
+    }
+
+    #[test]
+    fn payout_vector_wire_format_is_unchanged_and_round_trips() {
+        // The struct must still flatten to a bare Vec<Amount> on the wire so
+        // existing certificates / snapshots decode identically.
+        let values = vec![Amount::ONE, Amount::ZERO];
+        let pv = PayoutVector::new(values.clone()).unwrap();
+        let pv_bytes = postcard::to_allocvec(&pv).unwrap();
+        let bare_bytes = postcard::to_allocvec(&values).unwrap();
+        assert_eq!(pv_bytes, bare_bytes);
+        // Pin the exact bytes: len=2, zigzag-varint(1_000_000), zigzag-varint(0).
+        assert_eq!(pv_bytes, vec![0x02, 0x80, 0x89, 0x7A, 0x00]);
+
+        // Round trip through decode.
+        let decoded: PayoutVector = postcard::from_bytes(&pv_bytes).unwrap();
+        assert_eq!(decoded, pv);
+
+        // A full-width vector (exactly MAX_OUTCOMES) still round-trips.
+        let wide = PayoutVector::new(vec![Amount::from_raw(7); MAX_OUTCOMES]).unwrap();
+        let wide_bytes = postcard::to_allocvec(&wide).unwrap();
+        let wide_decoded: PayoutVector = postcard::from_bytes(&wide_bytes).unwrap();
+        assert_eq!(wide_decoded, wide);
     }
 }
