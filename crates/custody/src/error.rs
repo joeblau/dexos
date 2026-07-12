@@ -138,6 +138,20 @@ pub enum CustodyError {
     /// A rotation targeted an epoch not strictly newer than the current one.
     #[error("rotation epoch is not newer than current")]
     StaleEpoch,
+    /// Settle was attempted without a prior successful authorize for this id,
+    /// or the amount/chain does not match the authorized pending entry.
+    #[error("settlement does not match an authorized pending withdrawal")]
+    UnauthenticatedSettle,
+    /// Settlement finality proof failed policy (confirmations / missing proof).
+    #[error("settlement finality proof rejected")]
+    UnverifiedFinality,
+    /// Threshold signing was requested without a verified wallet or session
+    /// authorization for this withdrawal.
+    #[error("missing wallet or session authorization for withdrawal")]
+    MissingUserAuthorization,
+    /// EIP-1271 contract address does not match the claimed wallet address.
+    #[error("EIP-1271 contract address mismatch")]
+    ContractAddressMismatch,
 
     // ---- arithmetic / wire ------------------------------------------------
     /// A fixed-point accumulation overflowed.
@@ -154,6 +168,8 @@ impl From<CryptoError> for CustodyError {
             CryptoError::MalformedKey => Self::MalformedKey,
             CryptoError::MalformedSignature => Self::MalformedSignature,
             CryptoError::InvalidSignature => Self::InvalidSignature,
+            CryptoError::HighS => Self::InvalidSignature,
+            CryptoError::ContractAddressMismatch => Self::ContractAddressMismatch,
         }
     }
 }

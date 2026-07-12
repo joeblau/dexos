@@ -69,11 +69,14 @@ pub enum WalletProof {
         /// 64-byte `r || s` signature.
         signature: Vec<u8>,
     },
-    /// EIP-1271: smart-wallet authorization modeled as the owner secp256k1 key.
+    /// EIP-1271: smart-wallet authorization modeled as the owner secp256k1 key,
+    /// bound to the contract address (see [`crypto::verify_eip1271`] trust model).
     Eip1271 {
+        /// Smart-wallet contract address (20 bytes); must equal the bound wallet.
+        contract_address: [u8; 20],
         /// SEC1 owner public key.
         owner_public_key_sec1: Vec<u8>,
-        /// 64-byte `r || s` signature.
+        /// 64-byte `r || s` low-S signature.
         signature: Vec<u8>,
     },
     /// Solana ed25519 signature; the wallet address is the public key itself.
@@ -105,6 +108,10 @@ impl WalletProof {
     }
 
     /// Verify this proof over `message`, returning the typed error on failure.
+    ///
+    /// For [`Self::Eip1271`], `claimed_address` must be supplied as the EVM
+    /// wallet address being bound; verification fails if it disagrees with the
+    /// proof's `contract_address`.
     pub fn verify(&self, message: &[u8]) -> Result<(), CustodyError> {
         match self {
             Self::Eip712 {
@@ -112,13 +119,49 @@ impl WalletProof {
                 signature,
             } => Ok(verify_secp256k1_evm(public_key_sec1, message, signature)?),
             Self::Eip1271 {
+                contract_address,
                 owner_public_key_sec1,
                 signature,
-            } => Ok(verify_eip1271(owner_public_key_sec1, message, signature)?),
+            } => {
+                // Without a claimed address, still require contract self-binding
+                // (contract == contract) and a valid owner signature.
+                Ok(verify_eip1271(
+                    contract_address,
+                    contract_address,
+                    owner_public_key_sec1,
+                    message,
+                    signature,
+                )?)
+            }
             Self::Ed25519 {
                 public_key,
                 signature,
             } => Ok(verify_ed25519(public_key, message, signature)?),
+        }
+    }
+
+    /// Verify, binding an EIP-1271 proof to `claimed_evm` when present.
+    pub fn verify_for_address(
+        &self,
+        message: &[u8],
+        claimed_evm: Option<&[u8; 20]>,
+    ) -> Result<(), CustodyError> {
+        match self {
+            Self::Eip1271 {
+                contract_address,
+                owner_public_key_sec1,
+                signature,
+            } => {
+                let claimed = claimed_evm.ok_or(CustodyError::AddressMismatch)?;
+                Ok(verify_eip1271(
+                    contract_address,
+                    claimed,
+                    owner_public_key_sec1,
+                    message,
+                    signature,
+                )?)
+            }
+            _ => self.verify(message),
         }
     }
 
@@ -133,10 +176,12 @@ impl WalletProof {
                 w.var_bytes(signature)?;
             }
             Self::Eip1271 {
+                contract_address,
                 owner_public_key_sec1,
                 signature,
             } => {
                 w.u8(PROOF_EIP1271);
+                w.raw(contract_address);
                 w.var_bytes(owner_public_key_sec1)?;
                 w.var_bytes(signature)?;
             }
@@ -159,6 +204,7 @@ impl WalletProof {
                 signature: r.var_bytes()?,
             }),
             PROOF_EIP1271 => Ok(Self::Eip1271 {
+                contract_address: r.array::<20>()?,
                 owner_public_key_sec1: r.var_bytes()?,
                 signature: r.var_bytes()?,
             }),
@@ -416,7 +462,6 @@ impl WalletRegistry {
     /// is consistent with the proof and chain family.
     fn verify_control(&self, cmd: &BindWallet) -> Result<(), CustodyError> {
         let message = cmd.binding_message();
-        cmd.proof.verify(&message)?;
         match (&cmd.address, &cmd.proof) {
             (
                 WalletAddress::Evm(addr),
@@ -424,16 +469,27 @@ impl WalletRegistry {
                     public_key_sec1, ..
                 },
             ) => {
+                cmd.proof.verify(&message)?;
                 let derived = evm_address_from_pubkey(public_key_sec1)?;
                 if &derived != addr {
                     return Err(CustodyError::AddressMismatch);
                 }
             }
-            (WalletAddress::Evm(_), WalletProof::Eip1271 { .. }) => {
-                // Smart-wallet contract address is independent of the owner key;
-                // the owner signature has already been verified above.
+            (
+                WalletAddress::Evm(addr),
+                WalletProof::Eip1271 {
+                    contract_address, ..
+                },
+            ) => {
+                // Contract address is bound into the proof and must equal the
+                // claimed wallet address (owner key alone is insufficient).
+                cmd.proof.verify_for_address(&message, Some(addr))?;
+                if contract_address != addr {
+                    return Err(CustodyError::ContractAddressMismatch);
+                }
             }
             (WalletAddress::Svm(addr), WalletProof::Ed25519 { public_key, .. }) => {
+                cmd.proof.verify(&message)?;
                 if addr != public_key {
                     return Err(CustodyError::AddressMismatch);
                 }

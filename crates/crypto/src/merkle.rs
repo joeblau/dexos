@@ -1,8 +1,9 @@
 //! Dense binary Merkle tree with incremental updates and inclusion proofs.
 //!
 //! A fixed-capacity segment-tree layout: setting one leaf recomputes only the
-//! O(log n) nodes on its root path, and the incremental root is identical to a
-//! from-scratch recomputation over the same leaves.
+//! O(log n) nodes on its root path. Full construction from a leaf slice is
+//! bottom-up O(N) (not O(N log N) per-leaf inserts). The incremental root is
+//! identical to a from-scratch recomputation over the same leaves.
 
 use crate::hash::hash_node;
 use types::Hash;
@@ -25,16 +26,35 @@ pub struct MerkleTree {
 
 impl MerkleTree {
     /// Build a tree with capacity rounded up to a power of two ≥ `min_leaves`.
+    ///
+    /// All leaves start as [`Hash::ZERO`]; internal nodes are filled bottom-up
+    /// in O(capacity).
     pub fn new(min_leaves: usize) -> Self {
         let capacity = min_leaves.max(1).next_power_of_two();
         let mut tree = Self {
             capacity,
             nodes: vec![Hash::ZERO; capacity * 2],
         };
-        for j in (1..capacity).rev() {
-            tree.nodes[j] = hash_node(tree.nodes[2 * j], tree.nodes[2 * j + 1]);
-        }
+        tree.recompute_all_parents();
         tree
+    }
+
+    /// Build a tree from `leaves` in a single bottom-up pass: O(N).
+    ///
+    /// Capacity is the next power of two ≥ `leaves.len()` (minimum 1). Missing
+    /// trailing leaves are [`Hash::ZERO`], matching [`Self::new`] + repeated
+    /// [`Self::set`].
+    pub fn from_leaves(leaves: &[Hash]) -> Self {
+        let capacity = leaves.len().max(1).next_power_of_two();
+        let mut nodes = vec![Hash::ZERO; capacity * 2];
+        for (i, leaf) in leaves.iter().enumerate() {
+            nodes[capacity + i] = *leaf;
+        }
+        // Bottom-up: parents of the leaf layer through the root.
+        for j in (1..capacity).rev() {
+            nodes[j] = hash_node(nodes[2 * j], nodes[2 * j + 1]);
+        }
+        Self { capacity, nodes }
     }
 
     /// Leaf capacity.
@@ -42,7 +62,7 @@ impl MerkleTree {
         self.capacity
     }
 
-    /// Set a leaf and recompute its root path.
+    /// Set a leaf and recompute its root path (O(log n)).
     pub fn set(&mut self, index: usize, leaf: Hash) -> Result<(), MerkleError> {
         if index >= self.capacity {
             return Err(MerkleError::IndexOutOfRange);
@@ -57,7 +77,7 @@ impl MerkleTree {
         Ok(())
     }
 
-    /// The current root.
+    /// The current root (O(1)).
     pub fn root(&self) -> Hash {
         self.nodes[1]
     }
@@ -75,19 +95,24 @@ impl MerkleTree {
         }
         Ok(proof)
     }
+
+    /// Rebuild every internal node from the current leaves (O(capacity)).
+    fn recompute_all_parents(&mut self) {
+        for j in (1..self.capacity).rev() {
+            self.nodes[j] = hash_node(self.nodes[2 * j], self.nodes[2 * j + 1]);
+        }
+    }
 }
 
 /// From-scratch root over a leaf slice (empty slice hashes to the zero root).
+///
+/// Built bottom-up in O(N); bit-identical to inserting each leaf via
+/// [`MerkleTree::set`] into a fresh tree of the same capacity.
 pub fn merkle_root(leaves: &[Hash]) -> Hash {
     if leaves.is_empty() {
         return Hash::ZERO;
     }
-    let mut tree = MerkleTree::new(leaves.len());
-    for (i, leaf) in leaves.iter().enumerate() {
-        // In-range by construction (capacity ≥ leaves.len()).
-        let _ = tree.set(i, *leaf);
-    }
-    tree.root()
+    MerkleTree::from_leaves(leaves).root()
 }
 
 /// Verify an inclusion proof. Total (never panics) on adversarial input; returns
@@ -147,6 +172,27 @@ mod tests {
                 leaves[idx] = leaf;
                 tree.set(idx, leaf).unwrap();
                 assert_eq!(tree.root(), merkle_root(&leaves), "n={n}");
+            }
+        }
+    }
+
+    #[test]
+    fn from_leaves_matches_set_loop_and_is_bottom_up() {
+        let mut r = Lcg(99);
+        for n in [0usize, 1, 2, 3, 5, 8, 15, 16, 17, 64, 100] {
+            let leaves: Vec<Hash> = (0..n).map(|_| r.leaf()).collect();
+            let bottom_up = MerkleTree::from_leaves(&leaves);
+            let mut via_set = MerkleTree::new(leaves.len().max(1));
+            for (i, l) in leaves.iter().enumerate() {
+                via_set.set(i, *l).unwrap();
+            }
+            if leaves.is_empty() {
+                // from_leaves([]) has capacity 1 of ZERO; merkle_root([]) is ZERO.
+                assert_eq!(merkle_root(&leaves), Hash::ZERO);
+                assert_eq!(bottom_up.root(), Hash::ZERO);
+            } else {
+                assert_eq!(bottom_up.root(), via_set.root(), "n={n}");
+                assert_eq!(merkle_root(&leaves), via_set.root(), "n={n}");
             }
         }
     }

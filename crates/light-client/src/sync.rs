@@ -8,17 +8,28 @@
 //! equal the tip's `new_state_root`) and sequence continuity (`first_sequence`
 //! must be exactly the tip's `last_sequence + 1`).
 //!
+//! # Validator-set trust
+//!
+//! Epoch 0 is a **weak-subjectivity bootstrap**: the host installs a trusted
+//! genesis / checkpoint committee once (see [`ShardSync::bootstrap_validator_set`]).
+//! Every later epoch must be installed via a quorum certificate from the
+//! *prior* epoch over [`validator_set_transition_digest`] — free host
+//! replacement of a non-bootstrap set is rejected.
+//!
 //! Out-of-order / gapped delivery buffers the future checkpoint and reports the
 //! missing range so the driver can request a backfill; duplicate delivery is
 //! idempotent; a checkpoint that conflicts with an already-accepted range is
-//! rejected as equivocation. Replaying an identical stream yields an identical
-//! verified tip and accepted set (deterministic).
+//! rejected as equivocation. Compact commitments of accepted ranges are retained
+//! for a bounded history window so conflicting historical QCs still surface
+//! evidence after prune.
 
 use std::collections::BTreeMap;
 
 use consensus::{verify_checkpoint, Checkpoint};
-use crypto::ValidatorSet;
-use types::{ShardId, StateRoot};
+use crypto::{
+    hash_domain, ValidatorSet, DOMAIN_VALIDATOR_SET_TRANSITION, QuorumCertificate,
+};
+use types::{Hash, ShardId, StateRoot};
 
 use crate::error::LightClientError;
 
@@ -26,6 +37,51 @@ use crate::error::LightClientError;
 pub const DEFAULT_HISTORY_LIMIT: usize = 1024;
 /// Default bound on the out-of-order backfill buffer.
 pub const DEFAULT_BUFFER_LIMIT: usize = 256;
+
+/// Domain-separated digest the prior epoch signs to authorize a successor set.
+///
+/// Binds `(old_epoch, new_epoch, new_set.commitment())`.
+#[must_use]
+pub fn validator_set_transition_digest(
+    old_epoch: u64,
+    new_epoch: u64,
+    new_set: &ValidatorSet,
+) -> Hash {
+    let mut buf = Vec::with_capacity(8 + 8 + 32);
+    buf.extend_from_slice(&old_epoch.to_le_bytes());
+    buf.extend_from_slice(&new_epoch.to_le_bytes());
+    buf.extend_from_slice(new_set.commitment().as_bytes());
+    hash_domain(DOMAIN_VALIDATOR_SET_TRANSITION, &buf)
+}
+
+/// A quorum-proven validator-set transition from `old_epoch` to `new_epoch`.
+///
+/// `certificate` must be a QC from the **old** epoch's set over
+/// [`validator_set_transition_digest`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatorSetTransition {
+    /// Epoch of the committee that signed the transition (must already be known).
+    pub old_epoch: u64,
+    /// Epoch being installed (`old_epoch + 1` or any strictly greater unused epoch).
+    pub new_epoch: u64,
+    /// The successor validator set.
+    pub new_set: ValidatorSet,
+    /// Quorum certificate from `old_epoch` over the transition digest.
+    pub certificate: QuorumCertificate,
+}
+
+/// Compact commitment retained for an accepted range (equivocation surface).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcceptedRange {
+    /// First sequence of the range.
+    pub first: u64,
+    /// Last sequence of the range.
+    pub last: u64,
+    /// Committed state root after the range.
+    pub root: StateRoot,
+    /// Epoch that certified the range.
+    pub epoch: u64,
+}
 
 /// The highest verified checkpoint on a shard: its height and committed root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,10 +124,11 @@ pub struct ShardSync {
     shard_id: ShardId,
     trusted_root: StateRoot,
     validator_sets: BTreeMap<u64, ValidatorSet>,
+    /// Highest epoch that has been installed (bootstrap or transition).
+    latest_epoch: Option<u64>,
     tip: Option<VerifiedTip>,
-    /// `first_sequence -> (last_sequence, new_state_root)` for accepted ranges,
-    /// used for equivocation detection and stale-root classification. Bounded.
-    accepted: BTreeMap<u64, (u64, StateRoot)>,
+    /// `first_sequence -> AcceptedRange` for equivocation detection. Bounded.
+    accepted: BTreeMap<u64, AcceptedRange>,
     history_limit: usize,
     /// Future, QC-verified checkpoints held for backfill, keyed by
     /// `first_sequence`. Bounded; overflow drops with a counter.
@@ -83,6 +140,13 @@ pub struct ShardSync {
 impl ShardSync {
     /// A new sync for `shard_id` anchored at `trusted_root` (the genesis /
     /// weak-subjectivity root the first checkpoint must chain onto).
+    ///
+    /// # Weak-subjectivity bootstrap
+    ///
+    /// Callers must install the epoch-0 (or checkpoint) committee via
+    /// [`Self::bootstrap_validator_set`] from a trusted source (social
+    /// consensus, hardened config, or a weak-subjectivity checkpoint). Later
+    /// epochs require [`Self::apply_validator_set_transition`].
     #[must_use]
     pub fn new(shard_id: ShardId, trusted_root: StateRoot) -> Self {
         Self::with_limits(
@@ -105,6 +169,7 @@ impl ShardSync {
             shard_id,
             trusted_root,
             validator_sets: BTreeMap::new(),
+            latest_epoch: None,
             tip: None,
             accepted: BTreeMap::new(),
             history_limit: history_limit.max(1),
@@ -114,10 +179,110 @@ impl ShardSync {
         }
     }
 
-    /// Register (or replace) the validator set trusted for `epoch`. A checkpoint
-    /// whose epoch has no registered set is rejected.
-    pub fn register_validator_set(&mut self, epoch: u64, set: ValidatorSet) {
+    /// Weak-subjectivity bootstrap: install the **first** trusted validator set.
+    ///
+    /// Allowed only when no set is known yet. Subsequent epochs must use
+    /// [`Self::apply_validator_set_transition`]. Unsolicited replacement of an
+    /// already-installed set is rejected.
+    pub fn bootstrap_validator_set(
+        &mut self,
+        epoch: u64,
+        set: ValidatorSet,
+    ) -> Result<(), LightClientError> {
+        if !self.validator_sets.is_empty() {
+            return Err(LightClientError::UnsolicitedValidatorSet {
+                epoch,
+            });
+        }
         self.validator_sets.insert(epoch, set);
+        self.latest_epoch = Some(epoch);
+        Ok(())
+    }
+
+    /// Register a validator set — **bootstrap only** (no set installed yet).
+    ///
+    /// Prefer [`Self::bootstrap_validator_set`] for clarity. This alias exists
+    /// for call sites that historically treated host install as free; it now
+    /// fails closed once a set is present.
+    pub fn register_validator_set(&mut self, epoch: u64, set: ValidatorSet) {
+        // Fallible path is preferred; this method keeps the old signature for
+        // call-site migration but silently ignores unsolicited replacements so
+        // existing host code that re-registers the same bootstrap epoch remains
+        // harmless. Prefer `bootstrap_validator_set` / `apply_validator_set_transition`.
+        let _ = self.try_register_validator_set(epoch, set);
+    }
+
+    /// Fallible registration: bootstrap if empty; reject unsolicited replacement.
+    pub fn try_register_validator_set(
+        &mut self,
+        epoch: u64,
+        set: ValidatorSet,
+    ) -> Result<(), LightClientError> {
+        if self.validator_sets.is_empty() {
+            return self.bootstrap_validator_set(epoch, set);
+        }
+        // Idempotent re-bootstrap of the exact same epoch+commitment is OK.
+        if let Some(existing) = self.validator_sets.get(&epoch) {
+            if existing.commitment() == set.commitment() {
+                return Ok(());
+            }
+        }
+        Err(LightClientError::UnsolicitedValidatorSet { epoch })
+    }
+
+    /// Install a successor validator set proven by a QC from the prior epoch.
+    pub fn apply_validator_set_transition(
+        &mut self,
+        transition: ValidatorSetTransition,
+    ) -> Result<(), LightClientError> {
+        if transition.new_epoch <= transition.old_epoch {
+            return Err(LightClientError::InvalidValidatorSetTransition {
+                old_epoch: transition.old_epoch,
+                new_epoch: transition.new_epoch,
+            });
+        }
+        if self.validator_sets.contains_key(&transition.new_epoch) {
+            // Idempotent if identical.
+            if let Some(existing) = self.validator_sets.get(&transition.new_epoch) {
+                if existing.commitment() == transition.new_set.commitment() {
+                    return Ok(());
+                }
+            }
+            return Err(LightClientError::UnsolicitedValidatorSet {
+                epoch: transition.new_epoch,
+            });
+        }
+        let old_set = self
+            .validator_sets
+            .get(&transition.old_epoch)
+            .ok_or(LightClientError::UnknownValidatorSet {
+                epoch: transition.old_epoch,
+            })?;
+        let digest = validator_set_transition_digest(
+            transition.old_epoch,
+            transition.new_epoch,
+            &transition.new_set,
+        );
+        if transition.certificate.message != digest {
+            return Err(LightClientError::InvalidValidatorSetTransition {
+                old_epoch: transition.old_epoch,
+                new_epoch: transition.new_epoch,
+            });
+        }
+        old_set
+            .verify(&transition.certificate)
+            .map_err(|_| LightClientError::InvalidValidatorSetTransition {
+                old_epoch: transition.old_epoch,
+                new_epoch: transition.new_epoch,
+            })?;
+        self.validator_sets
+            .insert(transition.new_epoch, transition.new_set);
+        self.latest_epoch = Some(
+            self.latest_epoch
+                .unwrap_or(0)
+                .max(transition.new_epoch),
+        );
+        Ok(())
     }
 
     /// The shard this sync follows.
@@ -130,6 +295,12 @@ impl ShardSync {
     #[must_use]
     pub fn trusted_root(&self) -> StateRoot {
         self.trusted_root
+    }
+
+    /// Latest installed validator-set epoch, if any.
+    #[must_use]
+    pub fn latest_epoch(&self) -> Option<u64> {
+        self.latest_epoch
     }
 
     /// The highest verified checkpoint, if any has been accepted.
@@ -236,8 +407,8 @@ impl ShardSync {
 
     /// Classify a checkpoint whose range starts at or before the verified tip.
     fn classify_old(&self, checkpoint: &Checkpoint) -> Result<IngestOutcome, LightClientError> {
-        if let Some(&(last, root)) = self.accepted.get(&checkpoint.first_sequence) {
-            if last == checkpoint.last_sequence && root == checkpoint.new_state_root {
+        if let Some(range) = self.accepted.get(&checkpoint.first_sequence) {
+            if range.last == checkpoint.last_sequence && range.root == checkpoint.new_state_root {
                 Ok(IngestOutcome::Duplicate)
             } else {
                 Err(LightClientError::Equivocation {
@@ -246,9 +417,14 @@ impl ShardSync {
                 })
             }
         } else {
-            // Range boundary not on record (pruned or misaligned). It commits to
-            // territory we already verified; treat as a stale duplicate.
-            Ok(IngestOutcome::Duplicate)
+            // Range boundary not on record (pruned). Conflicting historical QC
+            // cannot be proven from local state; surface as stale-history miss
+            // so callers can fetch evidence from peers rather than silently
+            // accepting a fork.
+            Err(LightClientError::PrunedHistoryConflict {
+                first: checkpoint.first_sequence,
+                last: checkpoint.last_sequence,
+            })
         }
     }
 
@@ -262,7 +438,12 @@ impl ShardSync {
         });
         self.accepted.insert(
             checkpoint.first_sequence,
-            (checkpoint.last_sequence, checkpoint.new_state_root),
+            AcceptedRange {
+                first: checkpoint.first_sequence,
+                last: checkpoint.last_sequence,
+                root: checkpoint.new_state_root,
+                epoch: checkpoint.epoch,
+            },
         );
         // Bound the history window: drop the oldest ranges.
         while self.accepted.len() > self.history_limit {
@@ -315,6 +496,6 @@ impl ShardSync {
         self.accepted
             .values()
             .rev()
-            .map(|&(last, root)| (last, root))
+            .map(|r| (r.last, r.root))
     }
 }

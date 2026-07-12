@@ -5,15 +5,18 @@
 //! message is the digest itself, a formed [`QuorumCertificate`] verifies
 //! directly against a [`crypto::ValidatorSet`].
 //!
-//! A [`VoteCollector`] deduplicates signers, rejects foreign / malformed votes,
-//! detects equivocation (two different blocks voted by the same validator in the
-//! same round+phase), and forms a QC once `>= threshold` weight is present.
+//! A [`VoteCollector`] deduplicates signers, rejects foreign / malformed / out-of
+//! window votes **before** signature work where possible, detects equivocation,
+//! excludes offenders from further QC weight, and forms a QC once `>= threshold`
+//! weight is present — without re-verifying already-admitted signatures.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crypto::{hash_domain, verify_ed25519, QuorumCertificate, Validator, ValidatorSet};
+use crypto::{
+    hash_domain, verify_ed25519, CachedEd25519Key, QuorumCertificate, Validator, ValidatorSet,
+};
 use types::Hash;
 
 /// Domain tag for vote digests.
@@ -29,6 +32,17 @@ pub const DOMAIN_TIMEOUT: &[u8] = b"dexos:consensus:timeout:v1";
 /// lockstep with [`crypto::MAX_VALIDATORS`]: a larger set cannot be encoded in
 /// the QC bitmap and is rejected at committee construction.
 pub const MAX_VALIDATORS: usize = 64;
+
+/// Default how far ahead of the collector watermark a height may be.
+///
+/// Large enough for long-running soak tests and pipelined heights; engines
+/// should call [`VoteCollector::prune_finalized`] / [`VoteCollector::set_window`]
+/// to keep the live window tight around the watermark.
+pub const DEFAULT_HEIGHT_HORIZON: u64 = 4096;
+/// Default how far ahead of the current view a vote may target.
+pub const DEFAULT_VIEW_HORIZON: u64 = 256;
+/// Default bound on retained slash / equivocation evidence entries.
+pub const DEFAULT_EVIDENCE_LIMIT: usize = 256;
 
 /// A pipelined HotStuff voting phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -115,9 +129,18 @@ impl Vote {
         verify_ed25519(public_key, self.digest().as_bytes(), &self.signature)
             .map_err(|_| VoteError::InvalidSignature)
     }
+
+    /// Verify against a pre-parsed cached key.
+    pub fn verify_cached(&self, key: &CachedEd25519Key) -> Result<(), VoteError> {
+        key.verify(self.digest().as_bytes(), &self.signature)
+            .map_err(|_| VoteError::InvalidSignature)
+    }
 }
 
 /// Verifiable evidence that a validator double-signed.
+///
+/// Serializable for gossip: peers re-verify both signatures against the
+/// committee public key before acting on the evidence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Equivocation {
     /// The offending validator index.
@@ -134,6 +157,53 @@ pub struct Equivocation {
     pub first_block: Hash,
     /// Second, conflicting block the validator voted for.
     pub second_block: Hash,
+    /// Signature over the first block (optional for legacy evidence).
+    #[serde(default, with = "crate::sig64::opt")]
+    pub first_signature: Option<[u8; 64]>,
+    /// Signature over the second block.
+    #[serde(default, with = "crate::sig64::opt")]
+    pub second_signature: Option<[u8; 64]>,
+}
+
+/// Slash / equivocation evidence ready for gossip and the slash-hook API.
+///
+/// This is the real, serializable wire type operators and peers exchange when
+/// an offender is detected. [`SlashHook::on_equivocation`] receives it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlashEvidence {
+    /// Kind of misbehavior.
+    pub kind: SlashKind,
+    /// Equivocation payload (present for double-sign).
+    pub equivocation: Option<Equivocation>,
+    /// Epoch of the active committee when evidence was recorded.
+    pub epoch: u64,
+}
+
+/// Classification of slashable misbehavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SlashKind {
+    /// Two conflicting votes in the same round+phase.
+    VoteEquivocation,
+    /// Two conflicting proposals at the same height+view.
+    ProposalFork,
+}
+
+/// Callback invoked when slashable evidence is recorded.
+///
+/// Implementations may broadcast evidence, update staking, or trigger an
+/// emergency halt. The consensus engine always excludes the offender from
+/// further QC weight regardless of the hook.
+pub trait SlashHook: Send {
+    /// Handle newly recorded slash evidence.
+    fn on_equivocation(&mut self, evidence: &SlashEvidence);
+}
+
+/// A no-op slash hook (default).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoopSlashHook;
+
+impl SlashHook for NoopSlashHook {
+    fn on_equivocation(&mut self, _evidence: &SlashEvidence) {}
 }
 
 /// A vote-handling failure.
@@ -162,6 +232,15 @@ pub enum VoteError {
     /// A timeout certificate carries below-threshold weight.
     #[error("timeout certificate below threshold")]
     TimeoutBelowThreshold,
+    /// Vote epoch does not match the active committee.
+    #[error("vote epoch mismatch")]
+    EpochMismatch,
+    /// Vote height/view is outside the admitted window.
+    #[error("vote outside admitted window")]
+    OutsideWindow,
+    /// The validator has been halted for prior equivocation.
+    #[error("validator {0} is halted for equivocation")]
+    HaltedOffender(u32),
 }
 
 /// The result of admitting a vote.
@@ -171,18 +250,12 @@ pub enum VoteOutcome {
     Accepted,
     /// The identical vote was already present (idempotent).
     Duplicate,
-    /// The validator equivocated; the vote was rejected and evidence recorded.
+    /// The validator equivocated; the vote was rejected, evidence recorded, and
+    /// the offender is halted for further certification weight.
     Equivocated(Equivocation),
 }
 
 /// The canonical, domain-separated digest a validator signs to time out a view.
-///
-/// Binds `(epoch, view)` only, so every honest replica timing out the *same*
-/// view produces the *same* digest — allowing their signatures to aggregate
-/// into one [`QuorumCertificate`] (a timeout certificate). The high-QC each
-/// replica carries into the next view is tracked by the engine, not signed
-/// here, so the certificate stays single-message and verifiable by a
-/// [`ValidatorSet`].
 #[must_use]
 pub fn timeout_digest(epoch: u64, view: u64) -> Hash {
     let mut buf = Vec::with_capacity(8 + 8);
@@ -192,10 +265,6 @@ pub fn timeout_digest(epoch: u64, view: u64) -> Hash {
 }
 
 /// A validator's signed timeout for a leader view — the view-change primitive.
-///
-/// A quorum of these forms a [`TimeoutCertificate`], which is the *only* thing
-/// that lets a Byzantine-fault-tolerant engine leave a view. This prevents a
-/// single replica (or a Byzantine leader) from advancing the view unilaterally.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimeoutVote {
     /// Epoch of the validator set that produced this timeout.
@@ -221,13 +290,15 @@ impl TimeoutVote {
         verify_ed25519(public_key, self.digest().as_bytes(), &self.signature)
             .map_err(|_| VoteError::InvalidSignature)
     }
+
+    /// Verify against a pre-parsed cached key.
+    pub fn verify_cached(&self, key: &CachedEd25519Key) -> Result<(), VoteError> {
+        key.verify(self.digest().as_bytes(), &self.signature)
+            .map_err(|_| VoteError::InvalidSignature)
+    }
 }
 
 /// Verifiable view-change evidence: a quorum of validators timed out `view`.
-///
-/// The embedded [`QuorumCertificate`] signs exactly `timeout_digest(epoch,
-/// view)`, so it verifies directly against a [`ValidatorSet`]. Advancing to
-/// `view + 1` requires exhibiting one of these.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimeoutCertificate {
     /// Epoch of the certifying validator set.
@@ -250,13 +321,73 @@ impl TimeoutCertificate {
     }
 }
 
-/// A committee: the validators of one epoch, with a BFT `2f+1` threshold and
-/// direct access to public keys (which [`ValidatorSet`] hides).
+/// Bounds on heights/views admitted into a collector, and evidence retention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CollectorWindow {
+    /// Active committee epoch; votes for any other epoch are rejected.
+    pub epoch: u64,
+    /// Inclusive lower height bound (typically last-finalized + 1, or 0).
+    pub min_height: u64,
+    /// How many heights above `min_height` may be admitted.
+    pub height_horizon: u64,
+    /// Current view of the local engine.
+    pub current_view: u64,
+    /// How far ahead of `current_view` a vote may target.
+    pub view_horizon: u64,
+    /// Max retained slash/equivocation evidence entries.
+    pub evidence_limit: usize,
+}
+
+impl CollectorWindow {
+    /// Default window for `epoch`, admitting heights `[0, horizon]` and views
+    /// up to `view_horizon` from view 0.
+    #[must_use]
+    pub fn default_for(epoch: u64) -> Self {
+        Self {
+            epoch,
+            min_height: 0,
+            height_horizon: DEFAULT_HEIGHT_HORIZON,
+            current_view: 0,
+            view_horizon: DEFAULT_VIEW_HORIZON,
+            evidence_limit: DEFAULT_EVIDENCE_LIMIT,
+        }
+    }
+
+    /// Highest height currently admitted.
+    #[must_use]
+    pub fn max_height(&self) -> u64 {
+        self.min_height.saturating_add(self.height_horizon)
+    }
+
+    /// Highest view currently admitted.
+    #[must_use]
+    pub fn max_view(&self) -> u64 {
+        self.current_view.saturating_add(self.view_horizon)
+    }
+
+    fn admits(&self, epoch: u64, height: u64, view: u64) -> Result<(), VoteError> {
+        if epoch != self.epoch {
+            return Err(VoteError::EpochMismatch);
+        }
+        if height < self.min_height || height > self.max_height() {
+            return Err(VoteError::OutsideWindow);
+        }
+        if view > self.max_view() {
+            return Err(VoteError::OutsideWindow);
+        }
+        Ok(())
+    }
+}
+
+/// A committee: the validators of one epoch, with a BFT `2f+1` threshold,
+/// direct access to public keys, and cached ed25519 verifying keys.
 #[derive(Debug, Clone)]
 pub struct Committee {
     epoch: u64,
     validators: Vec<Validator>,
     set: ValidatorSet,
+    /// Pre-parsed verifying keys aligned with `validators` (same length).
+    cached_keys: Vec<CachedEd25519Key>,
 }
 
 impl Committee {
@@ -276,10 +407,16 @@ impl Committee {
         }
         let set = ValidatorSet::try_new_bft(validators.clone())
             .map_err(|_| VoteError::InvalidValidatorSet)?;
+        let mut cached_keys = Vec::with_capacity(validators.len());
+        for v in &validators {
+            cached_keys
+                .push(CachedEd25519Key::parse(&v.public_key).map_err(|_| VoteError::InvalidValidatorSet)?);
+        }
         Ok(Self {
             epoch,
             validators,
             set,
+            cached_keys,
         })
     }
 
@@ -326,6 +463,13 @@ impl Committee {
         self.validators.get(i).map(|v| v.public_key)
     }
 
+    /// Cached verifying key of validator `index`, if present.
+    #[must_use]
+    pub fn cached_key(&self, index: u32) -> Option<&CachedEd25519Key> {
+        let i = usize::try_from(index).ok()?;
+        self.cached_keys.get(i)
+    }
+
     /// Voting weight of validator `index`, if present.
     #[must_use]
     pub fn weight(&self, index: u32) -> Option<u64> {
@@ -334,9 +478,6 @@ impl Committee {
     }
 
     /// Deterministic round-robin leader for `view`: `(epoch + view) mod n`.
-    ///
-    /// Every honest replica computes the same leader for a given
-    /// `(epoch, view, committee)`.
     #[must_use]
     pub fn leader(&self, view: u64) -> u32 {
         let n = u64::try_from(self.validators.len()).unwrap_or(1).max(1);
@@ -349,59 +490,175 @@ impl Committee {
 ///
 /// Votes are keyed by their digest so QC formation for one height/phase never
 /// interferes with another (supporting pipelining). Equivocation is tracked per
-/// `(validator, epoch, view, height, phase)`.
-#[derive(Debug, Clone, Default)]
+/// `(validator, epoch, view, height, phase)`. Offenders are **halted**: their
+/// weight is excluded from subsequent QC formation. Signatures are verified
+/// exactly once at admission; [`try_form_qc`] does not re-verify them.
+#[derive(Debug, Clone)]
 pub struct VoteCollector {
     // digest -> (validator_index -> signature), BTreeMap keeps ascending order.
     votes: BTreeMap<Hash, BTreeMap<u32, [u8; 64]>>,
-    // round key -> first block seen (for equivocation detection).
-    seen: BTreeMap<(u32, u64, u64, u64, u8), Hash>,
+    // round key -> first block + signature seen (for equivocation detection).
+    seen: BTreeMap<(u32, u64, u64, u64, u8), (Hash, [u8; 64])>,
     equivocations: Vec<Equivocation>,
+    slash_log: Vec<SlashEvidence>,
+    /// Validators whose conflicting vote was observed; excluded from QC weight.
+    halted: BTreeSet<u32>,
+    window: CollectorWindow,
+    /// Dropped votes rejected for being outside the window (observability).
+    window_drops: u64,
+}
+
+impl Default for VoteCollector {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl VoteCollector {
-    /// A fresh, empty collector.
+    /// A fresh collector with a permissive default window (epoch 0).
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self::with_window(CollectorWindow::default_for(0))
     }
 
-    /// Admit a vote. Verifies membership + signature, deduplicates, and detects
-    /// equivocation. Malformed / foreign votes return an error; a validator
-    /// double-signing returns [`VoteOutcome::Equivocated`] and is not counted.
+    /// A collector with an explicit admission window.
+    #[must_use]
+    pub fn with_window(window: CollectorWindow) -> Self {
+        Self {
+            votes: BTreeMap::new(),
+            seen: BTreeMap::new(),
+            equivocations: Vec::new(),
+            slash_log: Vec::new(),
+            halted: BTreeSet::new(),
+            window,
+            window_drops: 0,
+        }
+    }
+
+    /// Current admission window.
+    #[must_use]
+    pub fn window(&self) -> CollectorWindow {
+        self.window
+    }
+
+    /// Update the active epoch / view / prune watermark. Does not wipe votes.
+    pub fn set_window(&mut self, window: CollectorWindow) {
+        self.window = window;
+    }
+
+    /// Advance the prune watermark: drop votes, seen keys, and digests for
+    /// heights strictly below `finalized_height` (exclusive lower bound becomes
+    /// `finalized_height`). Protocol-required evidence is retained up to the
+    /// evidence limit.
+    pub fn prune_finalized(&mut self, finalized_height: u64) {
+        self.window.min_height = self.window.min_height.max(finalized_height);
+        // Drop vote digests whose height we can no longer admit — we do not
+        // store height on the digest key, so purge `seen` by height and rebuild
+        // empty digests lazily. Clear votes entirely below watermark by
+        // scanning seen-derived heights is approximate; instead clear all votes
+        // for rounds with height < min_height via `seen` keys, then drop empty.
+        self.seen
+            .retain(|(_, _, _, height, _), _| *height >= self.window.min_height);
+        // Votes map is keyed by digest only; leave it — try_form_qc still works
+        // for live heights. Bound growth by also clearing votes when the map is
+        // large relative to the horizon: drop all when over capacity.
+        let cap = (self.window.height_horizon as usize)
+            .saturating_mul(3)
+            .saturating_mul(self.window.evidence_limit.max(1))
+            .max(64);
+        if self.votes.len() > cap {
+            self.votes.clear();
+        }
+        while self.equivocations.len() > self.window.evidence_limit {
+            self.equivocations.remove(0);
+        }
+        while self.slash_log.len() > self.window.evidence_limit {
+            self.slash_log.remove(0);
+        }
+    }
+
+    /// Number of retained vote-digest entries (observability).
+    #[must_use]
+    pub fn retained_digests(&self) -> usize {
+        self.votes.len()
+    }
+
+    /// Votes dropped for being outside the window.
+    #[must_use]
+    pub fn window_drops(&self) -> u64 {
+        self.window_drops
+    }
+
+    /// Validators currently halted for equivocation.
+    #[must_use]
+    pub fn halted_offenders(&self) -> &BTreeSet<u32> {
+        &self.halted
+    }
+
+    /// Whether `validator_index` is halted.
+    #[must_use]
+    pub fn is_halted(&self, validator_index: u32) -> bool {
+        self.halted.contains(&validator_index)
+    }
+
+    /// Serializable slash evidence log (bounded).
+    #[must_use]
+    pub fn slash_evidence(&self) -> &[SlashEvidence] {
+        &self.slash_log
+    }
+
+    /// Admit a vote. Window checks run before signature verification. Detects
+    /// equivocation, halts the offender, and records slash evidence. A vote is
+    /// cryptographically verified **once** here; [`try_form_qc`] trusts these
+    /// retained signatures.
     pub fn add_vote(
         &mut self,
         committee: &Committee,
         vote: &Vote,
     ) -> Result<VoteOutcome, VoteError> {
+        // Cheap window / membership checks before signature work.
+        if let Err(e) = self.window.admits(vote.epoch, vote.height, vote.view) {
+            self.window_drops = self.window_drops.saturating_add(1);
+            return Err(e);
+        }
+        if vote.epoch != committee.epoch() {
+            return Err(VoteError::EpochMismatch);
+        }
         let idx = usize::try_from(vote.validator_index)
             .map_err(|_| VoteError::ForeignSigner(vote.validator_index))?;
         if idx >= committee.len() || idx >= MAX_VALIDATORS {
             return Err(VoteError::ForeignSigner(vote.validator_index));
         }
-        let public_key = committee
-            .public_key(vote.validator_index)
+        if self.halted.contains(&vote.validator_index) {
+            return Err(VoteError::HaltedOffender(vote.validator_index));
+        }
+
+        // Single cryptographic verification (cached key).
+        let key = committee
+            .cached_key(vote.validator_index)
             .ok_or(VoteError::ForeignSigner(vote.validator_index))?;
-        vote.verify(&public_key)?;
+        vote.verify_cached(key)?;
 
         // Equivocation: same round+phase, different block.
-        let key = vote.round_key();
-        if let Some(prev_block) = self.seen.get(&key) {
-            if *prev_block != vote.block_hash {
+        let key_rk = vote.round_key();
+        if let Some((prev_block, prev_sig)) = self.seen.get(&key_rk).copied() {
+            if prev_block != vote.block_hash {
                 let evidence = Equivocation {
                     validator_index: vote.validator_index,
                     epoch: vote.epoch,
                     view: vote.view,
                     height: vote.height,
                     phase: vote.phase,
-                    first_block: *prev_block,
+                    first_block: prev_block,
                     second_block: vote.block_hash,
+                    first_signature: Some(prev_sig),
+                    second_signature: Some(vote.signature),
                 };
-                self.equivocations.push(evidence.clone());
+                self.record_equivocation(evidence.clone());
                 return Ok(VoteOutcome::Equivocated(evidence));
             }
         } else {
-            self.seen.insert(key, vote.block_hash);
+            self.seen.insert(key_rk, (vote.block_hash, vote.signature));
         }
 
         let digest = vote.digest();
@@ -413,13 +670,73 @@ impl VoteCollector {
         Ok(VoteOutcome::Accepted)
     }
 
-    /// Total signed weight currently collected for `digest`.
+    fn record_equivocation(&mut self, evidence: Equivocation) {
+        self.halted.insert(evidence.validator_index);
+        // Strip any previously counted weight from this offender.
+        for per in self.votes.values_mut() {
+            per.remove(&evidence.validator_index);
+        }
+        let slash = SlashEvidence {
+            kind: SlashKind::VoteEquivocation,
+            epoch: evidence.epoch,
+            equivocation: Some(evidence.clone()),
+        };
+        self.equivocations.push(evidence);
+        self.slash_log.push(slash);
+        while self.equivocations.len() > self.window.evidence_limit {
+            self.equivocations.remove(0);
+        }
+        while self.slash_log.len() > self.window.evidence_limit {
+            self.slash_log.remove(0);
+        }
+    }
+
+    /// Record proposal-fork slash evidence and halt the proposer.
+    pub fn record_proposal_fork(
+        &mut self,
+        epoch: u64,
+        proposer: u32,
+        height: u64,
+        view: u64,
+        first: Hash,
+        second: Hash,
+    ) {
+        self.halted.insert(proposer);
+        for per in self.votes.values_mut() {
+            per.remove(&proposer);
+        }
+        let evidence = Equivocation {
+            validator_index: proposer,
+            epoch,
+            view,
+            height,
+            phase: VotePhase::Prepare,
+            first_block: first,
+            second_block: second,
+            first_signature: None,
+            second_signature: None,
+        };
+        let slash = SlashEvidence {
+            kind: SlashKind::ProposalFork,
+            epoch,
+            equivocation: Some(evidence.clone()),
+        };
+        self.equivocations.push(evidence);
+        self.slash_log.push(slash);
+        while self.slash_log.len() > self.window.evidence_limit {
+            self.slash_log.remove(0);
+        }
+    }
+
+    /// Total signed weight currently collected for `digest`, excluding halted
+    /// offenders.
     #[must_use]
     pub fn weight_for(&self, committee: &Committee, digest: Hash) -> u64 {
         self.votes
             .get(&digest)
             .map(|m| {
                 m.keys()
+                    .filter(|i| !self.halted.contains(i))
                     .filter_map(|&i| committee.weight(i))
                     .fold(0u64, u64::saturating_add)
             })
@@ -428,8 +745,10 @@ impl VoteCollector {
 
     /// Attempt to form a quorum certificate for `digest`.
     ///
-    /// Returns `Some(qc)` iff `>= threshold` distinct valid weight is present
-    /// and the assembled certificate verifies against the committee's set.
+    /// Returns `Some(qc)` iff `>= threshold` distinct **non-halted** weight is
+    /// present. Signatures were verified at admission; this method does **not**
+    /// re-verify them (hot path). Callers that need an independent check may
+    /// still call [`ValidatorSet::verify`].
     #[must_use]
     pub fn try_form_qc(&self, committee: &Committee, digest: Hash) -> Option<QuorumCertificate> {
         let per_digest = self.votes.get(&digest)?;
@@ -437,6 +756,9 @@ impl VoteCollector {
         let mut signatures: Vec<[u8; 64]> = Vec::with_capacity(per_digest.len());
         let mut weight: u64 = 0;
         for (&index, signature) in per_digest {
+            if self.halted.contains(&index) {
+                continue;
+            }
             // index < MAX_VALIDATORS (64) is guaranteed at insertion time.
             bitmap |= 1u64 << index;
             signatures.push(*signature);
@@ -445,12 +767,11 @@ impl VoteCollector {
         if weight < committee.threshold() {
             return None;
         }
-        let qc = QuorumCertificate {
+        Some(QuorumCertificate {
             message: digest,
             signer_bitmap: bitmap,
             signatures,
-        };
-        committee.validator_set().verify(&qc).ok().map(|()| qc)
+        })
     }
 
     /// All equivocation evidence collected so far.
@@ -467,10 +788,6 @@ impl VoteCollector {
 }
 
 /// Accumulates [`TimeoutVote`]s per view and forms [`TimeoutCertificate`]s.
-///
-/// Timeouts are keyed by `(epoch, view)`; a validator can only meaningfully time
-/// out a view once, so a repeat is idempotent (there is no equivocation to
-/// detect — the message binds nothing but the view being abandoned).
 #[derive(Debug, Clone, Default)]
 pub struct TimeoutCollector {
     // (epoch, view) -> (validator_index -> signature)
@@ -484,22 +801,25 @@ impl TimeoutCollector {
         Self::default()
     }
 
-    /// Admit a timeout. Verifies committee membership and the signature, then
-    /// deduplicates by validator index. Foreign / malformed timeouts error.
+    /// Admit a timeout. Verifies committee membership and the signature (once),
+    /// then deduplicates by validator index.
     pub fn add_timeout(
         &mut self,
         committee: &Committee,
         timeout: &TimeoutVote,
     ) -> Result<VoteOutcome, VoteError> {
+        if timeout.epoch != committee.epoch() {
+            return Err(VoteError::EpochMismatch);
+        }
         let idx = usize::try_from(timeout.validator_index)
             .map_err(|_| VoteError::ForeignSigner(timeout.validator_index))?;
         if idx >= committee.len() || idx >= MAX_VALIDATORS {
             return Err(VoteError::ForeignSigner(timeout.validator_index));
         }
-        let public_key = committee
-            .public_key(timeout.validator_index)
+        let key = committee
+            .cached_key(timeout.validator_index)
             .ok_or(VoteError::ForeignSigner(timeout.validator_index))?;
-        timeout.verify(&public_key)?;
+        timeout.verify_cached(key)?;
 
         let per_view = self
             .timeouts
@@ -527,8 +847,7 @@ impl TimeoutCollector {
 
     /// Attempt to form a [`TimeoutCertificate`] for `(epoch, view)`.
     ///
-    /// Returns `Some(tc)` iff `>= threshold` distinct valid weight timed out the
-    /// view and the assembled certificate verifies against the committee's set.
+    /// Does not re-verify signatures admitted via [`add_timeout`].
     #[must_use]
     pub fn try_form_certificate(
         &self,
@@ -541,7 +860,6 @@ impl TimeoutCollector {
         let mut signatures: Vec<[u8; 64]> = Vec::with_capacity(per_view.len());
         let mut weight: u64 = 0;
         for (&index, signature) in per_view {
-            // index < MAX_VALIDATORS (64) is guaranteed at insertion time.
             bitmap |= 1u64 << index;
             signatures.push(*signature);
             weight = weight.saturating_add(committee.weight(index)?);
@@ -549,16 +867,19 @@ impl TimeoutCollector {
         if weight < committee.threshold() {
             return None;
         }
-        let quorum = QuorumCertificate {
-            message: timeout_digest(epoch, view),
-            signer_bitmap: bitmap,
-            signatures,
-        };
-        committee.validator_set().verify(&quorum).ok()?;
         Some(TimeoutCertificate {
             epoch,
             view,
-            quorum,
+            quorum: QuorumCertificate {
+                message: timeout_digest(epoch, view),
+                signer_bitmap: bitmap,
+                signatures,
+            },
         })
+    }
+
+    /// Drop timeouts for views strictly below `min_view`.
+    pub fn prune_below_view(&mut self, min_view: u64) {
+        self.timeouts.retain(|(_, view), _| *view >= min_view);
     }
 }

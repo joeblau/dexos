@@ -35,8 +35,8 @@ use types::Hash;
 
 use crate::sequencer::CommandStatus;
 use crate::vote::{
-    vote_digest, Committee, Equivocation, TimeoutCertificate, TimeoutCollector, TimeoutVote, Vote,
-    VoteError, VoteOutcome, VotePhase,
+    vote_digest, CollectorWindow, Committee, Equivocation, SlashEvidence, TimeoutCertificate,
+    TimeoutCollector, TimeoutVote, Vote, VoteError, VoteOutcome, VotePhase,
 };
 
 /// Domain tag for proposal digests.
@@ -543,6 +543,15 @@ impl BftEngine {
                     second_block: proposal.block_hash,
                 };
                 self.forks.push(fork.clone());
+                // Halt the offender: exclude from QC weight and emit slash evidence.
+                self.collector.record_proposal_fork(
+                    proposal.epoch,
+                    proposal.proposer_index,
+                    proposal.height,
+                    proposal.view,
+                    fork.first_block,
+                    fork.second_block,
+                );
                 return Ok(ProposalOutcome::Forked(fork));
             }
         }
@@ -829,6 +838,43 @@ impl BftEngine {
         self.collector.equivocations()
     }
 
+    /// Serializable slash / equivocation evidence ready for gossip.
+    #[must_use]
+    pub fn slash_evidence(&self) -> &[SlashEvidence] {
+        self.collector.slash_evidence()
+    }
+
+    /// Whether a validator is halted for prior equivocation / fork.
+    #[must_use]
+    pub fn is_offender_halted(&self, validator_index: u32) -> bool {
+        self.collector.is_halted(validator_index)
+    }
+
+    /// Prune finalized heights below `finalized_height` from the pipeline while
+    /// retaining locks, high-QC, and bounded slash evidence. Updates the vote
+    /// collector admission window so stale/future messages are rejected cheaply.
+    pub fn prune_finalized(&mut self, finalized_height: u64) {
+        self.pipeline.retain(|&h, s| {
+            h >= finalized_height || s.status != CommandStatus::Finalized
+        });
+        // Drop chain entries well below the watermark (keep one parent for ancestry).
+        let keep_from = finalized_height.saturating_sub(1);
+        self.chain.retain(|&h, _| h >= keep_from);
+        self.locked.retain(|&h, _| h >= keep_from);
+        let mut window = CollectorWindow::default_for(self.epoch());
+        window.min_height = finalized_height;
+        window.current_view = self.view;
+        self.collector.set_window(window);
+        self.collector.prune_finalized(finalized_height);
+        self.timeouts.prune_below_view(self.view.saturating_sub(2));
+    }
+
+    /// Number of heights currently retained in the pipeline (observability).
+    #[must_use]
+    pub fn retained_pipeline(&self) -> usize {
+        self.pipeline.len()
+    }
+
     /// Schedule an explicit validator-set update to activate at its
     /// `activation_epoch` boundary.
     pub fn schedule_update(&mut self, update: ValidatorSetUpdate) {
@@ -863,7 +909,9 @@ impl BftEngine {
         }
         self.committee = Committee::new_bft(new_epoch, update.validators)?;
         self.view = 0;
-        self.collector = crate::vote::VoteCollector::new();
+        let mut window = CollectorWindow::default_for(new_epoch);
+        window.current_view = 0;
+        self.collector = crate::vote::VoteCollector::with_window(window);
         self.timeouts = TimeoutCollector::new();
         self.last_view_change = None;
         Ok(())

@@ -17,3 +17,32 @@ pub(crate) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 64], D
     <[u8; 64]>::try_from(v.as_slice())
         .map_err(|_| serde::de::Error::custom("signature must be 64 bytes"))
 }
+
+/// Optional 64-byte signature adapter (`None` ↔ absent / null).
+pub(crate) mod opt {
+    use super::*;
+
+    pub(crate) fn serialize<S: Serializer>(
+        v: &Option<[u8; 64]>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(sig) => super::serialize(sig, s),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Option<[u8; 64]>, D::Error> {
+        let v: Option<Vec<u8>> = Option::deserialize(d)?;
+        match v {
+            None => Ok(None),
+            Some(bytes) => {
+                let arr = <[u8; 64]>::try_from(bytes.as_slice())
+                    .map_err(|_| serde::de::Error::custom("signature must be 64 bytes"))?;
+                Ok(Some(arr))
+            }
+        }
+    }
+}
