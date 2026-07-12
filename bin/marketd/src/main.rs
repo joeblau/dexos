@@ -227,6 +227,28 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
     }
 }
 
+/// Open a durable WAL strictly read-only for the inspection subcommands.
+///
+/// `DurableLog::open` is a *writer* open: it takes the exclusive `wal.lock`
+/// and truncates torn tails during recovery, so it must never be used by
+/// `replay`/`inspect` — they could mutate the WAL or race a live node
+/// (issue #402). `open_read_only` takes a shared lock and recovers purely in
+/// memory. A `Locked` result (a live writer holds the exclusive lock) is
+/// mapped to an operator-actionable message.
+fn open_wal_read_only(path: &std::path::Path) -> anyhow::Result<storage::DurableLog> {
+    storage::DurableLog::open_read_only(
+        storage::DurableConfig::new(path).with_sync(storage::SyncPolicy::Never),
+    )
+    .map_err(|e| match e {
+        storage::DurableError::Locked { .. } => anyhow::anyhow!(
+            "durable log {} is locked by a live writer ({e}); \
+             stop the node or run against a copy of the WAL directory",
+            path.display()
+        ),
+        e => anyhow::anyhow!("opening durable log {}: {e}", path.display()),
+    })
+}
+
 /// Load a snapshot + durable WAL, verify what can actually be verified, and
 /// count applied records.
 ///
@@ -234,18 +256,16 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
 /// and state-length bounds, so those are not re-checked here. The embedded
 /// state root is only *verified* when the operator supplies a trusted
 /// checkpoint root via `--expect-root`; otherwise it is reported as unverified.
-/// The durable log is checked for record CRCs, sequence continuity, and sealed
-/// chain tips, and `DurableLog::replay` enforces contiguous sequences from
-/// `snapshot_seq + 1`.
+/// The durable log is opened **read-only** (shared lock, in-memory recovery,
+/// no on-disk mutation), checked for record CRCs, sequence continuity, and
+/// sealed chain tips, and `DurableLog::replay` enforces contiguous sequences
+/// from `snapshot_seq + 1`.
 fn run_replay(args: &ReplayArgs) -> anyhow::Result<()> {
     let snap = storage::Snapshot::load(&args.snapshot)
         .map_err(|e| anyhow::anyhow!("loading snapshot {}: {e}", args.snapshot.display()))?;
     let root_status = describe_state_root(&snap, args.expect_root)?;
 
-    let log = storage::DurableLog::open(
-        storage::DurableConfig::new(&args.log).with_sync(storage::SyncPolicy::Never),
-    )
-    .map_err(|e| anyhow::anyhow!("opening durable log {}: {e}", args.log.display()))?;
+    let log = open_wal_read_only(&args.log)?;
     log.verify()
         .map_err(|e| anyhow::anyhow!("log integrity verify failed: {e}"))?;
 
@@ -324,11 +344,12 @@ fn describe_state_root(
 }
 
 /// Inspect a single sequence from a durable WAL directory.
+///
+/// The WAL is opened **read-only**: inspection never truncates a torn tail or
+/// takes the writer lock, so it is safe next to (but not concurrent with the
+/// exclusive lock of) a live node.
 fn run_inspect(args: &InspectArgs) -> anyhow::Result<()> {
-    let log = storage::DurableLog::open(
-        storage::DurableConfig::new(&args.log).with_sync(storage::SyncPolicy::Never),
-    )
-    .map_err(|e| anyhow::anyhow!("opening durable log {}: {e}", args.log.display()))?;
+    let log = open_wal_read_only(&args.log)?;
     let rec = log
         .find(args.sequence)
         .map_err(|e| anyhow::anyhow!("inspect sequence {}: {e}", args.sequence))?;
@@ -758,6 +779,114 @@ mod tests {
         .expect("verify without --expect-root still succeeds");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Path to the single `seg-*.log` file inside a WAL directory.
+    fn only_segment_path(dir: &std::path::Path) -> std::path::PathBuf {
+        let mut segs: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("seg-") && n.ends_with(".log"))
+            })
+            .collect();
+        segs.sort();
+        assert_eq!(segs.len(), 1, "expected exactly one segment in {dir:?}");
+        segs.remove(0)
+    }
+
+    #[test]
+    fn inspect_fails_cleanly_when_wal_is_locked_by_a_live_writer() {
+        // Issue #402: inspect used to take the writer open path and could run
+        // concurrently with a live node. Now it takes a shared lock and fails
+        // closed (typed error, no panic) while the writer holds wal.lock.
+        let dir = unique_temp_path("inspect-locked");
+        let mut writer = storage::DurableLog::open(storage::DurableConfig::new(&dir))
+            .expect("writer opens fresh WAL");
+        writer.append(1, 0, 1, b"live").expect("writer appends");
+
+        let err = run_inspect(&InspectArgs {
+            sequence: 1,
+            log: dir.clone(),
+        })
+        .expect_err("inspect must be excluded while a writer holds wal.lock");
+        assert!(
+            format!("{err:#}").contains("locked by a live writer"),
+            "error should name the lock conflict: {err:#}"
+        );
+
+        // Dropping the writer releases the lock; inspect then works read-only.
+        drop(writer);
+        run_inspect(&InspectArgs {
+            sequence: 1,
+            log: dir.clone(),
+        })
+        .expect("inspect succeeds once the writer is gone");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inspect_missing_wal_dir_is_an_error_not_an_empty_log() {
+        // A typo'd --log path must be an error; the old writer-open would
+        // create_dir_all and "inspect" a freshly created empty WAL.
+        let dir = unique_temp_path("inspect-missing");
+        let _ = std::fs::remove_dir_all(&dir);
+        let err = run_inspect(&InspectArgs {
+            sequence: 1,
+            log: dir.clone(),
+        })
+        .expect_err("missing WAL dir must be rejected");
+        assert!(
+            format!("{err:#}").contains("does not exist"),
+            "error should say the directory is missing: {err:#}"
+        );
+        assert!(!dir.exists(), "inspect must not create the WAL directory");
+    }
+
+    #[test]
+    fn replay_is_read_only_and_leaves_torn_wal_bytes_unchanged() {
+        // Issue #402: replay used DurableLog::open, whose recovery truncates a
+        // torn tail on disk — an ostensibly read-only subcommand mutated the
+        // WAL. Now recovery runs purely in memory.
+        let wal_dir = unique_temp_path("replay-ro-wal");
+        {
+            let mut log = storage::DurableLog::open(storage::DurableConfig::new(&wal_dir))
+                .expect("writer opens fresh WAL");
+            for seq in 1..=3u64 {
+                log.append(seq, seq, 1, b"cmd").expect("append");
+            }
+        }
+        // Tear the active segment's tail, as a crashed writer would.
+        let seg = only_segment_path(&wal_dir);
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&seg).unwrap();
+            f.write_all(&[0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
+            f.sync_data().unwrap();
+        }
+        let before = std::fs::read(&seg).unwrap();
+
+        // Snapshot at sequence 1 so replay applies 2..=3.
+        let snap_path = unique_temp_path("replay-ro-snap");
+        storage::Snapshot::new(types::Hash::from_bytes([9u8; 32]), 1, b"state".to_vec())
+            .install_atomic(&snap_path)
+            .expect("fixture snapshot installs");
+
+        run_replay(&ReplayArgs {
+            snapshot: snap_path.clone(),
+            log: wal_dir.clone(),
+            expect_root: None,
+        })
+        .expect("replay over a torn WAL succeeds read-only");
+
+        // The torn tail is still on disk, byte for byte: replay mutated nothing.
+        let after = std::fs::read(&seg).unwrap();
+        assert_eq!(after, before, "replay must not rewrite WAL bytes");
+
+        let _ = std::fs::remove_file(&snap_path);
+        let _ = std::fs::remove_dir_all(&wal_dir);
     }
 
     #[test]

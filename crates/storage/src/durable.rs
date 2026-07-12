@@ -14,8 +14,21 @@
 //!
 //! ```text
 //! <dir>/
+//!   wal.lock                      # dedicated advisory-lock file (never a segment)
 //!   seg-<base_sequence:020>.log   # record region + optional sealed trailer
 //! ```
+//!
+//! # Single-writer locking
+//!
+//! [`DurableLog::open`] takes an **exclusive** OS advisory lock on
+//! `<dir>/wal.lock`; [`DurableLog::open_read_only`] takes a **shared** one.
+//! Both are held for exactly the lifetime of the returned handle (dropping the
+//! log releases the lock). A second writer, or a writer racing a reader, fails
+//! closed with [`DurableError::Locked`] instead of silently corrupting the log
+//! with divergent in-memory metadata. The lock lives on a dedicated file —
+//! never a segment — because segments are created and deleted by rotation and
+//! [`DurableLog::truncate_after`], and a lock on an unlinked inode protects
+//! nothing.
 //!
 //! Sealed segments end with a fixed trailer committing `chain_tip` over all
 //! framed records. Only the active (final) segment may be trailer-less after a
@@ -31,7 +44,7 @@
 //! uses binary search over segment metadata then the sparse index, followed by a
 //! bounded local scan of at most `index_stride` records.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -106,6 +119,22 @@ pub enum DurableError {
     /// Directory / path layout invalid.
     #[error("invalid durable log path: {0}")]
     InvalidPath(String),
+    /// A conflicting advisory lock on `<dir>/wal.lock` is already held —
+    /// another writer, or (for an exclusive open) live readers.
+    #[error(
+        "durable log directory {} is locked by another process (wal.lock advisory lock held)",
+        dir.display()
+    )]
+    Locked {
+        /// Directory whose `wal.lock` is held by another handle.
+        dir: PathBuf,
+    },
+    /// Mutation attempted through a handle from [`DurableLog::open_read_only`].
+    #[error("durable log at {} was opened read-only", dir.display())]
+    ReadOnly {
+        /// Directory of the read-only log.
+        dir: PathBuf,
+    },
 }
 
 /// Configuration for opening a durable log.
@@ -202,6 +231,46 @@ pub struct DurableLog {
     active_chain: Hash,
     /// Appends since last sync_data.
     appends_since_sync: u32,
+    /// Advisory lock on `<dir>/wal.lock` — exclusive for writers, shared for
+    /// read-only handles. Held for exactly the lifetime of this log; dropping
+    /// the log drops the file and releases the lock.
+    _lock: File,
+    /// Whether this handle may mutate disk (append / seal / truncate).
+    writable: bool,
+}
+
+/// Dedicated advisory-lock file inside the WAL directory.
+///
+/// The lock deliberately lives on its own file rather than a segment:
+/// segments are created and unlinked by rotation and `truncate_after`, and an
+/// advisory lock held on a deleted inode excludes nobody.
+const LOCK_FILE_NAME: &str = "wal.lock";
+
+/// Create/open `<dir>/wal.lock` and take a non-blocking advisory lock on it.
+///
+/// Fails closed with [`DurableError::Locked`] when a conflicting lock is
+/// already held (would-block), so two writers — or a writer and a reader —
+/// can never share a WAL directory.
+fn acquire_dir_lock(dir: &Path, exclusive: bool) -> Result<File, DurableError> {
+    let lock_path = dir.join(LOCK_FILE_NAME);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    let result = if exclusive {
+        file.try_lock()
+    } else {
+        file.try_lock_shared()
+    };
+    match result {
+        Ok(()) => Ok(file),
+        Err(TryLockError::WouldBlock) => Err(DurableError::Locked {
+            dir: dir.to_path_buf(),
+        }),
+        Err(TryLockError::Error(e)) => Err(DurableError::Io(e)),
+    }
 }
 
 impl DurableLog {
@@ -218,10 +287,56 @@ impl DurableLog {
     /// returns [`DurableError::Integrity`] and leaves every on-disk byte
     /// unmodified for inspection.
     ///
+    /// Takes an **exclusive** advisory lock on `<dir>/wal.lock` held for the
+    /// lifetime of the returned handle, so a second writer — or a concurrent
+    /// [`Self::open_read_only`] reader — fails with [`DurableError::Locked`]
+    /// instead of racing recovery/appends with divergent in-memory metadata.
+    ///
     /// # Errors
-    /// Returns I/O or integrity errors.
+    /// Returns [`DurableError::Locked`] when the directory is already locked,
+    /// plus I/O or integrity errors.
     pub fn open(cfg: DurableConfig) -> Result<Self, DurableError> {
         fs::create_dir_all(&cfg.dir)?;
+        let lock = acquire_dir_lock(&cfg.dir, /*exclusive*/ true)?;
+        Self::open_locked(cfg, lock, /*writable*/ true)
+    }
+
+    /// Open an existing durable log for inspection without mutating a single
+    /// on-disk byte.
+    ///
+    /// Takes a **shared** advisory lock on `<dir>/wal.lock`: any number of
+    /// read-only handles coexist, but an exclusive writer ([`Self::open`]) is
+    /// excluded — and a live writer excludes read-only opens. The directory
+    /// must already exist: a typo'd path is [`DurableError::InvalidPath`],
+    /// not a silently empty log. Recovery runs purely in memory — a torn
+    /// tail on the final segment is excluded from the visible records but is
+    /// **not** truncated, resealed, or synced on disk.
+    ///
+    /// Mutating calls ([`Self::append`], [`Self::truncate_after`]) on the
+    /// returned handle fail with [`DurableError::ReadOnly`].
+    ///
+    /// # Errors
+    /// Returns [`DurableError::Locked`] when a writer holds the exclusive
+    /// lock, [`DurableError::InvalidPath`] when the directory does not exist,
+    /// plus I/O or integrity errors.
+    pub fn open_read_only(cfg: DurableConfig) -> Result<Self, DurableError> {
+        if !cfg.dir.is_dir() {
+            return Err(DurableError::InvalidPath(format!(
+                "durable log directory {} does not exist",
+                cfg.dir.display()
+            )));
+        }
+        let lock = acquire_dir_lock(&cfg.dir, /*exclusive*/ false)?;
+        Self::open_locked(cfg, lock, /*writable*/ false)
+    }
+
+    /// Shared recovery behind [`Self::open`] / [`Self::open_read_only`].
+    ///
+    /// Per-segment recovery ([`recover_segment`]) is already pure; the only
+    /// disk mutation during open is the final torn-tail truncation, which is
+    /// gated on `writable` so the read-only path computes the valid prefix
+    /// and metadata entirely in memory.
+    fn open_locked(cfg: DurableConfig, lock: File, writable: bool) -> Result<Self, DurableError> {
         let mut paths = list_segment_paths(&cfg.dir)?;
         paths.sort();
 
@@ -268,16 +383,12 @@ impl DurableLog {
         // Every segment verified and continuity holds — only now is it safe to
         // mutate disk state. Discard torn bytes after the valid prefix of the
         // final (unsealed) segment. If any check above failed, `open` returned
-        // without modifying a single on-disk byte.
-        if let Some(seg) = segments.last() {
-            if !seg.sealed {
-                let disk_len = fs::metadata(&seg.path)?.len();
-                if disk_len > seg.records_len {
-                    let wf = OpenOptions::new().write(true).open(&seg.path)?;
-                    wf.set_len(seg.records_len)?;
-                    wf.sync_data()?;
-                }
-            }
+        // without modifying a single on-disk byte. Read-only handles skip the
+        // truncation entirely: their in-memory `records_len` already excludes
+        // the torn suffix, so every read path sees the valid prefix while the
+        // on-disk bytes stay byte-for-byte untouched.
+        if writable {
+            truncate_torn_tail(&segments)?;
         }
 
         for (i, seg) in segments.iter_mut().enumerate() {
@@ -292,12 +403,16 @@ impl DurableLog {
             total_records,
             active_chain: chain_genesis(),
             appends_since_sync: 0,
+            _lock: lock,
+            writable,
         };
 
         if let Some(last) = log.segments.last() {
             log.active_chain = last.chain_tip;
-            let f = OpenOptions::new().read(true).write(true).open(&last.path)?;
-            log.active = Some(f);
+            if writable {
+                let f = OpenOptions::new().read(true).write(true).open(&last.path)?;
+                log.active = Some(f);
+            }
         }
 
         Ok(log)
@@ -336,7 +451,8 @@ impl DurableLog {
     /// Append a command; durability follows [`SyncPolicy`].
     ///
     /// # Errors
-    /// Returns sequence, framing, or I/O errors.
+    /// Returns [`DurableError::ReadOnly`] on a handle from
+    /// [`Self::open_read_only`], plus sequence, framing, or I/O errors.
     pub fn append(
         &mut self,
         sequence: u64,
@@ -344,6 +460,13 @@ impl DurableLog {
         command_type: u16,
         payload: &[u8],
     ) -> Result<(), DurableError> {
+        // Fail closed before any disk effect: a read-only handle holds only a
+        // shared lock, so letting it seal/rotate/write would race a writer.
+        if !self.writable {
+            return Err(DurableError::ReadOnly {
+                dir: self.cfg.dir.clone(),
+            });
+        }
         if let Some(last) = self.last_sequence {
             if sequence <= last {
                 return Err(DurableError::OutOfOrder {
@@ -497,11 +620,18 @@ impl DurableLog {
     /// the retained prefix).
     ///
     /// # Errors
-    /// Returns I/O or decode errors while locating the cut point, and
-    /// propagates a failed segment unlink. On error the in-memory metadata
-    /// (`last_sequence`, `total_records`, segment list) still matches disk,
-    /// so a reopen cannot resurrect a suffix that truncation claimed to drop.
+    /// Returns [`DurableError::ReadOnly`] on a handle from
+    /// [`Self::open_read_only`]. Returns I/O or decode errors while locating
+    /// the cut point, and propagates a failed segment unlink. On error the
+    /// in-memory metadata (`last_sequence`, `total_records`, segment list)
+    /// still matches disk, so a reopen cannot resurrect a suffix that
+    /// truncation claimed to drop.
     pub fn truncate_after(&mut self, keep_through: u64) -> Result<(), DurableError> {
+        if !self.writable {
+            return Err(DurableError::ReadOnly {
+                dir: self.cfg.dir.clone(),
+            });
+        }
         // Drop whole segments entirely after keep_through, highest-first. The
         // fallible unlink precedes every in-memory mutation and propagates:
         // if the OS refuses the unlink (EACCES, EIO, an immutable directory,
@@ -804,6 +934,25 @@ fn list_segment_paths(dir: &Path) -> Result<Vec<PathBuf>, DurableError> {
         }
     }
     Ok(out)
+}
+
+/// Discard torn bytes after the valid prefix of the final (unsealed) segment.
+///
+/// Called only from the **writable** open path, and only after every segment
+/// has verified and cross-segment continuity holds; the read-only open never
+/// reaches this function.
+fn truncate_torn_tail(segments: &[SegmentMeta]) -> Result<(), DurableError> {
+    if let Some(seg) = segments.last() {
+        if !seg.sealed {
+            let disk_len = fs::metadata(&seg.path)?.len();
+            if disk_len > seg.records_len {
+                let wf = OpenOptions::new().write(true).open(&seg.path)?;
+                wf.set_len(seg.records_len)?;
+                wf.sync_data()?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn read_records_region(path: &Path, records_len: u64) -> Result<Vec<u8>, DurableError> {
@@ -1183,9 +1332,13 @@ mod tests {
         {
             let mut log = DurableLog::open(cfg(&dir)).unwrap();
             log.append(1, 0, 1, b"durable").unwrap();
-            // Explicitly do not call drop cleanup beyond scope end — fdatasync
-            // already happened inside append.
-            std::mem::forget(log);
+            // Leak the active segment handle so no graceful close/flush runs —
+            // fdatasync already happened inside append. The wal.lock handle is
+            // dropped normally: on a real kill -9 the OS releases advisory
+            // locks with the process, but an in-process mem::forget would pin
+            // the lock for the whole test process and deadlock the reopen.
+            std::mem::forget(log.active.take());
+            drop(log);
         }
         let log = DurableLog::open(cfg(&dir)).unwrap();
         assert_eq!(log.len(), 1);
@@ -1500,6 +1653,179 @@ mod tests {
             matches!(err, DurableError::Integrity(_)),
             "expected Integrity, got {err:?}"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Unwrap the error of an open attempt (`DurableLog` is not `Debug`, so
+    /// `expect_err` cannot be used directly).
+    fn open_err(res: Result<DurableLog, DurableError>, ctx: &str) -> DurableError {
+        match res {
+            Ok(_) => panic!("open unexpectedly succeeded: {ctx}"),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn second_exclusive_open_fails_locked() {
+        // Two live writers on one WAL directory would each hold independent
+        // in-memory metadata and corrupt the log; the second must fail closed.
+        let dir = temp_dir("lock-excl");
+        let writer = DurableLog::open(cfg(&dir)).unwrap();
+        let err = open_err(
+            DurableLog::open(cfg(&dir)),
+            "second writer must be rejected",
+        );
+        assert!(
+            matches!(err, DurableError::Locked { .. }),
+            "expected Locked, got {err:?}"
+        );
+        // The lock lives exactly as long as the handle: drop releases it.
+        drop(writer);
+        let _reopened = DurableLog::open(cfg(&dir)).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shared_readers_coexist_and_exclude_writer() {
+        let dir = temp_dir("lock-shared");
+        {
+            let mut log = DurableLog::open(cfg(&dir)).unwrap();
+            log.append(1, 0, 1, b"a").unwrap();
+        }
+
+        // Multiple shared read-only handles coexist.
+        let r1 = DurableLog::open_read_only(cfg(&dir)).unwrap();
+        let r2 = DurableLog::open_read_only(cfg(&dir)).unwrap();
+        assert_eq!(r1.len(), 1);
+        assert_eq!(r2.len(), 1);
+
+        // An exclusive writer is excluded while ANY reader holds the lock.
+        let err = open_err(
+            DurableLog::open(cfg(&dir)),
+            "writer must be excluded by readers",
+        );
+        assert!(
+            matches!(err, DurableError::Locked { .. }),
+            "expected Locked, got {err:?}"
+        );
+        drop(r1);
+        let err = open_err(
+            DurableLog::open(cfg(&dir)),
+            "one remaining reader still excludes",
+        );
+        assert!(
+            matches!(err, DurableError::Locked { .. }),
+            "expected Locked, got {err:?}"
+        );
+        drop(r2);
+
+        // And vice versa: a live writer excludes read-only opens.
+        let writer = DurableLog::open(cfg(&dir)).unwrap();
+        let err = open_err(
+            DurableLog::open_read_only(cfg(&dir)),
+            "reader must be excluded by writer",
+        );
+        assert!(
+            matches!(err, DurableError::Locked { .. }),
+            "expected Locked, got {err:?}"
+        );
+        drop(writer);
+        let _reader = DurableLog::open_read_only(cfg(&dir)).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_only_open_leaves_torn_tail_bytes_unchanged() {
+        // open() truncates a torn tail during recovery; open_read_only must
+        // recover purely in memory and leave every on-disk byte untouched.
+        let dir = temp_dir("ro-torn");
+        {
+            let mut log = DurableLog::open(cfg(&dir)).unwrap();
+            log.append(1, 0, 1, b"ok1").unwrap();
+            log.append(2, 0, 1, b"ok2").unwrap();
+        }
+        let segs = sorted_segment_paths(&dir);
+        assert_eq!(segs.len(), 1);
+        let mut f = OpenOptions::new().append(true).open(&segs[0]).unwrap();
+        f.write_all(&[0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02]).unwrap();
+        f.sync_data().unwrap();
+        drop(f);
+        let before = fs::read(&segs[0]).unwrap();
+
+        {
+            let log = DurableLog::open_read_only(cfg(&dir)).unwrap();
+            // The valid prefix is fully visible in memory...
+            assert_eq!(log.len(), 2);
+            assert_eq!(log.last_sequence(), Some(2));
+            assert_eq!(log.find(2).unwrap().payload, b"ok2");
+            log.verify().unwrap();
+        }
+        // ...and not a single on-disk byte changed (length or content).
+        let after = fs::read(&segs[0]).unwrap();
+        assert_eq!(
+            after.len(),
+            before.len(),
+            "read-only open changed the segment length"
+        );
+        assert_eq!(after, before, "read-only open changed segment bytes");
+
+        // A writable open of the same WAL DOES truncate the torn suffix.
+        let log = DurableLog::open(cfg(&dir)).unwrap();
+        assert_eq!(log.len(), 2);
+        assert!(
+            fs::read(&segs[0]).unwrap().len() < before.len(),
+            "writable open should have discarded the torn tail"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_only_open_missing_dir_is_an_error_not_an_empty_log() {
+        // A typo'd path must surface as an error; silently returning an empty
+        // log would let tooling "verify" a WAL that was never looked at.
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("dexos-wal-missing-{nanos}"));
+        let _ = fs::remove_dir_all(&dir);
+        let err = open_err(
+            DurableLog::open_read_only(cfg(&dir)),
+            "missing dir must not become an empty log",
+        );
+        assert!(
+            matches!(err, DurableError::InvalidPath(_)),
+            "expected InvalidPath, got {err:?}"
+        );
+        assert!(
+            !dir.exists(),
+            "read-only open must not create the directory"
+        );
+    }
+
+    #[test]
+    fn read_only_handle_rejects_mutation() {
+        let dir = temp_dir("ro-mutate");
+        {
+            let mut log = DurableLog::open(cfg(&dir)).unwrap();
+            log.append(1, 0, 1, b"a").unwrap();
+        }
+        let mut log = DurableLog::open_read_only(cfg(&dir)).unwrap();
+        assert!(
+            matches!(
+                log.append(2, 0, 1, b"b"),
+                Err(DurableError::ReadOnly { .. })
+            ),
+            "append on a read-only handle must fail closed"
+        );
+        assert!(
+            matches!(log.truncate_after(0), Err(DurableError::ReadOnly { .. })),
+            "truncate_after on a read-only handle must fail closed"
+        );
+        // Disk is untouched: reopening writable still sees the record.
+        drop(log);
+        let log = DurableLog::open(cfg(&dir)).unwrap();
+        assert_eq!(log.len(), 1);
         let _ = fs::remove_dir_all(&dir);
     }
 }
