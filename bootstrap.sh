@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # bootstrap.sh — one-shot developer environment setup for DexOS.
 #
-# Installs everything needed to build the workspace on this machine: the pinned
-# Rust toolchain (+ components and the wasm target), the per-OS system libraries
-# the Dioxus desktop/mobile frontends link (GTK/webkit on Linux, WebKit on
-# macOS), the Dioxus CLI (`dx`), and a full download of the crate dependency
-# graph. Idempotent — safe to re-run; it skips anything already present.
+# Installs everything needed to build the workspace on this machine: the base C
+# build toolchain, the pinned Rust toolchain (+ components and the wasm target),
+# the per-OS GUI libraries the Dioxus desktop/mobile frontends link (GTK/webkit
+# on Linux, system WebKit on macOS), the Dioxus CLI (`dx`), and a full download
+# of the crate dependency graph. Idempotent — safe to re-run; it skips anything
+# already present.
 #
 # It sets up the machine to build *natively on the OS it runs on* (Linux, macOS,
 # or Windows via Git Bash/MSYS). It does not cross-compile to other OSes; mobile
@@ -72,62 +73,88 @@ OS="$(uname -s)"
 # ---------------------------------------------------------------------------
 # 1. System packages (per OS / distro)
 # ---------------------------------------------------------------------------
-# The Dioxus *desktop*/*mobile* apps link wry, which needs the platform webview
-# and its dev headers. The engine, the CLI, and the wasm *web* app need none of
-# this — pass --no-frontend to skip the whole step.
-install_system_deps_linux() {
-    # Package names differ per distro; keep these lists in lockstep with the
-    # apt list in .github/workflows/ci.yml (the `apps` job).
-    if have apt-get; then
-        info "Debian/Ubuntu (apt-get)"
-        $SUDO apt-get update
-        $SUDO apt-get install -y --no-install-recommends \
-            build-essential pkg-config libssl-dev curl \
-            libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev \
-            libgtk-3-dev libsoup-3.0-dev libxdo-dev
-    elif have dnf; then
-        info "Fedora (dnf)"
-        $SUDO dnf install -y \
-            gcc gcc-c++ make pkgconf-pkg-config openssl-devel curl \
-            webkit2gtk4.1-devel gtk3-devel libsoup3-devel libxdo-devel
-    elif have pacman; then
-        info "Arch (pacman)"
-        $SUDO pacman -Sy --needed --noconfirm \
-            base-devel pkgconf openssl curl \
-            webkit2gtk-4.1 gtk3 libsoup3 xdotool
-    elif have zypper; then
-        info "openSUSE (zypper) — best effort"
-        $SUDO zypper install -y \
-            gcc gcc-c++ make pkg-config libopenssl-devel curl \
-            webkit2gtk3-devel gtk3-devel libsoup-devel xdotool
+# Split in two: the *base* build toolchain (a C compiler/linker + pkg-config +
+# curl) is needed to build **anything** in the workspace — even the engine links
+# `ring`, which shells out to `cc` — so it installs on every run. The *GUI* dev
+# headers (GTK3 / webkit2gtk / libsoup3 / xdo) are only needed by the Dioxus
+# desktop/mobile apps, so they install only when frontends are wanted. Pass
+# --no-frontend to skip just the GUI set; --skip-system skips both.
+PM=""
+detect_pm() {
+    for pm in apt-get dnf pacman zypper; do
+        if have "$pm"; then PM="$pm"; return 0; fi
+    done
+    return 1
+}
+
+install_base_deps_linux() {
+    case "$PM" in
+        apt-get) $SUDO apt-get update
+                 $SUDO apt-get install -y --no-install-recommends \
+                     build-essential pkg-config curl ca-certificates ;;
+        dnf)     $SUDO dnf install -y \
+                     gcc gcc-c++ make pkgconf-pkg-config curl ca-certificates ;;
+        pacman)  $SUDO pacman -Sy --needed --noconfirm \
+                     base-devel pkgconf curl ca-certificates ;;
+        zypper)  $SUDO zypper install -y \
+                     gcc gcc-c++ make pkg-config curl ca-certificates ;;
+    esac
+}
+
+install_gui_deps_linux() {
+    # Kept in lockstep with the apt list in .github/workflows/ci.yml (`apps` job).
+    case "$PM" in
+        apt-get) $SUDO apt-get install -y --no-install-recommends \
+                     libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev \
+                     libgtk-3-dev libsoup-3.0-dev libxdo-dev ;;
+        dnf)     $SUDO dnf install -y \
+                     webkit2gtk4.1-devel gtk3-devel libsoup3-devel libxdo-devel ;;
+        pacman)  $SUDO pacman -Sy --needed --noconfirm \
+                     webkit2gtk-4.1 gtk3 libsoup3 xdotool ;;
+        zypper)  $SUDO zypper install -y \
+                     webkit2gtk3-devel gtk3-devel libsoup-devel xdotool ;;
+    esac
+}
+
+ensure_xcode_clt() {
+    if xcode-select -p >/dev/null 2>&1; then
+        info "Xcode Command Line Tools already installed."
     else
-        warn "no supported package manager found (apt/dnf/pacman/zypper)."
-        warn "install the GTK3 + webkit2gtk-4.1 + libsoup3 dev packages manually,"
-        warn "or re-run with --no-frontend to set up the engine only."
-        return 1
+        info "installing Xcode Command Line Tools (a GUI prompt may appear)…"
+        xcode-select --install 2>/dev/null || \
+            warn "could not trigger 'xcode-select --install'; install it manually if compilers are missing."
     fi
 }
 
 install_system_deps() {
     case "$OS" in
         Linux)
-            install_system_deps_linux
+            if ! detect_pm; then
+                warn "no supported package manager (apt/dnf/pacman/zypper) found."
+                warn "install a C toolchain + pkg-config manually, plus (for frontends)"
+                warn "the GTK3 + webkit2gtk-4.1 + libsoup3 dev packages."
+                return 1
+            fi
+            info "Linux ($PM) — base build toolchain…"
+            install_base_deps_linux
+            if [ "$WANT_FRONTEND" -eq 1 ]; then
+                info "frontend GUI libraries (GTK3 / webkit2gtk-4.1 / libsoup3)…"
+                install_gui_deps_linux
+            fi
             ;;
         Darwin)
-            info "macOS — desktop uses the system WebKit (WKWebView); no extra libraries needed."
-            if ! xcode-select -p >/dev/null 2>&1; then
-                info "installing Xcode Command Line Tools (a GUI prompt may appear)…"
-                xcode-select --install 2>/dev/null || \
-                    warn "could not trigger 'xcode-select --install'; install it manually if compilers are missing."
-            else
-                info "Xcode Command Line Tools already installed."
+            # The Xcode Command Line Tools provide the base cc/linker; the desktop
+            # app uses the system WebKit (WKWebView), so there is no GUI-lib step.
+            ensure_xcode_clt
+            if [ "$WANT_FRONTEND" -eq 1 ]; then
+                info "macOS desktop uses the system WebKit (WKWebView) — no extra libraries."
+                info "iOS builds additionally require full Xcode from the App Store."
             fi
-            info "iOS builds additionally require full Xcode from the App Store."
             ;;
         MINGW*|MSYS*|CYGWIN*|Windows_NT)
             warn "Windows detected. Install these manually (no reliable CLI path):"
-            warn "  • Visual Studio Build Tools (MSVC + Windows SDK)"
-            warn "  • WebView2 Runtime (preinstalled on Windows 11)"
+            warn "  • Visual Studio Build Tools (MSVC + Windows SDK) — the base toolchain"
+            warn "  • WebView2 Runtime (preinstalled on Windows 11) — for the desktop app"
             warn "then re-run with --skip-system to continue with the Rust setup."
             return 1
             ;;
@@ -144,8 +171,10 @@ install_system_deps() {
 install_rust() {
     if ! have rustup; then
         info "rustup not found — installing…"
+        # Let rustup add ~/.cargo/bin to the shell profile so `cargo`/`dx` are on
+        # PATH in *new* shells; source its env now so the rest of this run sees it.
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal --no-modify-path
+            | sh -s -- -y --profile minimal
         # shellcheck disable=SC1091
         . "$HOME/.cargo/env"
     fi
@@ -207,16 +236,18 @@ install_dev_tools() {
 printf '%sDexOS bootstrap%s — OS=%s frontend=%s dev=%s\n' \
     "$BOLD" "$RST" "$OS" "$WANT_FRONTEND" "$WANT_DEV"
 
-if [ "$WANT_FRONTEND" -eq 1 ] && [ "$SKIP_SYSTEM" -eq 0 ]; then
-    step "Installing system libraries"
+if [ "$SKIP_SYSTEM" -eq 1 ]; then
+    step "Skipping system packages (--skip-system)"
+else
+    if [ "$WANT_FRONTEND" -eq 1 ]; then
+        step "Installing system packages (base toolchain + frontend GUI libraries)"
+    else
+        step "Installing system packages (base toolchain — GUI libs skipped via --no-frontend)"
+    fi
     if ! install_system_deps; then
         warn "system package step did not complete; continuing with Rust setup."
-        warn "(re-run with --skip-system once packages are handled, or --no-frontend.)"
+        warn "(handle the packages manually, then re-run with --skip-system.)"
     fi
-elif [ "$SKIP_SYSTEM" -eq 1 ]; then
-    step "Skipping system libraries (--skip-system)"
-else
-    step "Skipping GUI system libraries (--no-frontend: engine build needs none)"
 fi
 
 step "Setting up the Rust toolchain"
@@ -244,4 +275,7 @@ if [ "$WANT_FRONTEND" -eq 1 ]; then
     info "Run the desktop app:    cargo run -p dexos-desktop"
 fi
 info "Run all PR gates:       ./scripts/preflight.sh"
+if ! have cargo; then
+    info "PATH: open a new shell (or 'source \"\$HOME/.cargo/env\"') so cargo/dx resolve."
+fi
 printf '%s✓ ready%s\n' "$GRN" "$RST"
