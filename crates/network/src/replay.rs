@@ -257,10 +257,7 @@ impl PeerDedup {
 
     /// Drop one (peer, epoch) slot after that connection closes.
     pub fn forget_epoch(&mut self, peer: &PeerId, epoch: u64) {
-        self.windows.remove(&DedupKey {
-            peer: *peer,
-            epoch,
-        });
+        self.windows.remove(&DedupKey { peer: *peer, epoch });
     }
 }
 
@@ -306,7 +303,10 @@ mod tests {
         assert!(!w.check(5 + 10_000));
         assert!(matches!(
             w.admit(5 + 10_000),
-            ReplayAdmit::JumpTooLarge { highest: 5, got: 10005 }
+            ReplayAdmit::JumpTooLarge {
+                highest: 5,
+                got: 10005
+            }
         ));
         // A bounded jump within max_jump is still accepted.
         assert!(w.check(5 + 32));
@@ -422,16 +422,10 @@ mod tests {
         }
         // Reconnect under epoch 2 starts a fresh space: sequence 0 is fresh,
         // and replaying epoch-1's sequences under epoch 1 is still a duplicate.
-        assert!(d
-            .accept_class(peer, 2, TrafficClass::Consensus, 0)
-            .unwrap());
-        assert!(!d
-            .accept_class(peer, 1, TrafficClass::Consensus, 0)
-            .unwrap());
+        assert!(d.accept_class(peer, 2, TrafficClass::Consensus, 0).unwrap());
+        assert!(!d.accept_class(peer, 1, TrafficClass::Consensus, 0).unwrap());
         // Sequence 1 on the new epoch is independent of the old epoch's history.
-        assert!(d
-            .accept_class(peer, 2, TrafficClass::Consensus, 1)
-            .unwrap());
+        assert!(d.accept_class(peer, 2, TrafficClass::Consensus, 1).unwrap());
     }
 
     #[test]

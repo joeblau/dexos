@@ -824,7 +824,10 @@ mod tests {
             vec![],
             100,
         );
-        assert_eq!(t.ingest_announcement(r.clone(), 10), IngestOutcome::Admitted);
+        assert_eq!(
+            t.ingest_announcement(r.clone(), 10),
+            IngestOutcome::Admitted
+        );
         // Immediate re-announce of same record within interval: suppressed.
         assert_eq!(t.ingest_announcement(r, 15), IngestOutcome::Suppressed);
     }

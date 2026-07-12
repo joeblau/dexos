@@ -84,7 +84,7 @@ impl ReconnectBackoff {
     /// then the base is grown for the next attempt.
     pub fn next_delay<R: FnMut() -> u64>(&mut self, mut rng_u64: R) -> Duration {
         let base = self.current;
-        let base_ns = u128::from(base.as_nanos().min(u128::from(u64::MAX)));
+        let base_ns = base.as_nanos().min(u128::from(u64::MAX));
         let delay = if base_ns == 0 {
             Duration::ZERO
         } else {

@@ -173,14 +173,14 @@ mod tests {
         s.insert(2, "b", t);
         s.insert(3, "c", t);
         // Touch 1 so it is MRU; 2 becomes the LRU after next insert.
-        assert_eq!(s.get(&1, t).as_deref(), Some("a"));
+        assert_eq!(s.get(&1, t), Some("a"));
         s.insert(4, "d", t);
         assert_eq!(s.len(), 3);
         // 2 was least recently used and should be gone.
         assert!(s.get(&2, t).is_none());
-        assert_eq!(s.get(&1, t).as_deref(), Some("a"));
-        assert_eq!(s.get(&3, t).as_deref(), Some("c"));
-        assert_eq!(s.get(&4, t).as_deref(), Some("d"));
+        assert_eq!(s.get(&1, t), Some("a"));
+        assert_eq!(s.get(&3, t), Some("c"));
+        assert_eq!(s.get(&4, t), Some("d"));
     }
 
     #[test]

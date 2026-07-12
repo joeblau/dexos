@@ -595,10 +595,12 @@ impl MarketRegistry {
             prior,
             MarketLifecycle::Open | MarketLifecycle::Bootstrapping
         ) {
-            return Err(MarketError::Lifecycle(crate::LifecycleError::IllegalTransition {
-                from: prior,
-                to: MarketLifecycle::Halted,
-            }));
+            return Err(MarketError::Lifecycle(
+                crate::LifecycleError::IllegalTransition {
+                    from: prior,
+                    to: MarketLifecycle::Halted,
+                },
+            ));
         }
         self.transition(market_id, MarketLifecycle::Halted)?;
         let record = self.record_mut(market_id)?;
@@ -616,13 +618,17 @@ impl MarketRegistry {
     pub fn resume_market(&mut self, market_id: MarketId) -> Result<(), MarketError> {
         let record = self.record(market_id)?;
         if record.lifecycle != MarketLifecycle::Halted {
-            return Err(MarketError::Lifecycle(crate::LifecycleError::IllegalTransition {
-                from: record.lifecycle,
-                to: MarketLifecycle::Open,
-            }));
+            return Err(MarketError::Lifecycle(
+                crate::LifecycleError::IllegalTransition {
+                    from: record.lifecycle,
+                    to: MarketLifecycle::Open,
+                },
+            ));
         }
         let halt = record.halt.ok_or(MarketError::ResumePrerequisites)?;
-        let target = halt.resume_target().ok_or(MarketError::ResumePrerequisites)?;
+        let target = halt
+            .resume_target()
+            .ok_or(MarketError::ResumePrerequisites)?;
 
         // Stake must still meet the requirement.
         let stake_ok = record.definition.sponsor_set.total_stake().raw()
@@ -1317,7 +1323,9 @@ impl MarketRegistry {
             .definition
             .sponsor_set
             .share(sponsor_id)
-            .ok_or(MarketError::Sponsor(crate::error::SponsorError::UnknownSponsor))?
+            .ok_or(MarketError::Sponsor(
+                crate::error::SponsorError::UnknownSponsor,
+            ))?
             .stake;
         // Preview the penalty without mutating, using the same bps math as slash.
         let ratio = types::Ratio::from_bps(i64::from(fault.penalty_bps()))?;
@@ -1397,9 +1405,7 @@ impl MarketRegistry {
                 funding_account,
                 amount,
             } => self.add_bootstrap_liquidity(market_id, funding_account, amount),
-            MarketCommand::HaltMarket { market_id, reason } => {
-                self.halt_market(market_id, reason)
-            }
+            MarketCommand::HaltMarket { market_id, reason } => self.halt_market(market_id, reason),
             MarketCommand::ResumeMarket(id) => self.resume_market(id),
             MarketCommand::CloseMarket { market_id, now } => self.close_market(market_id, now),
             MarketCommand::BeginResolution(id) => self.begin_resolution(id),
@@ -2617,11 +2623,8 @@ mod tests {
         // Partial slash (20% of 2.0 = 0.4) funds insurance; 1.6 >= 1.0 so the
         // market stays Open. Invalid-config evidence uses an over-bps attestation.
         let key = sponsor_key();
-        let evidence =
-            invalid_config_evidence(&key, m, SponsorId::new(1), 1, 3, 12_000, 1);
-        let slashed = reg
-            .slash_sponsor(m, SponsorId::new(1), &evidence)
-            .unwrap();
+        let evidence = invalid_config_evidence(&key, m, SponsorId::new(1), 1, 3, 12_000, 1);
+        let slashed = reg.slash_sponsor(m, SponsorId::new(1), &evidence).unwrap();
         assert_eq!(slashed, Amount::from_raw(400_000));
         assert_eq!(reg.get_market_status(m), Some(MarketLifecycle::Open));
 
@@ -2713,7 +2716,8 @@ mod tests {
             .unwrap();
         reg.activate_market(m).unwrap();
         // Still bootstrapping.
-        reg.halt_market(m, crate::HaltReason::BootstrapFailed).unwrap();
+        reg.halt_market(m, crate::HaltReason::BootstrapFailed)
+            .unwrap();
         assert_eq!(reg.get_market_status(m), Some(MarketLifecycle::Halted));
         assert_eq!(
             reg.halt_state(m).unwrap().prior,
@@ -2740,7 +2744,8 @@ mod tests {
         drive_to_open(&mut reg, 1);
         let m = MarketId::new(1);
         reg.set_oracle_health(m, OracleHealth::Normal).unwrap();
-        reg.halt_market(m, crate::HaltReason::OracleUnhealthy).unwrap();
+        reg.halt_market(m, crate::HaltReason::OracleUnhealthy)
+            .unwrap();
         // Oracle still stale -> cannot resume new risk.
         reg.set_oracle_health(m, OracleHealth::Stale).unwrap();
         assert_eq!(

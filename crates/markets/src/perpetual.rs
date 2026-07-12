@@ -234,12 +234,7 @@ pub fn fill_fee(notional: Amount, bps: i32) -> Result<Amount, PerpError> {
         return Err(PerpError::FeeOutOfRange);
     }
     let mag = if notional.is_negative() {
-        Amount::from_raw(
-            notional
-                .raw()
-                .checked_neg()
-                .ok_or(ArithError::Overflow)?,
-        )
+        Amount::from_raw(notional.raw().checked_neg().ok_or(ArithError::Overflow)?)
     } else {
         notional
     };
@@ -484,10 +479,13 @@ mod tests {
     #[test]
     fn fill_fee_directed_rounding_and_rebate() {
         let notional = Amount::from_raw(1_000_000_000); // 1000.0
-        // 10 bps fee = 1.0
+                                                        // 10 bps fee = 1.0
         assert_eq!(fill_fee(notional, 10).unwrap(), Amount::from_raw(1_000_000));
         // -10 bps rebate = -1.0
-        assert_eq!(fill_fee(notional, -10).unwrap(), Amount::from_raw(-1_000_000));
+        assert_eq!(
+            fill_fee(notional, -10).unwrap(),
+            Amount::from_raw(-1_000_000)
+        );
         // Out of range.
         assert_eq!(fill_fee(notional, 10_001), Err(PerpError::FeeOutOfRange));
         // Sub-unit notional with ceil: 1 micro * 1 bps still collects 1 if any.

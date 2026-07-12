@@ -264,9 +264,7 @@ pub struct Eip712Domain {
 
 /// Type hash for `EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)`.
 fn eip712_domain_type_hash() -> [u8; 32] {
-    keccak256(
-        b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
-    )
+    keccak256(b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)")
 }
 
 /// Encode a `uint256` as a 32-byte big-endian word (ABI word).
@@ -443,7 +441,7 @@ mod tests {
                 let diff = u16::from(n[i])
                     .wrapping_sub(u16::from(s[i]))
                     .wrapping_sub(borrow);
-                new_s[i] = diff as u8;
+                new_s[i] = diff.to_le_bytes()[0];
                 borrow = if diff > 0xff { 1 } else { 0 };
             }
             high[32..].copy_from_slice(&new_s);

@@ -223,9 +223,9 @@ mod macos {
     pub(super) fn pin(core: usize) -> bool {
         // Affinity tags are opaque; use core+1 so 0 (null policy) is never sent.
         let tag = i32::try_from(core.saturating_add(1)).unwrap_or(1);
+        #[allow(unsafe_code)]
         // SAFETY: mach_thread_self returns the calling thread; policy_info points
-        // to a single i32 for THREAD_AFFINITY_POLICY with count 1.
-        #[allow(unsafe_code)] // SAFETY: documented affinity call; isolated perf module
+        // to a single i32 for THREAD_AFFINITY_POLICY with count 1 (isolated perf module).
         let rc = unsafe {
             let thread = mach_thread_self();
             thread_policy_set(

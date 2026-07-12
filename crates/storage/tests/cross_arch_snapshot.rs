@@ -27,10 +27,7 @@ fn state_bytes() -> Vec<u8> {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     let d = crypto::hash_domain(b"dexos:test:file-digest:v1", bytes);
-    d.as_bytes()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    d.as_bytes().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn tempfile_dir() -> PathBuf {

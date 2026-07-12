@@ -1231,12 +1231,24 @@ fn private_topics_are_gated() {
     );
     // Matching bound account via server-installed session, unexpired -> ok.
     assert!(hub
-        .subscribe_private(Topic::Orders(owner), &owner_pk, &sessions, 0, Reliability::Reliable)
+        .subscribe_private(
+            Topic::Orders(owner),
+            &owner_pk,
+            &sessions,
+            0,
+            Reliability::Reliable
+        )
         .is_ok());
     // Cross-account session key -> unauthorized (no leakage).
     assert_eq!(
-        hub.subscribe_private(Topic::Orders(owner), &other_pk, &sessions, 0, Reliability::Reliable)
-            .err(),
+        hub.subscribe_private(
+            Topic::Orders(owner),
+            &other_pk,
+            &sessions,
+            0,
+            Reliability::Reliable
+        )
+        .err(),
         Some(RpcError::Unauthorized)
     );
     // Unknown session key -> unauthorized (client cannot spoof binding).
@@ -1695,14 +1707,26 @@ fn private_stream_cannot_spoof_account_binding() {
     );
     // Attacker tries to subscribe to a(2)'s orders using a(1)'s session key.
     assert_eq!(
-        hub.subscribe_private(Topic::Orders(a(2)), &real_pk, &sessions, 0, Reliability::Reliable)
-            .err(),
+        hub.subscribe_private(
+            Topic::Orders(a(2)),
+            &real_pk,
+            &sessions,
+            0,
+            Reliability::Reliable
+        )
+        .err(),
         Some(RpcError::Unauthorized)
     );
     // Invented key with no server install cannot bind to anything.
     assert_eq!(
-        hub.subscribe_private(Topic::Orders(a(1)), &[0xff; 32], &sessions, 0, Reliability::Reliable)
-            .err(),
+        hub.subscribe_private(
+            Topic::Orders(a(1)),
+            &[0xff; 32],
+            &sessions,
+            0,
+            Reliability::Reliable
+        )
+        .err(),
         Some(RpcError::Unauthorized)
     );
 }
@@ -1751,6 +1775,7 @@ fn get_market_book_depth_is_clamped_centrally() {
 }
 
 #[test]
+#[allow(clippy::assertions_on_constants)]
 fn rpc_default_payload_cap_is_below_sync_cap() {
     assert!(codec::MAX_RPC_FRAME_PAYLOAD < codec::MAX_FRAME_PAYLOAD);
     assert_eq!(codec::MAX_RPC_FRAME_PAYLOAD, 256 * 1024);
@@ -1772,8 +1797,8 @@ async fn tls_server_round_trips_a_query() {
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
     use tokio_rustls::rustls::ClientConfig as RustlsClientConfig;
-    use tokio_rustls::rustls::pki_types::{ServerName, CertificateDer};
     use tokio_rustls::TlsConnector;
 
     let (cert_pem, key_pem) = crate::generate_self_signed_localhost().unwrap();
@@ -1781,9 +1806,10 @@ async fn tls_server_round_trips_a_query() {
 
     // Client trusts the same self-signed cert.
     let mut roots = rustls::RootCertStore::empty();
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut std::io::Cursor::new(&cert_pem))
-        .collect::<Result<_, _>>()
-        .unwrap();
+    let certs: Vec<CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut std::io::Cursor::new(&cert_pem))
+            .collect::<Result<_, _>>()
+            .unwrap();
     for c in certs {
         roots.add(c).unwrap();
     }
@@ -1814,7 +1840,9 @@ async fn tls_server_round_trips_a_query() {
     let plen = u32::from_le_bytes([header[15], header[16], header[17], header[18]]) as usize;
     let mut buf = vec![0u8; codec::FRAME_HEADER_LEN + plen];
     buf[..codec::FRAME_HEADER_LEN].copy_from_slice(&header);
-    tls.read_exact(&mut buf[codec::FRAME_HEADER_LEN..]).await.unwrap();
+    tls.read_exact(&mut buf[codec::FRAME_HEADER_LEN..])
+        .await
+        .unwrap();
     let resp = decode_response(&buf).unwrap();
     assert!(matches!(resp.result, Ok(RpcOk::NetworkStatus(_))));
 }
@@ -1908,7 +1936,10 @@ fn hot_topic_byte_budget_does_not_block_other_topics() {
         );
     }
     let hot_stats = hub.topic_stats(hot);
-    assert!(hot_stats.history_shed > 0, "hot topic must shed under budget");
+    assert!(
+        hot_stats.history_shed > 0,
+        "hot topic must shed under budget"
+    );
     assert!(hot_stats.history_bytes <= hub.topic_byte_budget());
 
     let cold_event = hub.publish_delta(
@@ -1960,7 +1991,7 @@ fn fanout_scales_to_many_subscribers_without_per_sub_alloc_growth() {
         }
         // Lossy + bounded broadcast: all in-capacity receivers should see it.
         assert!(received >= n.min(32), "n={n} received={received}");
-        assert_eq!(std::sync::Arc::strong_count(&shared) >= 1, true);
+        assert!(std::sync::Arc::strong_count(&shared) >= 1);
     }
 }
 

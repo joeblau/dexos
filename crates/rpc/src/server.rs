@@ -307,8 +307,10 @@ where
         let frame_bytes = bytes.len();
         // Pre-admission: hold process + connection permits for the whole
         // dispatch. Failure here means the command was never submitted.
-        let response = match (work_budget.try_acquire(frame_bytes), conn_budget.try_acquire(frame_bytes))
-        {
+        let response = match (
+            work_budget.try_acquire(frame_bytes),
+            conn_budget.try_acquire(frame_bytes),
+        ) {
             (Some(proc_permit), Some(conn_permit)) => {
                 match decode_request(&bytes) {
                     Ok(request) => {
@@ -321,9 +323,8 @@ where
                         let backend = Arc::clone(&backend);
                         let dispatch_timeout = config.dispatch_timeout;
                         // Isolate synchronous backend work off the IO worker.
-                        let join = tokio::task::spawn_blocking(move || {
-                            dispatch(&*backend, mode, request)
-                        });
+                        let join =
+                            tokio::task::spawn_blocking(move || dispatch(&*backend, mode, request));
                         let result = match tokio::time::timeout(dispatch_timeout, join).await {
                             Ok(Ok(resp)) => resp,
                             Ok(Err(join_err)) => RpcResponse::new(

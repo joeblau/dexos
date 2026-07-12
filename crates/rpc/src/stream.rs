@@ -366,8 +366,8 @@ impl StreamHub {
         // broadcast channel length and derive a proportional byte budget so
         // existing tests keep their lag semantics.
         let broadcast_capacity = capacity.max(1);
-        let topic_byte_budget = DEFAULT_TOPIC_BYTE_BUDGET
-            .max(broadcast_capacity.saturating_mul(256));
+        let topic_byte_budget =
+            DEFAULT_TOPIC_BYTE_BUDGET.max(broadcast_capacity.saturating_mul(256));
         Self::with_limits(broadcast_capacity, topic_byte_budget, DEFAULT_MAX_TOPICS)
     }
 
@@ -582,7 +582,9 @@ impl StreamHub {
         // a global lock. Idle GC + lowest-receiver eviction stay local.
         let per_shard_cap = self.max_topics.div_ceil(SHARD_COUNT).max(1);
         if shard.channels.len() >= per_shard_cap {
-            shard.channels.retain(|_, ch| ch.sender.receiver_count() > 0);
+            shard
+                .channels
+                .retain(|_, ch| ch.sender.receiver_count() > 0);
         }
         while shard.channels.len() >= per_shard_cap {
             let victim = shard

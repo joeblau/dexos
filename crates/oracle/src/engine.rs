@@ -106,10 +106,7 @@ impl OracleEngine {
         self.markets.insert(market, state);
         if is_new {
             // Insert into sorted leaf_order and rebuild bottom-up O(M).
-            let pos = self
-                .leaf_order
-                .binary_search(&market)
-                .unwrap_or_else(|i| i);
+            let pos = self.leaf_order.binary_search(&market).unwrap_or_else(|i| i);
             self.leaf_order.insert(pos, market);
             self.rebuild_tree();
         } else {

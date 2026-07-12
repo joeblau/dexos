@@ -55,8 +55,8 @@ pub use proofs::{
 };
 pub use rpc::{RpcRequest, RpcResponse};
 pub use sync::{
-    validator_set_transition_digest, AcceptedRange, IngestOutcome, ShardSync, ValidatorSetTransition,
-    VerifiedTip, DEFAULT_BUFFER_LIMIT, DEFAULT_HISTORY_LIMIT,
+    validator_set_transition_digest, AcceptedRange, IngestOutcome, ShardSync,
+    ValidatorSetTransition, VerifiedTip, DEFAULT_BUFFER_LIMIT, DEFAULT_HISTORY_LIMIT,
 };
 pub use verification::{Verification, VerifiedValue};
 
@@ -981,11 +981,10 @@ mod tests {
     // ---- RpcRequest round-trips through codec -----------------------------
 
     #[test]
-
-    #[test]
     fn unsolicited_validator_set_replacement_rejected() {
         let ts = signers();
-        let other = ThresholdSigners::from_seeds(&[[20u8; 32], [21u8; 32], [22u8; 32], [23u8; 32]], 3);
+        let other =
+            ThresholdSigners::from_seeds(&[[20u8; 32], [21u8; 32], [22u8; 32], [23u8; 32]], 3);
         let shard = ShardId::new(0);
         let mut sync = ShardSync::new(shard, Hash::ZERO);
         sync.bootstrap_validator_set(0, ts.validator_set()).unwrap();
@@ -995,13 +994,16 @@ mod tests {
             Err(LightClientError::UnsolicitedValidatorSet { epoch: 1 })
         );
         // Idempotent re-bootstrap of the same epoch+commitment is OK.
-        assert!(sync.try_register_validator_set(0, ts.validator_set()).is_ok());
+        assert!(sync
+            .try_register_validator_set(0, ts.validator_set())
+            .is_ok());
     }
 
     #[test]
     fn quorum_proven_validator_set_transition() {
         let ts = signers();
-        let next = ThresholdSigners::from_seeds(&[[30u8; 32], [31u8; 32], [32u8; 32], [33u8; 32]], 3);
+        let next =
+            ThresholdSigners::from_seeds(&[[30u8; 32], [31u8; 32], [32u8; 32], [33u8; 32]], 3);
         let shard = ShardId::new(0);
         let mut sync = ShardSync::new(shard, Hash::ZERO);
         sync.bootstrap_validator_set(0, ts.validator_set()).unwrap();
@@ -1027,6 +1029,8 @@ mod tests {
             })
             .is_err());
     }
+
+    #[test]
 
     fn rpc_request_round_trips() {
         let req = RpcRequest::GetAccountProof {

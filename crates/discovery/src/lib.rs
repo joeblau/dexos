@@ -30,16 +30,17 @@ mod table;
 pub const CRATE_NAME: &str = "discovery";
 
 pub use record::{
-    NodeId, PeerRecord, RecordError, Region, Role, RoleSet, MAX_ADDRESSES, MAX_ADDRESS_BYTES,
-    MAX_ADDRESSES_TOTAL_BYTES, MAX_MARKET_IDS, MAX_PROTOCOLS, MAX_REGIONS, MAX_STATIC_SEEDS,
+    NodeId, PeerRecord, RecordError, Region, Role, RoleSet, MAX_ADDRESSES,
+    MAX_ADDRESSES_TOTAL_BYTES, MAX_ADDRESS_BYTES, MAX_MARKET_IDS, MAX_PROTOCOLS, MAX_REGIONS,
+    MAX_STATIC_SEEDS,
 };
 pub use service::{
     bootstrap, run_liveness_loop, FailingResolver, SeedError, SeedResolver, StaticSeedResolver,
     TRANSPORT_CRATE,
 };
 pub use table::{
-    signed_record, IngestOutcome, Liveness, PeerConfig, PeerEntry, PeerTable, DEFAULT_ANNOUNCE_MIN_INTERVAL,
-    REP_BAD, REP_DUP, REP_GOOD, REP_INITIAL,
+    signed_record, IngestOutcome, Liveness, PeerConfig, PeerEntry, PeerTable,
+    DEFAULT_ANNOUNCE_MIN_INTERVAL, REP_BAD, REP_DUP, REP_GOOD, REP_INITIAL,
 };
 
 #[cfg(test)]

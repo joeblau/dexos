@@ -176,8 +176,7 @@ impl BatchSender {
             enqueued_at: Instant::now(),
             deadline,
         });
-        self.pending.len() >= self.max_batch
-            || self.pending_bytes >= self.max_bytes
+        self.pending.len() >= self.max_batch || self.pending_bytes >= self.max_bytes
     }
 
     /// Number of queued datagrams awaiting flush.
@@ -332,7 +331,7 @@ mod tests {
             assert_eq!(sent, accept.min(5));
             assert_eq!(tx.pending(), 5 - sent);
             // Remaining payloads are the ordered suffix.
-            let expected: Vec<u8> = (sent as u8..5).collect();
+            let expected: Vec<u8> = (u8::try_from(sent).unwrap()..5).collect();
             let remaining: Vec<u8> = tx.pending.iter().map(|p| p.bytes[0]).collect();
             assert_eq!(remaining, expected, "accept={accept}");
             assert_eq!(tx.drop_metrics().total(), 0, "no silent drops");
@@ -377,7 +376,7 @@ mod tests {
         let mut tx = BatchSender::with_limits(2, 1024, Duration::from_secs(1));
         assert!(!tx.push(vec![1]));
         assert!(tx.push(vec![2])); // full
-        // Third push exceeds count cap: overflow recorded, needs flush.
+                                   // Third push exceeds count cap: overflow recorded, needs flush.
         assert!(tx.push(vec![3]));
         assert_eq!(tx.drop_metrics().reason(DropReason::Overflow), 1);
         assert_eq!(tx.pending(), 2);

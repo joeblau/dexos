@@ -15,9 +15,7 @@ use types::{
     Quantity, SequenceNumber, Side,
 };
 
-use crate::command::{
-    Authorization, Command, DeterministicEngine, ExecutionReceipt, ReceiptKind,
-};
+use crate::command::{Authorization, Command, DeterministicEngine, ExecutionReceipt, ReceiptKind};
 use crate::error::ExecutionError;
 use crate::idempotency::{
     command_binding, derive_withdrawal_id, GuardDecision, KeyDomain, ReplayGuard,
@@ -198,12 +196,7 @@ impl Engine {
     }
 
     /// Outcome-claim balance for `account` in `market` at `instrument`, or zero.
-    pub fn claim_balance(
-        &self,
-        account: AccountId,
-        market: MarketId,
-        instrument: u16,
-    ) -> Amount {
+    pub fn claim_balance(&self, account: AccountId, market: MarketId, instrument: u16) -> Amount {
         self.claims
             .get(&(account.get(), market.get()))
             .and_then(|v| v.get(usize::from(instrument)))
@@ -228,9 +221,7 @@ impl Engine {
             return Err(ExecutionError::MarketNotOpen);
         }
         match meta.oracle_health {
-            OracleHealth::Halted | OracleHealth::Stale => {
-                Err(ExecutionError::OracleRiskFrozen)
-            }
+            OracleHealth::Halted | OracleHealth::Stale => Err(ExecutionError::OracleRiskFrozen),
             OracleHealth::Normal | OracleHealth::Degraded => Ok(()),
         }
     }
@@ -241,10 +232,7 @@ impl Engine {
         requested: Quantity,
     ) -> Result<Amount, ExecutionError> {
         let filled = result.filled_quantity();
-        let remaining = requested
-            .raw()
-            .saturating_sub(filled.raw())
-            .max(0);
+        let remaining = requested.raw().saturating_sub(filled.raw()).max(0);
         if remaining == 0 {
             return Ok(Amount::ZERO);
         }
@@ -282,8 +270,10 @@ impl Engine {
             return Ok(());
         }
         self.risk.reserve_resting(account, notional)?;
-        self.order_reserves
-            .insert((market.get(), instrument, order_id.get()), (account, notional));
+        self.order_reserves.insert(
+            (market.get(), instrument, order_id.get()),
+            (account, notional),
+        );
         Ok(())
     }
 
@@ -576,8 +566,7 @@ impl Engine {
         // Premium cash: buyer pays seller (zero-sum ledger + risk).
         let premium = fill.price.notional(fill.quantity)?;
         if premium.raw() > 0 {
-            self.ledger
-                .transfer_available(buyer, seller, premium)?;
+            self.ledger.transfer_available(buyer, seller, premium)?;
             self.risk.debit_collateral(buyer, premium)?;
             self.risk.credit_collateral(seller, premium)?;
         }
@@ -654,7 +643,12 @@ impl Engine {
             return Err(ExecutionError::NotImplemented("fee bps out of range"));
         }
         let mag = if notional.is_negative() {
-            Amount::from_raw(notional.raw().checked_neg().ok_or(types::ArithError::Overflow)?)
+            Amount::from_raw(
+                notional
+                    .raw()
+                    .checked_neg()
+                    .ok_or(types::ArithError::Overflow)?,
+            )
         } else {
             notional
         };
@@ -664,7 +658,10 @@ impl Engine {
         } else {
             let rebate = mag.mul_ratio(ratio)?;
             Ok(Amount::from_raw(
-                rebate.raw().checked_neg().ok_or(types::ArithError::Overflow)?,
+                rebate
+                    .raw()
+                    .checked_neg()
+                    .ok_or(types::ArithError::Overflow)?,
             ))
         }
     }
@@ -924,13 +921,12 @@ impl Engine {
                 if rested {
                     let rest_notional = Self::residual_notional(&result, c.price, c.quantity)?;
                     // Limit orders use their limit price; market residuals do not rest.
-                    let rest_notional = if !matches!(c.order_type, OrderType::Market)
-                        && c.price.raw() > 0
-                    {
-                        rest_notional
-                    } else {
-                        Amount::ZERO
-                    };
+                    let rest_notional =
+                        if !matches!(c.order_type, OrderType::Market) && c.price.raw() > 0 {
+                            rest_notional
+                        } else {
+                            Amount::ZERO
+                        };
                     self.reserve_order(
                         c.market,
                         c.instrument,
@@ -1036,7 +1032,8 @@ impl Engine {
                         }
                     }
                 }
-                let instrument = instrument.ok_or(ExecutionError::Order(orderbook::OrderError::UnknownOrder))?;
+                let instrument =
+                    instrument.ok_or(ExecutionError::Order(orderbook::OrderError::UnknownOrder))?;
                 let notional = c.price.notional_ceil(c.quantity)?;
                 self.authorize(c.account, c.market, notional, &c.auth)?;
                 self.release_order_reserve(c.market, instrument, c.order_id, c.account)?;
@@ -1055,13 +1052,7 @@ impl Engine {
                 );
                 if rested {
                     let rest_notional = Self::residual_notional(&result, c.price, c.quantity)?;
-                    self.reserve_order(
-                        c.market,
-                        instrument,
-                        c.order_id,
-                        c.account,
-                        rest_notional,
-                    )?;
+                    self.reserve_order(c.market, instrument, c.order_id, c.account, rest_notional)?;
                 }
                 for a in touched {
                     self.commit_account(a)?;
@@ -1097,8 +1088,7 @@ impl Engine {
                 }
                 let key = (c.account.get(), c.market.get());
                 let prev = self.mint_locked.get(&key).copied().unwrap_or(Amount::ZERO);
-                self.mint_locked
-                    .insert(key, prev.checked_add(c.count)?);
+                self.mint_locked.insert(key, prev.checked_add(c.count)?);
                 self.commit_account(c.account)?;
                 Ok(self.receipt(seq, ReceiptKind::CompleteSet(c.count)))
             }
@@ -1264,7 +1254,11 @@ impl Engine {
                     let mut v = Vec::new();
                     for i in 0..n {
                         if let Ok(a) = AccountId::from_index(i) {
-                            if self.risk.position(a, c.market).map(|q| q.raw() != 0).unwrap_or(false)
+                            if self
+                                .risk
+                                .position(a, c.market)
+                                .map(|q| q.raw() != 0)
+                                .unwrap_or(false)
                             {
                                 v.push(a);
                             }

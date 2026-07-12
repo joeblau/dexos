@@ -417,7 +417,7 @@ mod tests {
     #[test]
     fn hostile_declared_length_fails_before_payload_alloc() {
         // Only 4 bytes of length + tiny rest: declared length is huge.
-        let mut bytes = vec![0u8; FRAME_OVERHEAD];
+        let mut bytes = [0u8; FRAME_OVERHEAD];
         let hostile = u32::try_from(DEFAULT_MAX_RECORD_BYTES.saturating_add(1)).unwrap();
         bytes[0..4].copy_from_slice(&hostile.to_le_bytes());
         // Pad so buffer is large enough that BadLength wouldn't trip first if

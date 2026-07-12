@@ -26,9 +26,7 @@
 use std::collections::BTreeMap;
 
 use consensus::{verify_checkpoint, Checkpoint};
-use crypto::{
-    hash_domain, ValidatorSet, DOMAIN_VALIDATOR_SET_TRANSITION, QuorumCertificate,
-};
+use crypto::{hash_domain, QuorumCertificate, ValidatorSet, DOMAIN_VALIDATOR_SET_TRANSITION};
 use types::{Hash, ShardId, StateRoot};
 
 use crate::error::LightClientError;
@@ -190,9 +188,7 @@ impl ShardSync {
         set: ValidatorSet,
     ) -> Result<(), LightClientError> {
         if !self.validator_sets.is_empty() {
-            return Err(LightClientError::UnsolicitedValidatorSet {
-                epoch,
-            });
+            return Err(LightClientError::UnsolicitedValidatorSet { epoch });
         }
         self.validator_sets.insert(epoch, set);
         self.latest_epoch = Some(epoch);
@@ -252,12 +248,11 @@ impl ShardSync {
                 epoch: transition.new_epoch,
             });
         }
-        let old_set = self
-            .validator_sets
-            .get(&transition.old_epoch)
-            .ok_or(LightClientError::UnknownValidatorSet {
+        let old_set = self.validator_sets.get(&transition.old_epoch).ok_or(
+            LightClientError::UnknownValidatorSet {
                 epoch: transition.old_epoch,
-            })?;
+            },
+        )?;
         let digest = validator_set_transition_digest(
             transition.old_epoch,
             transition.new_epoch,
@@ -269,19 +264,15 @@ impl ShardSync {
                 new_epoch: transition.new_epoch,
             });
         }
-        old_set
-            .verify(&transition.certificate)
-            .map_err(|_| LightClientError::InvalidValidatorSetTransition {
+        old_set.verify(&transition.certificate).map_err(|_| {
+            LightClientError::InvalidValidatorSetTransition {
                 old_epoch: transition.old_epoch,
                 new_epoch: transition.new_epoch,
-            })?;
+            }
+        })?;
         self.validator_sets
             .insert(transition.new_epoch, transition.new_set);
-        self.latest_epoch = Some(
-            self.latest_epoch
-                .unwrap_or(0)
-                .max(transition.new_epoch),
-        );
+        self.latest_epoch = Some(self.latest_epoch.unwrap_or(0).max(transition.new_epoch));
         Ok(())
     }
 
@@ -493,9 +484,6 @@ impl ShardSync {
     /// Iterate accepted `(last_sequence, new_state_root)` pairs, newest first,
     /// for stale-root classification by proof re-verification.
     pub(crate) fn accepted_roots(&self) -> impl Iterator<Item = (u64, StateRoot)> + '_ {
-        self.accepted
-            .values()
-            .rev()
-            .map(|r| (r.last, r.root))
+        self.accepted.values().rev().map(|r| (r.last, r.root))
     }
 }

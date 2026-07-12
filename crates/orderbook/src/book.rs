@@ -13,7 +13,7 @@ use crate::order::{
     BookConfig, Fill, MatchPlan, MatchResult, NewOrder, Node, OrderOutcome, PlannedFill, StpPolicy,
 };
 use crate::slab::Slab;
-use crate::{BOOK_ROOT_SCHEMA_VERSION, BOOK_ROOT_HOT_PATH_HASH_BUDGET_BYTES};
+use crate::{BOOK_ROOT_HOT_PATH_HASH_BUDGET_BYTES, BOOK_ROOT_SCHEMA_VERSION};
 
 /// Where a resting order lives, for O(1) lookup on cancel / replace.
 #[derive(Debug, Clone, Copy)]

@@ -709,7 +709,7 @@ fn incremental_root_matches_full_rebuild_after_every_op() {
                 };
                 let px = 50 + (r.below(50) as i64);
                 let qty = 1 + (r.below(20) as i64);
-                let _ = b.submit(limit(id, (r.below(8) as u32) + 1, side, px, qty));
+                let _ = b.submit(limit(id, (u32::try_from(r.below(8)).unwrap()) + 1, side, px, qty));
             }
             2 => {
                 let _ = b.cancel(OrderId::new(r.next_u64()));
@@ -732,7 +732,7 @@ fn incremental_root_matches_full_rebuild_after_every_op() {
                 let qty = 1 + (r.below(30) as i64);
                 let _ = b.submit(order(
                     id,
-                    (r.below(8) as u32) + 1,
+                    (u32::try_from(r.below(8)).unwrap()) + 1,
                     side,
                     OrderType::Market,
                     TimeInForce::Ioc,

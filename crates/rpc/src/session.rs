@@ -54,10 +54,7 @@ impl SessionRegistry {
     /// Install (or overwrite) a session binding.
     pub fn insert(&self, account: AccountId, session: Session) {
         let mut g = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        g.insert(
-            session.session_pubkey,
-            SessionBinding { account, session },
-        );
+        g.insert(session.session_pubkey, SessionBinding { account, session });
     }
 
     /// Revoke a session key. Returns whether one was present.

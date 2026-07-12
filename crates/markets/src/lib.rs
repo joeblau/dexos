@@ -46,8 +46,8 @@ pub use payout::{
     CompleteSetPool, PayoutRule, Settlement,
 };
 pub use perpetual::{
-    apply_funding, book_mid, derive_mark, fill_fee, funding_payment, realized_pnl, FundingEpochReceipt,
-    FundingUpdate, PerpMarketState,
+    apply_funding, book_mid, derive_mark, fill_fee, funding_payment, realized_pnl,
+    FundingEpochReceipt, FundingUpdate, PerpMarketState,
 };
 pub use registry::{LifecycleEvent, MarketCommand, MarketDefinition, MarketRegistry};
 pub use resolution::{

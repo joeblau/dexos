@@ -286,10 +286,10 @@ impl PriorityScheduler {
             let weight = usize::from(self.weights[idx].max(1));
             // Quantum unit: weight * 256 bytes of credit per visit.
             self.deficit[idx] = self.deficit[idx].saturating_add(weight.saturating_mul(256));
-            while !self.queues[idx].is_empty() {
+            if !self.queues[idx].is_empty() {
                 let cost = self.queues[idx].front().map(frame_cost).unwrap_or(0);
                 if cost > self.deficit[idx] {
-                    break;
+                    continue;
                 }
                 let frame = self.take_from(idx)?;
                 let cost = frame_cost(&frame);
@@ -542,7 +542,7 @@ mod tests {
         let weights = DEFAULT_CLASS_WEIGHTS;
         let mut s = PriorityScheduler::with_weights(4096, usize::MAX, weights, 1024);
         // Offer 100 frames * 100 bytes = 10 KB per class.
-        for class_byte in 0..NUM_CLASSES as u8 {
+        for class_byte in 0..u8::try_from(NUM_CLASSES).unwrap() {
             let class = TrafficClass::from_u8(class_byte).unwrap();
             for seq in 0..100u64 {
                 let f = Frame {
@@ -558,7 +558,7 @@ mod tests {
         while s.dequeue().is_some() {}
         let total = s.total_dequeued_bytes();
         assert_eq!(total, 9 * 100 * 100);
-        for class_byte in 0..NUM_CLASSES as u8 {
+        for class_byte in 0..u8::try_from(NUM_CLASSES).unwrap() {
             let class = TrafficClass::from_u8(class_byte).unwrap();
             let got = s.dequeued_bytes(class);
             assert!(

@@ -429,7 +429,14 @@ mod tests {
                 "c.log",
             ],
             &["marketd", "verify", "--snapshot", "s.snap"],
-            &["marketd", "inspect", "--sequence", "42", "--log", "/tmp/wal"],
+            &[
+                "marketd",
+                "inspect",
+                "--sequence",
+                "42",
+                "--log",
+                "/tmp/wal",
+            ],
             &["marketd", "keygen"],
             &["marketd", "snapshot"],
         ];
@@ -459,15 +466,8 @@ mod tests {
 
     #[test]
     fn duplicate_role_flags_are_rejected() {
-        let cli = Cli::try_parse_from([
-            "marketd",
-            "run",
-            "--role",
-            "gateway",
-            "--role",
-            "gateway",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["marketd", "run", "--role", "gateway", "--role", "gateway"])
+            .unwrap();
         let Command::Run(args) = cli.command else {
             panic!("expected run");
         };

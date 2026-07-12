@@ -173,7 +173,6 @@ impl TriggerKind {
             TriggerKind::Below(t) => price.raw() <= t.raw(),
         }
     }
-
 }
 
 /// Direction of a trailing stop.
@@ -297,7 +296,6 @@ struct Entry {
 ///
 /// # Errors
 /// [`ConditionalError::NonPositiveQuantity`] if any slice would be zero.
-#[must_use]
 fn twap_slice_qty(parent: i64, slices: u32, index: u32) -> Result<i64, ConditionalError> {
     if slices == 0 || parent <= 0 {
         return Err(ConditionalError::NonPositiveQuantity);
@@ -498,11 +496,18 @@ impl ConditionalEngine {
 
     fn alloc_id(&mut self) -> Result<u64, ConditionalError> {
         let id = self.next_id;
-        self.next_id = self.next_id.checked_add(1).ok_or(ConditionalError::Overflow)?;
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .ok_or(ConditionalError::Overflow)?;
         Ok(id)
     }
 
-    fn insert(&mut self, kind: EntryKind, owner: AccountId) -> Result<ConditionalId, ConditionalError> {
+    fn insert(
+        &mut self,
+        kind: EntryKind,
+        owner: AccountId,
+    ) -> Result<ConditionalId, ConditionalError> {
         if self.entries.len() >= self.config.capacity {
             return Err(ConditionalError::CapacityExhausted);
         }
@@ -716,7 +721,10 @@ impl ConditionalEngine {
         id: ConditionalId,
         owner: AccountId,
     ) -> Result<OrderIntent, ConditionalError> {
-        let entry = self.entries.get_mut(&id).ok_or(ConditionalError::UnknownId)?;
+        let entry = self
+            .entries
+            .get_mut(&id)
+            .ok_or(ConditionalError::UnknownId)?;
         if entry.owner != owner {
             return Err(ConditionalError::OwnerMismatch);
         }

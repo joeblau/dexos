@@ -13,11 +13,11 @@ pub mod ledger;
 pub mod session;
 
 pub use command::{
-    ApplyFundingEpoch, Authorization, AuthorizeSession, BindWallet, CancelAll, CancelOrder, Command,
-    CompleteSetOp, CreateAccount, CreateMarket, DepositCredit, DeterministicEngine, ExecutionReceipt,
-    FinalizeWithdrawal, Liquidate, PlaceOrder, ProtocolUpgrade, ReceiptKind, ReplaceOrder,
-    RequestWithdrawal, ResolveMarket, RevokeSession, SetMarkPrice, SetMarketLifecycle,
-    SetOracleHealth, SettleMarket, Timestamp,
+    ApplyFundingEpoch, Authorization, AuthorizeSession, BindWallet, CancelAll, CancelOrder,
+    Command, CompleteSetOp, CreateAccount, CreateMarket, DepositCredit, DeterministicEngine,
+    ExecutionReceipt, FinalizeWithdrawal, Liquidate, PlaceOrder, ProtocolUpgrade, ReceiptKind,
+    ReplaceOrder, RequestWithdrawal, ResolveMarket, RevokeSession, SetMarkPrice,
+    SetMarketLifecycle, SetOracleHealth, SettleMarket, Timestamp,
 };
 pub use engine::{Engine, EngineConfig, WalletBinding};
 pub use error::ExecutionError;
@@ -1784,7 +1784,10 @@ mod tests {
         assert!(e.risk().perp_positions(seller).unwrap().is_empty());
         assert!(e.risk().perp_positions(buyer).unwrap().is_empty());
         // Premium 0.40 * 100 = 40 moved seller←buyer.
-        assert_eq!(e.ledger().available(seller).unwrap(), amt(1_000_000 - 100 + 40));
+        assert_eq!(
+            e.ledger().available(seller).unwrap(),
+            amt(1_000_000 - 100 + 40)
+        );
         assert_eq!(e.ledger().available(buyer).unwrap(), amt(1_000_000 - 40));
         assert!(e.ledger().conservation_holds());
         // Resolve outcome 0 wins; settle pays buyer 100 from locked pool.

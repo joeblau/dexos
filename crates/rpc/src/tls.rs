@@ -34,11 +34,10 @@ pub fn acceptor_from_pem(
     if certs.is_empty() {
         return Err(TlsError::Pem("no certificates in chain".into()));
     }
-    let mut keys = rustls_pemfile::pkcs8_private_keys(&mut BufReader::new(Cursor::new(
-        private_key_pem,
-    )))
-    .collect::<Result<Vec<PrivatePkcs8KeyDer<'static>>, _>>()
-    .map_err(|e| TlsError::Pem(e.to_string()))?;
+    let mut keys =
+        rustls_pemfile::pkcs8_private_keys(&mut BufReader::new(Cursor::new(private_key_pem)))
+            .collect::<Result<Vec<PrivatePkcs8KeyDer<'static>>, _>>()
+            .map_err(|e| TlsError::Pem(e.to_string()))?;
     let key = keys
         .pop()
         .ok_or_else(|| TlsError::Pem("no PKCS#8 private key found".into()))?;
@@ -47,14 +46,11 @@ pub fn acceptor_from_pem(
     let builder = match client_roots_pem {
         Some(roots_pem) => {
             let mut roots = RootCertStore::empty();
-            let root_certs =
-                rustls_pemfile::certs(&mut BufReader::new(Cursor::new(roots_pem)))
-                    .collect::<Result<Vec<CertificateDer<'static>>, _>>()
-                    .map_err(|e| TlsError::Pem(e.to_string()))?;
+            let root_certs = rustls_pemfile::certs(&mut BufReader::new(Cursor::new(roots_pem)))
+                .collect::<Result<Vec<CertificateDer<'static>>, _>>()
+                .map_err(|e| TlsError::Pem(e.to_string()))?;
             for c in root_certs {
-                roots
-                    .add(c)
-                    .map_err(|e| TlsError::Config(e.to_string()))?;
+                roots.add(c).map_err(|e| TlsError::Config(e.to_string()))?;
             }
             let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
                 .build()

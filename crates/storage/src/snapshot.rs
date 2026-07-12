@@ -93,16 +93,7 @@ impl PartialEq for SnapshotError {
     fn eq(&self, other: &Self) -> bool {
         use SnapshotError::*;
         match (self, other) {
-            (
-                TooShort {
-                    have: a,
-                    need: b,
-                },
-                TooShort {
-                    have: c,
-                    need: d,
-                },
-            ) => a == c && b == d,
+            (TooShort { have: a, need: b }, TooShort { have: c, need: d }) => a == c && b == d,
             (
                 BadLength {
                     declared: a,

@@ -858,8 +858,7 @@ impl SlashEvidence {
                 if obligation.public_key != activity.public_key {
                     return Err(SponsorError::EvidenceSignatureInvalid);
                 }
-                let obl_hash =
-                    quote_window_payload_hash(*window_start, *window_end, *min_quotes);
+                let obl_hash = quote_window_payload_hash(*window_start, *window_end, *min_quotes);
                 let act_hash =
                     quote_window_payload_hash(*window_start, *window_end, *actual_quotes);
                 if obligation.payload_hash != obl_hash || activity.payload_hash != act_hash {

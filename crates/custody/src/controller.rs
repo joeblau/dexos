@@ -401,13 +401,7 @@ impl CustodyController {
                 address,
                 proof,
             } => registry
-                .authorize_withdrawal(
-                    cert.request.account,
-                    address,
-                    proof,
-                    &message,
-                    now,
-                )
+                .authorize_withdrawal(cert.request.account, address, proof, &message, now)
                 .map_err(|e| {
                     // Surface missing-auth distinctly from other wallet errors
                     // when the wallet is unknown / not permitted.
@@ -458,10 +452,7 @@ impl CustodyController {
         if auth.chain != key || auth.amount != amount {
             return Err(CustodyError::UnauthenticatedSettle);
         }
-        let policy = self
-            .policies
-            .get(&key)
-            .ok_or(CustodyError::UnknownChain)?;
+        let policy = self.policies.get(&key).ok_or(CustodyError::UnknownChain)?;
         if finality.confirmations < policy.min_confirmations {
             return Err(CustodyError::UnverifiedFinality);
         }
@@ -749,7 +740,12 @@ mod tests {
         let proof = wallet_proof_for(&crt);
         // 3-of-4 succeeds.
         let signed = c
-            .authorize_withdrawal(&crt, auth(&reg, &addr, &proof), &[0, 1, 2], SequenceNumber::new(1))
+            .authorize_withdrawal(
+                &crt,
+                auth(&reg, &addr, &proof),
+                &[0, 1, 2],
+                SequenceNumber::new(1),
+            )
             .unwrap();
         assert!(c
             .signers
@@ -795,8 +791,13 @@ mod tests {
         let (reg, addr) = wallets();
         let crt = cert(1, 100, 6);
         let proof = wallet_proof_for(&crt);
-        c.authorize_withdrawal(&crt, auth(&reg, &addr, &proof), &[0, 1, 2], SequenceNumber::new(1))
-            .unwrap();
+        c.authorize_withdrawal(
+            &crt,
+            auth(&reg, &addr, &proof),
+            &[0, 1, 2],
+            SequenceNumber::new(1),
+        )
+        .unwrap();
         assert_eq!(
             c.authorize_withdrawal(
                 &crt,
@@ -894,12 +895,22 @@ mod tests {
         // max_pending = 2000; three 1000-withdrawals: 2 fit, 3rd exceeds.
         let c1 = cert(1, 1_000, 6);
         let p1 = wallet_proof_for(&c1);
-        c.authorize_withdrawal(&c1, auth(&reg, &addr, &p1), &[0, 1, 2], SequenceNumber::new(1))
-            .unwrap();
+        c.authorize_withdrawal(
+            &c1,
+            auth(&reg, &addr, &p1),
+            &[0, 1, 2],
+            SequenceNumber::new(1),
+        )
+        .unwrap();
         let c2 = cert(2, 1_000, 6);
         let p2 = wallet_proof_for(&c2);
-        c.authorize_withdrawal(&c2, auth(&reg, &addr, &p2), &[0, 1, 2], SequenceNumber::new(2))
-            .unwrap();
+        c.authorize_withdrawal(
+            &c2,
+            auth(&reg, &addr, &p2),
+            &[0, 1, 2],
+            SequenceNumber::new(2),
+        )
+        .unwrap();
         assert_eq!(c.pending(ChainId(1)), Amount::from_raw(2_000));
         let c3 = cert(3, 1_000, 6);
         let p3 = wallet_proof_for(&c3);
@@ -930,12 +941,7 @@ mod tests {
         assert_eq!(c.pending(ChainId(1)), Amount::from_raw(2_000));
         // Wrong amount does not free slots.
         assert_eq!(
-            c.settle(
-                ChainId(1),
-                &id,
-                Amount::from_raw(999),
-                &good_finality()
-            ),
+            c.settle(ChainId(1), &id, Amount::from_raw(999), &good_finality()),
             Err(CustodyError::UnauthenticatedSettle)
         );
         assert_eq!(c.pending(ChainId(1)), Amount::from_raw(2_000));

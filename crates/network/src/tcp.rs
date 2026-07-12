@@ -129,6 +129,7 @@ pub(crate) struct HandshakeResult {
 }
 
 /// The signed handshake transcript.
+#[allow(clippy::too_many_arguments)] // mirrors fixed on-wire field order
 fn transcript(
     challenge: &[u8; 32],
     signer_pub: &[u8; 32],
@@ -156,7 +157,13 @@ fn transcript(
     m
 }
 
-fn encode_meta(network_id: u64, min_ver: u16, max_ver: u16, caps: u64, epoch: u64) -> [u8; HS_META_LEN] {
+fn encode_meta(
+    network_id: u64,
+    min_ver: u16,
+    max_ver: u16,
+    caps: u64,
+    epoch: u64,
+) -> [u8; HS_META_LEN] {
     let mut out = [0u8; HS_META_LEN];
     out[0..8].copy_from_slice(&network_id.to_le_bytes());
     out[8..10].copy_from_slice(&min_ver.to_le_bytes());
@@ -532,9 +539,7 @@ fn spawn_connection(
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            let last = *idle_activity
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+            let last = *idle_activity.lock().unwrap_or_else(PoisonError::into_inner);
             if last.elapsed() >= idle_timeout {
                 idle_disconnects.record(DisconnectReason::RemoteClose);
                 idle_out.close();
@@ -923,8 +928,7 @@ mod tests {
         // Either side may surface the failure depending on who closes first.
         let accept_result = acceptor.await.unwrap();
         assert!(
-            matches!(accept_result, Err(TransportError::NotInMembership))
-                || client_result.is_err(),
+            matches!(accept_result, Err(TransportError::NotInMembership)) || client_result.is_err(),
             "unknown peer must be rejected: accept={accept_result:?} client={client_result:?}"
         );
     }
@@ -936,16 +940,8 @@ mod tests {
         server_cfg.network_id = 42;
         let mut client_cfg = cfg();
         client_cfg.network_id = 99;
-        let server = Arc::new(
-            TcpTransport::bind(addr, kp(12), server_cfg)
-                .await
-                .unwrap(),
-        );
-        let client = Arc::new(
-            TcpTransport::bind(addr, kp(13), client_cfg)
-                .await
-                .unwrap(),
-        );
+        let server = Arc::new(TcpTransport::bind(addr, kp(12), server_cfg).await.unwrap());
+        let client = Arc::new(TcpTransport::bind(addr, kp(13), client_cfg).await.unwrap());
         let server_addr = server.local_addr().unwrap();
         let server_id = server.id();
         let acceptor = {
@@ -975,16 +971,8 @@ mod tests {
         let mut client_cfg = cfg();
         client_cfg.min_wire_version = 1;
         client_cfg.max_wire_version = 2;
-        let server = Arc::new(
-            TcpTransport::bind(addr, kp(14), server_cfg)
-                .await
-                .unwrap(),
-        );
-        let client = Arc::new(
-            TcpTransport::bind(addr, kp(15), client_cfg)
-                .await
-                .unwrap(),
-        );
+        let server = Arc::new(TcpTransport::bind(addr, kp(14), server_cfg).await.unwrap());
+        let client = Arc::new(TcpTransport::bind(addr, kp(15), client_cfg).await.unwrap());
         let server_addr = server.local_addr().unwrap();
         let server_id = server.id();
         let acceptor = {
@@ -1010,16 +998,8 @@ mod tests {
         let mut client_cfg = cfg();
         client_cfg.min_wire_version = 1;
         client_cfg.max_wire_version = 1;
-        let server = Arc::new(
-            TcpTransport::bind(addr, kp(16), server_cfg)
-                .await
-                .unwrap(),
-        );
-        let client = Arc::new(
-            TcpTransport::bind(addr, kp(17), client_cfg)
-                .await
-                .unwrap(),
-        );
+        let server = Arc::new(TcpTransport::bind(addr, kp(16), server_cfg).await.unwrap());
+        let client = Arc::new(TcpTransport::bind(addr, kp(17), client_cfg).await.unwrap());
         let server_addr = server.local_addr().unwrap();
         let server_id = server.id();
         let acceptor = {
@@ -1051,7 +1031,11 @@ mod tests {
 
         let mut c = cfg();
         c.handshake_timeout = Duration::from_millis(200);
-        let client = Arc::new(TcpTransport::bind("127.0.0.1:0".parse().unwrap(), kp(18), c).await.unwrap());
+        let client = Arc::new(
+            TcpTransport::bind("127.0.0.1:0".parse().unwrap(), kp(18), c)
+                .await
+                .unwrap(),
+        );
         let result = client
             .connect(&Peer::dial(PeerId::from([1u8; 32]), addr))
             .await;

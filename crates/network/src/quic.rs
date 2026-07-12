@@ -38,7 +38,9 @@ use bytes::Bytes;
 use codec::{Frame, TrafficClass, FRAME_HEADER_LEN, MAX_FRAME_PAYLOAD};
 use crypto::KeyPair;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-use quinn::{ClientConfig, Connection as QuinnConnection, Endpoint, RecvStream, SendStream, ServerConfig};
+use quinn::{
+    ClientConfig, Connection as QuinnConnection, Endpoint, RecvStream, SendStream, ServerConfig,
+};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::sync::{mpsc, Semaphore};
 use tokio::time::timeout;
@@ -241,14 +243,9 @@ async fn write_frame(send: &mut SendStream, frame: &Frame) -> Result<(), Transpo
 }
 
 /// Read one self-delimiting [`Frame`] from a QUIC stream.
-async fn read_frame(
-    recv: &mut RecvStream,
-    max_payload: usize,
-) -> Result<Frame, TransportError> {
+async fn read_frame(recv: &mut RecvStream, max_payload: usize) -> Result<Frame, TransportError> {
     let mut header = [0u8; FRAME_HEADER_LEN];
-    recv.read_exact(&mut header)
-        .await
-        .map_err(map_read_err)?;
+    recv.read_exact(&mut header).await.map_err(map_read_err)?;
     let plen = u32::from_le_bytes([header[15], header[16], header[17], header[18]]) as usize;
     let cap = max_payload.min(MAX_FRAME_PAYLOAD);
     if plen > cap {
@@ -359,7 +356,8 @@ fn spawn_quic_connection(
         .zip(class_rxs.into_iter())
         .enumerate()
     {
-        let class = TrafficClass::from_u8(idx as u8).unwrap_or(TrafficClass::Sync);
+        let class = TrafficClass::from_u8(u8::try_from(idx).unwrap_or(u8::MAX))
+            .unwrap_or(TrafficClass::Sync);
         let chunk = class_chunk_limit(class);
         let writer_disconnects = disconnects.clone();
         let writer = tokio::spawn(async move {
@@ -446,25 +444,20 @@ fn spawn_quic_connection(
         let dgram_conn = quinn_conn.clone();
         let dgram_max = cfg.datagram_max_bytes;
         let dgram_reader = tokio::spawn(async move {
-            loop {
-                match dgram_conn.read_datagram().await {
-                    Ok(data) => {
-                        match Frame::decode_with_max(&data, dgram_max.max(FRAME_HEADER_LEN)) {
-                            Ok((frame, _)) if frame.msg_type == MSG_TYPE_DATAGRAM => {
-                                if frame.payload.len() <= dgram_max {
-                                    let _ = in_dtx.try_send(frame);
-                                }
-                            }
-                            Ok((frame, _)) => {
-                                // Unexpected reliable frame on datagram path — ignore.
-                                let _ = frame;
-                            }
-                            Err(_) => {
-                                // Malformed datagram: shed, never tear down reliable.
-                            }
+            while let Ok(data) = dgram_conn.read_datagram().await {
+                match Frame::decode_with_max(&data, dgram_max.max(FRAME_HEADER_LEN)) {
+                    Ok((frame, _)) if frame.msg_type == MSG_TYPE_DATAGRAM => {
+                        if frame.payload.len() <= dgram_max {
+                            let _ = in_dtx.try_send(frame);
                         }
                     }
-                    Err(_) => break,
+                    Ok((frame, _)) => {
+                        // Unexpected reliable frame on datagram path — ignore.
+                        let _ = frame;
+                    }
+                    Err(_) => {
+                        // Malformed datagram: shed, never tear down reliable.
+                    }
                 }
             }
         });
@@ -511,7 +504,7 @@ async fn open_class_streams_initiator(
             .open_bi()
             .await
             .map_err(|e| TransportError::Io(e.to_string()))?;
-        send.write_all(&[class_id as u8])
+        send.write_all(&[u8::try_from(class_id).unwrap_or(0)])
             .await
             .map_err(map_write_err)?;
         sends.push(send);
@@ -523,7 +516,8 @@ async fn open_class_streams_initiator(
 async fn open_class_streams_responder(
     conn: &QuinnConnection,
 ) -> Result<(Vec<SendStream>, Vec<RecvStream>), TransportError> {
-    let mut by_class: Vec<Option<(SendStream, RecvStream)>> = (0..NUM_CLASSES).map(|_| None).collect();
+    let mut by_class: Vec<Option<(SendStream, RecvStream)>> =
+        (0..NUM_CLASSES).map(|_| None).collect();
     for _ in 0..NUM_CLASSES {
         let (send, mut recv) = conn
             .accept_bi()
@@ -830,11 +824,9 @@ fn clone_private_key(key: &PrivateKeyDer<'static>) -> PrivateKeyDer<'static> {
         PrivateKeyDer::Sec1(k) => PrivateKeyDer::Sec1(rustls_pki_types::PrivateSec1KeyDer::from(
             k.secret_sec1_der().to_vec(),
         )),
-        PrivateKeyDer::Pkcs1(k) => {
-            PrivateKeyDer::Pkcs1(rustls_pki_types::PrivatePkcs1KeyDer::from(
-                k.secret_pkcs1_der().to_vec(),
-            ))
-        }
+        PrivateKeyDer::Pkcs1(k) => PrivateKeyDer::Pkcs1(
+            rustls_pki_types::PrivatePkcs1KeyDer::from(k.secret_pkcs1_der().to_vec()),
+        ),
         _ => PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(Vec::<u8>::new())),
     }
 }
@@ -888,11 +880,7 @@ mod tests {
 
     async fn bound(seed: u8) -> Arc<QuicTransport> {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        Arc::new(
-            QuicTransport::bind(addr, kp(seed), cfg())
-                .await
-                .unwrap(),
-        )
+        Arc::new(QuicTransport::bind(addr, kp(seed), cfg()).await.unwrap())
     }
 
     #[tokio::test]
@@ -968,16 +956,8 @@ mod tests {
         c.queue_capacity = 256;
         c.max_class_bytes = 64 * 1024 * 1024;
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let server = Arc::new(
-            QuicTransport::bind(addr, kp(110), c)
-                .await
-                .unwrap(),
-        );
-        let client = Arc::new(
-            QuicTransport::bind(addr, kp(111), c)
-                .await
-                .unwrap(),
-        );
+        let server = Arc::new(QuicTransport::bind(addr, kp(110), c).await.unwrap());
+        let client = Arc::new(QuicTransport::bind(addr, kp(111), c).await.unwrap());
         let server_addr = server.local_addr().unwrap();
         let server_id = server.id();
         let acceptor = {
@@ -1069,8 +1049,7 @@ mod tests {
         let mut saw = false;
         while start.elapsed() < Duration::from_secs(5) {
             // Drain any datagrams without blocking reliable.
-            while let Ok(Ok(_)) = to(Duration::from_millis(1), server_conn.recv_datagram()).await {
-            }
+            while let Ok(Ok(_)) = to(Duration::from_millis(1), server_conn.recv_datagram()).await {}
             if let Ok(Ok(frame)) = to(Duration::from_millis(50), server_conn.recv()).await {
                 if frame.class == TrafficClass::Consensus {
                     assert_eq!(frame.payload, b"after-dgrams");
@@ -1162,11 +1141,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let client = Arc::new(
-            QuicTransport::bind(addr, kp(151), cfg())
-                .await
-                .unwrap(),
-        );
+        let client = Arc::new(QuicTransport::bind(addr, kp(151), cfg()).await.unwrap());
         let server_addr = server.local_addr().unwrap();
         let server_id = server.id();
         let acceptor = {
@@ -1176,8 +1151,7 @@ mod tests {
         let client_result = client.connect(&Peer::dial(server_id, server_addr)).await;
         let accept_result = acceptor.await.unwrap();
         assert!(
-            matches!(accept_result, Err(TransportError::NotInMembership))
-                || client_result.is_err(),
+            matches!(accept_result, Err(TransportError::NotInMembership)) || client_result.is_err(),
             "unknown peer must be rejected: accept={accept_result:?} client={client_result:?}"
         );
     }

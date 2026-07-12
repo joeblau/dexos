@@ -245,6 +245,7 @@ pub enum VoteError {
 
 /// The result of admitting a vote.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum VoteOutcome {
     /// A new, valid, distinct vote was recorded.
     Accepted,
@@ -409,8 +410,10 @@ impl Committee {
             .map_err(|_| VoteError::InvalidValidatorSet)?;
         let mut cached_keys = Vec::with_capacity(validators.len());
         for v in &validators {
-            cached_keys
-                .push(CachedEd25519Key::parse(&v.public_key).map_err(|_| VoteError::InvalidValidatorSet)?);
+            cached_keys.push(
+                CachedEd25519Key::parse(&v.public_key)
+                    .map_err(|_| VoteError::InvalidValidatorSet)?,
+            );
         }
         Ok(Self {
             epoch,
@@ -498,6 +501,7 @@ pub struct VoteCollector {
     // digest -> (validator_index -> signature), BTreeMap keeps ascending order.
     votes: BTreeMap<Hash, BTreeMap<u32, [u8; 64]>>,
     // round key -> first block + signature seen (for equivocation detection).
+    #[allow(clippy::type_complexity)] // equivocation index key
     seen: BTreeMap<(u32, u64, u64, u64, u8), (Hash, [u8; 64])>,
     equivocations: Vec<Equivocation>,
     slash_log: Vec<SlashEvidence>,
@@ -562,7 +566,8 @@ impl VoteCollector {
         // Votes map is keyed by digest only; leave it — try_form_qc still works
         // for live heights. Bound growth by also clearing votes when the map is
         // large relative to the horizon: drop all when over capacity.
-        let cap = (self.window.height_horizon as usize)
+        let cap = usize::try_from(self.window.height_horizon)
+            .unwrap_or(usize::MAX)
             .saturating_mul(3)
             .saturating_mul(self.window.evidence_limit.max(1))
             .max(64);

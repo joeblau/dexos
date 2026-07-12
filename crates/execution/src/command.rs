@@ -2,8 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 use types::{
-    AccountId, Hash, MarketId, MarketLifecycle, MarketType, OracleHealth, OrderId, OrderType, Price,
-    Quantity, Ratio, SequenceNumber, Side, TimeInForce,
+    AccountId, Hash, MarketId, MarketLifecycle, MarketType, OracleHealth, OrderId, OrderType,
+    Price, Quantity, Ratio, SequenceNumber, Side, TimeInForce,
 };
 
 use crate::error::ExecutionError;

@@ -340,12 +340,13 @@ impl SegmentedLog {
     /// Returns [`LogError::NotFound`] if no such record exists, or a
     /// [`LogError::Record`] if the matching record is corrupt.
     pub fn find(&self, sequence: u64) -> Result<Record, LogError> {
-        let seg_idx = self.segment_index_for(sequence).ok_or(LogError::NotFound(sequence))?;
+        let seg_idx = self
+            .segment_index_for(sequence)
+            .ok_or(LogError::NotFound(sequence))?;
         let seg = &self.segments[seg_idx];
         let mut off = sparse_seek(&seg.index_points, sequence).unwrap_or(0);
         while off < seg.bytes.len() {
-            let (rref, consumed) =
-                decode_ref_bounded(&seg.bytes[off..], self.max_record_bytes)?;
+            let (rref, consumed) = decode_ref_bounded(&seg.bytes[off..], self.max_record_bytes)?;
             if rref.sequence == sequence {
                 return Ok(rref.to_owned());
             }

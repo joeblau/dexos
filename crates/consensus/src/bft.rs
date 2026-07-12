@@ -854,9 +854,8 @@ impl BftEngine {
     /// retaining locks, high-QC, and bounded slash evidence. Updates the vote
     /// collector admission window so stale/future messages are rejected cheaply.
     pub fn prune_finalized(&mut self, finalized_height: u64) {
-        self.pipeline.retain(|&h, s| {
-            h >= finalized_height || s.status != CommandStatus::Finalized
-        });
+        self.pipeline
+            .retain(|&h, s| h >= finalized_height || s.status != CommandStatus::Finalized);
         // Drop chain entries well below the watermark (keep one parent for ancestry).
         let keep_from = finalized_height.saturating_sub(1);
         self.chain.retain(|&h, _| h >= keep_from);

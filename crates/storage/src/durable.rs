@@ -368,10 +368,7 @@ impl DurableLog {
 
         let stride = self.cfg.index_stride.max(1);
         if seg.record_count == 1 || seg.record_count % stride == 1 {
-            seg.index_points.push(IndexPoint {
-                sequence,
-                offset,
-            });
+            seg.index_points.push(IndexPoint { sequence, offset });
         }
 
         self.last_sequence = Some(sequence);
@@ -437,7 +434,9 @@ impl DurableLog {
     /// # Errors
     /// Returns [`DurableError::NotFound`] or decode errors.
     pub fn find(&self, sequence: u64) -> Result<Record, DurableError> {
-        let seg_idx = self.segment_index_for(sequence).ok_or(DurableError::NotFound(sequence))?;
+        let seg_idx = self
+            .segment_index_for(sequence)
+            .ok_or(DurableError::NotFound(sequence))?;
         let seg = &self.segments[seg_idx];
         let start_off = sparse_seek(&seg.index_points, sequence).unwrap_or(0);
         let data = read_records_region(&seg.path, seg.records_len)?;
@@ -582,11 +581,7 @@ impl DurableLog {
     ///
     /// # Errors
     /// Returns decode / gap errors.
-    pub fn replay<F>(
-        &self,
-        from_sequence: Option<u64>,
-        mut apply: F,
-    ) -> Result<u64, DurableError>
+    pub fn replay<F>(&self, from_sequence: Option<u64>, mut apply: F) -> Result<u64, DurableError>
     where
         F: FnMut(Record),
     {
@@ -652,10 +647,7 @@ impl DurableLog {
             self.active = None;
         }
 
-        let path = self
-            .cfg
-            .dir
-            .join(format!("seg-{:020}.log", next_sequence));
+        let path = self.cfg.dir.join(format!("seg-{:020}.log", next_sequence));
         let f = OpenOptions::new()
             .read(true)
             .write(true)
@@ -803,15 +795,10 @@ fn recover_segment(
     if file_len >= SEGMENT_TRAILER_LEN as u64 {
         let split = all.len() - SEGMENT_TRAILER_LEN;
         if let Ok(trailer) = parse_trailer(&all[split..]) {
-            if trailer.records_len as usize == split
-                && u64::try_from(split).ok() == Some(trailer.records_len)
-            {
+            if u64::try_from(split).ok() == Some(trailer.records_len) {
                 let records = &all[..split];
                 let tip = chain_over_records(records, cfg.max_record_bytes).ok_or_else(|| {
-                    DurableError::Integrity(format!(
-                        "chain walk failed for {}",
-                        path.display()
-                    ))
+                    DurableError::Integrity(format!("chain walk failed for {}", path.display()))
                 })?;
                 if tip != trailer.chain_tip {
                     return Err(DurableError::Integrity(format!(
@@ -822,7 +809,7 @@ fn recover_segment(
                 // Validate each record CRC and build index.
                 let (count, last, points, base) =
                     scan_records(records, cfg.max_record_bytes, cfg.index_stride)?;
-                if count != trailer.record_count as usize
+                if count as u64 != trailer.record_count
                     || last != Some(trailer.last_sequence)
                     || base != trailer.base_sequence
                 {
@@ -972,7 +959,7 @@ fn verify_sealed_bytes(data: &[u8], cfg: &DurableConfig) -> Result<(), DurableEr
     }
     let split = data.len() - SEGMENT_TRAILER_LEN;
     let trailer = parse_trailer(&data[split..])?;
-    if trailer.records_len as usize != split {
+    if split as u64 != trailer.records_len {
         return Err(DurableError::Integrity("records_len mismatch".into()));
     }
     let tip = chain_over_records(&data[..split], cfg.max_record_bytes)
@@ -1013,6 +1000,7 @@ fn scan_records(
     Ok((count, last, points, base))
 }
 
+#[allow(clippy::type_complexity)] // recovery return tuple
 fn scan_valid_prefix(
     data: &[u8],
     max_record_bytes: usize,
@@ -1201,10 +1189,7 @@ mod tests {
             .map(|e| e.unwrap().path())
             .collect();
         segs.sort();
-        let mut f = OpenOptions::new()
-            .append(true)
-            .open(&segs[0])
-            .unwrap();
+        let mut f = OpenOptions::new().append(true).open(&segs[0]).unwrap();
         f.write_all(&[0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02]).unwrap();
         f.sync_data().unwrap();
         drop(f);
@@ -1235,12 +1220,8 @@ mod tests {
     #[test]
     fn find_uses_index_across_segments() {
         let dir = temp_dir("find");
-        let mut log = DurableLog::open(
-            cfg(&dir)
-                .with_segment_max_bytes(80)
-                .with_index_stride(3),
-        )
-        .unwrap();
+        let mut log =
+            DurableLog::open(cfg(&dir).with_segment_max_bytes(80).with_index_stride(3)).unwrap();
         for seq in 1..=40u64 {
             log.append(seq, 0, 1, format!("v{seq:04}").as_bytes())
                 .unwrap();

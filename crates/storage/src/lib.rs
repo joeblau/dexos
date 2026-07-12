@@ -55,7 +55,8 @@ pub const CRATE_NAME: &str = "storage";
 /// After a successful [`DurableLog::append`] under `Always`, the record has been
 /// `fdatasync`'d. Process crash or `kill -9` after that return cannot lose the
 /// acknowledged record (RPO = 0 for acks).
-pub const RPO_ALWAYS_SYNC: &str = "RPO=0 for acknowledged appends under SyncPolicy::Always (fdatasync per append)";
+pub const RPO_ALWAYS_SYNC: &str =
+    "RPO=0 for acknowledged appends under SyncPolicy::Always (fdatasync per append)";
 
 #[cfg(test)]
 mod tests {
