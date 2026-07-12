@@ -2,12 +2,13 @@
 # Build reproducible production artifacts for marketd with checksums, SBOM, and
 # rollback metadata. Intended for CI tag builds and operator release smoke tests.
 #
-# Outputs under ${OUT_DIR:-dist/}:
+# Outputs under ${OUT_DIR:-dist/} (all names are target-suffixed so that
+# multiple architectures can attach to one GitHub Release without colliding):
 #   marketd-<target>                 binary
-#   SHA256SUMS                       checksums
-#   sbom.cdx.json                    CycloneDX-like SBOM from cargo metadata
-#   build-metadata.json              commit, rustc, features, target, timestamp
-#   ROLLBACK.md                      digest-based rollback procedure
+#   SHA256SUMS-<target>              checksums
+#   sbom-<target>.cdx.json           CycloneDX-like SBOM from cargo metadata
+#   build-metadata-<target>.json     commit, rustc, features, target, timestamp
+#   ROLLBACK-<target>.md             digest-based rollback procedure
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -42,15 +43,15 @@ echo "==> SHA-256 checksums"
 (
   cd "${OUT_DIR}"
   if command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$(basename "${DEST_BIN}")" > SHA256SUMS
+    shasum -a 256 "$(basename "${DEST_BIN}")" > "SHA256SUMS-${TARGET}"
   else
-    sha256sum "$(basename "${DEST_BIN}")" > SHA256SUMS
+    sha256sum "$(basename "${DEST_BIN}")" > "SHA256SUMS-${TARGET}"
   fi
-  cat SHA256SUMS
+  cat "SHA256SUMS-${TARGET}"
 )
 
 echo "==> SBOM (CycloneDX-like from cargo metadata)"
-python3 - <<'PY' > "${OUT_DIR}/sbom.cdx.json"
+python3 - <<'PY' > "${OUT_DIR}/sbom-${TARGET}.cdx.json"
 import json, subprocess, datetime
 meta = json.loads(subprocess.check_output(
     ["cargo", "metadata", "--format-version", "1", "--locked"]
@@ -86,8 +87,8 @@ print(json.dumps(bom, indent=2, sort_keys=True))
 PY
 
 echo "==> build metadata"
-DIGEST="$(awk '{print $1}' "${OUT_DIR}/SHA256SUMS" | head -1)"
-python3 - <<PY > "${OUT_DIR}/build-metadata.json"
+DIGEST="$(awk '{print $1}' "${OUT_DIR}/SHA256SUMS-${TARGET}" | head -1)"
+python3 - <<PY > "${OUT_DIR}/build-metadata-${TARGET}.json"
 import json
 print(json.dumps({
     "binary": "$(basename "${DEST_BIN}")",
@@ -109,7 +110,7 @@ print(json.dumps({
 PY
 
 echo "==> rollback procedure"
-cat > "${OUT_DIR}/ROLLBACK.md" <<EOF
+cat > "${OUT_DIR}/ROLLBACK-${TARGET}.md" <<EOF
 # Rollback by immutable digest
 
 Artifact: \`$(basename "${DEST_BIN}")\`
@@ -121,7 +122,7 @@ Built: \`${TIMESTAMP_UTC}\`
 
 1. Identify the last known-good digest from your release notes / artifact store.
 2. Fetch that exact binary (do not rebuild ad-hoc).
-3. Verify: \`shasum -a 256 -c SHA256SUMS\` (or \`sha256sum -c\`).
+3. Verify: \`shasum -a 256 -c SHA256SUMS-${TARGET}\` (or \`sha256sum -c\`).
 4. Stop the running node with SIGTERM; wait for drain (see \`performance.drain_timeout_ms\`).
 5. Replace the binary path used by systemd/k8s with the verified artifact.
 6. Start the node; confirm \`/livez\` then \`/readyz\`, and that the state root
