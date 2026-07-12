@@ -1733,6 +1733,73 @@ async fn serve_with_shutdown_honors_stop_signalled_before_start() {
 }
 
 // ---------------------------------------------------------------------------
+// Accept-error resilience (#406): the accept loop classifies listener errors
+// instead of terminating on the first one. Injecting accept() failures through
+// a real TcpListener is not portable, so the classification helper is
+// unit-tested directly; the loop consumes it verbatim.
+// ---------------------------------------------------------------------------
+
+/// Per-connection accept failures (the queued peer died before we accepted,
+/// or the syscall was interrupted) leave the listener healthy: accept again
+/// immediately.
+#[test]
+fn accept_action_continues_on_transient_socket_errors() {
+    use crate::server::{accept_action, AcceptAction};
+    use std::io::ErrorKind;
+
+    for kind in [
+        ErrorKind::ConnectionAborted,
+        ErrorKind::ConnectionReset,
+        ErrorKind::Interrupted,
+    ] {
+        let err = std::io::Error::new(kind, "transient");
+        assert_eq!(
+            accept_action(&err),
+            AcceptAction::Continue,
+            "{kind:?} must not terminate the accept loop"
+        );
+    }
+    // The raw-errno path decodes the same way (ECONNABORTED is exactly the
+    // errno a flooded accept() surfaces between kernel queueing and accept).
+    let err = std::io::Error::from_raw_os_error(libc::ECONNABORTED);
+    assert_eq!(accept_action(&err), AcceptAction::Continue);
+}
+
+/// FD/buffer/memory exhaustion has no stable `io::ErrorKind` in Rust 1.92, so
+/// the classifier must recognize the raw errnos and back off — terminating
+/// here would kill the server during exactly the flood its admission control
+/// exists to survive.
+#[test]
+fn accept_action_backs_off_on_resource_exhaustion_errnos() {
+    use crate::server::{accept_action, AcceptAction};
+
+    for errno in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+        let err = std::io::Error::from_raw_os_error(errno);
+        assert_eq!(
+            accept_action(&err),
+            AcceptAction::Backoff,
+            "errno {errno} (kind {:?}) must back off, not terminate",
+            err.kind()
+        );
+    }
+}
+
+/// Unclassified errors stay fatal: a genuinely broken listener (e.g. a
+/// permission failure) must terminate the server rather than spin.
+#[test]
+fn accept_action_is_fatal_for_unclassified_errors() {
+    use crate::server::{accept_action, AcceptAction};
+
+    let err = std::io::Error::from_raw_os_error(libc::EACCES);
+    assert_eq!(accept_action(&err), AcceptAction::Fatal);
+    let err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+    assert_eq!(accept_action(&err), AcceptAction::Fatal);
+    // A synthetic error with no OS errno and no transient kind is also fatal.
+    let err = std::io::Error::other("listener broke");
+    assert_eq!(accept_action(&err), AcceptAction::Fatal);
+}
+
+// ---------------------------------------------------------------------------
 // P1 #285: authorize_session installs; bounded idempotency; authenticated streams
 // ---------------------------------------------------------------------------
 

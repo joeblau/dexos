@@ -17,6 +17,11 @@ serde.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
 tracing.workspace = true
+# Errno constants (EMFILE/ENFILE/ENOBUFS/ENOMEM) for classifying accept()
+# failures: std has no stable `io::ErrorKind` for FD exhaustion (they decode
+# to `Uncategorized`), so the accept loop matches raw OS error codes. Already
+# in-tree transitively via tokio.
+libc = "0.2"
 # Public RPC TLS 1.3 (no OpenSSL; banned by cargo-deny). TLS 1.2 is intentionally
 # not enabled — production accepts TLS 1.3 only.
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
