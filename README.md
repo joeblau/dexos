@@ -36,7 +36,9 @@ crates/
   discovery        signed peer records, peer + market discovery, reputation
   network          async Transport (in-process + TCP), priority classes, backpressure
   consensus        BFT sequencing, quorum certificates, checkpoints, witnesses
-  rpc              public binary RPC + streaming subscription API
+  proto            transport-free RPC wire/protocol types (wasm-safe, no async)
+  rpc              public binary RPC server + streaming subscription API
+  client           native typed RPC client (proto + rpc round-trip, ed25519 signing)
   light-client     verified checkpoint sync + Merkle proofs (read-only)
   markets          registry, lifecycle, sponsor staking, payout, perp funding, resolution
   prediction-markets  binary / multi-outcome / scalar / dead-heat settlement
@@ -54,6 +56,11 @@ bin/
   marketd          the node binary (run/benchmark/replay/inspect/keygen/snapshot/verify)
   market-loadgen   the load generator binary
   dexos            command-line RPC client (queries + signed control methods)
+ui/                Dioxus 0.7 frontends (built separately from the engine — see Run)
+  shared           renderer-agnostic components + view models (dexos-ui, wasm-safe)
+  web              browser (wasm) app (dexos-web)
+  desktop          native desktop app (dexos-desktop, links client directly)
+  mobile           iOS / Android app (dexos-mobile, links client directly)
 ```
 
 **Strict dependency direction.** The deterministic execution core
@@ -150,6 +157,57 @@ marketd keygen --output trader.seed
 It targets a plaintext listener today (TLS client + `marketd run` binding are
 planned). See [the CLI reference](docs/CLI.md) for the full command table,
 signing model, and status.
+
+### Frontends (web · desktop · mobile)
+
+The `ui/*` crates are [Dioxus 0.7](https://dioxuslabs.com) apps and are **not**
+built by the engine's default `cargo build` — they need a wasm target (web) or
+platform system libraries (desktop/mobile), so they are compiled explicitly. The
+shared `dexos-ui` crate holds renderer-agnostic components; `dexos-web` is the
+browser build; `dexos-desktop` / `dexos-mobile` link the native `client` crate
+and talk to a node directly.
+
+**Prerequisites** — the Dioxus CLI (its binary is `dx`) plus the wasm target for
+web builds:
+
+```sh
+cargo install dioxus-cli --locked        # provides `dx` (match the pinned Dioxus 0.7.x)
+rustup target add wasm32-unknown-unknown  # for the web build
+dx --version                              # confirm `dx` resolves to the Dioxus CLI
+```
+
+**Web app** (`dexos-web`) — served as wasm via the Dioxus dev server:
+
+```sh
+dx serve --package dexos-web --platform web
+# opens http://localhost:8080 by default; pass `--port 8081` to avoid clashing
+# with the node's default RPC port (127.0.0.1:8080).
+```
+
+**Desktop app** (`dexos-desktop`) — a native webview window. Runs with plain
+cargo (no `dx` needed) or under `dx serve` for hot-reload:
+
+```sh
+cargo run -p dexos-desktop                       # or: dx serve --package dexos-desktop --platform desktop
+DEXOS_NODE_ADDR=127.0.0.1:8080 cargo run -p dexos-desktop   # point at a node
+```
+
+**Mobile app** (`dexos-mobile`) — iOS / Android via `dx` (requires the platform
+SDK/simulator):
+
+```sh
+dx serve --package dexos-mobile --platform ios      # or --platform android
+```
+
+> **Status.** The frontends are **scaffolds**. `dexos-web` currently renders the
+> markets view's empty state; live data will arrive through Dioxus server
+> functions that call `client` server-side (not yet wired). `dexos-desktop` /
+> `dexos-mobile` already link `client` and query `get_markets` from
+> `DEXOS_NODE_ADDR` (default `127.0.0.1:8080`), degrading to an empty table on
+> error. Note that `marketd run` does **not** yet bind the RPC listener
+> ([TODO #418](crates/node/src/config.rs)), so there is no live node↔UI data path
+> today — point the apps at a process that serves the RPC directly (a dev harness
+> or test server) until the node's listener lands.
 
 ## Demo scripts
 
