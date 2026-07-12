@@ -136,6 +136,11 @@ jobs:
             determinism-digest.txt
           if-no-files-found: error
 
+  # Fails closed if x86_64 and aarch64 disagree on any protocol-stable digest
+  # key: `execution_replay_root` (the execution engine's state root over the
+  # pinned golden replay script — recomputed by each arch's build, so a real
+  # matching/risk/funding/liquidation divergence is caught here) plus the
+  # storage keys `snapshot_sha256` / `state_root` / `wire_corpus_sha256`.
   determinism-compare:
     name: multi-arch digest gate
     needs: determinism

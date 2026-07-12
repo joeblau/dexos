@@ -42,33 +42,43 @@ if [[ $rc -ne 0 ]]; then
 fi
 tail -30 "${TEST_LOG}" || true
 
-echo "==> corpus digest (for cross-arch comparison)"
+echo "==> execution golden replay root (export for cross-arch comparison)"
+# A REAL execution-core state root, recomputed by this host's build of the
+# engine over the pinned golden replay script. Unlike a table hashed inside
+# this script, a cross-arch divergence in matching/risk/funding/liquidation
+# arithmetic shows up here and fails the multi-arch compare gate.
+EXEC_LOG="${WORKDIR}/execution-replay-out.txt"
+set +e
+cargo test -p execution --lib --locked \
+  execution_replay_root_golden -- --nocapture >"${EXEC_LOG}" 2>&1
+rc=$?
+set -e
+if [[ $rc -ne 0 ]]; then
+  echo "execution execution_replay_root_golden test failed:" >&2
+  cat "${EXEC_LOG}" >&2
+  exit "$rc"
+fi
+tail -10 "${EXEC_LOG}" || true
+
+echo "==> determinism digest (for cross-arch comparison)"
 export CROSS_ARCH_TEST_LOG="${TEST_LOG}"
+export EXECUTION_REPLAY_TEST_LOG="${EXEC_LOG}"
 export DETERMINISM_DIGEST_PATH="${OUT_DIGEST}"
 python3 - <<'PY'
-import hashlib, platform, struct, os, re, pathlib
-h = hashlib.sha256()
-# Fixed golden table from crates/node/tests/scalar_payout_cross_crate.rs
-GOLDEN = [
-    (0, 100_000_000, 0, 0, 1_000_000),
-    (0, 100_000_000, 25_000_000, 250_000, 750_000),
-    (0, 100_000_000, 50_000_000, 500_000, 500_000),
-    (0, 100_000_000, 75_000_000, 750_000, 250_000),
-    (0, 100_000_000, 100_000_000, 1_000_000, 0),
-    (0, 3_000_000, 1_000_000, 333_333, 666_667),
-    (10_000_000, 20_000_000, 15_000_000, 500_000, 500_000),
-    (10_000_000, 20_000_000, 5_000_000, 0, 1_000_000),
-    (10_000_000, 20_000_000, 25_000_000, 1_000_000, 0),
-]
-for row in GOLDEN:
-    for v in row:
-        h.update(struct.pack("<q", int(v)))
-digest = h.hexdigest()
+import platform, os, re, pathlib
 lines = [
-    f"golden_corpus_sha256={digest}",
     f"host_machine={platform.machine()}",
     f"host_endian={__import__('sys').byteorder}",
 ]
+# Execution-core replay root: scraped from the golden known-answer replay
+# test (crates/execution tests::execution_replay_root_golden), which prints
+# `execution_replay_root=<hex>` and asserts it equals the in-source pinned
+# constant EXECUTION_REPLAY_ROOT_GOLDEN.
+exec_log = pathlib.Path(os.environ.get("EXECUTION_REPLAY_TEST_LOG", ""))
+if exec_log.is_file():
+    m = re.search(r"execution_replay_root=([0-9a-fA-F]+)", exec_log.read_text())
+    if m:
+        lines.append(f"execution_replay_root={m.group(1).lower()}")
 # Merge storage fixture digests (architecture-stable keys).
 snap_file = os.environ.get("CROSS_ARCH_SNAPSHOT_OUT", "")
 found = False
@@ -97,7 +107,7 @@ print(f"wrote {out}")
 print("note: wire formats and state roots are little-endian fixed-width integers;")
 print("      big-endian hosts are not a supported production target.")
 # Require protocol-stable keys so multi-arch compare has something to gate on.
-required = {"golden_corpus_sha256", "snapshot_sha256", "state_root", "wire_corpus_sha256"}
+required = {"execution_replay_root", "snapshot_sha256", "state_root", "wire_corpus_sha256"}
 have = {ln.split("=", 1)[0] for ln in lines if "=" in ln}
 missing = required - have
 if missing:

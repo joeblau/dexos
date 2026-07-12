@@ -728,6 +728,196 @@ mod tests {
         assert_eq!(hex::encode(&leaf), expected);
     }
 
+    /// Golden known-answer replay root for the cross-architecture determinism
+    /// gate (#428).
+    ///
+    /// This is the committed state root produced by replaying
+    /// [`replay_golden_script`] on a fresh engine. CI runs
+    /// [`execution_replay_root_golden`] on every supported architecture
+    /// (`scripts/check-determinism.sh` scrapes the `execution_replay_root=`
+    /// line it prints into `determinism-digest.txt`, and
+    /// `scripts/compare-determinism-digests.sh` fails closed if x86_64 and
+    /// aarch64 disagree), so the value pinned here is a real execution-core
+    /// output recomputed per-arch — not a constant folded into the gate.
+    ///
+    /// Bump discipline (mirrors `LEAF_ENCODING_VERSION` in
+    /// `state-tree/src/leaf.rs`): this constant may only change when the
+    /// engine's committed state semantics intentionally change — leaf layout,
+    /// hashing domains, matching/risk/funding/liquidation arithmetic, or the
+    /// golden script itself. Any such change is consensus-affecting: re-derive
+    /// the value by running this test with `--nocapture`, update the constant
+    /// in the same commit, and explain in the commit message why the root
+    /// moved.
+    const EXECUTION_REPLAY_ROOT_GOLDEN: &str =
+        "a33fc982b96e9c6cd3dfa05b73775d063d9266e76829909640bdf7dc24a44dad";
+
+    /// A rich, fixed command script exercising the deterministic core
+    /// end-to-end: three accounts, two perpetual markets and a binary
+    /// prediction market, crossing fills, a resting order swept up by a
+    /// `SetMarkPrice`-driven liquidation (ADL + socialized loss), cancel /
+    /// replace / cancel-all, a funding epoch, a complete-set mint with a
+    /// claim trade through resolve + settle, a deposit credit, and a
+    /// withdrawal request.
+    fn replay_golden_script() -> Vec<Command> {
+        let (perp_a, perp_b, pred) = (MarketId::new(0), MarketId::new(1), MarketId::new(2));
+        let (alice, bob, carol) = (AccountId::new(0), AccountId::new(1), AccountId::new(2));
+        let order = |account, market, order_id: u64, side, price, qty| {
+            Command::PlaceOrder(PlaceOrder {
+                account,
+                market,
+                order_id: OrderId::new(order_id),
+                side,
+                order_type: OrderType::Limit,
+                tif: TimeInForce::Gtc,
+                price: Price::from_raw(price),
+                quantity: Quantity::from_raw(qty),
+                client_id: order_id,
+                reduce_only: false,
+                instrument: 0,
+                auth: Authorization::Master,
+            })
+        };
+        vec![
+            // Three accounts with distinct collateral.
+            Command::CreateAccount(CreateAccount {
+                initial_collateral: amt(1_000_000_000), // alice: 1000.0
+            }),
+            Command::CreateAccount(CreateAccount {
+                initial_collateral: amt(60_000_000), // bob: 60.0
+            }),
+            Command::CreateAccount(CreateAccount {
+                initial_collateral: amt(500_000_000), // carol: 500.0
+            }),
+            // Two perpetual markets and one binary prediction market.
+            Command::CreateMarket(CreateMarket {
+                market: perp_a,
+                market_type: MarketType::Perpetual,
+                outcomes: 1,
+                mark_price: Price::from_raw(100_000_000), // 100.0
+            }),
+            Command::CreateMarket(CreateMarket {
+                market: perp_b,
+                market_type: MarketType::Perpetual,
+                outcomes: 1,
+                mark_price: Price::from_raw(1_000_000), // 1.0
+            }),
+            Command::CreateMarket(CreateMarket {
+                market: pred,
+                market_type: MarketType::BinaryPrediction,
+                outcomes: 2,
+                mark_price: Price::from_raw(500_000), // 0.5
+            }),
+            // perp_a: alice rests an ask; bob crosses -> alice short 5, bob
+            // long 5 @ 100.0. Bob leaves a resting bid the liquidation must
+            // cancel.
+            order(alice, perp_a, 1, Side::Ask, 100_000_000, 5_000_000),
+            order(bob, perp_a, 2, Side::Bid, 100_000_000, 5_000_000),
+            order(bob, perp_a, 3, Side::Bid, 90_000_000, 1_000_000),
+            // Mark crashes -> bob's long is deeply underwater; liquidation
+            // cancels his resting order, closes both legs via ADL, and
+            // socializes the 40.0 shortfall onto alice.
+            Command::SetMarkPrice(SetMarkPrice {
+                market: perp_a,
+                price: Price::from_raw(80_000_000), // 80.0
+            }),
+            Command::Liquidate(Liquidate { account: bob }),
+            // perp_b: alice rests a bid; carol crosses -> alice long 2,
+            // carol short 2 @ 1.0.
+            order(alice, perp_b, 10, Side::Bid, 1_000_000, 2_000_000),
+            order(carol, perp_b, 11, Side::Ask, 1_000_000, 2_000_000),
+            // Carol rests an ask then cancels it.
+            order(carol, perp_b, 12, Side::Ask, 1_200_000, 1_000_000),
+            Command::CancelOrder(CancelOrder {
+                market: perp_b,
+                account: carol,
+                order_id: OrderId::new(12),
+                auth: Authorization::Master,
+            }),
+            // Alice rests a bid, replaces it, then cancels all her perp_b
+            // orders.
+            order(alice, perp_b, 13, Side::Bid, 900_000, 1_000_000),
+            Command::ReplaceOrder(ReplaceOrder {
+                market: perp_b,
+                account: alice,
+                order_id: OrderId::new(13),
+                price: Price::from_raw(950_000),
+                quantity: Quantity::from_raw(1_500_000),
+                auth: Authorization::Master,
+            }),
+            Command::CancelAll(CancelAll {
+                market: perp_b,
+                account: alice,
+                auth: Authorization::Master,
+            }),
+            // One funding epoch on perp_b: the long (alice) pays 1%.
+            Command::ApplyFundingEpoch(ApplyFundingEpoch {
+                market: perp_b,
+                epoch: 1,
+                rate: types::Ratio::from_bps(100).unwrap(),
+            }),
+            // Prediction market: carol mints 100 complete sets, sells outcome
+            // 0 to alice at 0.40; the market resolves to outcome 0 and
+            // settles, paying the current holder from the locked pool.
+            Command::MintCompleteSet(CompleteSetOp {
+                account: carol,
+                market: pred,
+                count: amt(100),
+            }),
+            order(carol, pred, 20, Side::Ask, 400_000, 100),
+            order(alice, pred, 21, Side::Bid, 400_000, 100),
+            Command::ResolveMarket(ResolveMarket {
+                market: pred,
+                winning_outcome: 0,
+            }),
+            Command::SettleMarket(SettleMarket { market: pred }),
+            // Settlement-ledger flows: a deposit credit and a withdrawal
+            // request (reserve without finalize).
+            Command::DepositCredit(DepositCredit {
+                source_chain: 7,
+                source_tx: vec![0xde, 0xad, 0xbe, 0xef],
+                source_event_index: 3,
+                account: alice,
+                amount: amt(25_000_000),
+            }),
+            Command::RequestWithdrawal(RequestWithdrawal {
+                account: carol,
+                amount: amt(10_000_000),
+                nonce: 1,
+                destination_chain: 1,
+                destination_address: vec![0x11, 0x22, 0x33],
+                auth: Authorization::Master,
+            }),
+        ]
+    }
+
+    /// The cross-architecture determinism gate's execution-core key: replaying
+    /// the golden script must reproduce the pinned state root, bit-identical,
+    /// on every architecture. See [`EXECUTION_REPLAY_ROOT_GOLDEN`] for the
+    /// bump discipline. The `execution_replay_root=` line printed below is
+    /// scraped by `scripts/check-determinism.sh` into the per-arch
+    /// determinism digest.
+    #[test]
+    fn execution_replay_root_golden() {
+        let script = replay_golden_script();
+        let root = run(&script);
+        // Replay determinism first: two runs of the same stream agree.
+        assert_eq!(
+            root,
+            run(&script),
+            "identical command streams must yield identical state roots"
+        );
+        assert!(!root.is_zero());
+        let hex_root = hex::encode(root.as_bytes());
+        // CI scrapes this exact line into the cross-arch determinism digest.
+        println!("execution_replay_root={hex_root}");
+        assert_eq!(
+            hex_root, EXECUTION_REPLAY_ROOT_GOLDEN,
+            "execution replay root drifted from the pinned golden value; \
+             this is consensus-affecting — see EXECUTION_REPLAY_ROOT_GOLDEN \
+             for the bump discipline"
+        );
+    }
+
     #[test]
     fn protocol_upgrade_is_monotonic() {
         use command::ProtocolUpgrade;
