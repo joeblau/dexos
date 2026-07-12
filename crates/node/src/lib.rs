@@ -10,6 +10,7 @@
 
 pub mod config;
 pub mod error;
+pub mod lowering;
 pub mod metrics;
 pub mod readiness;
 pub mod shutdown;
@@ -29,6 +30,7 @@ pub use config::{
     NodeSection, ObservabilitySection, PerformanceSection, Role, RpcSection, StorageSection,
 };
 pub use error::NodeError;
+pub use lowering::{control_plane_produces, lower, LoweringError};
 pub use observability::{MetricsRegistry, TraceGen, TraceId};
 pub use readiness::Readiness;
 pub use shutdown::{FlushHooks, DEFAULT_DRAIN_TIMEOUT};
