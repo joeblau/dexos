@@ -128,7 +128,7 @@ impl SessionRegistry {
     ) -> Result<(), CustodyError> {
         let nonce_key = (cmd.account.get(), cmd.nonce);
         if self.used_nonces.contains(&nonce_key) {
-            return Err(CustodyError::ReplayedBinding);
+            return Err(CustodyError::ReplayedSession);
         }
         let master = wallets
             .master(cmd.account, seq)
@@ -178,13 +178,15 @@ impl SessionRegistry {
             .sessions
             .get(&(account.get(), *session_pubkey))
             .ok_or(CustodyError::UnknownSession)?;
+        // Expiry is checked before revoke so a session that is both expired and
+        // revoked surfaces `SessionExpired` (lifecycle terminal state first).
+        if seq > s.scope.expiry {
+            return Err(CustodyError::SessionExpired);
+        }
         if let Some(r) = s.revoked_at {
             if seq > r {
                 return Err(CustodyError::SessionRevoked);
             }
-        }
-        if seq > s.scope.expiry {
-            return Err(CustodyError::SessionExpired);
         }
         Ok(s)
     }
@@ -384,7 +386,7 @@ mod tests {
         let acc = AccountId::new(1);
 
         sessions.revoke(acc, &sk, SequenceNumber::new(10)).unwrap();
-        // At/below N still allowed; above N rejected.
+        // At/below N still allowed; above N rejected as revoked.
         assert!(sessions
             .authorize_withdrawal(acc, &sk, SequenceNumber::new(10))
             .is_ok());
@@ -392,10 +394,30 @@ mod tests {
             sessions.authorize_withdrawal(acc, &sk, SequenceNumber::new(11)),
             Err(CustodyError::SessionRevoked)
         );
-        // Past expiry rejected.
+        // Past expiry is SessionExpired even when also revoked (expiry first).
         assert_eq!(
             sessions.authorize_withdrawal(acc, &sk, SequenceNumber::new(101)),
-            Err(CustodyError::SessionRevoked)
+            Err(CustodyError::SessionExpired)
+        );
+    }
+
+    #[test]
+    fn session_nonce_replay_is_distinct_error() {
+        let (wallets, master) = master_bound(&[1u8; 32], 1);
+        let mut sessions = SessionRegistry::new();
+        let cmd = authorize_cmd(&master, 1, scope(100, false));
+        sessions
+            .authorize(&cmd, &wallets, SequenceNumber::new(2))
+            .unwrap();
+        // Replaying the same authorization nonce is ReplayedSession, not
+        // ReplayedBinding (which is reserved for wallet-bind nonces).
+        assert_eq!(
+            sessions.authorize(&cmd, &wallets, SequenceNumber::new(3)),
+            Err(CustodyError::ReplayedSession)
+        );
+        assert_ne!(
+            CustodyError::ReplayedSession,
+            CustodyError::ReplayedBinding
         );
     }
 }

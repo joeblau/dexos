@@ -70,11 +70,25 @@ pub fn verify_ed25519(
 
 /// Verify N ed25519 signatures. Results are bit-identical to calling
 /// [`verify_ed25519`] sequentially over the same inputs.
-pub fn batch_verify_ed25519(items: &[([u8; 32], Vec<u8>, [u8; 64])]) -> Vec<bool> {
+///
+/// This is a sequential multi-verify helper (not a cryptographic batch
+/// verification algorithm with shared random linear combination). The name
+/// reflects that semantics; prefer it over the deprecated
+/// [`batch_verify_ed25519`] alias.
+pub fn verify_ed25519_all(items: &[([u8; 32], Vec<u8>, [u8; 64])]) -> Vec<bool> {
     items
         .iter()
         .map(|(pk, msg, sig)| verify_ed25519(pk, msg, sig).is_ok())
         .collect()
+}
+
+/// Deprecated alias for [`verify_ed25519_all`].
+///
+/// Kept so existing call sites continue to compile; the name `batch_verify`
+/// overstated the algorithm (it is sequential, not a true batch proof).
+#[deprecated(note = "renamed to verify_ed25519_all — sequential multi-verify, not crypto batch")]
+pub fn batch_verify_ed25519(items: &[([u8; 32], Vec<u8>, [u8; 64])]) -> Vec<bool> {
+    verify_ed25519_all(items)
 }
 
 /// An EVM (secp256k1) keypair for EIP-712-style signing over keccak-256 digests.
@@ -195,13 +209,17 @@ mod tests {
         // Corrupt a few.
         items[5].2[0] ^= 1;
         items[40].0[0] ^= 1;
-        let batch = batch_verify_ed25519(&items);
+        let batch = verify_ed25519_all(&items);
         let seq: Vec<bool> = items
             .iter()
             .map(|(p, m, s)| verify_ed25519(p, m, s).is_ok())
             .collect();
         assert_eq!(batch, seq);
         assert!(!batch[5] && !batch[40] && batch[0]);
+        #[allow(deprecated)]
+        {
+            assert_eq!(batch_verify_ed25519(&items), batch);
+        }
     }
 
     #[test]

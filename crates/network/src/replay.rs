@@ -8,6 +8,11 @@
 //! space is usable before [`types::SequenceNumber`] exhaustion is signalled
 //! upstream.
 //!
+//! Storage is a modular ring of `Option<u64>` slots (`slots[seq % window]`), so
+//! a sequential advance is **O(1)** — no bitmap word shifts. Semantics match the
+//! classical sliding window: in-window reordering is accepted once; out-of-window
+//! and duplicate sequences are rejected.
+//!
 //! [`PeerDedup`] layers a bounded per-peer set of windows on top, keyed on
 //! [`crate::PeerId`], to give *at-most-once* delivery across multiple
 //! connections / paths to the same logical peer (multipath + connection
@@ -17,7 +22,7 @@ use std::collections::HashMap;
 
 use crate::error::TransportError;
 use crate::peer::PeerId;
-use crate::util::{as_u64, as_usize};
+use crate::util::as_usize;
 
 /// Largest supported window (in sequence numbers).
 pub const MAX_WINDOW: u64 = 4096;
@@ -26,8 +31,9 @@ pub const DEFAULT_WINDOW: u64 = 1024;
 
 /// A sliding-window anti-replay filter over a single monotonic sequence space.
 ///
-/// Memory is `ceil(window / 64)` `u64` words — bounded and fixed at
-/// construction. Bit `i` records whether sequence `highest - i` has been seen.
+/// Memory is exactly `window` slots of `Option<u64>` — bounded and fixed at
+/// construction. Slot `i` holds `Some(seq)` when sequence `seq` with
+/// `seq % window == i` has been accepted and is still inside the live window.
 #[derive(Debug, Clone)]
 pub struct ReplayWindow {
     /// Window width in sequence numbers (1..=[`MAX_WINDOW`]).
@@ -36,8 +42,8 @@ pub struct ReplayWindow {
     highest: u64,
     /// Whether any sequence has been accepted yet.
     seen_any: bool,
-    /// Bitmap; bit index `i` (word `i/64`, bit `i%64`) == sequence `highest - i`.
-    words: Vec<u64>,
+    /// Modular slots: `slots[seq % window] == Some(seq)` means `seq` was seen.
+    slots: Vec<Option<u64>>,
 }
 
 impl ReplayWindow {
@@ -45,12 +51,12 @@ impl ReplayWindow {
     /// `1..=MAX_WINDOW`.
     pub fn new(window: u64) -> Self {
         let window = window.clamp(1, MAX_WINDOW);
-        let words = as_usize(window.div_ceil(64));
+        let words = as_usize(window);
         Self {
             window,
             highest: 0,
             seen_any: false,
-            words: vec![0; words],
+            slots: vec![None; words],
         }
     }
 
@@ -59,76 +65,9 @@ impl ReplayWindow {
         self.window
     }
 
-    fn clear(&mut self) {
-        for w in &mut self.words {
-            *w = 0;
-        }
-    }
-
-    fn set_bit(&mut self, idx: usize) {
-        let word = idx / 64;
-        let bit = idx % 64;
-        if let Some(w) = self.words.get_mut(word) {
-            *w |= 1u64 << bit;
-        }
-    }
-
-    fn get_bit(&self, idx: usize) -> bool {
-        let word = idx / 64;
-        let bit = idx % 64;
-        self.words.get(word).is_some_and(|w| (*w >> bit) & 1 == 1)
-    }
-
-    /// Clear bits that fall outside `[0, window)` in the top word so that stale
-    /// positions cannot be misread after a shift.
-    fn mask_top(&mut self) {
-        let word_count = as_u64(self.words.len());
-        if word_count == 0 {
-            return;
-        }
-        let valid_in_top = self.window - (word_count - 1) * 64; // 1..=64
-        if valid_in_top < 64 {
-            let mask = (1u64 << valid_in_top) - 1;
-            let last = self.words.len() - 1;
-            self.words[last] &= mask;
-        }
-    }
-
-    /// Shift every recorded bit up by `n` positions (older), dropping anything
-    /// that leaves the window. Used when `highest` advances by `n`.
-    fn shift_left(&mut self, n: u64) {
-        if n >= self.window {
-            self.clear();
-            return;
-        }
-        let n = as_usize(n); // n < window <= MAX_WINDOW, so this always fits.
-        let word_shift = n / 64;
-        let bit_shift = n % 64;
-        let wlen = self.words.len();
-        if bit_shift == 0 {
-            for i in (0..wlen).rev() {
-                self.words[i] = if i >= word_shift {
-                    self.words[i - word_shift]
-                } else {
-                    0
-                };
-            }
-        } else {
-            for i in (0..wlen).rev() {
-                let hi = if i >= word_shift {
-                    self.words[i - word_shift] << bit_shift
-                } else {
-                    0
-                };
-                let lo = if i > word_shift {
-                    self.words[i - word_shift - 1] >> (64 - bit_shift)
-                } else {
-                    0
-                };
-                self.words[i] = hi | lo;
-            }
-        }
-        self.mask_top();
+    fn slot_index(&self, seq: u64) -> usize {
+        // `window` is in 1..=MAX_WINDOW, so the remainder always fits `usize`.
+        as_usize(seq % self.window)
     }
 
     /// Test-and-record `seq`.
@@ -136,30 +75,32 @@ impl ReplayWindow {
     /// Returns `true` if `seq` is fresh (and records it); `false` if it is a
     /// duplicate or a stale replay that has already slid out of the window.
     /// Reordered-but-in-window sequences are accepted exactly once.
+    ///
+    /// Sequential advances (and large jumps) are **O(1)**: only the modular
+    /// slot for `seq` is written; no bitmap shift is performed.
     pub fn check(&mut self, seq: u64) -> bool {
+        let idx = self.slot_index(seq);
         if !self.seen_any {
             self.seen_any = true;
             self.highest = seq;
-            self.clear();
-            self.set_bit(0);
+            self.slots[idx] = Some(seq);
             return true;
         }
         if seq > self.highest {
-            let advance = seq - self.highest;
-            self.shift_left(advance);
+            // Accept and advance highest. Older sequences fall out of the
+            // window by the stale check below; modular overwrite handles reuse.
             self.highest = seq;
-            self.set_bit(0);
+            self.slots[idx] = Some(seq);
             return true;
         }
         let diff = self.highest - seq;
         if diff >= self.window {
             return false; // stale: already slid out of the window
         }
-        let idx = as_usize(diff);
-        if self.get_bit(idx) {
+        if self.slots[idx] == Some(seq) {
             return false; // duplicate
         }
-        self.set_bit(idx);
+        self.slots[idx] = Some(seq);
         true
     }
 }
@@ -271,14 +212,14 @@ mod tests {
 
     #[test]
     fn multiword_shift_preserves_marks() {
-        // window spanning multiple 64-bit words; shift by a non-word-aligned
-        // amount and confirm previously-seen marks are preserved / duplicates
-        // still caught.
+        // Window spanning what used to be multiple bitmap words; advance by a
+        // non-aligned amount and confirm previously-seen marks are preserved /
+        // duplicates still caught under the modular-slot representation.
         let mut w = ReplayWindow::new(256);
         for s in [100u64, 120, 150, 200] {
             assert!(w.check(s));
         }
-        // advance highest by 37 (crosses word boundary math)
+        // advance highest by 37
         assert!(w.check(237));
         // originals still recognised as duplicates while in window
         for s in [100u64, 120, 150, 200, 237] {
@@ -287,6 +228,34 @@ mod tests {
         // a fresh in-window sequence between them is accepted once
         assert!(w.check(101));
         assert!(!w.check(101));
+    }
+
+    #[test]
+    fn sequential_advance_is_idempotent_for_all_window_widths() {
+        // O(1) sequential traffic must remain correct for every supported width:
+        // each new sequence is accepted once; an immediate retry is a duplicate.
+        for window in [1u64, 2, 7, 64, 65, 128, 1024, 4096] {
+            let mut w = ReplayWindow::new(window);
+            assert_eq!(w.window(), window.clamp(1, MAX_WINDOW));
+            for seq in 0..512u64 {
+                assert!(
+                    w.check(seq),
+                    "window={window}: first accept of {seq} must succeed"
+                );
+                assert!(
+                    !w.check(seq),
+                    "window={window}: immediate retry of {seq} must be a duplicate"
+                );
+            }
+            // A sequence that has slid out of the window is stale.
+            if 512 > window {
+                let stale = 512 - window - 1;
+                assert!(
+                    !w.check(stale),
+                    "window={window}: seq {stale} should be stale after advancing to 511"
+                );
+            }
+        }
     }
 
     #[test]

@@ -7,6 +7,17 @@
 //! scalar reference and a lane-structured vectorized reduction that is
 //! **bit-identical** to it.
 //!
+//! # NOT for solvency / margin decisions
+//!
+//! **Do not feed [`ScenarioStats::sum`] (or any wrapping kernel in this module)
+//! into solvency, margin, liquidation, or other fund-safety decisions.** The sum
+//! uses [`i128::wrapping_add`] so vectorized and scalar paths stay bit-identical
+//! across lane widths; on overflow the sum wraps silently and can understate
+//! exposure. Checked / saturating arithmetic in the `risk` crate remains the
+//! authoritative path for anything that can freeze, seize, or move collateral.
+//! Use these kernels only for filters, ranking, telemetry, or other
+//! non-authoritative stats where a wrap is acceptable noise.
+//!
 //! ## Determinism of the sum
 //!
 //! The vectorized path accumulates strided lanes and combines them at the end.
@@ -28,9 +39,13 @@ use types::Amount;
 const LANES: usize = 8;
 
 /// Summary statistics of a scenario payout scan.
+///
+/// **Warning:** [`Self::sum`] is a *wrapping* total. It is **not** safe as a
+/// solvency or margin input — see the module-level docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ScenarioStats {
     /// Wrapping sum of all payouts (see module docs on wrapping semantics).
+    /// **Not** for solvency / margin decisions.
     pub sum: i128,
     /// Minimum (worst-case) payout in the scan.
     pub min: i128,
@@ -270,5 +285,34 @@ mod tests {
             let _ = scenario_stats_vectorized(&data);
             let _ = scenario_stats_dispatch(&data);
         }
+    }
+
+    #[test]
+    fn wrapping_sum_diverges_from_checked_add_on_overflow() {
+        // Document why these kernels must not drive solvency: on overflow the
+        // wrapping sum disagrees with a checked accumulation that reports error.
+        let data = [i128::MAX, 1];
+        let stats = scenario_stats_scalar(&data).unwrap();
+        // wrapping: MAX + 1 -> MIN
+        assert_eq!(stats.sum, i128::MIN);
+        // checked path refuses to produce a silent wrong total.
+        let mut checked: Result<i128, ()> = Ok(0);
+        for &p in &data {
+            checked = checked.and_then(|acc| acc.checked_add(p).ok_or(()));
+        }
+        assert!(
+            checked.is_err(),
+            "checked accumulation must signal overflow"
+        );
+        assert_ne!(
+            Ok(stats.sum),
+            checked,
+            "wrapping SIMD sum must not be treated as the checked total"
+        );
+        // Scalar and vectorized still agree with each other (bit-identical wrap).
+        assert_eq!(
+            scenario_stats_scalar(&data),
+            scenario_stats_vectorized(&data)
+        );
     }
 }

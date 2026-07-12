@@ -37,6 +37,11 @@ pub enum CustodyError {
     /// The (account, nonce) binding was already consumed (replay).
     #[error("binding nonce already consumed")]
     ReplayedBinding,
+    /// The (account, nonce) session authorization was already consumed (replay).
+    /// Distinct from [`Self::ReplayedBinding`] so ops can separate wallet-bind
+    /// replays from session-authorize replays in metrics and alerts.
+    #[error("session authorization nonce already consumed")]
+    ReplayedSession,
     /// Binding would exceed the per-account wallet cap.
     #[error("per-account binding cap exceeded")]
     BindingCapExceeded,

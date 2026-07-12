@@ -23,7 +23,11 @@ pub const DOMAIN_VOTE: &[u8] = b"dexos:consensus:vote:v1";
 pub const DOMAIN_TIMEOUT: &[u8] = b"dexos:consensus:timeout:v1";
 
 /// Maximum committee size — bounded by the 64-bit signer bitmap of a
-/// [`QuorumCertificate`].
+/// [`QuorumCertificate`] (bit `i` names validator index `i`).
+///
+/// This is the operational ceiling for HotStuff committees and must stay in
+/// lockstep with [`crypto::MAX_VALIDATORS`]: a larger set cannot be encoded in
+/// the QC bitmap and is rejected at committee construction.
 pub const MAX_VALIDATORS: usize = 64;
 
 /// A pipelined HotStuff voting phase.

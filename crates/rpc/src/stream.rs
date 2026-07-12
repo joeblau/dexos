@@ -243,19 +243,40 @@ impl TopicChannel {
     }
 }
 
+/// Default ceiling on distinct live topics in a [`StreamHub`].
+///
+/// Bounds the hub's topic map so a flood of distinct topic keys cannot grow
+/// memory without limit. Idle topics are GC'd first; if still at capacity the
+/// topic with the lowest live receiver count is evicted.
+pub const DEFAULT_MAX_TOPICS: usize = 4096;
+
 /// A bounded fan-out registry mapping topics to broadcast channels, with a
 /// retained per-topic history window for delta backfill recovery.
+///
+/// The number of distinct topics is capped at [`StreamHub::max_topics`] (default
+/// [`DEFAULT_MAX_TOPICS`]). Creating a topic past the cap GCs idle channels and,
+/// if still full, evicts the topic with the fewest live receivers so the map
+/// never grows unbounded.
 pub struct StreamHub {
     capacity: usize,
+    max_topics: usize,
     channels: Mutex<HashMap<Topic, TopicChannel>>,
 }
 
 impl StreamHub {
     /// Create a hub whose per-topic broadcast buffer and recovery window each
-    /// hold `capacity` events. `capacity` is clamped to at least 1.
+    /// hold `capacity` events, with a topic map capped at [`DEFAULT_MAX_TOPICS`].
+    /// `capacity` is clamped to at least 1.
     pub fn new(capacity: usize) -> Self {
+        Self::with_limits(capacity, DEFAULT_MAX_TOPICS)
+    }
+
+    /// Create a hub with an explicit per-topic buffer capacity and a hard cap
+    /// on the number of distinct topics. Both limits are clamped to at least 1.
+    pub fn with_limits(capacity: usize, max_topics: usize) -> Self {
         StreamHub {
             capacity: capacity.max(1),
+            max_topics: max_topics.max(1),
             channels: Mutex::new(HashMap::new()),
         }
     }
@@ -296,9 +317,7 @@ impl StreamHub {
 
     fn subscribe_unchecked(&self, topic: Topic, reliability: Reliability) -> Subscription {
         let mut guard = self.lock();
-        let entry = guard
-            .entry(topic)
-            .or_insert_with(|| TopicChannel::new(self.capacity));
+        let entry = Self::topic_entry(&mut guard, topic, self.capacity, self.max_topics);
         Subscription {
             topic,
             rx: entry.sender.subscribe(),
@@ -319,9 +338,7 @@ impl StreamHub {
 
     fn publish(&self, topic: Topic, kind: EventKind, payload: StreamPayload) -> SequenceNumber {
         let mut guard = self.lock();
-        let entry = guard
-            .entry(topic)
-            .or_insert_with(|| TopicChannel::new(self.capacity));
+        let entry = Self::topic_entry(&mut guard, topic, self.capacity, self.max_topics);
         entry.next_seq = entry.next_seq.saturating_add(1);
         let sequence = SequenceNumber::new(entry.next_seq);
         let event = StreamEvent {
@@ -374,6 +391,54 @@ impl StreamHub {
     /// The configured per-topic buffer / window capacity.
     pub fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    /// The hard cap on distinct topics this hub will retain.
+    pub fn max_topics(&self) -> usize {
+        self.max_topics
+    }
+
+    /// Number of distinct topics currently retained (for tests / metrics).
+    pub fn topic_count(&self) -> usize {
+        self.lock().len()
+    }
+
+    /// Obtain (or create) the channel for `topic`, GCing idle topics and
+    /// never growing the map past `max_topics`.
+    ///
+    /// 1. If `topic` already exists, return it.
+    /// 2. If at capacity, drop topics with zero live receivers.
+    /// 3. If still at capacity, evict the topic with the lowest
+    ///    `receiver_count` (ties broken by first match) until there is room.
+    fn topic_entry<'a>(
+        channels: &'a mut HashMap<Topic, TopicChannel>,
+        topic: Topic,
+        capacity: usize,
+        max_topics: usize,
+    ) -> &'a mut TopicChannel {
+        if channels.contains_key(&topic) {
+            return channels.get_mut(&topic).expect("topic just checked");
+        }
+        if channels.len() >= max_topics {
+            // Prefer reclaiming idle (zero-receiver) topics first.
+            channels.retain(|_, ch| ch.sender.receiver_count() > 0);
+        }
+        while channels.len() >= max_topics {
+            // Evict the least-subscribed topic so the map never grows past max.
+            let victim = channels
+                .iter()
+                .min_by_key(|(_, ch)| ch.sender.receiver_count())
+                .map(|(t, _)| *t);
+            match victim {
+                Some(t) => {
+                    channels.remove(&t);
+                }
+                None => break,
+            }
+        }
+        channels
+            .entry(topic)
+            .or_insert_with(|| TopicChannel::new(capacity))
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Topic, TopicChannel>> {

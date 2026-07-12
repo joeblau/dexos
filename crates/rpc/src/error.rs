@@ -21,6 +21,11 @@ pub enum RpcError {
     /// blocking.
     #[error("backpressure: ingress saturated")]
     Backpressure,
+    /// A framed request declared a payload larger than the server's accepted
+    /// maximum (or an implausible length). Distinct from [`Self::Backpressure`],
+    /// which signals admission/queue saturation rather than message size.
+    #[error("message too large")]
+    MessageTooLarge,
     /// The request was structurally invalid or failed decoding.
     #[error("invalid request: {0}")]
     InvalidRequest(String),

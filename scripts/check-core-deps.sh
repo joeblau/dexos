@@ -9,7 +9,14 @@ CORE=(types execution orderbook risk state-tree)
 FORBIDDEN='tokio|async-std|network|discovery|rpc|storage'
 status=0
 for crate in "${CORE[@]}"; do
-    tree="$(cargo tree --quiet -e normal -p "$crate" 2>/dev/null || true)"
+    # Fail closed: a broken `cargo tree` (missing target, resolver error, …)
+    # must not be swallowed. Previously `|| true` hid toolchain/config failures.
+    if ! tree="$(cargo tree --quiet -e normal -p "$crate" 2>&1)"; then
+        echo "dep-direction gate FAILED: cargo tree -p $crate errored:" >&2
+        printf '%s\n' "$tree" >&2
+        status=1
+        continue
+    fi
     # Drop the first line (the crate itself) before scanning its dependencies.
     hits="$(printf '%s\n' "$tree" | tail -n +2 | grep -Eiw "$FORBIDDEN" || true)"
     if [ -n "$hits" ]; then

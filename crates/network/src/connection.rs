@@ -22,7 +22,7 @@
 //! [`TransportError::ReliableGap`] with the link torn down — never hidden.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use codec::{Frame, TrafficClass, MAX_FRAME_PAYLOAD};
 use tokio::sync::mpsc;
@@ -92,6 +92,10 @@ impl ReliableOrder {
     }
 }
 
+/// Default capacity of the loopback accept/admission queue
+/// ([`TransportConfig::accept_queue_capacity`]).
+pub const DEFAULT_ACCEPT_QUEUE: usize = 64;
+
 /// Tunables shared by all transports.
 #[derive(Debug, Clone, Copy)]
 pub struct TransportConfig {
@@ -103,6 +107,10 @@ pub struct TransportConfig {
     pub dedup_window: u64,
     /// Maximum application payload accepted per message.
     pub max_payload: usize,
+    /// Capacity of the listener's pending-accept queue (loopback admission).
+    /// A full queue causes [`crate::Transport::connect`] to return
+    /// [`TransportError::Backpressure`] rather than grow memory without bound.
+    pub accept_queue_capacity: usize,
 }
 
 impl Default for TransportConfig {
@@ -112,6 +120,7 @@ impl Default for TransportConfig {
             datagram_capacity: 1024,
             dedup_window: crate::replay::DEFAULT_WINDOW,
             max_payload: MAX_FRAME_PAYLOAD,
+            accept_queue_capacity: DEFAULT_ACCEPT_QUEUE,
         }
     }
 }
@@ -191,7 +200,10 @@ impl Connection {
             return Err(TransportError::MessageTooLarge);
         }
         let idx = usize::from(class.priority());
-        let mut counters = self.seq_reliable.lock().expect("sequence mutex poisoned");
+        let mut counters = self
+            .seq_reliable
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         // `priority()` is always 0..=8 for a valid class; guard defensively.
         let slot = counters
             .get_mut(idx)
@@ -253,7 +265,7 @@ impl Connection {
             let admit = self
                 .order_reliable
                 .lock()
-                .expect("order mutex poisoned")
+                .unwrap_or_else(PoisonError::into_inner)
                 .admit(frame.class, frame.sequence);
             match admit {
                 Admit::Fresh => return Ok(frame),
@@ -283,7 +295,7 @@ impl Connection {
             let fresh = self
                 .dedup_datagram
                 .lock()
-                .expect("dedup mutex poisoned")
+                .unwrap_or_else(PoisonError::into_inner)
                 .check(frame.sequence);
             if fresh {
                 return Ok(frame.payload);
@@ -449,5 +461,47 @@ mod tests {
         // The retried send reuses sequence 1 (contiguous), not 2 — no gap.
         let second = out.recv().await.unwrap();
         assert_eq!(second.sequence, 1);
+    }
+
+    #[tokio::test]
+    async fn poisoned_order_mutex_recovers_without_task_panic() {
+        let inbound = Arc::new(AsyncPriorityChannel::new(16));
+        let conn = conn_with_inbound(inbound.clone());
+        // Intentionally poison the order mutex; recv must recover the guard
+        // rather than panicking the connection task.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = conn.order_reliable.lock().unwrap();
+            panic!("intentional order mutex poison");
+        }));
+        inbound
+            .try_send(rframe(TrafficClass::Consensus, 0))
+            .unwrap();
+        assert_eq!(conn.recv().await.unwrap().sequence, 0);
+    }
+
+    #[test]
+    fn poisoned_sequence_mutex_recovers_on_send() {
+        let out = Arc::new(AsyncPriorityChannel::new(16));
+        let (out_dtx, _out_drx) = mpsc::channel(4);
+        let (_in_dtx, in_drx) = mpsc::channel(4);
+        let conn = Connection::new(
+            PeerId::from([3u8; 32]),
+            out.clone(),
+            Arc::new(AsyncPriorityChannel::new(16)),
+            out_dtx,
+            in_drx,
+            &TransportConfig::default(),
+            Vec::new(),
+        );
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = conn.seq_reliable.lock().unwrap();
+            panic!("intentional sequence mutex poison");
+        }));
+        // Send recovers the poisoned sequence mutex without a task panic.
+        conn.send_priority(TrafficClass::NewOrder, b"ok").unwrap();
+        assert_eq!(conn.pending_outbound(), 1);
+        // A second send still works (sequence advanced through the recovered guard).
+        conn.send_priority(TrafficClass::NewOrder, b"ok2").unwrap();
+        assert_eq!(conn.pending_outbound(), 2);
     }
 }

@@ -3,8 +3,52 @@
 Cargo.lock.bak
 results.json
 *.profraw
+*.profdata
 perf.data*
 flamegraph.svg
 /data
 .DS_Store
 .claude/
+
+# Local secrets and environment overrides — never commit.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+id_ed25519
+id_rsa
+**/secrets/
+**/keys/
+!**/keys/.gitkeep
+
+# Local config overrides (operator / developer machines).
+*.local.toml
+config/*.local.toml
+config/local.toml
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# Coverage / profiling HTML and lcov
+coverage/
+lcov.info
+tarpaulin-report.html
+cobertura.xml
+*.lcov
+htmlcov/
+
+# OS / tooling noise
+Thumbs.db
+.direnv/
+.venv/
+venv/
+node_modules/

@@ -55,7 +55,7 @@ pub use server::{
 pub use session::Session;
 pub use stream::{
     EventKind, Gap, Progress, Recovery, Reliability, SequenceTracker, StreamError, StreamEvent,
-    StreamHub, StreamPayload, Subscription, Topic,
+    StreamHub, StreamPayload, Subscription, Topic, DEFAULT_MAX_TOPICS,
 };
 pub use stub::StubBackend;
 pub use transport::{

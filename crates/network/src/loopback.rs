@@ -6,9 +6,15 @@
 //! the crate's own async tests. It exercises the exact same [`Connection`]
 //! surface, priority scheduler, backpressure, and replay suppression as the TCP
 //! transport.
+//!
+//! Admission is **bounded**: each listener's accept queue has a fixed capacity
+//! ([`TransportConfig::accept_queue_capacity`], default
+//! [`crate::DEFAULT_ACCEPT_QUEUE`]). Flooding `connect` past that capacity
+//! returns [`TransportError::Backpressure`] instead of growing memory without
+//! limit — matching production overload behaviour.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::sync::mpsc;
 use tokio::sync::Mutex as AsyncMutex;
@@ -18,13 +24,14 @@ use crate::connection::{Connection, TransportConfig};
 use crate::error::TransportError;
 use crate::peer::{Peer, PeerId};
 use crate::transport::Transport;
+use codec::TrafficClass;
 
 /// A shared switchboard through which loopback peers find one another.
 ///
 /// Clone freely: all clones share one registry.
 #[derive(Clone, Default)]
 pub struct LoopbackFabric {
-    registry: Arc<Mutex<HashMap<PeerId, mpsc::UnboundedSender<Connection>>>>,
+    registry: Arc<Mutex<HashMap<PeerId, mpsc::Sender<Connection>>>>,
 }
 
 impl LoopbackFabric {
@@ -33,17 +40,17 @@ impl LoopbackFabric {
         Self::default()
     }
 
-    fn register(&self, id: PeerId, inbox: mpsc::UnboundedSender<Connection>) {
+    fn register(&self, id: PeerId, inbox: mpsc::Sender<Connection>) {
         self.registry
             .lock()
-            .expect("fabric mutex poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .insert(id, inbox);
     }
 
-    fn inbox_for(&self, id: &PeerId) -> Option<mpsc::UnboundedSender<Connection>> {
+    fn inbox_for(&self, id: &PeerId) -> Option<mpsc::Sender<Connection>> {
         self.registry
             .lock()
-            .expect("fabric mutex poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .get(id)
             .cloned()
     }
@@ -51,7 +58,7 @@ impl LoopbackFabric {
     fn deregister(&self, id: &PeerId) {
         self.registry
             .lock()
-            .expect("fabric mutex poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .remove(id);
     }
 }
@@ -89,14 +96,15 @@ fn make_pair(a: PeerId, b: PeerId, cfg: &TransportConfig) -> (Connection, Connec
 pub struct LoopbackTransport {
     id: PeerId,
     fabric: LoopbackFabric,
-    incoming: AsyncMutex<mpsc::UnboundedReceiver<Connection>>,
+    incoming: AsyncMutex<mpsc::Receiver<Connection>>,
     cfg: TransportConfig,
 }
 
 impl LoopbackTransport {
     /// Register `id` on `fabric` and return its transport.
     pub fn new(fabric: LoopbackFabric, id: PeerId, cfg: TransportConfig) -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let cap = cfg.accept_queue_capacity.max(1);
+        let (tx, rx) = mpsc::channel(cap);
         fabric.register(id, tx);
         Self {
             id,
@@ -130,10 +138,15 @@ impl Transport for LoopbackTransport {
             .inbox_for(&peer.id)
             .ok_or(TransportError::PeerUnreachable)?;
         let (local, remote) = make_pair(self.id, peer.id, &self.cfg);
-        inbox
-            .send(remote)
-            .map_err(|_| TransportError::PeerUnreachable)?;
-        Ok(local)
+        match inbox.try_send(remote) {
+            Ok(()) => Ok(local),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(TransportError::Backpressure {
+                // Admission pressure is not class-specific; Sync is the lowest
+                // priority traffic class and stands in for connection-level shed.
+                class: TrafficClass::Sync,
+            }),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(TransportError::PeerUnreachable),
+        }
     }
 
     async fn accept(&self) -> Result<Connection, TransportError> {
@@ -145,6 +158,7 @@ impl Transport for LoopbackTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connection::DEFAULT_ACCEPT_QUEUE;
     use crate::replay::PeerDedup;
     use codec::TrafficClass;
 
@@ -263,6 +277,37 @@ mod tests {
         let a = LoopbackTransport::new(fabric, PeerId::from([1u8; 32]), cfg());
         let err = a.connect(&Peer::loopback(PeerId::from([9u8; 32]))).await;
         assert!(matches!(err, Err(TransportError::PeerUnreachable)));
+    }
+
+    #[tokio::test]
+    async fn connect_flood_applies_accept_queue_backpressure() {
+        let mut c = cfg();
+        c.accept_queue_capacity = 4;
+        let fabric = LoopbackFabric::new();
+        let a = LoopbackTransport::new(fabric.clone(), PeerId::from([1u8; 32]), c);
+        // Listener that never drains its accept queue.
+        let b = LoopbackTransport::new(fabric, PeerId::from([2u8; 32]), c);
+
+        // Fill the accept queue to capacity.
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            held.push(a.connect(&b.as_peer()).await.unwrap());
+        }
+        // The next connect is rejected with Backpressure; the queue does not grow.
+        let err = a.connect(&b.as_peer()).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                TransportError::Backpressure {
+                    class: TrafficClass::Sync
+                }
+            ),
+            "expected Backpressure, got {err:?}"
+        );
+        // Keep `held` live so the sender side of the accept queue stays open.
+        drop(held);
+        assert_eq!(DEFAULT_ACCEPT_QUEUE, 64);
+        assert_eq!(TransportConfig::default().accept_queue_capacity, 64);
     }
 
     #[tokio::test]

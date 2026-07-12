@@ -569,7 +569,7 @@ mod tests {
         for (i, sig) in sigs.iter().enumerate() {
             batch.push((keys[i].public(), msg.as_bytes().to_vec(), *sig));
         }
-        let batch_results = crypto::batch_verify_ed25519(&batch);
+        let batch_results = crypto::verify_ed25519_all(&batch);
         let scalar_results: Vec<bool> = batch
             .iter()
             .map(|(pk, m, sig)| crypto::verify_ed25519(pk, m, sig).is_ok())
