@@ -2818,6 +2818,211 @@ async fn rpc_metrics_count_shed_paths_and_track_active_connections() {
 }
 
 // ---------------------------------------------------------------------------
+// #427: the work budget is charged from the frame's DECLARED size before the
+// payload is read or allocated — an over-budget frame is refused on its
+// header alone, and the connection keeps serving after the rejection.
+// ---------------------------------------------------------------------------
+
+/// Acceptance (#427): a header declaring a payload that exceeds the in-flight
+/// byte budget is answered with `Backpressure` while the payload has not been
+/// sent at all — proving admission now happens before the payload is read (or
+/// its `FRAME_HEADER_LEN + plen` buffer allocated); under the old
+/// read-then-acquire order the server would sit blocked waiting for 200 000
+/// payload bytes instead of replying. The session then stays usable: once the
+/// declared bytes are delivered (drained, never buffered), a within-budget
+/// request on the same connection round-trips normally.
+#[tokio::test]
+async fn over_budget_frame_is_rejected_on_header_before_payload_is_read() {
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+
+    let backend: Arc<dyn RpcBackend> = Arc::new(populated_backend(RpcMode::Full));
+    let mut cfg = budget_config(4);
+    // Process-wide in-flight bytes far below the declared payload, so
+    // admission must fail on the header alone — yet far above a small query
+    // frame, so the follow-up request is admitted.
+    cfg.work = crate::work::WorkBudgetConfig {
+        max_in_flight_requests: 8,
+        max_in_flight_bytes: 1024,
+        max_in_flight_requests_per_conn: 1,
+        max_in_flight_bytes_per_conn: 1_000_000,
+    };
+    let (mut client, server_io) = tokio::io::duplex(512 * 1024);
+    let server = tokio::spawn(async move {
+        crate::server::handle_connection_with(server_io, backend, RpcMode::Full, &cfg, None).await
+    });
+
+    // A structurally valid frame declaring a 200_000-byte payload: within the
+    // frame cap (so it is not an oversize violation) but over the byte budget.
+    let big = codec::Frame {
+        class: codec::TrafficClass::NewOrder,
+        msg_type: MSG_REQUEST,
+        sequence: 7,
+        payload: vec![0u8; 200_000],
+    }
+    .encode()
+    .unwrap();
+
+    // Send ONLY the header; the Backpressure reply must arrive anyway.
+    client
+        .write_all(&big[..codec::FRAME_HEADER_LEN])
+        .await
+        .unwrap();
+    client.flush().await.unwrap();
+    let frame = tokio::time::timeout(Duration::from_secs(5), read_one_frame(&mut client))
+        .await
+        .expect("backpressure must be signalled from the header alone, before any payload")
+        .unwrap();
+    let resp = decode_response(&frame).unwrap();
+    assert_eq!(resp.result, Err(RpcError::Backpressure));
+
+    // The rejection kept the session framed: deliver the declared payload
+    // (the server drains it through a fixed-size buffer), then a
+    // within-budget request on the very same connection succeeds.
+    client
+        .write_all(&big[codec::FRAME_HEADER_LEN..])
+        .await
+        .unwrap();
+    let req = RpcRequest::new(11, RpcMethod::GetNetworkStatus);
+    let out = encode_request(&req).unwrap();
+    client.write_all(&out).await.unwrap();
+    client.flush().await.unwrap();
+    let frame = tokio::time::timeout(Duration::from_secs(5), read_one_frame(&mut client))
+        .await
+        .expect("connection must keep serving after a budget rejection")
+        .unwrap();
+    let resp = decode_response(&frame).unwrap();
+    assert_eq!(resp.request_id, 11);
+    assert!(matches!(resp.result, Ok(RpcOk::NetworkStatus(_))));
+
+    // Client hangs up; the handler exits cleanly.
+    drop(client);
+    assert!(server.await.unwrap().is_ok());
+}
+
+/// Acceptance (#427 + #416): a work-budget rejection made at header time is
+/// counted on `rpc_backpressure_total` — not smeared into the oversize or
+/// read-timeout counters — and the rejected connection survives to serve a
+/// within-budget request. Runs over real TCP through `serve_with_metrics`.
+#[tokio::test]
+async fn header_time_backpressure_is_counted_and_connection_survives() {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::{TcpListener, TcpStream};
+
+    let registry = Arc::new(observability::MetricsRegistry::new());
+    let metrics = Arc::new(crate::RpcMetrics::register(&registry));
+    let backend: Arc<dyn RpcBackend> = Arc::new(populated_backend(RpcMode::Full));
+    let mut cfg = budget_config(4);
+    cfg.work = crate::work::WorkBudgetConfig {
+        max_in_flight_requests: 8,
+        max_in_flight_bytes: 1024,
+        max_in_flight_requests_per_conn: 1,
+        max_in_flight_bytes_per_conn: 1_000_000,
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn({
+        let metrics = Arc::clone(&metrics);
+        async move {
+            let _ = crate::server::serve_with_metrics(
+                listener,
+                backend,
+                RpcMode::Full,
+                cfg,
+                Some(metrics),
+                stop_rx,
+            )
+            .await;
+        }
+    });
+
+    // The whole over-budget frame goes on the wire; the reply is still
+    // Backpressure (never MessageTooLarge — the frame respects the size cap)
+    // and the shed lands on its dedicated counter.
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let big = codec::Frame {
+        class: codec::TrafficClass::NewOrder,
+        msg_type: MSG_REQUEST,
+        sequence: 3,
+        payload: vec![0u8; 100_000],
+    }
+    .encode()
+    .unwrap();
+    stream.write_all(&big).await.unwrap();
+    stream.flush().await.unwrap();
+    let frame = read_one_frame(&mut stream).await.unwrap();
+    assert_eq!(
+        decode_response(&frame).unwrap().result,
+        Err(RpcError::Backpressure)
+    );
+    assert_eq!(counter_value(&registry, "rpc_backpressure_total"), 1);
+    assert_eq!(counter_value(&registry, "rpc_oversize_total"), 0);
+    assert_eq!(counter_value(&registry, "rpc_read_timeouts_total"), 0);
+
+    // Same connection, within-budget request: served normally.
+    let req = RpcRequest::new(21, RpcMethod::GetNetworkStatus);
+    let out = encode_request(&req).unwrap();
+    stream.write_all(&out).await.unwrap();
+    stream.flush().await.unwrap();
+    let frame = read_one_frame(&mut stream).await.unwrap();
+    let resp = decode_response(&frame).unwrap();
+    assert_eq!(resp.request_id, 21);
+    assert!(matches!(resp.result, Ok(RpcOk::NetworkStatus(_))));
+}
+
+/// Regression pin for the header/payload split (#427): a header violating the
+/// protocol (bad magic) with a within-cap declared payload is answered with
+/// the same codec error as before the split — after the declared bytes have
+/// arrived (drained, never buffered) — and the connection keeps serving.
+#[tokio::test]
+async fn bad_magic_header_still_gets_codec_error_and_connection_survives() {
+    use tokio::io::AsyncWriteExt;
+
+    let backend: Arc<dyn RpcBackend> = Arc::new(populated_backend(RpcMode::Full));
+    let cfg = budget_config(4);
+    let (mut client, server_io) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move {
+        crate::server::handle_connection_with(server_io, backend, RpcMode::Full, &cfg, None).await
+    });
+
+    // A frame with a valid layout but corrupted magic, declaring 64 payload
+    // bytes. The whole frame is sent, mirroring a confused (not slow) peer.
+    let mut bad = codec::Frame {
+        class: codec::TrafficClass::NewOrder,
+        msg_type: MSG_REQUEST,
+        sequence: 1,
+        payload: vec![0u8; 64],
+    }
+    .encode()
+    .unwrap();
+    bad[0] ^= 0xFF;
+    client.write_all(&bad).await.unwrap();
+    client.flush().await.unwrap();
+    let frame = read_one_frame(&mut client).await.unwrap();
+    match decode_response(&frame).unwrap().result {
+        Err(RpcError::Codec(msg)) => {
+            assert!(msg.contains("magic"), "unexpected codec error: {msg}");
+        }
+        other => panic!("expected a codec error for bad magic, got {other:?}"),
+    }
+
+    // The declared payload was consumed, so the session stayed framed and a
+    // valid request still round-trips.
+    let req = RpcRequest::new(9, RpcMethod::GetNetworkStatus);
+    let out = encode_request(&req).unwrap();
+    client.write_all(&out).await.unwrap();
+    client.flush().await.unwrap();
+    let frame = read_one_frame(&mut client).await.unwrap();
+    let resp = decode_response(&frame).unwrap();
+    assert_eq!(resp.request_id, 9);
+    assert!(matches!(resp.result, Ok(RpcOk::NetworkStatus(_))));
+
+    drop(client);
+    assert!(server.await.unwrap().is_ok());
+}
+
+// ---------------------------------------------------------------------------
 // P1 #355: stream fanout byte-bounded, sharded, copy-light
 // ---------------------------------------------------------------------------
 
