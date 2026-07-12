@@ -350,6 +350,15 @@ fn every_request_round_trips_through_codec() {
 }
 
 #[test]
+fn request_round_trips_through_borrowed_frame_decode() {
+    // `decode_request` now reads the payload in place via `codec::FrameRef`
+    // (no intermediate payload Vec); the round-trip must be unchanged.
+    let request = RpcRequest::new(7, RpcMethod::GetNodeInfo);
+    let framed = encode_request(&request).unwrap();
+    assert_eq!(decode_request(&framed).unwrap(), request);
+}
+
+#[test]
 fn every_response_round_trips_through_codec() {
     for (i, ok) in all_oks().into_iter().enumerate() {
         let response = RpcResponse::new(u64::try_from(i).unwrap(), Ok(ok));
