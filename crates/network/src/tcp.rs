@@ -43,7 +43,6 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Semaphore};
 use tokio::time::{timeout, MissedTickBehavior};
 
-use crate::batch::{BatchSender, BatchSink};
 use crate::budget::ByteBudget;
 use crate::channel::AsyncPriorityChannel;
 use crate::class_auth::PeerRole;
@@ -394,8 +393,6 @@ fn spawn_connection(
         const MAX_BATCH_BYTES: usize = 256 * 1024;
         let mut dgram_open = true;
         let mut output = Vec::with_capacity(16 * 1024);
-        // Datagram path: MTU-aware BatchSender preserves partial-send suffixes.
-        let mut dgram_batch = BatchSender::new(MAX_BATCH_FRAMES);
         loop {
             let first = tokio::select! {
                 biased;
@@ -412,64 +409,14 @@ fn spawn_connection(
                 .unwrap_or_else(PoisonError::into_inner) = Instant::now();
 
             output.clear();
-            if first.msg_type == MSG_TYPE_DATAGRAM {
-                // Coalesce datagrams; reliable frames take the encrypted path.
-                let _ = dgram_batch.push_class(
-                    first.payload,
-                    first.class,
-                    std::time::Duration::from_millis(50),
-                );
-                // Opportunistically drain more datagrams into the batch.
-                while !dgram_batch.is_full() {
-                    match out_drx.try_recv() {
-                        Ok(f) if f.msg_type == MSG_TYPE_DATAGRAM => {
-                            if dgram_batch.push_class(
-                                f.payload,
-                                f.class,
-                                std::time::Duration::from_millis(50),
-                            ) {
-                                break;
-                            }
-                        }
-                        Ok(f) => {
-                            // A reliable frame arrived: seal it after flushing dgrams.
-                            if append_encrypted_record(&mut output, &mut sealer, &f).is_err() {
-                                return;
-                            }
-                            break;
-                        }
-                        Err(_) => break,
-                    }
-                }
-                // Encode pending datagrams as individual encrypted records for
-                // the wire (TCP has no native multipacket); BatchSender still
-                // tracks batch metrics and would preserve suffixes on partial
-                // socket accepts if the sink reported them.
-                // For the encrypted stream we seal each retained payload as a
-                // datagram frame in order.
-                // Reconstruct frames from batch by flushing through a collecting sink.
-                struct CollectSink(Vec<Vec<u8>>);
-                impl BatchSink for CollectSink {
-                    fn flush_batch(&mut self, frames: &[Vec<u8>]) -> usize {
-                        self.0.extend(frames.iter().cloned());
-                        frames.len()
-                    }
-                }
-                let mut collect = CollectSink(Vec::new());
-                let n = dgram_batch.flush(&mut collect);
-                for (i, payload) in collect.0.into_iter().enumerate() {
-                    let frame = Frame {
-                        class: codec::TrafficClass::MarketData,
-                        msg_type: MSG_TYPE_DATAGRAM,
-                        sequence: 0, // original seq already consumed; wire AEAD orders
-                        payload,
-                    };
-                    let _ = (n, i);
-                    if append_encrypted_record(&mut output, &mut sealer, &frame).is_err() {
-                        return;
-                    }
-                }
-            } else if append_encrypted_record(&mut output, &mut sealer, &first).is_err() {
+            // Seal every frame — datagrams included — exactly as stamped by the
+            // sender. The receiver's replay/dedup windows key on the sender's
+            // per-datagram sequence, so rewriting it here (as an earlier
+            // batching pass did with `sequence: 0`) would make every datagram
+            // after the first look like a replay and be silently dropped.
+            // Coalescing still happens below: a bounded burst of queued frames
+            // is drained into one write_all/flush pair.
+            if append_encrypted_record(&mut output, &mut sealer, &first).is_err() {
                 break;
             }
 
@@ -894,6 +841,42 @@ mod tests {
         client_conn.send_datagram(b"tick").unwrap();
         let got = server_conn.recv_datagram().await.unwrap();
         assert_eq!(got, b"tick");
+    }
+
+    #[tokio::test]
+    async fn every_datagram_is_delivered_in_order_over_tcp() {
+        use tokio::time::timeout as to;
+
+        // Regression for issue #394: the TCP writer used to rewrite every
+        // datagram's sequence to 0 while re-batching payloads, so the
+        // receiver's replay window classified all but the first datagram as
+        // replays and silently dropped them. With sender-stamped sequences
+        // preserved on the wire, every datagram must arrive, in order.
+        let server = bound(60).await;
+        let client = bound(61).await;
+        let server_addr = server.local_addr().unwrap();
+        let server_id = server.id();
+        let acceptor = {
+            let server = server.clone();
+            tokio::spawn(async move { server.accept().await })
+        };
+        let client_conn = client
+            .connect(&Peer::dial(server_id, server_addr))
+            .await
+            .unwrap();
+        let server_conn = acceptor.await.unwrap().unwrap();
+
+        const N: u64 = 32;
+        for i in 0..N {
+            client_conn.send_datagram(&i.to_le_bytes()).unwrap();
+        }
+        for i in 0..N {
+            let got = to(Duration::from_secs(10), server_conn.recv_datagram())
+                .await
+                .expect("every datagram must be delivered, not just the first")
+                .unwrap();
+            assert_eq!(got, i.to_le_bytes(), "datagram {i} arrives in order");
+        }
     }
 
     #[tokio::test]
