@@ -5,7 +5,7 @@
 //! command and returns a receipt carrying the post-command state root. Identical
 //! command streams produce identical state roots (deterministic replay).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use orderbook::{BookConfig, NewOrder, OrderBook, OrderOutcome};
 use risk::{RiskConfig, RiskEngine};
@@ -1715,12 +1715,21 @@ impl Engine {
                     ids.sort_unstable();
                     ids
                 };
-                let mut market_ids: Vec<u32> = book_keys.iter().map(|(m, _)| *m).collect();
-                market_ids.sort_unstable();
-                market_ids.dedup();
+                // Markets whose book state actually changed: `cancel_all`
+                // removed at least one resting order there. Only these need a
+                // market-leaf re-commit below — for every other market the
+                // rebuilt leaf would be byte-identical to the one already in
+                // the tree (same book roots, same meta), so re-hashing its
+                // Merkle path is a pure no-op on the state root (#431).
+                // `BTreeSet` iterates in ascending market id — the same
+                // deterministic order the previous commit-every-market loop
+                // produced with sort + dedup.
+                let mut touched_markets: BTreeSet<u32> = BTreeSet::new();
                 for key in &book_keys {
                     if let Some(book) = self.books.get_mut(key) {
-                        book.cancel_all(c.account);
+                        if book.cancel_all(c.account) > 0 {
+                            touched_markets.insert(key.0);
+                        }
                     }
                 }
                 // Release the account's claim-market escrows for the orders
@@ -1768,9 +1777,14 @@ impl Engine {
                 for a in &affected {
                     self.commit_account(*a)?;
                 }
-                // Cancelled orders and reconciled book positions change every
-                // touched market root.
-                for m in &market_ids {
+                // Re-commit only the market leaves whose books changed. No
+                // other effect of this handler reaches a market leaf: escrow
+                // release, `risk.liquidate` (ADL fills, insurance draw,
+                // socialization), and reservation drops mutate ledger / risk /
+                // claim state, all of which lives in the account leaves
+                // committed above; market meta (type, outcomes, mark price,
+                // winning outcome) is untouched by liquidation.
+                for m in &touched_markets {
                     self.commit_market(MarketId::new(*m))?;
                 }
                 Ok(self.receipt(
@@ -3760,6 +3774,78 @@ mod tests {
         );
         assert_eq!(e.claim_balance(victim, m1, 0), Amount::from_raw(50_000_000));
         assert_eq!(e.claim_balance(victim, m1, 1), Amount::from_raw(50_000_000));
+        check_invariants(&e);
+    }
+
+    // #431: Liquidate re-commits only the market leaves whose books actually
+    // changed (a cancel removed at least one resting order). With many markets
+    // but victim orders resting in only a few, the post-liquidation root must
+    // be bit-identical to the root produced by the pre-#431 behavior of
+    // re-committing EVERY market leaf — skipped markets rebuild the exact
+    // same leaf, so committing them is a no-op on the state root.
+    #[test]
+    fn liquidate_commits_only_touched_markets_bit_identically() {
+        let mut e = engine_with_caps(4, 16);
+        e.execute(seq(1), create_account(100_000_000)).unwrap(); // victim 0: 100.0
+        e.execute(seq(2), create_account(10_000_000_000)).unwrap(); // cpty 1
+        let victim = AccountId::new(0);
+        for m in 0..12u32 {
+            e.execute(seq(3 + u64::from(m)), create_perp(m, 1_000_000))
+                .unwrap();
+        }
+        // Victim rests small non-crossing bids in ONLY markets 2 and 9.
+        e.execute(seq(15), place(0, 2, 1, Side::Bid, 500_000, 10_000_000))
+            .unwrap();
+        e.execute(seq(16), place(0, 9, 2, Side::Bid, 500_000, 10_000_000))
+            .unwrap();
+        // The counterparty rests bids in markets 4 and 7, so untouched books
+        // are non-empty (the skip must be per-account, not per-book-emptiness).
+        e.execute(seq(17), place(1, 4, 3, Side::Bid, 500_000, 10_000_000))
+            .unwrap();
+        e.execute(seq(18), place(1, 7, 4, Side::Bid, 500_000, 10_000_000))
+            .unwrap();
+        // Victim opens a 400.0 long at 1.0 in market 0; the mark drops to
+        // 0.75 so equity (100 - 100 = 0) falls below maintenance margin.
+        e.execute(seq(19), place(1, 0, 5, Side::Ask, 1_000_000, 400_000_000))
+            .unwrap();
+        e.execute(seq(20), place(0, 0, 6, Side::Bid, 1_000_000, 400_000_000))
+            .unwrap();
+        e.execute(
+            seq(21),
+            Command::SetMarkPrice(SetMarkPrice {
+                market: MarketId::new(0),
+                price: Price::from_raw(750_000),
+            }),
+        )
+        .unwrap();
+        check_invariants(&e);
+
+        e.execute(seq(22), Command::Liquidate(Liquidate { account: victim }))
+            .unwrap();
+        // The victim's resting orders are gone; bystander books are intact.
+        assert_eq!(e.market_resting_len(MarketId::new(2)), Some(0));
+        assert_eq!(e.market_resting_len(MarketId::new(9)), Some(0));
+        assert_eq!(e.market_resting_len(MarketId::new(4)), Some(1));
+        assert_eq!(e.market_resting_len(MarketId::new(7)), Some(1));
+        // Every committed market leaf (including the ten skipped ones)
+        // reconciles with the live books against the state root.
+        check_invariants(&e);
+
+        // Byte-identity with the pre-#431 behavior: force a re-commit of
+        // EVERY market leaf and assert the root does not move — the markets
+        // the handler skipped were provably unchanged.
+        let root_after = e.state_root();
+        let mut all_markets: Vec<u32> = e.markets.keys().copied().collect();
+        all_markets.sort_unstable();
+        assert_eq!(all_markets.len(), 12);
+        for m in all_markets {
+            e.commit_market(MarketId::new(m)).unwrap();
+        }
+        assert_eq!(
+            e.state_root(),
+            root_after,
+            "committing all markets after Liquidate moved the root: a changed market was skipped",
+        );
         check_invariants(&e);
     }
 
