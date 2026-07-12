@@ -9,7 +9,8 @@ CORE=(types execution orderbook risk state-tree)
 status=0
 for crate in "${CORE[@]}"; do
     src="crates/$crate/src"
-    [ -d "$src" ] || continue
+    # Fail closed: a missing/renamed core crate dir must not pass vacuously.
+    [ -d "$src" ] || { echo "unsafe gate FAILED: core crate dir '$src' missing — update CORE list in $0" >&2; status=1; continue; }
     if grep -RInE '\bunsafe\b' "$src" | grep -vE 'allow\(unsafe_code\)|SAFETY:'; then
         echo "unsafe gate FAILED: unannotated unsafe in core crate '$crate'" >&2
         status=1
