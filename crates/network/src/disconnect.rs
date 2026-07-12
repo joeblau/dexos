@@ -43,14 +43,46 @@ impl DisconnectMetrics {
 #[must_use]
 pub fn classify_disconnect(error: &TransportError) -> DisconnectReason {
     match error {
-        TransportError::AuthFailed | TransportError::HandshakeFailed => {
-            DisconnectReason::Authentication
-        }
+        TransportError::AuthFailed
+        | TransportError::HandshakeFailed
+        | TransportError::HandshakeTimeout
+        | TransportError::NotInMembership
+        | TransportError::NetworkMismatch { .. }
+        | TransportError::VersionMismatch { .. } => DisconnectReason::Authentication,
         TransportError::Backpressure { .. } => DisconnectReason::Backpressure,
-        TransportError::ConnectionClosed => DisconnectReason::RemoteClose,
+        TransportError::ConnectionClosed | TransportError::IdleTimeout => {
+            DisconnectReason::RemoteClose
+        }
         TransportError::Io(_) | TransportError::PeerUnreachable | TransportError::NoAddress => {
             DisconnectReason::Io
         }
         _ => DisconnectReason::Protocol,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disconnect_reason_classes_cover_handshake_and_idle() {
+        let m = DisconnectMetrics::default();
+        m.record(DisconnectReason::Authentication);
+        m.record(DisconnectReason::Io);
+        m.record(DisconnectReason::Protocol);
+        assert_eq!(m.get(DisconnectReason::Authentication), 1);
+        assert_eq!(m.get(DisconnectReason::Io), 1);
+        assert_eq!(
+            classify_disconnect(&TransportError::HandshakeTimeout),
+            DisconnectReason::Authentication
+        );
+        assert_eq!(
+            classify_disconnect(&TransportError::IdleTimeout),
+            DisconnectReason::RemoteClose
+        );
+        assert_eq!(
+            classify_disconnect(&TransportError::NotInMembership),
+            DisconnectReason::Authentication
+        );
     }
 }

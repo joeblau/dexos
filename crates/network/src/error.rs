@@ -2,6 +2,8 @@
 
 use codec::TrafficClass;
 
+use crate::class_auth::PeerRole;
+
 /// A transport-layer failure.
 ///
 /// Every fallible transport operation returns this typed error. Adversarial or
@@ -38,6 +40,49 @@ pub enum TransportError {
     /// The handshake was malformed or ended prematurely.
     #[error("handshake protocol violation")]
     HandshakeFailed,
+
+    /// The handshake stalled past the configured I/O deadline.
+    #[error("handshake timed out")]
+    HandshakeTimeout,
+
+    /// The peer is not on the configured membership / allowlist.
+    #[error("peer not in membership allowlist")]
+    NotInMembership,
+
+    /// Peer offered a network identity that does not match this deployment.
+    #[error("network identity mismatch: local={local} remote={remote}")]
+    NetworkMismatch {
+        /// Local configured network id.
+        local: u64,
+        /// Remote offered network id.
+        remote: u64,
+    },
+
+    /// No common wire protocol version between the two peers.
+    #[error("no common wire version: local={local_min}..={local_max} remote={remote_min}..={remote_max}")]
+    VersionMismatch {
+        /// Local minimum supported version.
+        local_min: u16,
+        /// Local maximum supported version.
+        local_max: u16,
+        /// Remote minimum supported version.
+        remote_min: u16,
+        /// Remote maximum supported version.
+        remote_max: u16,
+    },
+
+    /// Peer submitted a traffic class its authenticated role does not permit.
+    #[error("unauthorized traffic class {class:?} for role {role:?}")]
+    UnauthorizedClass {
+        /// The rejected traffic class.
+        class: TrafficClass,
+        /// The peer's authenticated role.
+        role: PeerRole,
+    },
+
+    /// Idle timeout: no authenticated traffic within the configured bound.
+    #[error("idle timeout")]
+    IdleTimeout,
 
     /// An encrypted record failed AEAD authentication (tamper, truncation,
     /// reorder, or wrong session key). The link must be torn down.

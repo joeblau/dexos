@@ -14,10 +14,14 @@ use crate::record::{NodeId, PeerRecord, RecordError, Region, Role, RoleSet};
 
 /// Reputation granted for a good interaction.
 pub const REP_GOOD: i32 = 1;
-/// Reputation removed for a bad interaction (invalid/replayed record, timeout).
+/// Reputation removed for a bad interaction (invalid signature, timeout).
 pub const REP_BAD: i32 = -4;
+/// Mild penalty for pure duplicate / reordered gossip (must not zero honest peers).
+pub const REP_DUP: i32 = 0;
 /// Reputation a freshly admitted peer starts with.
 pub const REP_INITIAL: i32 = 0;
+/// Default minimum interval between accepted announcements from one peer (seconds).
+pub const DEFAULT_ANNOUNCE_MIN_INTERVAL: u64 = 1;
 
 /// Tunable bounds for a [`PeerTable`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,10 +32,14 @@ pub struct PeerConfig {
     pub max_markets: usize,
     /// Hard cap on records admitted in a single seed/bootstrap round.
     pub max_seed_admit: usize,
+    /// Hard cap on retained static seeds.
+    pub max_static_seeds: usize,
     /// Consecutive missed liveness checks before a peer is marked dead.
     pub missed_checks_to_dead: u32,
     /// Reputation at or below which a peer is evicted.
     pub min_reputation: i32,
+    /// Minimum seconds between accepted announcements per peer (rate limit).
+    pub announce_min_interval: u64,
 }
 
 impl Default for PeerConfig {
@@ -40,8 +48,10 @@ impl Default for PeerConfig {
             max_peers: 1024,
             max_markets: 4096,
             max_seed_admit: 64,
+            max_static_seeds: crate::record::MAX_STATIC_SEEDS,
             missed_checks_to_dead: 3,
             min_reputation: -8,
+            announce_min_interval: DEFAULT_ANNOUNCE_MIN_INTERVAL,
         }
     }
 }
@@ -85,6 +95,10 @@ pub struct PeerEntry {
     pub missed_checks: u32,
     /// Logical time of the last gossip re-forward (for suppression).
     pub last_forwarded: u64,
+    /// Whether this peer is a static seed (eviction-immune under capacity pressure).
+    pub is_seed: bool,
+    /// Logical time of the last accepted announcement (rate limiting).
+    pub last_announce_at: u64,
 }
 
 impl PeerEntry {
@@ -96,7 +110,15 @@ impl PeerEntry {
             liveness: Liveness::Alive,
             missed_checks: 0,
             last_forwarded: 0,
+            is_seed: false,
+            last_announce_at: 0,
         }
+    }
+
+    fn new_seed(record: PeerRecord) -> Self {
+        let mut e = Self::new(record);
+        e.is_seed = true;
+        e
     }
 }
 
@@ -155,14 +177,17 @@ impl PeerTable {
     // --- Seeding ---------------------------------------------------------
 
     /// Register a static seed record. It is verified, stored for bootstrap
-    /// fallback, and admitted immediately.
+    /// fallback, and admitted immediately with eviction immunity.
     pub fn add_static_seed(&mut self, record: PeerRecord, now: u64) -> Result<(), RecordError> {
         record.verify(now)?;
-        // De-duplicate seeds by node id.
+        // Cap retained static seeds.
         if !self.seeds.iter().any(|s| s.node_id == record.node_id) {
+            if self.seeds.len() >= self.config.max_static_seeds {
+                return Err(RecordError::OversizedField);
+            }
             self.seeds.push(record.clone());
         }
-        self.admit_verified(record);
+        self.admit_verified_seed(record);
         Ok(())
     }
 
@@ -204,26 +229,42 @@ impl PeerTable {
     /// Ingest an announced peer record from gossip.
     ///
     /// Rejects unverifiable records (penalizing the sender if known), suppresses
-    /// duplicate or replayed records, and admits/updates on a strictly newer
-    /// `expires_at`.
+    /// duplicate or replayed records without destroying reputation, rate-limits
+    /// announcements per peer, and admits/updates on a strictly newer
+    /// `expires_at`. Self-attested roles remain hints only (see
+    /// [`PeerRecord::roles_if_authorized`]).
     pub fn ingest_announcement(&mut self, record: PeerRecord, now: u64) -> IngestOutcome {
         if let Err(e) = record.verify(now) {
-            // Penalize a known peer that emitted an invalid record.
-            if let Some(entry) = self.peers.get_mut(&record.node_id) {
-                entry.reputation = entry.reputation.saturating_add(REP_BAD);
+            // Penalize a known peer that emitted an *invalid* record (bad sig).
+            // Pure duplicates use REP_DUP (zero) — never REP_BAD.
+            if matches!(e, RecordError::BadSignature | RecordError::NodeIdMismatch) {
+                if let Some(entry) = self.peers.get_mut(&record.node_id) {
+                    entry.reputation = entry.reputation.saturating_add(REP_BAD);
+                }
+                self.evict_below_min();
             }
-            self.evict_below_min();
             return IngestOutcome::Rejected(e);
+        }
+        // Rate-limit announcements from a known peer.
+        if let Some(entry) = self.peers.get(&record.node_id) {
+            if entry.last_announce_at > 0
+                && now.saturating_sub(entry.last_announce_at) < self.config.announce_min_interval
+                && record.expires_at <= entry.record.expires_at
+            {
+                // Flood of same-or-stale announcements: suppress without penalty.
+                return IngestOutcome::Suppressed;
+            }
         }
         // Snapshot the known expiry (if any) so no borrow spans the mutations.
         let existing_expiry = self.peers.get(&record.node_id).map(|e| e.record.expires_at);
         match existing_expiry {
             Some(exp) if record.expires_at <= exp => {
-                // Replay or stale duplicate: penalize and suppress.
+                // Pure duplicate / reordered gossip: suppress with mild (zero)
+                // penalty so honest peers are not zeroed by reordering.
                 if let Some(entry) = self.peers.get_mut(&record.node_id) {
-                    entry.reputation = entry.reputation.saturating_add(REP_BAD);
+                    entry.reputation = entry.reputation.saturating_add(REP_DUP);
+                    entry.last_announce_at = now.max(1);
                 }
-                self.evict_below_min();
                 IngestOutcome::Suppressed
             }
             Some(_) => {
@@ -232,11 +273,16 @@ impl PeerTable {
                     entry.record = record;
                     entry.liveness = Liveness::Alive;
                     entry.missed_checks = 0;
+                    entry.last_announce_at = now.max(1);
                 }
                 IngestOutcome::Updated
             }
             None => {
+                let node_id = record.node_id;
                 self.admit_verified(record);
+                if let Some(entry) = self.peers.get_mut(&node_id) {
+                    entry.last_announce_at = now.max(1);
+                }
                 IngestOutcome::Admitted
             }
         }
@@ -423,10 +469,24 @@ impl PeerTable {
 
     /// Admit a record already known to be verified, enforcing capacity.
     fn admit_verified(&mut self, record: PeerRecord) {
+        self.admit_verified_inner(record, false);
+    }
+
+    /// Admit a static seed with eviction immunity.
+    fn admit_verified_seed(&mut self, record: PeerRecord) {
+        self.admit_verified_inner(record, true);
+    }
+
+    fn admit_verified_inner(&mut self, record: PeerRecord, as_seed: bool) {
         if let Some(existing_expiry) = self.peers.get(&record.node_id).map(|e| e.record.expires_at)
         {
             // Keep the strictly newer record.
             if record.expires_at <= existing_expiry {
+                if as_seed {
+                    if let Some(entry) = self.peers.get_mut(&record.node_id) {
+                        entry.is_seed = true;
+                    }
+                }
                 return;
             }
             self.reindex_markets(&record.node_id, &record);
@@ -434,23 +494,33 @@ impl PeerTable {
                 entry.record = record;
                 entry.liveness = Liveness::Alive;
                 entry.missed_checks = 0;
+                if as_seed {
+                    entry.is_seed = true;
+                }
             }
             return;
         }
-        // Enforce capacity before inserting a new peer.
+        // Enforce capacity before inserting a new peer. Seeds may still need a
+        // slot; make_room never picks an existing seed as victim.
         if self.peers.len() >= self.config.max_peers && !self.make_room() {
-            return; // full of good peers; drop the newcomer rather than exceed cap
+            return; // full of seeds/good peers; drop the newcomer
         }
         self.index_markets(&record.node_id, &record.market_ids);
-        self.peers.insert(record.node_id, PeerEntry::new(record));
+        let entry = if as_seed {
+            PeerEntry::new_seed(record)
+        } else {
+            PeerEntry::new(record)
+        };
+        self.peers.insert(entry.record.node_id, entry);
     }
 
-    /// Evict the single least-reputable peer to make room. Returns whether a
-    /// peer was evicted.
+    /// Evict the single least-reputable **non-seed** peer to make room.
+    /// Seeds are immune: a Sybil flood cannot displace bootstrap roots.
     fn make_room(&mut self) -> bool {
         let victim = self
             .peers
             .iter()
+            .filter(|(_, e)| !e.is_seed)
             .min_by_key(|(_, e)| (e.reputation, e.liveness == Liveness::Alive))
             .map(|(id, _)| *id);
         if let Some(id) = victim {
@@ -461,12 +531,13 @@ impl PeerTable {
         }
     }
 
-    /// Evict every peer at or below the configured reputation floor.
+    /// Evict every non-seed peer at or below the configured reputation floor.
+    /// Seeds are never reputation-evicted (operators must remove them explicitly).
     fn evict_below_min(&mut self) {
         let doomed: Vec<NodeId> = self
             .peers
             .iter()
-            .filter(|(_, e)| e.reputation <= self.config.min_reputation)
+            .filter(|(_, e)| !e.is_seed && e.reputation <= self.config.min_reputation)
             .map(|(id, _)| *id)
             .collect();
         for id in doomed {
@@ -639,7 +710,10 @@ mod tests {
 
     #[test]
     fn replay_and_duplicate_suppressed() {
-        let mut t = PeerTable::new(PeerConfig::default());
+        let mut t = PeerTable::new(PeerConfig {
+            announce_min_interval: 0, // allow immediate re-announce in this test
+            ..PeerConfig::default()
+        });
         let r = rec(
             8,
             RoleSet::empty().with(Role::Oracle),
@@ -651,13 +725,17 @@ mod tests {
             t.ingest_announcement(r.clone(), 10),
             IngestOutcome::Admitted
         );
-        // Same record replayed: suppressed and penalized.
+        // Same record replayed: suppressed but reputation is NOT destroyed.
         assert_eq!(
-            t.ingest_announcement(r.clone(), 10),
+            t.ingest_announcement(r.clone(), 11),
             IngestOutcome::Suppressed
         );
         let node = r.node_id;
-        assert!(t.peer(&node).unwrap().reputation < 0);
+        assert_eq!(
+            t.peer(&node).unwrap().reputation,
+            REP_INITIAL + REP_DUP,
+            "pure dups must not apply REP_BAD"
+        );
         // A strictly newer record updates.
         let newer = rec(
             8,
@@ -666,7 +744,89 @@ mod tests {
             vec![],
             200,
         );
-        assert_eq!(t.ingest_announcement(newer, 10), IngestOutcome::Updated);
+        assert_eq!(t.ingest_announcement(newer, 12), IngestOutcome::Updated);
+    }
+
+    #[test]
+    fn duplicate_gossip_does_not_destroy_reputation() {
+        let mut t = PeerTable::new(PeerConfig {
+            announce_min_interval: 0,
+            min_reputation: -3,
+            ..PeerConfig::default()
+        });
+        let r = rec(
+            80,
+            RoleSet::empty().with(Role::Gateway),
+            vec![Region::UsEast],
+            vec![],
+            100,
+        );
+        let node = r.node_id;
+        t.ingest_announcement(r.clone(), 10);
+        // Flood of pure duplicates: must not evict an honest peer.
+        for i in 0..20 {
+            assert_eq!(
+                t.ingest_announcement(r.clone(), 11 + i),
+                IngestOutcome::Suppressed
+            );
+        }
+        assert!(t.peer(&node).is_some(), "honest peer survived dup flood");
+        assert!(t.peer(&node).unwrap().reputation > t.config().min_reputation);
+    }
+
+    #[test]
+    fn sybil_flood_cannot_evict_seeds() {
+        let cfg = PeerConfig {
+            max_peers: 3,
+            ..PeerConfig::default()
+        };
+        let mut t = PeerTable::new(cfg);
+        let seed = rec(
+            90,
+            RoleSet::empty().with(Role::Validator),
+            vec![Region::UsEast],
+            vec![],
+            1000,
+        );
+        let seed_id = seed.node_id;
+        t.add_static_seed(seed, 10).unwrap();
+        assert!(t.peer(&seed_id).unwrap().is_seed);
+        // Flood with many cheap Sybil identities.
+        for s in 91..100u8 {
+            let r = rec(
+                s,
+                RoleSet::empty().with(Role::Gateway),
+                vec![Region::UsEast],
+                vec![],
+                100,
+            );
+            t.ingest_announcement(r, 10);
+        }
+        assert!(
+            t.peer(&seed_id).is_some(),
+            "seed must survive Sybil flood under capacity"
+        );
+        assert!(t.len() <= 3);
+        // All remaining non-seed slots are filled, but seed stays.
+        assert_eq!(t.static_seeds().len(), 1);
+    }
+
+    #[test]
+    fn announcement_rate_limit_suppresses_flood() {
+        let mut t = PeerTable::new(PeerConfig {
+            announce_min_interval: 10,
+            ..PeerConfig::default()
+        });
+        let r = rec(
+            81,
+            RoleSet::empty().with(Role::Oracle),
+            vec![Region::UsEast],
+            vec![],
+            100,
+        );
+        assert_eq!(t.ingest_announcement(r.clone(), 10), IngestOutcome::Admitted);
+        // Immediate re-announce of same record within interval: suppressed.
+        assert_eq!(t.ingest_announcement(r, 15), IngestOutcome::Suppressed);
     }
 
     #[test]

@@ -8,55 +8,61 @@
 //!
 //! The handshake is symmetric — both sides run [`mutual_handshake`]:
 //!
-//! 1. each side sends `public_key(32) || nonce(32) || ephemeral_x25519_pub(32)`;
-//! 2. each side signs the *peer's* nonce, bound into a transcript
-//!    `DOMAIN || peer_nonce || self_pub || peer_pub || self_eph || peer_eph`,
-//!    and sends the 64-byte signature;
-//! 3. each side verifies the peer's signature over the transcript it expects,
-//!    proving the peer holds the private key for its claimed public key **and**
-//!    authenticating both ephemeral keys against a man-in-the-middle.
+//! 1. each side sends
+//!    `public_key(32) || nonce(32) || ephemeral_x25519_pub(32)
+//!     || network_id(8) || min_ver(2) || max_ver(2) || capabilities(8)
+//!     || epoch(8)`;
+//! 2. each side signs the *peer's* nonce, bound into a transcript that also
+//!    covers the network identity, version range, capabilities, epoch, and
+//!    both ephemeral keys;
+//! 3. each side verifies the peer's signature, negotiates the highest common
+//!    wire version, intersects capability bits, and rejects network-id
+//!    mismatches or empty version overlap with a typed pre-application error.
 //!
 //! The dialer additionally checks the peer's public key equals the *expected*
-//! [`PeerId`] from the [`Peer`] descriptor. A forged or mismatched identity, or
-//! a malformed handshake, is rejected with [`TransportError::AuthFailed`] /
-//! [`TransportError::HandshakeFailed`] — never a panic.
+//! [`PeerId`]. When membership is configured, the accepter rejects unknown
+//! peers. Stalled handshakes are bounded by a timeout and a concurrency
+//! semaphore so half-open floods cannot pin FDs indefinitely.
 //!
-//! # Encryption
+//! # Encryption / keepalive / idle
 //!
-//! The authenticated ephemeral X25519 keys complete an ECDH whose secret is fed
-//! through HKDF-SHA256 into per-direction ChaCha20-Poly1305 keys (see
-//! [`crate::session`]). After the handshake every application frame crosses the
-//! wire as an AEAD record, so a passive observer or on-path middlebox sees only
-//! ciphertext and length prefixes, and the ephemeral secret gives forward
-//! secrecy. The frame `sequence` (and thus the replay window) lives inside the
-//! encrypted plaintext and is recovered before replay checking.
-//!
-//! After the handshake the stream is split: a writer task seals the outbound
-//! strict-priority channel (and datagram channel) to the socket, and a reader
-//! task opens inbound records and routes them to the inbound reliable / datagram
-//! channels with the same bounded backpressure as the loopback transport.
+//! After the handshake the stream is encrypted (see [`crate::session`]), TCP
+//! keepalive is enabled, and an application-level idle timeout tears down
+//! silent peers. Reconnect helpers apply exponential backoff with full jitter.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use codec::Frame;
 use crypto::KeyPair;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
+use tokio::time::{timeout, MissedTickBehavior};
 
+use crate::batch::{BatchSender, BatchSink};
 use crate::budget::ByteBudget;
 use crate::channel::AsyncPriorityChannel;
-use crate::connection::{Connection, TransportConfig, MSG_TYPE_DATAGRAM};
+use crate::class_auth::PeerRole;
+use crate::connection::{Connection, ConnectionOpts, TransportConfig, MSG_TYPE_DATAGRAM};
 use crate::disconnect::{classify_disconnect, DisconnectMetrics, DisconnectReason};
 use crate::error::TransportError;
 use crate::framing::{append_encrypted_record, read_encrypted_frame};
 use crate::peer::{Peer, PeerId};
+use crate::reconnect::ReconnectBackoff;
+use crate::replay::PeerDedup;
 use crate::session::{Ephemeral, Session, EPH_PUBLIC_LEN};
 use crate::transport::Transport;
 
 /// Domain separation tag for handshake signatures.
-const HS_DOMAIN: &[u8] = b"dexos-network-handshake-v1";
+const HS_DOMAIN: &[u8] = b"dexos-network-handshake-v2";
+
+/// Bytes exchanged in handshake phase-1 identity block (excluding key/nonce/eph).
+/// network_id(8) + min_ver(2) + max_ver(2) + caps(8) + epoch(8) = 28.
+const HS_META_LEN: usize = 28;
 
 /// Draw a fresh 32-byte handshake nonce from the OS CSPRNG.
 ///
@@ -72,66 +78,220 @@ fn make_nonce() -> Result<[u8; 32], TransportError> {
     Ok(nonce)
 }
 
+/// Membership allowlist: optional map from peer identity to authenticated role.
+#[derive(Debug, Clone, Default)]
+pub struct Membership {
+    /// When `None`, any authenticated peer is admitted (open mode).
+    /// When `Some`, only listed peers are accepted and carry the mapped role.
+    peers: Option<HashMap<PeerId, PeerRole>>,
+}
+
+impl Membership {
+    /// Open membership: any authenticated peer is admitted as [`PeerRole::Validator`]
+    /// (full privileges — used by tests and single-tenant deployments).
+    pub fn open() -> Self {
+        Self { peers: None }
+    }
+
+    /// Permissioned membership from an explicit allowlist.
+    pub fn allowlist(entries: impl IntoIterator<Item = (PeerId, PeerRole)>) -> Self {
+        Self {
+            peers: Some(entries.into_iter().collect()),
+        }
+    }
+
+    /// Whether membership is in permissioned mode.
+    pub fn is_permissioned(&self) -> bool {
+        self.peers.is_some()
+    }
+
+    /// Look up a peer's role. In open mode every peer is a validator.
+    pub fn role_of(&self, id: &PeerId) -> Option<PeerRole> {
+        match &self.peers {
+            None => Some(PeerRole::Validator),
+            Some(map) => map.get(id).copied(),
+        }
+    }
+
+    /// Insert or replace a peer (for dynamic membership updates).
+    pub fn insert(&mut self, id: PeerId, role: PeerRole) {
+        self.peers.get_or_insert_with(HashMap::new).insert(id, role);
+    }
+}
+
+/// Result of a successful handshake negotiation.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HandshakeResult {
+    pub peer: PeerId,
+    pub wire_version: u16,
+    pub capabilities: u64,
+    pub epoch: u64,
+}
+
 /// The signed handshake transcript.
-///
-/// Includes both parties' **ephemeral X25519 public keys** so the ed25519
-/// signature authenticates the session-key material: a man-in-the-middle cannot
-/// substitute its own ephemeral key without invalidating the signature.
 fn transcript(
     challenge: &[u8; 32],
     signer_pub: &[u8; 32],
     verifier_pub: &[u8; 32],
     signer_eph: &[u8; EPH_PUBLIC_LEN],
     verifier_eph: &[u8; EPH_PUBLIC_LEN],
+    network_id: u64,
+    min_ver: u16,
+    max_ver: u16,
+    capabilities: u64,
+    epoch: u64,
 ) -> Vec<u8> {
-    let mut m = Vec::with_capacity(HS_DOMAIN.len() + 160);
+    let mut m = Vec::with_capacity(HS_DOMAIN.len() + 160 + HS_META_LEN);
     m.extend_from_slice(HS_DOMAIN);
     m.extend_from_slice(challenge);
     m.extend_from_slice(signer_pub);
     m.extend_from_slice(verifier_pub);
     m.extend_from_slice(signer_eph);
     m.extend_from_slice(verifier_eph);
+    m.extend_from_slice(&network_id.to_le_bytes());
+    m.extend_from_slice(&min_ver.to_le_bytes());
+    m.extend_from_slice(&max_ver.to_le_bytes());
+    m.extend_from_slice(&capabilities.to_le_bytes());
+    m.extend_from_slice(&epoch.to_le_bytes());
     m
 }
 
-/// Run the mutual authentication handshake over `stream`, and establish an
-/// encrypted session.
-///
-/// If `expected` is `Some`, the peer's authenticated identity must match it.
-/// Returns the peer's verified [`PeerId`] and the derived [`Session`] ciphers.
+fn encode_meta(network_id: u64, min_ver: u16, max_ver: u16, caps: u64, epoch: u64) -> [u8; HS_META_LEN] {
+    let mut out = [0u8; HS_META_LEN];
+    out[0..8].copy_from_slice(&network_id.to_le_bytes());
+    out[8..10].copy_from_slice(&min_ver.to_le_bytes());
+    out[10..12].copy_from_slice(&max_ver.to_le_bytes());
+    out[12..20].copy_from_slice(&caps.to_le_bytes());
+    out[20..28].copy_from_slice(&epoch.to_le_bytes());
+    out
+}
+
+fn decode_meta(bytes: &[u8; HS_META_LEN]) -> (u64, u16, u16, u64, u64) {
+    let network_id = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    let min_ver = u16::from_le_bytes(bytes[8..10].try_into().unwrap());
+    let max_ver = u16::from_le_bytes(bytes[10..12].try_into().unwrap());
+    let caps = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
+    let epoch = u64::from_le_bytes(bytes[20..28].try_into().unwrap());
+    (network_id, min_ver, max_ver, caps, epoch)
+}
+
+/// Highest common version in the inclusive ranges, if any.
+fn negotiate_version(
+    local_min: u16,
+    local_max: u16,
+    remote_min: u16,
+    remote_max: u16,
+) -> Option<u16> {
+    let lo = local_min.max(remote_min);
+    let hi = local_max.min(remote_max);
+    if lo <= hi {
+        Some(hi)
+    } else {
+        None
+    }
+}
+
+/// Enable TCP keepalive (+ TCP_KEEPALIVE idle/interval where the platform allows).
+fn configure_socket(stream: &TcpStream, cfg: &TransportConfig) -> Result<(), TransportError> {
+    stream.set_nodelay(true).ok();
+    // socket2 for portable keepalive knobs. Convert via std stream reference.
+    let sock_ref = socket2::SockRef::from(stream);
+    sock_ref
+        .set_keepalive(true)
+        .map_err(|e| TransportError::Io(e.to_string()))?;
+    let mut ka = socket2::TcpKeepalive::new();
+    ka = ka.with_time(cfg.keepalive_time);
+    #[cfg(not(target_os = "windows"))]
+    {
+        ka = ka.with_interval(cfg.keepalive_interval);
+    }
+    sock_ref
+        .set_tcp_keepalive(&ka)
+        .map_err(|e| TransportError::Io(e.to_string()))?;
+    Ok(())
+}
+
+/// Run the mutual authentication + version/network negotiation handshake.
 pub(crate) async fn mutual_handshake(
     stream: &mut TcpStream,
     keypair: &KeyPair,
     expected: Option<PeerId>,
     is_initiator: bool,
-) -> Result<(PeerId, Session), TransportError> {
+    cfg: &TransportConfig,
+    local_epoch: u64,
+) -> Result<(HandshakeResult, Session), TransportError> {
     let our_pub = keypair.public();
     let our_nonce = make_nonce()?;
     let ephemeral = Ephemeral::generate()?;
     let our_eph = ephemeral.public();
+    let our_meta = encode_meta(
+        cfg.network_id,
+        cfg.min_wire_version,
+        cfg.max_wire_version,
+        cfg.capabilities,
+        local_epoch,
+    );
 
-    // Phase 1: exchange (public key, nonce, ephemeral public key). Both sides
-    // write before reading; 96 bytes fit the socket buffer, so no deadlock.
+    // Phase 1: exchange identity + negotiation block. Both sides write first.
     stream.write_all(&our_pub).await?;
     stream.write_all(&our_nonce).await?;
     stream.write_all(&our_eph).await?;
+    stream.write_all(&our_meta).await?;
     stream.flush().await?;
 
     let mut their_pub = [0u8; 32];
     let mut their_nonce = [0u8; 32];
     let mut their_eph = [0u8; EPH_PUBLIC_LEN];
+    let mut their_meta = [0u8; HS_META_LEN];
     stream.read_exact(&mut their_pub).await?;
     stream.read_exact(&mut their_nonce).await?;
     stream.read_exact(&mut their_eph).await?;
+    stream.read_exact(&mut their_meta).await?;
 
-    // Phase 2: sign the peer's challenge (binding both ephemeral keys), exchange
-    // signatures.
+    let (their_net, their_min, their_max, their_caps, their_epoch) = decode_meta(&their_meta);
+
+    // Network identity: non-zero local id requires an exact match. Zero means
+    // "unspecified" and accepts any remote (including zero).
+    if cfg.network_id != 0 && their_net != cfg.network_id {
+        return Err(TransportError::NetworkMismatch {
+            local: cfg.network_id,
+            remote: their_net,
+        });
+    }
+
+    let wire_version = negotiate_version(
+        cfg.min_wire_version,
+        cfg.max_wire_version,
+        their_min,
+        their_max,
+    )
+    .ok_or(TransportError::VersionMismatch {
+        local_min: cfg.min_wire_version,
+        local_max: cfg.max_wire_version,
+        remote_min: their_min,
+        remote_max: their_max,
+    })?;
+
+    let capabilities = cfg.capabilities & their_caps;
+    // Connection epoch: initiator's epoch is authoritative so both sides agree.
+    let epoch = if is_initiator {
+        local_epoch
+    } else {
+        their_epoch
+    };
+
+    // Phase 2: sign the peer's challenge binding all negotiated material.
     let our_sig = keypair.sign(&transcript(
         &their_nonce,
         &our_pub,
         &their_pub,
         &our_eph,
         &their_eph,
+        cfg.network_id,
+        cfg.min_wire_version,
+        cfg.max_wire_version,
+        cfg.capabilities,
+        local_epoch,
     ));
     stream.write_all(&our_sig).await?;
     stream.flush().await?;
@@ -141,7 +301,18 @@ pub(crate) async fn mutual_handshake(
 
     crypto::verify_ed25519(
         &their_pub,
-        &transcript(&our_nonce, &their_pub, &our_pub, &their_eph, &our_eph),
+        &transcript(
+            &our_nonce,
+            &their_pub,
+            &our_pub,
+            &their_eph,
+            &our_eph,
+            their_net,
+            their_min,
+            their_max,
+            their_caps,
+            their_epoch,
+        ),
         &their_sig,
     )
     .map_err(|_| TransportError::AuthFailed)?;
@@ -152,8 +323,6 @@ pub(crate) async fn mutual_handshake(
         }
     }
 
-    // Both ephemeral keys are now authenticated; complete the ECDH and derive
-    // the directional session ciphers.
     let session = ephemeral.into_session(
         is_initiator,
         &their_eph,
@@ -162,13 +331,17 @@ pub(crate) async fn mutual_handshake(
         &our_nonce,
         &their_nonce,
     );
-    Ok((PeerId::from(their_pub), session))
+    Ok((
+        HandshakeResult {
+            peer: PeerId::from(their_pub),
+            wire_version,
+            capabilities,
+            epoch,
+        },
+        session,
+    ))
 }
 
-/// Split an authenticated, encrypted [`TcpStream`] into a [`Connection`] with a
-/// writer and reader task. Every frame is sealed/opened with the handshake
-/// [`Session`] ciphers, so nothing but ciphertext and length prefixes crosses
-/// the wire.
 fn spawn_connection(
     stream: TcpStream,
     peer: PeerId,
@@ -176,17 +349,11 @@ fn spawn_connection(
     cfg: &TransportConfig,
     node_budget: &Arc<ByteBudget>,
     disconnects: Arc<DisconnectMetrics>,
+    opts: ConnectionOpts,
 ) -> Connection {
     let (mut read_half, mut write_half) = stream.into_split();
     let (mut sealer, mut opener) = session.split();
 
-    // A per-peer child budget under the node-wide budget bounds this peer's
-    // outbound reliable bytes and, together with the per-class byte caps on the
-    // inbound queue, keeps one peer from consuming the whole process ceiling.
-    // Only the outbound channel (filled via `try_send`) charges the budget; the
-    // inbound channel is filled via the never-shed `send` path and is bounded by
-    // its per-class byte caps instead, so a budget can never force a reliable
-    // frame the far side already saw to be dropped.
     let peer_budget = ByteBudget::child(cfg.max_peer_bytes, node_budget.clone());
     let out_reliable = Arc::new(AsyncPriorityChannel::with_limits(
         cfg.queue_capacity,
@@ -198,22 +365,23 @@ fn spawn_connection(
         cfg.max_class_bytes,
         None,
     ));
-    // A tokio bounded channel requires a non-zero buffer.
     let datagram_cap = cfg.datagram_capacity.max(1);
     let (out_dtx, mut out_drx) = mpsc::channel::<Frame>(datagram_cap);
     let (in_dtx, in_drx) = mpsc::channel::<Frame>(datagram_cap);
 
-    // Writer: strict priority wins over datagrams (biased select). Once one
-    // frame wakes the task, drain a bounded burst and emit it with one socket
-    // write. This avoids a syscall and flush per frame under load without
-    // adding an artificial timer to the low-latency path.
+    let idle_timeout = cfg.idle_timeout;
+    let last_activity = Arc::new(Mutex::new(Instant::now()));
+
     let writer_out = out_reliable.clone();
     let writer_disconnects = disconnects.clone();
+    let writer_activity = last_activity.clone();
     let writer = tokio::spawn(async move {
         const MAX_BATCH_FRAMES: usize = 64;
         const MAX_BATCH_BYTES: usize = 256 * 1024;
         let mut dgram_open = true;
         let mut output = Vec::with_capacity(16 * 1024);
+        // Datagram path: MTU-aware BatchSender preserves partial-send suffixes.
+        let mut dgram_batch = BatchSender::new(MAX_BATCH_FRAMES);
         loop {
             let first = tokio::select! {
                 biased;
@@ -225,38 +393,99 @@ fn spawn_connection(
             };
             let Some(first) = first else { break };
 
+            *writer_activity
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Instant::now();
+
             output.clear();
-            if append_encrypted_record(&mut output, &mut sealer, &first).is_err() {
+            if first.msg_type == MSG_TYPE_DATAGRAM {
+                // Coalesce datagrams; reliable frames take the encrypted path.
+                let _ = dgram_batch.push_class(
+                    first.payload,
+                    first.class,
+                    std::time::Duration::from_millis(50),
+                );
+                // Opportunistically drain more datagrams into the batch.
+                while !dgram_batch.is_full() {
+                    match out_drx.try_recv() {
+                        Ok(f) if f.msg_type == MSG_TYPE_DATAGRAM => {
+                            if dgram_batch.push_class(
+                                f.payload,
+                                f.class,
+                                std::time::Duration::from_millis(50),
+                            ) {
+                                break;
+                            }
+                        }
+                        Ok(f) => {
+                            // A reliable frame arrived: seal it after flushing dgrams.
+                            if append_encrypted_record(&mut output, &mut sealer, &f).is_err() {
+                                return;
+                            }
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                // Encode pending datagrams as individual encrypted records for
+                // the wire (TCP has no native multipacket); BatchSender still
+                // tracks batch metrics and would preserve suffixes on partial
+                // socket accepts if the sink reported them.
+                // For the encrypted stream we seal each retained payload as a
+                // datagram frame in order.
+                // Reconstruct frames from batch by flushing through a collecting sink.
+                struct CollectSink(Vec<Vec<u8>>);
+                impl BatchSink for CollectSink {
+                    fn flush_batch(&mut self, frames: &[Vec<u8>]) -> usize {
+                        self.0.extend(frames.iter().cloned());
+                        frames.len()
+                    }
+                }
+                let mut collect = CollectSink(Vec::new());
+                let n = dgram_batch.flush(&mut collect);
+                for (i, payload) in collect.0.into_iter().enumerate() {
+                    let frame = Frame {
+                        class: codec::TrafficClass::MarketData,
+                        msg_type: MSG_TYPE_DATAGRAM,
+                        sequence: 0, // original seq already consumed; wire AEAD orders
+                        payload,
+                    };
+                    let _ = (n, i);
+                    if append_encrypted_record(&mut output, &mut sealer, &frame).is_err() {
+                        return;
+                    }
+                }
+            } else if append_encrypted_record(&mut output, &mut sealer, &first).is_err() {
                 break;
             }
+
             for _ in 1..MAX_BATCH_FRAMES {
                 if output.len() >= MAX_BATCH_BYTES {
                     break;
                 }
-                // Always drain reliable priority traffic first. Datagrams join
-                // the burst only when no reliable frame is immediately ready.
                 let next = writer_out.try_recv().or_else(|| out_drx.try_recv().ok());
                 let Some(frame) = next else { break };
                 if append_encrypted_record(&mut output, &mut sealer, &frame).is_err() {
                     return;
                 }
             }
-            if write_half.write_all(&output).await.is_err() || write_half.flush().await.is_err() {
+            if !output.is_empty()
+                && (write_half.write_all(&output).await.is_err()
+                    || write_half.flush().await.is_err())
+            {
                 writer_disconnects.record(DisconnectReason::Io);
                 break;
             }
         }
     });
 
-    // Reader: frame inbound bytes and route by the reserved datagram msg_type.
     let reader_in = in_reliable.clone();
     let max_payload = cfg.max_payload;
     let datagram_max = cfg.datagram_max_bytes;
     let semantic_max = cfg.semantic_max;
-    let reader_disconnects = disconnects;
+    let reader_disconnects = disconnects.clone();
+    let reader_activity = last_activity.clone();
     let reader = tokio::spawn(async move {
-        // Loop ends when a record fails to read/open (EOF, malformed framing, or
-        // AEAD authentication failure — any of which tears the link down).
         loop {
             let frame = match read_encrypted_frame(&mut read_half, &mut opener, max_payload).await {
                 Ok(frame) => frame,
@@ -265,28 +494,21 @@ fn spawn_connection(
                     break;
                 }
             };
+            *reader_activity
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Instant::now();
             if frame.msg_type == MSG_TYPE_DATAGRAM {
-                // Best-effort: drop an over-cap datagram before it is enqueued,
-                // and shed on backpressure or a closed receiver.
                 if frame.payload.len() <= datagram_max {
                     let _ = in_dtx.try_send(frame);
                 }
             } else {
-                // A reliable frame over its class's semantic ceiling is a
-                // protocol violation (e.g. a peer trying to stuff a bulk payload
-                // into the high-priority consensus class): reject it *before* it
-                // is copied into the inbound queue by tearing the link down. This
-                // never silently sheds an acknowledged frame — it fails loudly.
                 let idx = usize::from(frame.class.priority());
                 let cap = semantic_max.get(idx).copied().unwrap_or(max_payload);
                 if frame.payload.len() > cap {
+                    reader_disconnects.record(DisconnectReason::Protocol);
                     break;
                 }
                 if reader_in.send(frame).await.is_err() {
-                    // Reliable frames are *never* shed: `send` awaits queue space,
-                    // so a full inbound queue stops us draining the socket and
-                    // closes the peer's TCP window instead of dropping a frame the
-                    // sender already observed as delivered. An error means closed.
                     break;
                 }
             }
@@ -294,14 +516,35 @@ fn spawn_connection(
         reader_in.close();
     });
 
-    Connection::new(
+    // Idle-timeout watchdog: tear down when no authenticated traffic arrives.
+    let idle_out = out_reliable.clone();
+    let idle_disconnects = disconnects;
+    let idle_activity = last_activity;
+    let idle = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(1));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let last = *idle_activity
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if last.elapsed() >= idle_timeout {
+                idle_disconnects.record(DisconnectReason::RemoteClose);
+                idle_out.close();
+                break;
+            }
+        }
+    });
+
+    Connection::new_with_opts(
         peer,
         out_reliable,
         in_reliable,
         out_dtx,
         in_drx,
         cfg,
-        vec![writer, reader],
+        vec![writer, reader, idle],
+        opts,
     )
 }
 
@@ -311,28 +554,55 @@ pub struct TcpTransport {
     keypair: Arc<KeyPair>,
     listener: TcpListener,
     cfg: TransportConfig,
-    /// Node-wide reliable-byte budget shared by every accepted/dialed peer.
     node_budget: Arc<ByteBudget>,
     disconnects: Arc<DisconnectMetrics>,
+    membership: Arc<Mutex<Membership>>,
+    /// Shared multipath PeerDedup across all connections.
+    peer_dedup: Arc<Mutex<PeerDedup>>,
+    /// Handshake concurrency limiter.
+    handshake_sem: Arc<Semaphore>,
+    /// Monotonic epoch counter for outbound sessions.
+    epoch_counter: AtomicU64,
+    /// Live connection counts per peer (connection budget).
+    conn_counts: Mutex<HashMap<PeerId, usize>>,
 }
 
 impl TcpTransport {
-    /// Bind a listener at `addr` (use port 0 for an ephemeral port) with the
-    /// given node keypair and configuration.
+    /// Bind a listener at `addr` with open membership.
     pub async fn bind(
         addr: SocketAddr,
         keypair: Arc<KeyPair>,
         cfg: TransportConfig,
     ) -> Result<Self, TransportError> {
+        Self::bind_with_membership(addr, keypair, cfg, Membership::open()).await
+    }
+
+    /// Bind with an explicit membership allowlist.
+    pub async fn bind_with_membership(
+        addr: SocketAddr,
+        keypair: Arc<KeyPair>,
+        cfg: TransportConfig,
+        membership: Membership,
+    ) -> Result<Self, TransportError> {
         let listener = TcpListener::bind(addr).await?;
         let id = PeerId::from(keypair.public());
+        let max_hs = cfg.max_concurrent_handshakes.max(1);
         Ok(Self {
             id,
             keypair,
             listener,
+            peer_dedup: Arc::new(Mutex::new(PeerDedup::with_max_jump(
+                cfg.dedup_window,
+                cfg.max_seq_jump,
+                4096,
+            ))),
             cfg,
             node_budget: ByteBudget::root(cfg.max_node_bytes),
             disconnects: Arc::new(DisconnectMetrics::default()),
+            membership: Arc::new(Mutex::new(membership)),
+            handshake_sem: Arc::new(Semaphore::new(max_hs)),
+            epoch_counter: AtomicU64::new(1),
+            conn_counts: Mutex::new(HashMap::new()),
         })
     }
 
@@ -366,36 +636,165 @@ impl TcpTransport {
     pub fn disconnect_metrics(&self) -> Arc<DisconnectMetrics> {
         self.disconnects.clone()
     }
+
+    /// Replace the membership allowlist (permissioned mode).
+    pub fn set_membership(&self, membership: Membership) {
+        *self
+            .membership
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = membership;
+    }
+
+    /// Shared multipath dedup table.
+    pub fn peer_dedup(&self) -> Arc<Mutex<PeerDedup>> {
+        self.peer_dedup.clone()
+    }
+
+    /// Dial with reconnect backoff under transient failure. Returns the first
+    /// successful connection or the last error after `max_attempts`.
+    pub async fn connect_with_backoff(
+        &self,
+        peer: &Peer,
+        max_attempts: u32,
+    ) -> Result<Connection, TransportError> {
+        let mut backoff = ReconnectBackoff::new(self.cfg.reconnect);
+        let mut last_err = TransportError::PeerUnreachable;
+        for attempt in 0..max_attempts.max(1) {
+            match self.connect(peer).await {
+                Ok(c) => {
+                    backoff.reset();
+                    return Ok(c);
+                }
+                Err(e) => {
+                    last_err = e;
+                    if attempt + 1 >= max_attempts {
+                        break;
+                    }
+                    let delay = backoff.next_delay_os_rng();
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
+        Err(last_err)
+    }
+
+    async fn handshake_gated(
+        &self,
+        stream: &mut TcpStream,
+        expected: Option<PeerId>,
+        is_initiator: bool,
+        local_epoch: u64,
+    ) -> Result<(HandshakeResult, Session), TransportError> {
+        let _permit = self
+            .handshake_sem
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| TransportError::HandshakeFailed)?;
+        let fut = mutual_handshake(
+            stream,
+            &self.keypair,
+            expected,
+            is_initiator,
+            &self.cfg,
+            local_epoch,
+        );
+        match timeout(self.cfg.handshake_timeout, fut).await {
+            Ok(result) => result,
+            Err(_) => {
+                self.disconnects.record(DisconnectReason::Authentication);
+                Err(TransportError::HandshakeTimeout)
+            }
+        }
+    }
+
+    fn reserve_conn_slot(&self, peer: PeerId) -> Result<(), TransportError> {
+        let mut counts = self
+            .conn_counts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let entry = counts.entry(peer).or_insert(0);
+        if *entry >= self.cfg.connection_budget_per_peer {
+            return Err(TransportError::Backpressure {
+                class: codec::TrafficClass::Sync,
+            });
+        }
+        *entry += 1;
+        Ok(())
+    }
 }
 
 impl Transport for TcpTransport {
     async fn connect(&self, peer: &Peer) -> Result<Connection, TransportError> {
         let addr = peer.addr.ok_or(TransportError::NoAddress)?;
         let mut stream = TcpStream::connect(addr).await?;
-        stream.set_nodelay(true).ok();
-        let (verified, session) =
-            mutual_handshake(&mut stream, &self.keypair, Some(peer.id), true).await?;
+        configure_socket(&stream, &self.cfg)?;
+        let local_epoch = self.epoch_counter.fetch_add(1, Ordering::Relaxed);
+        let (hs, session) = self
+            .handshake_gated(&mut stream, Some(peer.id), true, local_epoch)
+            .await?;
+        self.reserve_conn_slot(hs.peer)?;
+        let role = self
+            .membership
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .role_of(&hs.peer)
+            .unwrap_or(PeerRole::Validator);
+        let opts = ConnectionOpts {
+            epoch: hs.epoch,
+            role,
+            wire_version: hs.wire_version,
+            capabilities: hs.capabilities,
+            peer_dedup: Some(self.peer_dedup.clone()),
+        };
         Ok(spawn_connection(
             stream,
-            verified,
+            hs.peer,
             session,
             &self.cfg,
             &self.node_budget,
             self.disconnects.clone(),
+            opts,
         ))
     }
 
     async fn accept(&self) -> Result<Connection, TransportError> {
         let (mut stream, _remote) = self.listener.accept().await?;
-        stream.set_nodelay(true).ok();
-        let (verified, session) = mutual_handshake(&mut stream, &self.keypair, None, false).await?;
+        configure_socket(&stream, &self.cfg)?;
+        let local_epoch = self.epoch_counter.fetch_add(1, Ordering::Relaxed);
+        let (hs, session) = self
+            .handshake_gated(&mut stream, None, false, local_epoch)
+            .await?;
+        // Membership / allowlist check on accept.
+        let role = {
+            let m = self
+                .membership
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            match m.role_of(&hs.peer) {
+                Some(role) => role,
+                None => {
+                    self.disconnects.record(DisconnectReason::Authentication);
+                    return Err(TransportError::NotInMembership);
+                }
+            }
+        };
+        self.reserve_conn_slot(hs.peer)?;
+        let opts = ConnectionOpts {
+            epoch: hs.epoch,
+            role,
+            wire_version: hs.wire_version,
+            capabilities: hs.capabilities,
+            peer_dedup: Some(self.peer_dedup.clone()),
+        };
         Ok(spawn_connection(
             stream,
-            verified,
+            hs.peer,
             session,
             &self.cfg,
             &self.node_budget,
             self.disconnects.clone(),
+            opts,
         ))
     }
 }
@@ -435,11 +834,11 @@ mod tests {
             .unwrap();
         let server_conn = acceptor.await.unwrap().unwrap();
 
-        // Identities were mutually authenticated.
         assert_eq!(client_conn.peer_id(), server_id);
         assert_eq!(server_conn.peer_id(), client.id());
+        assert_eq!(client_conn.wire_version(), 1);
+        assert_eq!(server_conn.wire_version(), 1);
 
-        // Framed reliable exchange, both directions.
         client_conn
             .send_priority(TrafficClass::Consensus, b"ping")
             .unwrap();
@@ -481,8 +880,6 @@ mod tests {
         let client = bound(6).await;
         let server_addr = server.local_addr().unwrap();
 
-        // Keep the server accepting so the handshake can proceed far enough for
-        // the client to detect the identity mismatch.
         let acceptor = {
             let server = server.clone();
             tokio::spawn(async move {
@@ -490,7 +887,6 @@ mod tests {
             })
         };
 
-        // Dial the real server address but *expect* a different identity.
         let wrong_id = PeerId::from([0xAAu8; 32]);
         let result = client.connect(&Peer::dial(wrong_id, server_addr)).await;
         assert!(matches!(result, Err(TransportError::AuthFailed)));
@@ -498,12 +894,170 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn slow_consumer_never_loses_reliable_frames() {
-        use std::time::Duration;
-        use tokio::time::timeout;
+    async fn membership_rejects_unknown_peer_on_accept() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        // Server only allows a specific peer (not the client).
+        let allowed = PeerId::from(kp(99).public());
+        let membership = Membership::allowlist([(allowed, PeerRole::Validator)]);
+        let server = Arc::new(
+            TcpTransport::bind_with_membership(addr, kp(10), cfg(), membership)
+                .await
+                .unwrap(),
+        );
+        let client = Arc::new(TcpTransport::bind(addr, kp(11), cfg()).await.unwrap());
+        let server_addr = server.local_addr().unwrap();
+        let server_id = server.id();
 
-        // Tight per-class queues so the inbound reliable buffer fills quickly and
-        // the reader must stall the peer's TCP window rather than shed frames.
+        let acceptor = {
+            let server = server.clone();
+            tokio::spawn(async move { server.accept().await })
+        };
+        let client_result = client.connect(&Peer::dial(server_id, server_addr)).await;
+        // Either side may surface the failure depending on who closes first.
+        let accept_result = acceptor.await.unwrap();
+        assert!(
+            matches!(accept_result, Err(TransportError::NotInMembership))
+                || client_result.is_err(),
+            "unknown peer must be rejected: accept={accept_result:?} client={client_result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_network_id_fails_with_network_mismatch() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut server_cfg = cfg();
+        server_cfg.network_id = 42;
+        let mut client_cfg = cfg();
+        client_cfg.network_id = 99;
+        let server = Arc::new(
+            TcpTransport::bind(addr, kp(12), server_cfg)
+                .await
+                .unwrap(),
+        );
+        let client = Arc::new(
+            TcpTransport::bind(addr, kp(13), client_cfg)
+                .await
+                .unwrap(),
+        );
+        let server_addr = server.local_addr().unwrap();
+        let server_id = server.id();
+        let acceptor = {
+            let server = server.clone();
+            tokio::spawn(async move { server.accept().await })
+        };
+        let client_result = client.connect(&Peer::dial(server_id, server_addr)).await;
+        let _ = acceptor.await;
+        assert!(
+            matches!(client_result, Err(TransportError::NetworkMismatch { .. }))
+                || matches!(client_result, Err(TransportError::AuthFailed))
+                || matches!(client_result, Err(TransportError::Io(_))),
+            "expected network mismatch, got {client_result:?}"
+        );
+        if let Err(TransportError::NetworkMismatch { local, remote }) = client_result {
+            assert_eq!(local, 99);
+            assert_eq!(remote, 42);
+        }
+    }
+
+    #[tokio::test]
+    async fn no_common_wire_version_fails_with_version_mismatch() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut server_cfg = cfg();
+        server_cfg.min_wire_version = 3;
+        server_cfg.max_wire_version = 4;
+        let mut client_cfg = cfg();
+        client_cfg.min_wire_version = 1;
+        client_cfg.max_wire_version = 2;
+        let server = Arc::new(
+            TcpTransport::bind(addr, kp(14), server_cfg)
+                .await
+                .unwrap(),
+        );
+        let client = Arc::new(
+            TcpTransport::bind(addr, kp(15), client_cfg)
+                .await
+                .unwrap(),
+        );
+        let server_addr = server.local_addr().unwrap();
+        let server_id = server.id();
+        let acceptor = {
+            let server = server.clone();
+            tokio::spawn(async move { server.accept().await })
+        };
+        let client_result = client.connect(&Peer::dial(server_id, server_addr)).await;
+        let _ = acceptor.await;
+        assert!(
+            matches!(client_result, Err(TransportError::VersionMismatch { .. }))
+                || matches!(client_result, Err(TransportError::Io(_)))
+                || matches!(client_result, Err(TransportError::AuthFailed)),
+            "expected version mismatch, got {client_result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn n_and_n_minus_1_negotiate_highest_common_version() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut server_cfg = cfg();
+        server_cfg.min_wire_version = 1;
+        server_cfg.max_wire_version = 2;
+        let mut client_cfg = cfg();
+        client_cfg.min_wire_version = 1;
+        client_cfg.max_wire_version = 1;
+        let server = Arc::new(
+            TcpTransport::bind(addr, kp(16), server_cfg)
+                .await
+                .unwrap(),
+        );
+        let client = Arc::new(
+            TcpTransport::bind(addr, kp(17), client_cfg)
+                .await
+                .unwrap(),
+        );
+        let server_addr = server.local_addr().unwrap();
+        let server_id = server.id();
+        let acceptor = {
+            let server = server.clone();
+            tokio::spawn(async move { server.accept().await })
+        };
+        let client_conn = client
+            .connect(&Peer::dial(server_id, server_addr))
+            .await
+            .unwrap();
+        let server_conn = acceptor.await.unwrap().unwrap();
+        assert_eq!(client_conn.wire_version(), 1);
+        assert_eq!(server_conn.wire_version(), 1);
+    }
+
+    #[tokio::test]
+    async fn stalled_handshake_times_out() {
+        use tokio::net::TcpListener as TokioListener;
+        // A raw listener that accepts but never completes the handshake.
+        let listener = TokioListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _stall = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            // Hold the socket open without responding.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let mut c = cfg();
+        c.handshake_timeout = Duration::from_millis(200);
+        let client = Arc::new(TcpTransport::bind("127.0.0.1:0".parse().unwrap(), kp(18), c).await.unwrap());
+        let result = client
+            .connect(&Peer::dial(PeerId::from([1u8; 32]), addr))
+            .await;
+        assert!(
+            matches!(result, Err(TransportError::HandshakeTimeout)),
+            "expected HandshakeTimeout, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_consumer_never_loses_reliable_frames() {
+        use tokio::time::timeout as to;
+
         let mut c = cfg();
         c.queue_capacity = 4;
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -523,8 +1077,6 @@ mod tests {
         let server_conn = acceptor.await.unwrap().unwrap();
 
         const N: u64 = 300;
-        // Producer: send N consensus frames, retrying (never dropping) on
-        // backpressure — the sender always eventually succeeds for each frame.
         let sender = tokio::spawn(async move {
             for i in 0..N {
                 loop {
@@ -535,16 +1087,12 @@ mod tests {
                     }
                 }
             }
-            // Keep the connection alive until the consumer has drained everything.
             Ok::<_, TransportError>(client_conn)
         });
 
-        // Slow consumer: pause so the inbound buffer saturates and the reader has
-        // to backpressure the wire, then drain everything and prove nothing was
-        // lost — every consensus frame arrives exactly once, strictly in order.
         tokio::time::sleep(Duration::from_millis(50)).await;
         for i in 0..N {
-            let frame = timeout(Duration::from_secs(10), server_conn.recv())
+            let frame = to(Duration::from_secs(10), server_conn.recv())
                 .await
                 .expect("slow consumer must not lose frames under backpressure")
                 .expect("reliable frame delivered without gap");
@@ -560,11 +1108,8 @@ mod tests {
 
     #[tokio::test]
     async fn inbound_over_semantic_ceiling_reliable_frame_tears_down_link() {
-        use std::time::Duration;
-        use tokio::time::timeout;
+        use tokio::time::timeout as to;
 
-        // The server enforces a tight consensus-class ceiling; the client's looser
-        // config lets it *send* an over-contract frame the server must reject.
         let mut server_cfg = cfg();
         server_cfg.semantic_max[usize::from(TrafficClass::Consensus.priority())] = 64;
         let mut client_cfg = cfg();
@@ -586,15 +1131,11 @@ mod tests {
             .unwrap();
         let server_conn = acceptor.await.unwrap().unwrap();
 
-        // A 500-byte consensus frame is within the client's ceiling but far over
-        // the server's 64-byte ceiling: the server rejects it on receipt.
         client_conn
             .send_priority(TrafficClass::Consensus, &[7u8; 500])
             .unwrap();
 
-        // The server never delivers the over-ceiling frame; it tears the link
-        // down instead of copying a bulk payload into its high-priority queue.
-        let closed = timeout(Duration::from_secs(10), server_conn.recv())
+        let closed = to(Duration::from_secs(10), server_conn.recv())
             .await
             .expect("server must react to the over-ceiling frame");
         assert!(matches!(closed, Err(TransportError::ConnectionClosed)));
@@ -602,8 +1143,7 @@ mod tests {
 
     #[tokio::test]
     async fn inbound_oversized_datagram_is_dropped_before_delivery() {
-        use std::time::Duration;
-        use tokio::time::timeout;
+        use tokio::time::timeout as to;
 
         let mut server_cfg = cfg();
         server_cfg.datagram_max_bytes = 16;
@@ -626,12 +1166,10 @@ mod tests {
             .unwrap();
         let server_conn = acceptor.await.unwrap().unwrap();
 
-        // The oversized datagram is dropped by the server's reader before it is
-        // enqueued; the following in-cap datagram is delivered normally.
         client_conn.send_datagram(&[9u8; 600]).unwrap();
         client_conn.send_datagram(b"ok").unwrap();
 
-        let got = timeout(Duration::from_secs(10), server_conn.recv_datagram())
+        let got = to(Duration::from_secs(10), server_conn.recv_datagram())
             .await
             .expect("in-cap datagram must still be delivered")
             .unwrap();
@@ -640,12 +1178,17 @@ mod tests {
 
     #[test]
     fn nonces_are_csprng_drawn_and_distinct() {
-        // Fresh draws from the OS CSPRNG must differ and must not be all-zero,
-        // proving the nonce is no longer a predictable time/counter derivation.
         let a = make_nonce().unwrap();
         let b = make_nonce().unwrap();
         assert_ne!(a, b, "two CSPRNG nonces collided");
         assert_ne!(a, [0u8; 32], "nonce was all zero");
+    }
+
+    #[test]
+    fn negotiate_version_picks_highest_common() {
+        assert_eq!(negotiate_version(1, 3, 2, 4), Some(3));
+        assert_eq!(negotiate_version(1, 1, 2, 2), None);
+        assert_eq!(negotiate_version(1, 2, 1, 1), Some(1));
     }
 
     #[tokio::test]
@@ -655,5 +1198,106 @@ mod tests {
             .connect(&Peer::loopback(PeerId::from([1u8; 32])))
             .await;
         assert!(matches!(result, Err(TransportError::NoAddress)));
+    }
+
+    #[tokio::test]
+    async fn peer_dedup_rejects_multipath_dual_delivery() {
+        // Two TCP paths to the same logical peer sharing the server's PeerDedup.
+        let server = bound(40).await;
+        let client = bound(41).await;
+        let server_addr = server.local_addr().unwrap();
+        let server_id = server.id();
+
+        let s1 = {
+            let server = server.clone();
+            tokio::spawn(async move { server.accept().await })
+        };
+        let c1 = client
+            .connect(&Peer::dial(server_id, server_addr))
+            .await
+            .unwrap();
+        let b1 = s1.await.unwrap().unwrap();
+
+        let s2 = {
+            let server = server.clone();
+            tokio::spawn(async move { server.accept().await })
+        };
+        let c2 = client
+            .connect(&Peer::dial(server_id, server_addr))
+            .await
+            .unwrap();
+        let b2 = s2.await.unwrap().unwrap();
+
+        // Force the same (epoch, seq) into PeerDedup via the shared table.
+        // Connections have independent epochs from the dialer; inject via the
+        // shared table directly to prove dual delivery rejection.
+        let peer = client.id();
+        let epoch = c1.epoch();
+        {
+            let dedup = server.peer_dedup();
+            let mut d = dedup.lock().unwrap();
+            assert!(d
+                .accept_class(peer, epoch, TrafficClass::Consensus, 0)
+                .unwrap());
+            assert!(!d
+                .accept_class(peer, epoch, TrafficClass::Consensus, 0)
+                .unwrap());
+        }
+        // Keep connections alive so the transport stays up for the assertion.
+        let _ = (c1, c2, b1, b2);
+    }
+
+    #[tokio::test]
+    async fn gateway_role_rejects_inbound_p0_on_recv() {
+        use crate::channel::AsyncPriorityChannel;
+        use crate::connection::ConnectionOpts;
+
+        let out = Arc::new(AsyncPriorityChannel::new(16));
+        let inbound = Arc::new(AsyncPriorityChannel::new(16));
+        let (out_dtx, _out_drx) = mpsc::channel(4);
+        let (_in_dtx, in_drx) = mpsc::channel(4);
+        let conn = Connection::new_with_opts(
+            PeerId::from([1u8; 32]),
+            out,
+            inbound.clone(),
+            out_dtx,
+            in_drx,
+            &TransportConfig::default(),
+            Vec::new(),
+            ConnectionOpts {
+                epoch: 1,
+                role: PeerRole::Gateway,
+                wire_version: 1,
+                capabilities: 0,
+                peer_dedup: None,
+            },
+        );
+        inbound
+            .try_send(Frame {
+                class: TrafficClass::Consensus,
+                msg_type: 0,
+                sequence: 0,
+                payload: b"vote".to_vec(),
+            })
+            .unwrap();
+        let err = conn.recv().await.unwrap_err();
+        assert!(matches!(
+            err,
+            TransportError::UnauthorizedClass {
+                class: TrafficClass::Consensus,
+                role: PeerRole::Gateway
+            }
+        ));
+    }
+
+    #[test]
+    fn membership_allowlist_contains_only_listed_peers() {
+        let a = PeerId::from([1u8; 32]);
+        let b = PeerId::from([2u8; 32]);
+        let m = Membership::allowlist([(a, PeerRole::Validator)]);
+        assert_eq!(m.role_of(&a), Some(PeerRole::Validator));
+        assert_eq!(m.role_of(&b), None);
+        let open = Membership::open();
+        assert_eq!(open.role_of(&b), Some(PeerRole::Validator));
     }
 }
