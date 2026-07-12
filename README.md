@@ -58,9 +58,11 @@ bin/
 
 **Strict dependency direction.** The deterministic execution core
 (`types`, `execution`, `orderbook`, `risk`, `state-tree`) links **no** async
-runtime, networking, RPC, or storage engine. Enforced in CI by
-`scripts/check-core-deps.sh`, `scripts/check-no-float.sh`, and
-`scripts/check-unsafe.sh`.
+runtime, networking, RPC, or storage engine. Enforced fail-closed in CI by
+`scripts/check-core-deps.sh`, which checks each core crate's full
+normal-dependency closure against the explicit allowlist in
+`scripts/core-deps-allowlist.txt` — any crate not on the list fails the
+gate — alongside `scripts/check-no-float.sh` and `scripts/check-unsafe.sh`.
 
 ## Toolchain
 
