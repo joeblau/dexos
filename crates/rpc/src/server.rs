@@ -101,7 +101,8 @@ pub struct ServerConfig {
     /// otherwise idle connection (bounds keep-alive and slow-header slowloris).
     pub idle_timeout: Duration,
     /// Maximum time to receive a frame's payload once its header has arrived
-    /// (bounds slow-body slowloris).
+    /// (bounds slow-body slowloris). Also bounds the TLS handshake when TLS is
+    /// required, so a stalled ClientHello cannot pin connection permits.
     pub read_timeout: Duration,
     /// Maximum time to flush a response before abandoning a stalled reader.
     pub write_timeout: Duration,
@@ -405,7 +406,10 @@ pub async fn serve(
 /// the admission control in `config`. Runs until the listener errors.
 ///
 /// When `config.tls` is [`TlsMode::Required`], each accepted socket performs a
-/// TLS 1.3 handshake before entering the RPC session. When TLS is required by
+/// TLS 1.3 handshake before entering the RPC session. The handshake is bounded
+/// by [`ServerConfig::read_timeout`] — the connection permits are held from
+/// accept time, so an unbounded handshake would let clients that never send a
+/// ClientHello exhaust the admission budget. When TLS is required by
 /// a production config but the acceptor is missing, the function returns
 /// immediately with [`ServerError::TlsRequired`].
 pub async fn serve_with_config(
@@ -466,21 +470,32 @@ pub async fn serve_with_config(
                         handle_connection_with(stream, backend, mode, &config, Some(work_budget))
                             .await;
                 }
-                TlsMode::Required(acceptor) => match acceptor.accept(stream).await {
-                    Ok(tls_stream) => {
-                        let _ = handle_connection_with(
-                            tls_stream,
-                            backend,
-                            mode,
-                            &config,
-                            Some(work_budget),
-                        )
-                        .await;
+                TlsMode::Required(acceptor) => {
+                    // Bound the handshake by `read_timeout`: the permits above are
+                    // already held, so a client that completes the TCP handshake
+                    // but never sends (or trickles) its ClientHello would otherwise
+                    // pin a global and a per-IP slot forever — permit-exhaustion
+                    // DoS. Dropping the timed-out accept future drops the stream
+                    // (clean close) and the task exits, releasing both permits.
+                    match tokio::time::timeout(config.read_timeout, acceptor.accept(stream)).await {
+                        Ok(Ok(tls_stream)) => {
+                            let _ = handle_connection_with(
+                                tls_stream,
+                                backend,
+                                mode,
+                                &config,
+                                Some(work_budget),
+                            )
+                            .await;
+                        }
+                        Ok(Err(e)) => {
+                            tracing::debug!(error = %e, "tls handshake failed");
+                        }
+                        Err(_elapsed) => {
+                            tracing::debug!(peer = %peer, "tls handshake timed out");
+                        }
                     }
-                    Err(e) => {
-                        tracing::debug!(error = %e, "tls handshake failed");
-                    }
-                },
+                }
             }
         });
     }
