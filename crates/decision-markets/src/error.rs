@@ -4,6 +4,7 @@
 //! these variants. Arithmetic and identifier failures from `types` are wrapped
 //! so callers can match on a single error type.
 
+use crypto::QuorumError;
 use types::{ArithError, IdError};
 
 use crate::lifecycle::DecisionPhase;
@@ -90,12 +91,49 @@ pub enum DecisionMarketError {
     /// A single account exceeded the concentration limit for a valid decision.
     #[error("position concentration exceeds the allowed limit")]
     ConcentrationExceeded,
-    /// An externally supplied confirmation payload was malformed.
-    #[error("malformed external confirmation payload")]
-    MalformedConfirmation,
-    /// An externally supplied confirmation replayed or reused a stale sequence.
+    /// The committed liquidity/concentration guards are outside their valid range.
+    #[error("committed decision guards are outside their valid range")]
+    InvalidGuards,
+    /// The committed minimum TWAP coverage fraction is outside `(0, 1]`.
+    #[error("committed minimum window coverage must lie in (0, 1]")]
+    InvalidCoverageThreshold,
+    /// The observed decision-price coverage over the selection window fell below
+    /// the committed minimum (also catches a single, non-time-weighting tick).
+    #[error("decision-price window coverage is below the committed minimum")]
+    InsufficientWindowCoverage,
+    /// A transition was attempted before its committed time window.
+    #[error("selection cannot run before the committed selection window elapses")]
+    SelectionWindowNotElapsed,
+    /// Evaluation was attempted before the committed evaluation window opened.
+    #[error("evaluation cannot run before the committed evaluation window opens")]
+    EvaluationWindowNotOpen,
+    /// A transition supplied a sequenced time earlier than a prior transition.
+    #[error("sequenced time moved backward")]
+    NonMonotonicTime,
+    /// A confirmation is bound to a different market than this one.
+    #[error("confirmation is bound to a different market")]
+    WrongMarket,
+    /// A confirmation is bound to a different network than this one.
+    #[error("confirmation is bound to a different network")]
+    WrongNetwork,
+    /// A confirmation's kind does not match the requested transition.
+    #[error("confirmation kind does not match the requested transition")]
+    WrongConfirmationKind,
+    /// A confirmation's payload does not match the digest its quorum signed.
+    #[error("confirmation payload does not match its signed digest")]
+    ConfirmationDigestMismatch,
+    /// A decision price fell outside the probability range `[0, 1]`.
+    #[error("a decision price is outside the probability range [0, 1]")]
+    ProbabilityOutOfRange,
+    /// The decision prices did not normalize to one unit within tolerance.
+    #[error("decision prices are not normalized to one unit within tolerance")]
+    UnnormalizedProbabilities,
+    /// An externally supplied confirmation replayed or reused a stale round.
     #[error("stale or replayed external confirmation")]
     StaleConfirmation,
+    /// A threshold quorum failed to verify the confirmation.
+    #[error("quorum verification failed: {0}")]
+    Quorum(#[from] QuorumError),
     /// A serialized definition could not be decoded from bytes.
     #[error("malformed decision-market definition bytes")]
     MalformedDefinition,

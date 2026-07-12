@@ -41,14 +41,18 @@ pub mod settlement;
 pub mod twap;
 
 pub use definition::{
-    Action, DecisionMarketDefinition, DecisionRule, Outcome, UnselectedActionPolicy,
-    UtilityFunction, MAX_ACTIONS, MAX_LABEL_BYTES, MAX_OUTCOMES,
+    Action, DecisionGuards, DecisionMarketDefinition, DecisionRule, Outcome,
+    UnselectedActionPolicy, UtilityFunction, MAX_ACTIONS, MAX_LABEL_BYTES, MAX_OUTCOMES,
 };
 pub use error::DecisionMarketError;
 pub use instrument::{instrument_coords, instrument_id, ActionId, InstrumentId, OutcomeId};
 pub use lifecycle::DecisionPhase;
-pub use market::{DecisionGuards, DecisionMarket};
-pub use selection::{expected_utility, select_action, ExternalConfirmation, SelectionOutcome};
+pub use market::DecisionMarket;
+pub use selection::{
+    expected_utility, select_action, validate_probability_vector, ConfirmationKind,
+    ConfirmationPayload, DecisionConfirmation, SelectionOutcome,
+    PROBABILITY_SUM_TOLERANCE_PER_OUTCOME,
+};
 pub use settlement::Settlement;
 pub use twap::{time_weighted_average, PriceTick, TimeWindow, TwapAccumulator};
 
@@ -58,14 +62,27 @@ pub const CRATE_NAME: &str = "decision-markets";
 #[cfg(test)]
 mod tests {
     use super::*;
-    use types::{AccountId, Amount, Price, Quantity, Ratio};
+    use crypto::ThresholdSigners;
+    use types::{AccountId, Amount, MarketId, Price, Quantity, Ratio, SequenceNumber};
+
+    const NETWORK_ID: u64 = 7;
+    const MARKET_ID: MarketId = MarketId::new(5);
 
     #[test]
     fn crate_name_is_stable() {
         assert_eq!(CRATE_NAME, "decision-markets");
     }
 
-    fn definition(policy: UnselectedActionPolicy) -> DecisionMarketDefinition {
+    fn authority() -> ThresholdSigners {
+        // 3-of-4 deterministic authority set.
+        let seeds: Vec<[u8; 32]> = (0..4).map(|i| [u8::try_from(i).unwrap(); 32]).collect();
+        ThresholdSigners::from_seeds(&seeds, 3)
+    }
+
+    fn definition_full(
+        policy: UnselectedActionPolicy,
+        guards: DecisionGuards,
+    ) -> DecisionMarketDefinition {
         DecisionMarketDefinition::new(
             vec![Action::new("ship"), Action::new("hold")],
             vec![Outcome::new("up"), Outcome::new("down")],
@@ -75,12 +92,45 @@ mod tests {
             TimeWindow::new(100, 200).unwrap(),
             policy,
             Amount::from_raw(1_000_000),
+            MARKET_ID,
+            NETWORK_ID,
+            guards,
+            Ratio::from_raw(500_000),
+            authority().validator_set(),
         )
         .unwrap()
     }
 
-    fn lenient_guards() -> DecisionGuards {
-        DecisionGuards::new(Amount::ZERO, Ratio::ONE)
+    fn definition(policy: UnselectedActionPolicy) -> DecisionMarketDefinition {
+        definition_full(policy, DecisionGuards::new(Amount::ZERO, Ratio::ONE))
+    }
+
+    /// Observe a constant `price` twice, covering the selection window with a
+    /// real inter-tick interval (`[0, 60)`, 60% of the window).
+    fn observe_covering(
+        m: &mut DecisionMarket,
+        action: ActionId,
+        outcome: OutcomeId,
+        price: Price,
+    ) {
+        m.observe_price(action, outcome, 0, price).unwrap();
+        m.observe_price(action, outcome, 60, price).unwrap();
+    }
+
+    fn action_confirmation(round: u64, action: u16) -> DecisionConfirmation {
+        let payload =
+            ConfirmationPayload::action(MARKET_ID, NETWORK_ID, SequenceNumber::new(round), action);
+        DecisionConfirmation::form(payload, &authority(), vec![0, 1, 2])
+    }
+
+    fn outcome_confirmation(round: u64, outcome: u16) -> DecisionConfirmation {
+        let payload = ConfirmationPayload::outcome(
+            MARKET_ID,
+            NETWORK_ID,
+            SequenceNumber::new(round),
+            outcome,
+        );
+        DecisionConfirmation::form(payload, &authority(), vec![0, 1, 2])
     }
 
     #[test]
@@ -128,7 +178,10 @@ mod tests {
 
     #[test]
     fn thin_market_blocks_selection_and_voids() {
-        let mut m = DecisionMarket::new(definition(UnselectedActionPolicy::Refund)).unwrap();
+        // Guards committed in the definition (min liquidity 1e9).
+        let guards = DecisionGuards::new(Amount::from_raw(1_000_000_000), Ratio::ONE);
+        let mut m =
+            DecisionMarket::new(definition_full(UnselectedActionPolicy::Refund, guards)).unwrap();
         m.open_trading().unwrap();
         // Only a tiny amount of liquidity.
         m.mint(ActionId::new(0), AccountId::new(1), Quantity::from_raw(1))
@@ -141,9 +194,8 @@ mod tests {
         )
         .unwrap();
         m.lock_decision().unwrap();
-        let guards = DecisionGuards::new(Amount::from_raw(1_000_000_000), Ratio::ONE);
         assert_eq!(
-            m.select_auto(guards),
+            m.select_auto(100),
             Err(DecisionMarketError::LiquidityTooThin)
         );
         assert_eq!(m.phase(), DecisionPhase::Invalid);
@@ -151,7 +203,10 @@ mod tests {
 
     #[test]
     fn concentration_limit_blocks_selection() {
-        let mut m = DecisionMarket::new(definition(UnselectedActionPolicy::Refund)).unwrap();
+        // Committed concentration limit of 50%.
+        let guards = DecisionGuards::new(Amount::ZERO, Ratio::from_raw(500_000));
+        let mut m =
+            DecisionMarket::new(definition_full(UnselectedActionPolicy::Refund, guards)).unwrap();
         m.open_trading().unwrap();
         // One account holds everything -> 100% concentration.
         m.mint(
@@ -167,13 +222,158 @@ mod tests {
         )
         .unwrap();
         m.lock_decision().unwrap();
-        // Limit 50%.
-        let guards = DecisionGuards::new(Amount::ZERO, Ratio::from_raw(500_000));
         assert_eq!(
-            m.select_auto(guards),
+            m.select_auto(100),
             Err(DecisionMarketError::ConcentrationExceeded)
         );
         assert_eq!(m.phase(), DecisionPhase::Invalid);
+    }
+
+    #[test]
+    fn insufficient_window_coverage_voids() {
+        // A single (final) tick per outcome carries no time-weighting.
+        let mut m = DecisionMarket::new(definition(UnselectedActionPolicy::Refund)).unwrap();
+        m.open_trading().unwrap();
+        m.mint(
+            ActionId::new(0),
+            AccountId::new(1),
+            Quantity::from_raw(1_000_000),
+        )
+        .unwrap();
+        m.mint(
+            ActionId::new(1),
+            AccountId::new(2),
+            Quantity::from_raw(1_000_000),
+        )
+        .unwrap();
+        // Exactly one observation per outcome -> zero observed coverage.
+        for a in 0..2u16 {
+            for o in 0..2u16 {
+                m.observe_price(
+                    ActionId::new(a),
+                    OutcomeId::new(o),
+                    90,
+                    Price::from_raw(500_000),
+                )
+                .unwrap();
+            }
+        }
+        m.lock_decision().unwrap();
+        assert_eq!(
+            m.select_auto(100),
+            Err(DecisionMarketError::InsufficientWindowCoverage)
+        );
+        assert_eq!(m.phase(), DecisionPhase::Invalid);
+    }
+
+    #[test]
+    fn selection_before_window_end_is_rejected() {
+        let mut m = DecisionMarket::new(definition(UnselectedActionPolicy::Refund)).unwrap();
+        m.open_trading().unwrap();
+        m.mint(
+            ActionId::new(0),
+            AccountId::new(1),
+            Quantity::from_raw(1_000_000),
+        )
+        .unwrap();
+        m.mint(
+            ActionId::new(1),
+            AccountId::new(2),
+            Quantity::from_raw(1_000_000),
+        )
+        .unwrap();
+        observe_covering(
+            &mut m,
+            ActionId::new(0),
+            OutcomeId::new(0),
+            Price::from_raw(900_000),
+        );
+        observe_covering(
+            &mut m,
+            ActionId::new(0),
+            OutcomeId::new(1),
+            Price::from_raw(100_000),
+        );
+        observe_covering(
+            &mut m,
+            ActionId::new(1),
+            OutcomeId::new(0),
+            Price::from_raw(100_000),
+        );
+        observe_covering(
+            &mut m,
+            ActionId::new(1),
+            OutcomeId::new(1),
+            Price::from_raw(900_000),
+        );
+        m.lock_decision().unwrap();
+        // Selection window is [0, 100); running before it elapses is rejected and
+        // does not void the market.
+        assert_eq!(
+            m.select_auto(99),
+            Err(DecisionMarketError::SelectionWindowNotElapsed)
+        );
+        assert_eq!(m.phase(), DecisionPhase::DecisionLocked);
+        // At the window end it proceeds.
+        assert_eq!(m.select_auto(100).unwrap().action, ActionId::new(0));
+    }
+
+    #[test]
+    fn evaluation_before_window_open_is_rejected() {
+        let mut m = DecisionMarket::new(definition(UnselectedActionPolicy::Refund)).unwrap();
+        m.open_trading().unwrap();
+        m.mint(
+            ActionId::new(0),
+            AccountId::new(1),
+            Quantity::from_raw(1_000_000),
+        )
+        .unwrap();
+        m.mint(
+            ActionId::new(1),
+            AccountId::new(2),
+            Quantity::from_raw(1_000_000),
+        )
+        .unwrap();
+        observe_covering(
+            &mut m,
+            ActionId::new(0),
+            OutcomeId::new(0),
+            Price::from_raw(900_000),
+        );
+        observe_covering(
+            &mut m,
+            ActionId::new(0),
+            OutcomeId::new(1),
+            Price::from_raw(100_000),
+        );
+        observe_covering(
+            &mut m,
+            ActionId::new(1),
+            OutcomeId::new(0),
+            Price::from_raw(100_000),
+        );
+        observe_covering(
+            &mut m,
+            ActionId::new(1),
+            OutcomeId::new(1),
+            Price::from_raw(900_000),
+        );
+        m.lock_decision().unwrap();
+        m.select_auto(100).unwrap();
+        // Evaluation window is [100, 200); begin_evaluation before it opens fails.
+        // (100 is the window open, so 99 is before it; but selection already set
+        // sequenced time to 100, so use a value below the window start.)
+        assert_eq!(
+            m.begin_evaluation(99),
+            Err(DecisionMarketError::EvaluationWindowNotOpen)
+        );
+        assert_eq!(m.phase(), DecisionPhase::ActionSelected);
+        m.begin_evaluation(120).unwrap();
+        // Sequenced time cannot move backward.
+        assert_eq!(
+            m.resolve(110, &outcome_confirmation(1, 0)),
+            Err(DecisionMarketError::NonMonotonicTime)
+        );
     }
 
     /// Drive a full market to SETTLED, asserting collateral conservation and the
@@ -196,40 +396,37 @@ mod tests {
         )
         .unwrap();
         // Decision prices: action 0 favors outcome up (0.9), action 1 favors down.
-        m.observe_price(
+        observe_covering(
+            &mut m,
             ActionId::new(0),
             OutcomeId::new(0),
-            0,
             Price::from_raw(900_000),
-        )
-        .unwrap();
-        m.observe_price(
+        );
+        observe_covering(
+            &mut m,
             ActionId::new(0),
             OutcomeId::new(1),
-            0,
             Price::from_raw(100_000),
-        )
-        .unwrap();
-        m.observe_price(
+        );
+        observe_covering(
+            &mut m,
             ActionId::new(1),
             OutcomeId::new(0),
-            0,
             Price::from_raw(100_000),
-        )
-        .unwrap();
-        m.observe_price(
+        );
+        observe_covering(
+            &mut m,
             ActionId::new(1),
             OutcomeId::new(1),
-            0,
             Price::from_raw(900_000),
-        )
-        .unwrap();
+        );
         m.lock_decision().unwrap();
-        let chosen = m.select_auto(lenient_guards()).unwrap();
+        let chosen = m.select_auto(100).unwrap();
         // Action 0 EU = 0.9 * 10 = 9.0 > Action 1 EU = 0.1 * 10 = 1.0.
         assert_eq!(chosen.action, ActionId::new(0));
-        m.begin_evaluation().unwrap();
-        m.resolve(OutcomeId::new(0)).unwrap(); // outcome "up" wins
+        m.begin_evaluation(120).unwrap();
+        // Outcome "up" wins, confirmed by a threshold-signed outcome confirmation.
+        m.resolve(150, &outcome_confirmation(1, 0)).unwrap();
         let s = m.settle().unwrap();
         assert_eq!(m.phase(), DecisionPhase::Settled);
         // Chosen action 0: account 1 held 4 sets of the winning outcome -> 4.0.
@@ -272,38 +469,35 @@ mod tests {
             Quantity::from_raw(1_000_000),
         )
         .unwrap();
-        m.observe_price(
+        // Normalized decision prices for every action, covering the window.
+        observe_covering(
+            &mut m,
             ActionId::new(0),
             OutcomeId::new(0),
-            0,
             Price::from_raw(900_000),
-        )
-        .unwrap();
-        m.observe_price(
+        );
+        observe_covering(
+            &mut m,
             ActionId::new(0),
             OutcomeId::new(1),
-            0,
             Price::from_raw(100_000),
-        )
-        .unwrap();
-        m.observe_price(
+        );
+        observe_covering(
+            &mut m,
             ActionId::new(1),
             OutcomeId::new(0),
-            0,
             Price::from_raw(100_000),
-        )
-        .unwrap();
-        m.observe_price(
+        );
+        observe_covering(
+            &mut m,
             ActionId::new(1),
             OutcomeId::new(1),
-            0,
-            Price::from_raw(100_000),
-        )
-        .unwrap();
+            Price::from_raw(900_000),
+        );
         m.lock_decision().unwrap();
-        m.select_auto(lenient_guards()).unwrap();
-        m.begin_evaluation().unwrap();
-        m.resolve(OutcomeId::new(0)).unwrap();
+        m.select_auto(100).unwrap();
+        m.begin_evaluation(120).unwrap();
+        m.resolve(150, &outcome_confirmation(1, 0)).unwrap();
         let s = m.settle().unwrap();
         // Action 1 total collateral 2.0, total shares: account1 has 2 (down), account2 has 2 (up).
         // Void distributes 2.0 pro-rata by total shares (2 vs 2) -> 1.0 each.
@@ -320,7 +514,7 @@ mod tests {
     }
 
     #[test]
-    fn external_confirmation_rejects_replay_and_bad_action() {
+    fn signed_confirmation_rejects_unsigned_wrong_market_authority_stale_and_cross_network() {
         let mut m = DecisionMarket::new(definition(UnselectedActionPolicy::Refund)).unwrap();
         m.open_trading().unwrap();
         m.mint(
@@ -336,26 +530,92 @@ mod tests {
         )
         .unwrap();
         m.lock_decision().unwrap();
-        // Out-of-range action.
-        let bad = ExternalConfirmation::new(ActionId::new(9), types::SequenceNumber::new(1));
+
+        // Unsigned: a confirmation with no signers never reaches threshold.
+        let unsigned = {
+            let payload =
+                ConfirmationPayload::action(MARKET_ID, NETWORK_ID, SequenceNumber::new(1), 1);
+            DecisionConfirmation::form(payload, &authority(), vec![])
+        };
+        assert!(matches!(
+            m.select_confirmed(100, &unsigned),
+            Err(DecisionMarketError::Quorum(_))
+        ));
+
+        // Wrong market.
+        let wrong_market = {
+            let payload = ConfirmationPayload::action(
+                MarketId::new(999),
+                NETWORK_ID,
+                SequenceNumber::new(1),
+                1,
+            );
+            DecisionConfirmation::form(payload, &authority(), vec![0, 1, 2])
+        };
         assert_eq!(
-            m.select_confirmed(&bad.encode(), lenient_guards()),
-            Err(DecisionMarketError::UnknownAction)
+            m.select_confirmed(100, &wrong_market),
+            Err(DecisionMarketError::WrongMarket)
         );
-        // Stale sequence (0 does not exceed the initial 0).
-        let stale = ExternalConfirmation::new(ActionId::new(1), types::SequenceNumber::new(0));
+
+        // Cross-network.
+        let wrong_network = {
+            let payload = ConfirmationPayload::action(MARKET_ID, 999, SequenceNumber::new(1), 1);
+            DecisionConfirmation::form(payload, &authority(), vec![0, 1, 2])
+        };
         assert_eq!(
-            m.select_confirmed(&stale.encode(), lenient_guards()),
+            m.select_confirmed(100, &wrong_network),
+            Err(DecisionMarketError::WrongNetwork)
+        );
+
+        // Wrong authority: a disjoint key set signs an otherwise-valid payload.
+        let wrong_authority = {
+            let foreign_seeds: Vec<[u8; 32]> = (0..4)
+                .map(|i| [u8::try_from(i).unwrap() + 100; 32])
+                .collect();
+            let foreign = ThresholdSigners::from_seeds(&foreign_seeds, 3);
+            let payload =
+                ConfirmationPayload::action(MARKET_ID, NETWORK_ID, SequenceNumber::new(1), 1);
+            DecisionConfirmation::form(payload, &foreign, vec![0, 1, 2])
+        };
+        assert!(matches!(
+            m.select_confirmed(100, &wrong_authority),
+            Err(DecisionMarketError::Quorum(_))
+        ));
+
+        // Stale round (0 does not exceed the initial 0), even when validly signed.
+        assert_eq!(
+            m.select_confirmed(100, &action_confirmation(0, 1)),
             Err(DecisionMarketError::StaleConfirmation)
         );
-        // Valid confirmation.
-        let good = ExternalConfirmation::new(ActionId::new(1), types::SequenceNumber::new(1));
+
+        // Out-of-range action.
         assert_eq!(
-            m.select_confirmed(&good.encode(), lenient_guards())
-                .unwrap(),
+            m.select_confirmed(100, &action_confirmation(1, 9)),
+            Err(DecisionMarketError::UnknownAction)
+        );
+
+        // Wrong kind: an outcome confirmation cannot select an action.
+        assert_eq!(
+            m.select_confirmed(100, &outcome_confirmation(1, 1)),
+            Err(DecisionMarketError::WrongConfirmationKind)
+        );
+
+        // Running before the selection window elapses is rejected.
+        assert_eq!(
+            m.select_confirmed(99, &action_confirmation(1, 1)),
+            Err(DecisionMarketError::SelectionWindowNotElapsed)
+        );
+
+        // None of the rejections changed the phase.
+        assert_eq!(m.phase(), DecisionPhase::DecisionLocked);
+
+        // A valid confirmation selects the action and advances the round.
+        assert_eq!(
+            m.select_confirmed(100, &action_confirmation(1, 1)).unwrap(),
             ActionId::new(1)
         );
         assert_eq!(m.selected_action(), Some(ActionId::new(1)));
+        assert_eq!(m.phase(), DecisionPhase::ActionSelected);
     }
 
     // Deterministic LCG property test: over randomized mint/transfer sets, both
@@ -394,23 +654,23 @@ mod tests {
             let to = AccountId::new(u32::try_from(r.next() % 4).unwrap() + 1);
             let _ = m.transfer(action, outcome, from, to, Quantity::from_raw(500_000));
         }
-        // Prices so action selection is well-defined.
+        // Normalized decision prices covering the window so selection is
+        // well-defined (0.5 / 0.5, observed inter-tick coverage 60%).
         for a in 0..2u16 {
             for o in 0..2u16 {
-                m.observe_price(
+                observe_covering(
+                    &mut m,
                     ActionId::new(a),
                     OutcomeId::new(o),
-                    0,
                     Price::from_raw(500_000),
-                )
-                .unwrap();
+                );
             }
         }
         m.lock_decision().unwrap();
-        m.select_auto(lenient_guards()).unwrap();
-        m.begin_evaluation().unwrap();
-        m.resolve(OutcomeId::new(u16::try_from(r.next() % 2).unwrap()))
-            .unwrap();
+        m.select_auto(100).unwrap();
+        m.begin_evaluation(120).unwrap();
+        let outcome = u16::try_from(r.next() % 2).unwrap();
+        m.resolve(150, &outcome_confirmation(1, outcome)).unwrap();
         let root = m.state_root();
         let s = m.settle().unwrap();
         assert_eq!(s.total_paid(), deposited, "collateral must be conserved");

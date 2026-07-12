@@ -97,6 +97,32 @@ impl TwapAccumulator {
         self.window
     }
 
+    /// Duration (within the window) spanned by *observed* inter-tick intervals,
+    /// i.e. the gaps between consecutive observations clamped to the window. This
+    /// deliberately excludes [`Self::finalize`]'s extrapolation of the final tick
+    /// to the window end, so a single observation reports zero coverage — the
+    /// signal a lone tick carries no time-weighting and must not decide a market.
+    #[inline]
+    pub const fn observed_coverage(&self) -> u64 {
+        self.covered
+    }
+
+    /// Whether the observed inter-tick coverage reaches `min_coverage` (a fraction
+    /// of the window duration in `Ratio` micro-units): `covered / duration >=
+    /// min_coverage`. A single observation (zero inter-tick coverage) never meets
+    /// a positive minimum.
+    #[inline]
+    pub fn coverage_meets(&self, min_coverage: types::Ratio) -> Result<bool, DecisionMarketError> {
+        // covered/duration >= min  <=>  covered * RATIO_SCALE >= duration * min.
+        let lhs = i128::from(self.covered)
+            .checked_mul(i128::from(types::RATIO_SCALE))
+            .ok_or(DecisionMarketError::Truncation)?;
+        let rhs = i128::from(self.window.duration())
+            .checked_mul(i128::from(min_coverage.raw()))
+            .ok_or(DecisionMarketError::Truncation)?;
+        Ok(lhs >= rhs)
+    }
+
     /// Fold the interval `[from, to)` carrying `price` into the accumulator,
     /// clamped to the window. Pure scalar arithmetic; never allocates.
     #[inline]
@@ -261,6 +287,37 @@ mod tests {
             time_weighted_average(w, &after),
             Err(DecisionMarketError::NoObservations)
         );
+    }
+
+    #[test]
+    fn single_tick_reports_zero_observed_coverage() {
+        use types::Ratio;
+        let w = TimeWindow::new(0, 100).unwrap();
+        let mut acc = TwapAccumulator::new(w);
+        // A lone tick at the window start: finalize extrapolates it across the
+        // whole window (so a value exists), but observed coverage is zero.
+        acc.observe(0, p(700_000)).unwrap();
+        assert_eq!(acc.finalize().unwrap(), p(700_000));
+        assert_eq!(acc.observed_coverage(), 0);
+        // Any positive minimum coverage is therefore unmet.
+        assert!(!acc.coverage_meets(Ratio::from_raw(1)).unwrap());
+        assert!(!acc.coverage_meets(Ratio::ONE).unwrap());
+        // A zero minimum is trivially met (guarded against elsewhere).
+        assert!(acc.coverage_meets(Ratio::ZERO).unwrap());
+    }
+
+    #[test]
+    fn observed_coverage_counts_inter_tick_span_only() {
+        use types::Ratio;
+        let w = TimeWindow::new(0, 100).unwrap();
+        let mut acc = TwapAccumulator::new(w);
+        acc.observe(10, p(1_000_000)).unwrap();
+        acc.observe(60, p(1_000_000)).unwrap();
+        // Inter-tick span [10, 60) == 50; the [60, 100) tail is extrapolation.
+        assert_eq!(acc.observed_coverage(), 50);
+        // 50/100 == 0.5 exactly.
+        assert!(acc.coverage_meets(Ratio::from_raw(500_000)).unwrap());
+        assert!(!acc.coverage_meets(Ratio::from_raw(500_001)).unwrap());
     }
 
     #[test]

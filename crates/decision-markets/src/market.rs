@@ -14,33 +14,13 @@ use std::collections::BTreeMap;
 use types::domain::Hash;
 use types::{AccountId, Amount, Price, Quantity, Ratio, SequenceNumber};
 
-use crate::definition::{DecisionMarketDefinition, UnselectedActionPolicy};
+use crate::definition::{DecisionGuards, DecisionMarketDefinition, UnselectedActionPolicy};
 use crate::error::DecisionMarketError;
 use crate::instrument::{ActionId, InstrumentId, OutcomeId};
 use crate::lifecycle::DecisionPhase;
-use crate::selection::{select_action, ExternalConfirmation, SelectionOutcome};
+use crate::selection::{select_action, ConfirmationKind, DecisionConfirmation, SelectionOutcome};
 use crate::settlement::Settlement;
 use crate::twap::TwapAccumulator;
-
-/// Minimum-liquidity and concentration guards for a valid decision.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DecisionGuards {
-    /// Minimum collateral each contingent market must hold to be decided.
-    pub min_liquidity: Amount,
-    /// Maximum share of a single market a single account may hold (`0..=1.0`).
-    pub max_concentration: Ratio,
-}
-
-impl DecisionGuards {
-    /// Construct guards.
-    #[inline]
-    pub const fn new(min_liquidity: Amount, max_concentration: Ratio) -> Self {
-        Self {
-            min_liquidity,
-            max_concentration,
-        }
-    }
-}
 
 /// One account's holdings within a single contingent market.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,7 +85,12 @@ pub struct DecisionMarket {
     markets: Vec<ContingentMarket>,
     selected: Option<ActionId>,
     resolved_outcome: Option<OutcomeId>,
-    ext_sequence: SequenceNumber,
+    /// The last accepted confirmation round (monotonic replay guard, shared
+    /// across action and outcome confirmations).
+    last_round: SequenceNumber,
+    /// The sequenced time of the last time-gated transition; every subsequent
+    /// transition must be at or after this (monotonic time).
+    sequenced_time: u64,
 }
 
 impl DecisionMarket {
@@ -124,7 +109,8 @@ impl DecisionMarket {
             markets,
             selected: None,
             resolved_outcome: None,
-            ext_sequence: SequenceNumber::ZERO,
+            last_round: SequenceNumber::ZERO,
+            sequenced_time: 0,
         })
     }
 
@@ -180,18 +166,83 @@ impl DecisionMarket {
     }
 
     /// `ActionSelected -> Evaluating`.
-    pub fn begin_evaluation(&mut self) -> Result<(), DecisionMarketError> {
-        self.set_phase(DecisionPhase::Evaluating)
+    ///
+    /// Driven by sequenced time: `now` must be at or after the committed
+    /// evaluation window opens (and never earlier than a prior transition).
+    pub fn begin_evaluation(&mut self, now: u64) -> Result<(), DecisionMarketError> {
+        if self.phase != DecisionPhase::ActionSelected {
+            return Err(DecisionMarketError::WrongPhase { phase: self.phase });
+        }
+        if now < self.definition.evaluation_window.start {
+            return Err(DecisionMarketError::EvaluationWindowNotOpen);
+        }
+        self.require_monotonic_time(now)?;
+        self.set_phase(DecisionPhase::Evaluating)?;
+        self.sequenced_time = now;
+        Ok(())
     }
 
     /// `Evaluating -> Resolved`: record the realized outcome for the selected
-    /// action's contingent market.
-    pub fn resolve(&mut self, outcome: OutcomeId) -> Result<(), DecisionMarketError> {
+    /// action's contingent market from a threshold-signed, domain-bound outcome
+    /// [`DecisionConfirmation`].
+    ///
+    /// Rejects (without recording) any confirmation that is unsigned, bound to a
+    /// different market or network, of the wrong kind, replays a stale round, or
+    /// is signed by a wrong authority. Driven by sequenced time: `now` must be at
+    /// or after the committed evaluation window opens.
+    pub fn resolve(
+        &mut self,
+        now: u64,
+        confirmation: &DecisionConfirmation,
+    ) -> Result<(), DecisionMarketError> {
+        if self.phase != DecisionPhase::Evaluating {
+            return Err(DecisionMarketError::WrongPhase { phase: self.phase });
+        }
+        if now < self.definition.evaluation_window.start {
+            return Err(DecisionMarketError::EvaluationWindowNotOpen);
+        }
+        self.require_monotonic_time(now)?;
+        let payload = confirmation.payload;
+        if payload.kind != ConfirmationKind::Outcome {
+            return Err(DecisionMarketError::WrongConfirmationKind);
+        }
+        self.check_confirmation_binding(payload.market_id, payload.network_id)?;
+        if payload.round.get() <= self.last_round.get() {
+            return Err(DecisionMarketError::StaleConfirmation);
+        }
+        confirmation.verify(&self.definition.authority_set)?;
+        let outcome = OutcomeId::new(payload.index);
         if outcome.index()? >= self.num_outcomes {
             return Err(DecisionMarketError::UnknownOutcome);
         }
         self.set_phase(DecisionPhase::Resolved)?;
+        self.last_round = payload.round;
         self.resolved_outcome = Some(outcome);
+        self.sequenced_time = now;
+        Ok(())
+    }
+
+    /// Reject a sequenced time earlier than the last time-gated transition.
+    fn require_monotonic_time(&self, now: u64) -> Result<(), DecisionMarketError> {
+        if now < self.sequenced_time {
+            Err(DecisionMarketError::NonMonotonicTime)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Bind a confirmation to this market and network.
+    fn check_confirmation_binding(
+        &self,
+        market_id: types::MarketId,
+        network_id: u64,
+    ) -> Result<(), DecisionMarketError> {
+        if market_id != self.definition.market_id {
+            return Err(DecisionMarketError::WrongMarket);
+        }
+        if network_id != self.definition.network_id {
+            return Err(DecisionMarketError::WrongNetwork);
+        }
         Ok(())
     }
 
@@ -372,7 +423,8 @@ impl DecisionMarket {
 
     // --- guards & selection ----------------------------------------------------
 
-    fn check_guards(&self, guards: DecisionGuards) -> Result<(), DecisionMarketError> {
+    fn check_guards(&self) -> Result<(), DecisionMarketError> {
+        let guards: DecisionGuards = self.definition.guards;
         for market in &self.markets {
             let total = market.total_collateral()?;
             if total.raw() < guards.min_liquidity.raw() {
@@ -406,6 +458,22 @@ impl DecisionMarket {
         Ok(())
     }
 
+    /// Require every outcome's decision-price accumulator to cover at least the
+    /// committed minimum fraction of the selection window with *observed*
+    /// inter-tick intervals. A single (final) tick carries no time-weighting, so
+    /// it reports zero coverage and fails this check.
+    fn check_coverage(&self) -> Result<(), DecisionMarketError> {
+        let min = self.definition.min_twap_coverage;
+        for market in &self.markets {
+            for twap in &market.twaps {
+                if !twap.coverage_meets(min)? {
+                    return Err(DecisionMarketError::InsufficientWindowCoverage);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn per_action_prices(&self) -> Result<Vec<Vec<Price>>, DecisionMarketError> {
         (0..self.markets.len())
             .map(|i| {
@@ -417,18 +485,26 @@ impl DecisionMarket {
 
     /// Automatically select the action maximizing time-weighted expected utility.
     ///
-    /// Requires [`DecisionPhase::DecisionLocked`]. If the liquidity or
-    /// concentration guards fail, the market transitions to
-    /// [`DecisionPhase::Invalid`] (the deterministic void path) and an error is
-    /// returned.
-    pub fn select_auto(
-        &mut self,
-        guards: DecisionGuards,
-    ) -> Result<SelectionOutcome, DecisionMarketError> {
+    /// Requires [`DecisionPhase::DecisionLocked`] and, driven by sequenced time,
+    /// that `now` be at or after the committed selection window closes (running
+    /// before it rejects). The committed liquidity/concentration guards and the
+    /// committed minimum window coverage are enforced; if either fails the market
+    /// transitions to [`DecisionPhase::Invalid`] (the deterministic void path)
+    /// and an error is returned. The winning action's decision prices must form a
+    /// valid probability vector.
+    pub fn select_auto(&mut self, now: u64) -> Result<SelectionOutcome, DecisionMarketError> {
         if self.phase != DecisionPhase::DecisionLocked {
             return Err(DecisionMarketError::WrongPhase { phase: self.phase });
         }
-        if let Err(e) = self.check_guards(guards) {
+        if now < self.definition.selection_window.end {
+            return Err(DecisionMarketError::SelectionWindowNotElapsed);
+        }
+        self.require_monotonic_time(now)?;
+        if let Err(e) = self.check_guards() {
+            self.phase = DecisionPhase::Invalid;
+            return Err(e);
+        }
+        if let Err(e) = self.check_coverage() {
             self.phase = DecisionPhase::Invalid;
             return Err(e);
         }
@@ -440,37 +516,53 @@ impl DecisionMarket {
         )?;
         self.selected = Some(outcome.action);
         self.set_phase(DecisionPhase::ActionSelected)?;
+        self.sequenced_time = now;
         Ok(outcome)
     }
 
-    /// Select the action from an externally-confirmed payload.
+    /// Select the action from a threshold-signed, domain-bound action
+    /// [`DecisionConfirmation`].
     ///
-    /// The payload is decoded panic-free; the action must be in range and the
-    /// sequence must strictly exceed the last accepted one (replay guard). Guards
-    /// are still enforced (a failure voids the market).
+    /// Requires [`DecisionPhase::DecisionLocked`] and, driven by sequenced time,
+    /// that `now` be at or after the committed selection window closes. Rejects
+    /// (without voiding or selecting) any confirmation that is unsigned, bound to
+    /// a different market or network, of the wrong kind, replays a stale round,
+    /// names an unknown action, or is signed by a wrong authority. The committed
+    /// guards are still enforced; a guard failure voids the market.
     pub fn select_confirmed(
         &mut self,
-        payload: &[u8],
-        guards: DecisionGuards,
+        now: u64,
+        confirmation: &DecisionConfirmation,
     ) -> Result<ActionId, DecisionMarketError> {
         if self.phase != DecisionPhase::DecisionLocked {
             return Err(DecisionMarketError::WrongPhase { phase: self.phase });
         }
-        let confirmation = ExternalConfirmation::decode(payload)?;
-        if confirmation.action.index()? >= self.markets.len() {
-            return Err(DecisionMarketError::UnknownAction);
+        if now < self.definition.selection_window.end {
+            return Err(DecisionMarketError::SelectionWindowNotElapsed);
         }
-        if confirmation.sequence.get() <= self.ext_sequence.get() {
+        self.require_monotonic_time(now)?;
+        let payload = confirmation.payload;
+        if payload.kind != ConfirmationKind::Action {
+            return Err(DecisionMarketError::WrongConfirmationKind);
+        }
+        self.check_confirmation_binding(payload.market_id, payload.network_id)?;
+        if payload.round.get() <= self.last_round.get() {
             return Err(DecisionMarketError::StaleConfirmation);
         }
-        if let Err(e) = self.check_guards(guards) {
+        confirmation.verify(&self.definition.authority_set)?;
+        let action = ActionId::new(payload.index);
+        if action.index()? >= self.markets.len() {
+            return Err(DecisionMarketError::UnknownAction);
+        }
+        if let Err(e) = self.check_guards() {
             self.phase = DecisionPhase::Invalid;
             return Err(e);
         }
-        self.ext_sequence = confirmation.sequence;
-        self.selected = Some(confirmation.action);
+        self.last_round = payload.round;
+        self.selected = Some(action);
         self.set_phase(DecisionPhase::ActionSelected)?;
-        Ok(confirmation.action)
+        self.sequenced_time = now;
+        Ok(action)
     }
 
     // --- settlement ------------------------------------------------------------
@@ -611,7 +703,8 @@ impl DecisionMarket {
     pub fn state_root(&self) -> Hash {
         let mut buf: Vec<u8> = Vec::new();
         buf.push(self.phase.discriminant());
-        buf.extend_from_slice(&self.ext_sequence.get().to_le_bytes());
+        buf.extend_from_slice(&self.last_round.get().to_le_bytes());
+        buf.extend_from_slice(&self.sequenced_time.to_le_bytes());
         match self.selected {
             None => buf.push(0),
             Some(a) => {

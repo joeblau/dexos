@@ -1,11 +1,15 @@
 //! End-to-end integration coverage for the decision-market crate.
 
+use crypto::ThresholdSigners;
 use decision_markets::{
-    Action, ActionId, DecisionGuards, DecisionMarket, DecisionMarketDefinition, DecisionPhase,
-    DecisionRule, ExternalConfirmation, Outcome, OutcomeId, TimeWindow, UnselectedActionPolicy,
-    UtilityFunction,
+    Action, ActionId, ConfirmationPayload, DecisionConfirmation, DecisionGuards, DecisionMarket,
+    DecisionMarketDefinition, DecisionPhase, DecisionRule, Outcome, OutcomeId, TimeWindow,
+    UnselectedActionPolicy, UtilityFunction,
 };
-use types::{AccountId, Amount, MarketType, Price, Quantity, Ratio, SequenceNumber};
+use types::{AccountId, Amount, MarketId, MarketType, Price, Quantity, Ratio, SequenceNumber};
+
+const NETWORK_ID: u64 = 42;
+const MARKET_ID: MarketId = MarketId::new(11);
 
 /// A minimal registry entry, standing in for the node's market registry, to show
 /// a `MarketType::Decision` entry is constructible from a valid definition.
@@ -13,6 +17,28 @@ struct RegistryEntry {
     market_type: MarketType,
     num_actions: usize,
     num_outcomes: usize,
+}
+
+fn authority() -> ThresholdSigners {
+    // 3-of-4 deterministic authority set.
+    let seeds: Vec<[u8; 32]> = (0..4).map(|i| [u8::try_from(i).unwrap(); 32]).collect();
+    ThresholdSigners::from_seeds(&seeds, 3)
+}
+
+fn action_conf(round: u64, action: u16) -> DecisionConfirmation {
+    DecisionConfirmation::form(
+        ConfirmationPayload::action(MARKET_ID, NETWORK_ID, SequenceNumber::new(round), action),
+        &authority(),
+        vec![0, 1, 2],
+    )
+}
+
+fn outcome_conf(round: u64, outcome: u16) -> DecisionConfirmation {
+    DecisionConfirmation::form(
+        ConfirmationPayload::outcome(MARKET_ID, NETWORK_ID, SequenceNumber::new(round), outcome),
+        &authority(),
+        vec![0, 1, 2],
+    )
 }
 
 fn sample_definition() -> DecisionMarketDefinition {
@@ -29,8 +55,19 @@ fn sample_definition() -> DecisionMarketDefinition {
         TimeWindow::new(1_000, 2_000).unwrap(),
         UnselectedActionPolicy::Refund,
         Amount::from_raw(1_000_000),
+        MARKET_ID,
+        NETWORK_ID,
+        DecisionGuards::new(Amount::from_raw(1_000_000), Ratio::ONE),
+        Ratio::from_raw(400_000),
+        authority().validator_set(),
     )
     .unwrap()
+}
+
+/// Observe a constant `price` covering the window from `ts=0` to `ts=500`.
+fn observe_covering(m: &mut DecisionMarket, action: ActionId, outcome: OutcomeId, price: Price) {
+    m.observe_price(action, outcome, 0, price).unwrap();
+    m.observe_price(action, outcome, 500, price).unwrap();
 }
 
 #[test]
@@ -80,37 +117,35 @@ fn full_lifecycle_from_creation_to_settled_conserves_collateral() {
     .unwrap();
     let funded = 10_000_000 + 5_000_000 + 4_000_000;
 
-    // Time-weighted decision prices: launch is most likely to succeed.
-    // A late spike on "delay" must NOT flip the selection (TWAP, not last tick).
-    m.observe_price(
+    // Time-weighted, normalized decision prices: launch is most likely to
+    // succeed. A late *complementary* spike on "delay" (success up, failure down)
+    // must NOT flip the selection (TWAP, not last tick).
+    observe_covering(
+        &mut m,
         ActionId::new(0),
         OutcomeId::new(0),
-        0,
         Price::from_raw(800_000),
-    )
-    .unwrap();
-    m.observe_price(
+    );
+    observe_covering(
+        &mut m,
         ActionId::new(0),
         OutcomeId::new(1),
-        0,
         Price::from_raw(200_000),
-    )
-    .unwrap();
-    m.observe_price(
+    );
+    observe_covering(
+        &mut m,
         ActionId::new(1),
         OutcomeId::new(0),
-        0,
         Price::from_raw(300_000),
-    )
-    .unwrap();
-    m.observe_price(
+    );
+    observe_covering(
+        &mut m,
         ActionId::new(1),
         OutcomeId::new(1),
-        0,
         Price::from_raw(700_000),
-    )
-    .unwrap();
-    // Final-tick spike for delay->success at t=999 (1 unit of a 1000-unit window).
+    );
+    // Final-tick spike for delay at t=999 (1 unit of a 1000-unit window), kept
+    // normalized (success -> 1.0, failure -> 0.0).
     m.observe_price(
         ActionId::new(1),
         OutcomeId::new(0),
@@ -118,28 +153,27 @@ fn full_lifecycle_from_creation_to_settled_conserves_collateral() {
         Price::from_raw(1_000_000),
     )
     .unwrap();
-    m.observe_price(
+    m.observe_price(ActionId::new(1), OutcomeId::new(1), 999, Price::ZERO)
+        .unwrap();
+    observe_covering(
+        &mut m,
         ActionId::new(2),
         OutcomeId::new(0),
-        0,
         Price::from_raw(100_000),
-    )
-    .unwrap();
-    m.observe_price(
+    );
+    observe_covering(
+        &mut m,
         ActionId::new(2),
         OutcomeId::new(1),
-        0,
         Price::from_raw(900_000),
-    )
-    .unwrap();
+    );
 
     m.lock_decision().unwrap();
-    let guards = DecisionGuards::new(Amount::from_raw(1_000_000), Ratio::ONE);
-    let chosen = m.select_auto(guards).unwrap();
+    let chosen = m.select_auto(1_000).unwrap();
     assert_eq!(chosen.action, ActionId::new(0), "launch should win on TWAP");
 
-    m.begin_evaluation().unwrap();
-    m.resolve(OutcomeId::new(0)).unwrap(); // success
+    m.begin_evaluation(1_100).unwrap();
+    m.resolve(1_200, &outcome_conf(1, 0)).unwrap(); // success
     let settlement = m.settle().unwrap();
     assert_eq!(m.phase(), DecisionPhase::Settled);
 
@@ -174,14 +208,13 @@ fn externally_confirmed_selection_end_to_end() {
         .unwrap();
     }
     m.lock_decision().unwrap();
-    let guards = DecisionGuards::new(Amount::ZERO, Ratio::ONE);
-    // Confirm action 2 externally.
-    let conf = ExternalConfirmation::new(ActionId::new(2), SequenceNumber::new(7));
-    let chosen = m.select_confirmed(&conf.encode(), guards).unwrap();
+    // Confirm action 2 with a threshold-signed, domain-bound action confirmation.
+    let chosen = m.select_confirmed(1_000, &action_conf(7, 2)).unwrap();
     assert_eq!(chosen, ActionId::new(2));
 
-    m.begin_evaluation().unwrap();
-    m.resolve(OutcomeId::new(0)).unwrap();
+    m.begin_evaluation(1_100).unwrap();
+    // The outcome round must strictly exceed the accepted action round (7).
+    m.resolve(1_200, &outcome_conf(8, 0)).unwrap();
     let s = m.settle().unwrap();
     // Chosen action 2: account 3 held 3 winning shares -> 3.0.
     assert_eq!(

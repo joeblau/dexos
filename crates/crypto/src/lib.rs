@@ -11,8 +11,8 @@ pub mod quorum;
 pub mod signature;
 
 pub use hash::{
-    hash_domain, hash_leaf, hash_node, keccak256, DOMAIN_ACCOUNT, DOMAIN_COMMAND, DOMAIN_EXECUTION,
-    DOMAIN_LEAF, DOMAIN_MARKET, DOMAIN_NODE, DOMAIN_ORACLE, DOMAIN_VALIDATOR_SET,
+    hash_domain, hash_leaf, hash_node, keccak256, DOMAIN_ACCOUNT, DOMAIN_COMMAND, DOMAIN_DECISION,
+    DOMAIN_EXECUTION, DOMAIN_LEAF, DOMAIN_MARKET, DOMAIN_NODE, DOMAIN_ORACLE, DOMAIN_VALIDATOR_SET,
 };
 pub use merkle::{merkle_root, verify_proof, MerkleError, MerkleTree};
 pub use quorum::{

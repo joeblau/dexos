@@ -163,6 +163,12 @@ impl ValidatorSet {
         self.validators.len()
     }
 
+    /// The validators in this set, in their canonical membership order (bit `i`
+    /// of a [`QuorumCertificate`] signer bitmap names `validators()[i]`).
+    pub fn validators(&self) -> &[Validator] {
+        &self.validators
+    }
+
     /// Whether the set is empty.
     pub fn is_empty(&self) -> bool {
         self.validators.is_empty()

@@ -20,6 +20,8 @@ pub const DOMAIN_EXECUTION: &[u8] = b"dexos:execution:v1";
 pub const DOMAIN_ORACLE: &[u8] = b"dexos:oracle:v1";
 /// Domain tag for a canonical validator-set commitment.
 pub const DOMAIN_VALIDATOR_SET: &[u8] = b"dexos:validator-set:v1";
+/// Domain tag for a decision-market action/outcome confirmation.
+pub const DOMAIN_DECISION: &[u8] = b"dexos:decision:v1";
 
 fn finalize(h: Sha256) -> Hash {
     let out = h.finalize();

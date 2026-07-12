@@ -5,8 +5,9 @@
 //! unselected actions. It also provides a panic-free binary codec so arbitrary
 //! bytes can be decoded and validated (or rejected) without ever panicking.
 
+use crypto::{Validator, ValidatorSet, MAX_VALIDATORS};
 use serde::{Deserialize, Serialize};
-use types::{Amount, MarketType};
+use types::{Amount, MarketId, MarketType, Ratio, RATIO_SCALE};
 
 use crate::error::DecisionMarketError;
 use crate::twap::TimeWindow;
@@ -148,6 +149,48 @@ impl UnselectedActionPolicy {
     }
 }
 
+/// Minimum-liquidity and concentration guards committed in the immutable
+/// definition.
+///
+/// Because the guards live in the definition they cannot be varied at selection
+/// time, and their ranges are validated once at construction via
+/// [`DecisionGuards::validate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecisionGuards {
+    /// Minimum collateral each contingent market must hold to be decided
+    /// (must be non-negative).
+    pub min_liquidity: Amount,
+    /// Maximum share of a single market a single account may hold: a
+    /// dimensionless fraction in `(0, 1]` (`RATIO_SCALE` == 1.0).
+    pub max_concentration: Ratio,
+}
+
+impl DecisionGuards {
+    /// Construct guards. Range validity is enforced by [`Self::validate`], which
+    /// the definition validator invokes; construction itself is total.
+    #[inline]
+    pub const fn new(min_liquidity: Amount, max_concentration: Ratio) -> Self {
+        Self {
+            min_liquidity,
+            max_concentration,
+        }
+    }
+
+    /// Validate the committed ranges: a non-negative liquidity floor and a
+    /// concentration limit that is a fraction in `(0, 1]`. A zero (or negative)
+    /// concentration limit could never be met; one above `1.0` is meaningless.
+    pub fn validate(&self) -> Result<(), DecisionMarketError> {
+        if self.min_liquidity.raw() < 0 {
+            return Err(DecisionMarketError::InvalidGuards);
+        }
+        let c = self.max_concentration.raw();
+        if !(1..=RATIO_SCALE).contains(&c) {
+            return Err(DecisionMarketError::InvalidGuards);
+        }
+        Ok(())
+    }
+}
+
 /// The complete, immutable specification of a decision market.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecisionMarketDefinition {
@@ -167,6 +210,20 @@ pub struct DecisionMarketDefinition {
     pub unselected_action_policy: UnselectedActionPolicy,
     /// Collateral (par) value backing one complete set of outcome shares.
     pub collateral_per_set: Amount,
+    /// The market this definition is for; every confirmation must name it.
+    pub market_id: MarketId,
+    /// The network this market lives on; every confirmation must name it (so a
+    /// confirmation minted for another network is rejected).
+    pub network_id: u64,
+    /// Committed liquidity/concentration guards; immutable at selection time.
+    pub guards: DecisionGuards,
+    /// Minimum fraction of the selection window that observed (inter-tick)
+    /// decision-price intervals must cover for a valid decision. A `Ratio` in
+    /// `(0, 1]`; a positive floor makes a single final tick undecidable.
+    pub min_twap_coverage: Ratio,
+    /// The authority set whose threshold signature confirms actions and
+    /// outcomes. Committing the keys here rejects wrong-authority confirmations.
+    pub authority_set: ValidatorSet,
 }
 
 impl DecisionMarketDefinition {
@@ -181,6 +238,11 @@ impl DecisionMarketDefinition {
         evaluation_window: TimeWindow,
         unselected_action_policy: UnselectedActionPolicy,
         collateral_per_set: Amount,
+        market_id: MarketId,
+        network_id: u64,
+        guards: DecisionGuards,
+        min_twap_coverage: Ratio,
+        authority_set: ValidatorSet,
     ) -> Result<Self, DecisionMarketError> {
         let def = Self {
             actions,
@@ -191,6 +253,11 @@ impl DecisionMarketDefinition {
             evaluation_window,
             unselected_action_policy,
             collateral_per_set,
+            market_id,
+            network_id,
+            guards,
+            min_twap_coverage,
+            authority_set,
         };
         def.validate()?;
         Ok(def)
@@ -235,6 +302,16 @@ impl DecisionMarketDefinition {
         if self.collateral_per_set.raw() <= 0 {
             return Err(DecisionMarketError::NonPositiveCollateral);
         }
+        // Committed guards must carry valid ranges (see `DecisionGuards`).
+        self.guards.validate()?;
+        // The minimum window coverage is a fraction in `(0, 1]`; a positive floor
+        // is what makes a single, non-time-weighting final tick undecidable.
+        let coverage = self.min_twap_coverage.raw();
+        if !(1..=RATIO_SCALE).contains(&coverage) {
+            return Err(DecisionMarketError::InvalidCoverageThreshold);
+        }
+        // The authority set's canonical invariants (nonempty, unique keys,
+        // positive weights, in-range threshold) hold by its own construction.
         Ok(())
     }
 
@@ -282,6 +359,19 @@ impl DecisionMarketDefinition {
         out.extend_from_slice(&self.evaluation_window.start.to_le_bytes());
         out.extend_from_slice(&self.evaluation_window.end.to_le_bytes());
         out.extend_from_slice(&self.collateral_per_set.raw().to_le_bytes());
+        out.extend_from_slice(&self.market_id.get().to_le_bytes());
+        out.extend_from_slice(&self.network_id.to_le_bytes());
+        out.extend_from_slice(&self.guards.min_liquidity.raw().to_le_bytes());
+        out.extend_from_slice(&self.guards.max_concentration.raw().to_le_bytes());
+        out.extend_from_slice(&self.min_twap_coverage.raw().to_le_bytes());
+        let nv =
+            u8::try_from(self.authority_set.len()).map_err(|_| DecisionMarketError::Truncation)?;
+        out.push(nv);
+        for v in self.authority_set.validators() {
+            out.extend_from_slice(&v.public_key);
+            out.extend_from_slice(&v.weight.to_le_bytes());
+        }
+        out.extend_from_slice(&self.authority_set.threshold().to_le_bytes());
         Ok(out)
     }
 
@@ -320,12 +410,30 @@ impl DecisionMarketDefinition {
         let eval_start = r.u64()?;
         let eval_end = r.u64()?;
         let collateral = Amount::from_raw(r.i128()?);
+        let market_id = MarketId::new(r.u32()?);
+        let network_id = r.u64()?;
+        let min_liquidity = Amount::from_raw(r.i128()?);
+        let max_concentration = Ratio::from_raw(r.i64()?);
+        let min_twap_coverage = Ratio::from_raw(r.i64()?);
+        let nv = usize::from(r.u8()?);
+        if nv == 0 || nv > MAX_VALIDATORS {
+            return Err(DecisionMarketError::MalformedDefinition);
+        }
+        let mut validators = Vec::with_capacity(nv);
+        for _ in 0..nv {
+            let public_key = r.key32()?;
+            let weight = r.u64()?;
+            validators.push(Validator { public_key, weight });
+        }
+        let threshold = r.u64()?;
         if !r.is_empty() {
             return Err(DecisionMarketError::MalformedDefinition);
         }
         let selection_window = TimeWindow::new(sel_start, sel_end)
             .map_err(|_| DecisionMarketError::MalformedDefinition)?;
         let evaluation_window = TimeWindow::new(eval_start, eval_end)
+            .map_err(|_| DecisionMarketError::MalformedDefinition)?;
+        let authority_set = ValidatorSet::try_with_threshold(validators, threshold)
             .map_err(|_| DecisionMarketError::MalformedDefinition)?;
         let def = Self {
             actions,
@@ -336,6 +444,11 @@ impl DecisionMarketDefinition {
             evaluation_window,
             unselected_action_policy: policy,
             collateral_per_set: collateral,
+            market_id,
+            network_id,
+            guards: DecisionGuards::new(min_liquidity, max_concentration),
+            min_twap_coverage,
+            authority_set,
         };
         def.validate()?;
         Ok(def)
@@ -396,10 +509,22 @@ impl<'a> Reader<'a> {
         Ok(u16::from_le_bytes(arr))
     }
 
+    fn u32(&mut self) -> Result<u32, DecisionMarketError> {
+        let b = self.take(4)?;
+        let arr = <[u8; 4]>::try_from(b).map_err(|_| DecisionMarketError::MalformedDefinition)?;
+        Ok(u32::from_le_bytes(arr))
+    }
+
     fn u64(&mut self) -> Result<u64, DecisionMarketError> {
         let b = self.take(8)?;
         let arr = <[u8; 8]>::try_from(b).map_err(|_| DecisionMarketError::MalformedDefinition)?;
         Ok(u64::from_le_bytes(arr))
+    }
+
+    fn i64(&mut self) -> Result<i64, DecisionMarketError> {
+        let b = self.take(8)?;
+        let arr = <[u8; 8]>::try_from(b).map_err(|_| DecisionMarketError::MalformedDefinition)?;
+        Ok(i64::from_le_bytes(arr))
     }
 
     fn i128(&mut self) -> Result<i128, DecisionMarketError> {
@@ -407,11 +532,22 @@ impl<'a> Reader<'a> {
         let arr = <[u8; 16]>::try_from(b).map_err(|_| DecisionMarketError::MalformedDefinition)?;
         Ok(i128::from_le_bytes(arr))
     }
+
+    fn key32(&mut self) -> Result<[u8; 32], DecisionMarketError> {
+        let b = self.take(32)?;
+        <[u8; 32]>::try_from(b).map_err(|_| DecisionMarketError::MalformedDefinition)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crypto::ThresholdSigners;
+
+    pub(crate) fn authority_set() -> ValidatorSet {
+        let seeds: Vec<[u8; 32]> = (0..4).map(|i| [u8::try_from(i).unwrap(); 32]).collect();
+        ThresholdSigners::from_seeds(&seeds, 3).validator_set()
+    }
 
     pub(crate) fn sample_definition() -> DecisionMarketDefinition {
         DecisionMarketDefinition::new(
@@ -423,6 +559,11 @@ mod tests {
             TimeWindow::new(100, 200).unwrap(),
             UnselectedActionPolicy::Refund,
             Amount::from_raw(1_000_000),
+            MarketId::new(5),
+            7,
+            DecisionGuards::new(Amount::ZERO, Ratio::ONE),
+            Ratio::from_raw(500_000),
+            authority_set(),
         )
         .unwrap()
     }
@@ -446,6 +587,11 @@ mod tests {
             TimeWindow::new(10, 20).unwrap(),
             UnselectedActionPolicy::Void,
             Amount::ONE,
+            MarketId::new(1),
+            1,
+            DecisionGuards::new(Amount::ZERO, Ratio::ONE),
+            Ratio::from_raw(500_000),
+            authority_set(),
         )
         .unwrap_err();
         assert_eq!(
@@ -469,9 +615,86 @@ mod tests {
             TimeWindow::new(50, 200).unwrap(),
             UnselectedActionPolicy::Void,
             Amount::ONE,
+            MarketId::new(1),
+            1,
+            DecisionGuards::new(Amount::ZERO, Ratio::ONE),
+            Ratio::from_raw(500_000),
+            authority_set(),
         )
         .unwrap_err();
         assert_eq!(err, DecisionMarketError::WindowOrdering);
+    }
+
+    fn definition_with(
+        guards: DecisionGuards,
+        coverage: Ratio,
+    ) -> Result<DecisionMarketDefinition, DecisionMarketError> {
+        DecisionMarketDefinition::new(
+            vec![Action::new("a")],
+            vec![Outcome::new("x")],
+            UtilityFunction::new(vec![Amount::ONE]).unwrap(),
+            DecisionRule::MaximizeExpectedUtility,
+            TimeWindow::new(0, 100).unwrap(),
+            TimeWindow::new(100, 200).unwrap(),
+            UnselectedActionPolicy::Void,
+            Amount::ONE,
+            MarketId::new(1),
+            1,
+            guards,
+            coverage,
+            authority_set(),
+        )
+    }
+
+    #[test]
+    fn invalid_guard_ranges_rejected() {
+        // Negative liquidity floor.
+        assert_eq!(
+            definition_with(
+                DecisionGuards::new(Amount::from_raw(-1), Ratio::ONE),
+                Ratio::from_raw(500_000)
+            ),
+            Err(DecisionMarketError::InvalidGuards)
+        );
+        // Zero concentration limit can never be met.
+        assert_eq!(
+            definition_with(
+                DecisionGuards::new(Amount::ZERO, Ratio::ZERO),
+                Ratio::from_raw(500_000)
+            ),
+            Err(DecisionMarketError::InvalidGuards)
+        );
+        // Concentration above 1.0 is meaningless.
+        assert_eq!(
+            definition_with(
+                DecisionGuards::new(Amount::ZERO, Ratio::from_raw(RATIO_SCALE + 1)),
+                Ratio::from_raw(500_000)
+            ),
+            Err(DecisionMarketError::InvalidGuards)
+        );
+        // Boundaries: exactly 1 micro and exactly 1.0 are both valid.
+        assert!(definition_with(
+            DecisionGuards::new(Amount::ZERO, Ratio::from_raw(1)),
+            Ratio::ONE
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn invalid_coverage_threshold_rejected() {
+        assert_eq!(
+            definition_with(DecisionGuards::new(Amount::ZERO, Ratio::ONE), Ratio::ZERO),
+            Err(DecisionMarketError::InvalidCoverageThreshold)
+        );
+        assert_eq!(
+            definition_with(
+                DecisionGuards::new(Amount::ZERO, Ratio::ONE),
+                Ratio::from_raw(RATIO_SCALE + 1)
+            ),
+            Err(DecisionMarketError::InvalidCoverageThreshold)
+        );
+        // Exactly 1.0 coverage is valid.
+        assert!(definition_with(DecisionGuards::new(Amount::ZERO, Ratio::ONE), Ratio::ONE).is_ok());
     }
 
     #[test]
