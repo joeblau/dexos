@@ -129,6 +129,13 @@ pub enum ExecutionError {
     /// Funding epoch was already applied or is not sequential.
     #[error("funding epoch not sequential")]
     FundingEpochConflict,
+    /// A funding epoch computed a negative residual (`collected < distributed`).
+    /// Impossible by construction — payers round obligations up, receivers are
+    /// credited truncated entitlements — but surfaced as a typed error instead
+    /// of a panic so a violated assumption rolls the epoch back fail-closed
+    /// rather than minting collateral out of the insurance fund.
+    #[error("funding residual negative: collected less than distributed")]
+    NegativeFundingResidual,
     /// Operation is incompatible with the market's committed instrument type.
     #[error("operation incompatible with market type")]
     IncompatibleMarketType,
