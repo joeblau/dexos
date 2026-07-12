@@ -66,7 +66,7 @@ impl Role {
 }
 
 /// `[node]` section.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeSection {
     /// Human-readable node name.
@@ -182,7 +182,7 @@ impl Default for RpcSection {
 }
 
 /// `[performance]` section.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PerformanceSection {
     /// Pin subsystem threads to cores.

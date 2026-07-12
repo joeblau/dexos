@@ -140,7 +140,7 @@ impl OrderBook {
         let targets: Vec<OrderId> = self
             .account_orders
             .get(&account)
-            .map_or_else(Vec::new, |ids| ids.iter().copied().collect());
+            .map_or_else(Vec::new, Vec::clone);
         for id in &targets {
             if let Some(loc) = self.id_index.get(id).copied() {
                 self.remove_resting(loc.side, loc.slot);
