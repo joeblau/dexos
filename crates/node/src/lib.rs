@@ -248,7 +248,9 @@ impl Node {
 
         // Root span carries node identity + a process-level TraceId so every
         // nested event on the hot path can correlate without custom scrapers.
-        let mut trace_gen = TraceGen::from_seed(0x0000_de05_0001);
+        // Seeded from OS entropy (never a constant) so distinct processes mint
+        // distinct trace-id streams; fixed seeds live only in tests/doc examples.
+        let mut trace_gen = TraceGen::from_seed(process_trace_seed(&identity));
         let process_trace = trace_gen.new_trace();
         let root = tracing::info_span!(
             "node.run",
@@ -411,6 +413,53 @@ struct NodeIdentity {
     name: String,
     region: String,
     version: &'static str,
+}
+
+/// Derives the process-level trace seed from OS entropy.
+///
+/// A constant seed here would make every marketd process on every node,
+/// region, and restart mint byte-identical trace ids (`TraceGen` is fully
+/// deterministic given its seed), defeating cross-fleet correlation.
+///
+/// Fails OPEN: if OS entropy is unavailable we fall back to hashing node
+/// identity, wall-clock time, and pid instead of aborting startup. Per the
+/// `TraceGen` contract (`observability::trace` module docs), trace ids are
+/// for correlation only — intentionally not cryptographic — so a weak,
+/// non-cryptographic fallback seed is acceptable where blocking startup on
+/// the entropy source is not. (Contrast with marketd key generation, which
+/// must fail hard.)
+fn process_trace_seed(identity: &NodeIdentity) -> u64 {
+    let mut buf = [0u8; 8];
+    match getrandom::getrandom(&mut buf) {
+        Ok(()) => u64::from_le_bytes(buf),
+        Err(err) => {
+            tracing::warn!(
+                target: "node",
+                error = %err,
+                "OS entropy unavailable; deriving trace seed from identity/time/pid"
+            );
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            fallback_trace_seed(&identity.name, &identity.region, nanos, std::process::id())
+        }
+    }
+}
+
+/// Entropy-free fallback seed: hashes node identity plus wall-clock nanos and
+/// pid so concurrent or restarted processes still diverge. Weak by design —
+/// trace ids are correlation-only, not cryptographic (see the
+/// `observability::trace` module docs).
+fn fallback_trace_seed(name: &str, region: &str, epoch_nanos: u128, pid: u32) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    name.hash(&mut hasher);
+    region.hash(&mut hasher);
+    epoch_nanos.hash(&mut hasher);
+    pid.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// One role handler: process ingress envelopes until the stop signal, then drain
@@ -636,5 +685,59 @@ mod tests {
         assert!(node.sender_for(Role::Oracle).is_some());
         assert!(node.sender_for(Role::Observer).is_some());
         assert!(node.sender_for(Role::Validator).is_none());
+    }
+
+    fn test_identity() -> NodeIdentity {
+        NodeIdentity {
+            name: "test".into(),
+            region: "local".into(),
+            version: "0.0.0",
+        }
+    }
+
+    #[test]
+    fn process_trace_seed_is_not_constant_across_invocations() {
+        // Issue #419: a fixed seed made every process emit identical trace
+        // ids. Two derivations for the same identity must differ, and the
+        // resulting TraceGen streams must mint different trace ids.
+        let identity = test_identity();
+        let a = process_trace_seed(&identity);
+        let b = process_trace_seed(&identity);
+        assert_ne!(a, b, "process trace seed must not repeat across startups");
+
+        let trace_a = TraceGen::from_seed(a).new_trace();
+        let trace_b = TraceGen::from_seed(b).new_trace();
+        assert_ne!(
+            trace_a.to_hex(),
+            trace_b.to_hex(),
+            "distinct seeds must mint distinct process trace ids"
+        );
+    }
+
+    #[test]
+    fn fallback_trace_seed_is_deterministic_for_fixed_inputs() {
+        let a = fallback_trace_seed("marketd-1", "us-east", 1_234_567_890, 42);
+        let b = fallback_trace_seed("marketd-1", "us-east", 1_234_567_890, 42);
+        assert_eq!(a, b, "fallback must be a pure function of its inputs");
+    }
+
+    #[test]
+    fn fallback_trace_seed_incorporates_time_and_pid() {
+        let base = fallback_trace_seed("marketd-1", "us-east", 1_234_567_890, 42);
+        assert_ne!(
+            base,
+            fallback_trace_seed("marketd-1", "us-east", 1_234_567_891, 42),
+            "clock nanos must perturb the fallback seed"
+        );
+        assert_ne!(
+            base,
+            fallback_trace_seed("marketd-1", "us-east", 1_234_567_890, 43),
+            "pid must perturb the fallback seed"
+        );
+        assert_ne!(
+            base,
+            fallback_trace_seed("marketd-2", "eu-west", 1_234_567_890, 42),
+            "node identity must perturb the fallback seed"
+        );
     }
 }
