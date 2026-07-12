@@ -80,9 +80,10 @@ pub fn svm_tx_signature(nonce: u64, to: &[u8], amount: Amount) -> [u8; 64] {
 mod mock {
     use super::SvmCommit;
     use chain_adapter::{
-        verify_finality, AdapterError, AssetId, BlockHeader, ChainAdapter, ChainCommit, ChainId,
-        DepositEvent, FinalityPolicy, FinalityWitness, InclusionProof, TxId, UnsignedTx,
-        VerifiedDeposit, WithdrawalRequest, WithdrawalStatus, Writer, MAX_ADDRESS_LEN,
+        verify_finality, verify_withdrawal_authorization, AdapterError, AssetId, BlockHeader,
+        ChainAdapter, ChainCommit, ChainId, DepositEvent, FinalityPolicy, FinalityWitness,
+        InclusionProof, TxId, UnsignedTx, VerifiedDeposit, WalletBinding, WithdrawalId,
+        WithdrawalLedger, WithdrawalRequest, WithdrawalReservation, WithdrawalStatus, Writer,
     };
     use crypto::{merkle_root, MerkleTree};
     use std::collections::{BTreeMap, BTreeSet};
@@ -109,7 +110,8 @@ mod mock {
         supported_assets: BTreeSet<AssetId>,
         deposits: BTreeMap<Vec<u8>, MockDeposit>,
         withdrawals: BTreeMap<Vec<u8>, MockWithdrawal>,
-        consumed_nonces: BTreeSet<(u32, u64)>,
+        bindings: BTreeMap<u32, WalletBinding>,
+        ledger: WithdrawalLedger,
     }
 
     impl MockSvmAdapter {
@@ -124,7 +126,8 @@ mod mock {
                 supported_assets: BTreeSet::new(),
                 deposits: BTreeMap::new(),
                 withdrawals: BTreeMap::new(),
-                consumed_nonces: BTreeSet::new(),
+                bindings: BTreeMap::new(),
+                ledger: WithdrawalLedger::new(),
             }
         }
 
@@ -143,6 +146,13 @@ mod mock {
         /// Register `asset` as supported for withdrawals.
         pub fn support_asset(&mut self, asset: AssetId) {
             self.supported_assets.insert(asset);
+        }
+
+        /// Bind `binding.account` to an authorized SVM (ed25519) wallet. A
+        /// withdrawal is only buildable/reservable if its account has a binding
+        /// and its user signature verifies under that wallet.
+        pub fn bind_wallet(&mut self, binding: WalletBinding) {
+            self.bindings.insert(binding.account.get(), binding);
         }
 
         /// Set the mock clock used for withdrawal-expiry checks.
@@ -167,19 +177,31 @@ mod mock {
             self.head = self.head.saturating_add(delta);
         }
 
-        /// Broadcast an unsigned withdrawal, returning the deterministic 64-byte
+        /// Broadcast a reserved withdrawal, returning the durable 64-byte
         /// transaction signature as its id.
-        pub fn broadcast_withdrawal(&mut self, tx: &UnsignedTx) -> TxId {
+        ///
+        /// Idempotent and reservation-gated: the withdrawal must have been
+        /// reserved via [`ChainAdapter::reserve_withdrawal`] first, and a
+        /// crash/retry returns the same [`TxId`] without producing a second
+        /// broadcast.
+        ///
+        /// # Errors
+        /// - [`AdapterError::UnknownTx`] if the withdrawal was never reserved.
+        /// - [`AdapterError::IllegalTransition`] if it is already finalized or a
+        ///   conflicting identity is presented.
+        pub fn broadcast_withdrawal(&mut self, tx: &UnsignedTx) -> Result<TxId, AdapterError> {
             let sig = super::svm_tx_signature(tx.nonce, &tx.to, tx.amount);
-            let key = sig.to_vec();
-            self.withdrawals.insert(
-                key.clone(),
-                MockWithdrawal {
+            let txid = self
+                .ledger
+                .record_broadcast(tx.withdrawal_id, TxId::new(sig.to_vec()))?;
+            // Track the broadcast tx for observation exactly once.
+            self.withdrawals
+                .entry(txid.as_bytes().to_vec())
+                .or_insert(MockWithdrawal {
                     confirmations: 0,
                     failed: false,
-                },
-            );
-            TxId::new(key)
+                });
+            Ok(txid)
         }
 
         /// Advance the slot-confirmation count of a broadcast withdrawal.
@@ -196,9 +218,25 @@ mod mock {
             }
         }
 
-        /// Record a `(account, nonce)` as already used.
-        pub fn consume_nonce(&mut self, account: u32, nonce: u64) {
-            self.consumed_nonces.insert((account, nonce));
+        /// Validate a withdrawal request without side effects: positive amount,
+        /// supported asset, unexpired, and an authorized bound-wallet signature
+        /// under this chain's scheme (which also enforces the destination chain
+        /// and exact address format).
+        fn validate(&self, w: &WithdrawalRequest) -> Result<(), AdapterError> {
+            if w.amount.raw() <= 0 {
+                return Err(AdapterError::InvalidRequest);
+            }
+            if !self.supported_assets.contains(&w.asset) {
+                return Err(AdapterError::UnsupportedAsset);
+            }
+            if w.expires_at <= self.now {
+                return Err(AdapterError::Expired);
+            }
+            let binding = self
+                .bindings
+                .get(&w.account_id.get())
+                .ok_or(AdapterError::Unauthorized)?;
+            verify_withdrawal_authorization(w, self.chain_id, binding)
         }
 
         /// SHA-256 deposit leaves for every deposit landed in `slot`, in the
@@ -290,24 +328,7 @@ mod mock {
         }
 
         fn build_withdrawal(&self, w: &WithdrawalRequest) -> Result<UnsignedTx, AdapterError> {
-            if w.amount.raw() <= 0 {
-                return Err(AdapterError::InvalidRequest);
-            }
-            if w.destination_address.is_empty() || w.destination_address.len() > MAX_ADDRESS_LEN {
-                return Err(AdapterError::InvalidRequest);
-            }
-            if !self.supported_assets.contains(&w.asset) {
-                return Err(AdapterError::UnsupportedAsset);
-            }
-            if w.expires_at <= self.now {
-                return Err(AdapterError::Expired);
-            }
-            if self
-                .consumed_nonces
-                .contains(&(w.account_id.get(), w.nonce))
-            {
-                return Err(AdapterError::ReplayedNonce);
-            }
+            self.validate(w)?;
             Ok(UnsignedTx {
                 destination_chain: w.destination_chain,
                 withdrawal_id: w.id(),
@@ -319,6 +340,14 @@ mod mock {
             })
         }
 
+        fn reserve_withdrawal(
+            &mut self,
+            w: &WithdrawalRequest,
+        ) -> Result<WithdrawalReservation, AdapterError> {
+            self.validate(w)?;
+            self.ledger.reserve(w)
+        }
+
         fn observe_withdrawal(&self, tx: &TxId) -> Result<WithdrawalStatus, AdapterError> {
             let w = self
                 .withdrawals
@@ -328,6 +357,14 @@ mod mock {
                 return Ok(WithdrawalStatus::Failed);
             }
             Ok(self.policy.confirmation_status(w.confirmations))
+        }
+
+        fn finalize_withdrawal(&mut self, id: WithdrawalId) -> Result<(), AdapterError> {
+            self.ledger.finalize(id)
+        }
+
+        fn release_withdrawal(&mut self, id: WithdrawalId) -> Result<(), AdapterError> {
+            self.ledger.release(id)
         }
     }
 }

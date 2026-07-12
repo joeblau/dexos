@@ -5,11 +5,46 @@ use super::{MockSvmAdapter, SvmCommit, SVM_ADDRESS_LEN};
 use chain_adapter::{
     certify_deposit, run_conformance, verify_finality, AdapterError, AssetId, BlockHeader,
     ChainAdapter, ChainCommit, ChainId, ConformanceFixture, DepositEvent, DepositTracker,
-    FinalityPolicy, FinalityWitness, InclusionProof, TxId, VerifiedDeposit, WithdrawalRequest,
-    WithdrawalStatus,
+    FinalityPolicy, FinalityWitness, InclusionProof, TxId, VerifiedDeposit, WalletBinding,
+    WalletScheme, WithdrawalRequest, WithdrawalStatus,
 };
-use crypto::ThresholdSigners;
+use crypto::{KeyPair, ThresholdSigners};
 use types::{AccountId, Amount, Hash};
+
+/// The account whose withdrawals these tests authorize.
+const WITHDRAWAL_ACCOUNT: u32 = 8;
+
+/// A deterministic SVM (ed25519) wallet keypair for the withdrawal account.
+fn wallet() -> KeyPair {
+    KeyPair::from_seed(&[0x33; 32])
+}
+
+/// Bind [`wallet`] to [`WITHDRAWAL_ACCOUNT`] and support the sample asset.
+fn setup_withdrawals(a: &mut MockSvmAdapter) {
+    a.support_asset(AssetId::new(3));
+    a.bind_wallet(WalletBinding {
+        account: AccountId::new(WITHDRAWAL_ACCOUNT),
+        scheme: WalletScheme::Ed25519,
+        public_key: wallet().public().to_vec(),
+    });
+}
+
+/// A well-formed withdrawal for [`WITHDRAWAL_ACCOUNT`] with a valid signature by
+/// [`wallet`] over its authorization digest.
+fn signed_withdrawal(nonce: u64) -> WithdrawalRequest {
+    let mut req = WithdrawalRequest {
+        account_id: AccountId::new(WITHDRAWAL_ACCOUNT),
+        destination_chain: ChainId::new(900),
+        destination_address: vec![0xCD; SVM_ADDRESS_LEN],
+        asset: AssetId::new(3),
+        amount: Amount::from_raw(2_000_000),
+        nonce,
+        expires_at: 1_000,
+        user_signature: vec![],
+    };
+    req.user_signature = wallet().sign(req.signing_hash().as_bytes()).to_vec();
+    req
+}
 
 struct Lcg(u64);
 impl Lcg {
@@ -36,19 +71,6 @@ fn sample_deposit(tx: u8, amount: i128) -> DepositEvent {
         asset: AssetId::new(3),
         amount: Amount::from_raw(amount),
         destination_account: AccountId::new(8),
-    }
-}
-
-fn sample_withdrawal() -> WithdrawalRequest {
-    WithdrawalRequest {
-        account_id: AccountId::new(8),
-        destination_chain: ChainId::new(900),
-        destination_address: vec![0xCD; SVM_ADDRESS_LEN],
-        asset: AssetId::new(3),
-        amount: Amount::from_raw(2_000_000),
-        nonce: 1,
-        expires_at: 1_000,
-        user_signature: vec![9; 64],
     }
 }
 
@@ -141,15 +163,16 @@ fn unknown_deposit_is_reported() {
 #[test]
 fn withdrawal_reaches_finalized_at_commitment() {
     let mut a = MockSvmAdapter::new(ChainId::new(900), FinalityPolicy::new(2));
-    a.support_asset(AssetId::new(3));
+    setup_withdrawals(&mut a);
     a.set_now(10);
-    let req = sample_withdrawal();
+    let req = signed_withdrawal(1);
 
+    assert!(a.reserve_withdrawal(&req).unwrap().fresh);
     let unsigned = a.build_withdrawal(&req).unwrap();
     assert_eq!(a.build_withdrawal(&req).unwrap(), unsigned);
     assert_eq!(unsigned.withdrawal_id, req.id());
 
-    let tx = a.broadcast_withdrawal(&unsigned);
+    let tx = a.broadcast_withdrawal(&unsigned).unwrap();
     assert_eq!(
         a.observe_withdrawal(&tx).unwrap(),
         WithdrawalStatus::Pending
@@ -164,35 +187,146 @@ fn withdrawal_reaches_finalized_at_commitment() {
         a.observe_withdrawal(&tx).unwrap(),
         WithdrawalStatus::Finalized
     );
+
+    // Finalizing consumes the nonce permanently: a *different* request reusing
+    // nonce 1 is rejected (the identical request would be an idempotent no-op).
+    a.finalize_withdrawal(req.id()).unwrap();
+    let mut reused = signed_withdrawal(1);
+    reused.amount = Amount::from_raw(3_000_000);
+    reused.user_signature = wallet().sign(reused.signing_hash().as_bytes()).to_vec();
+    assert_eq!(
+        a.reserve_withdrawal(&reused),
+        Err(AdapterError::ReplayedNonce)
+    );
 }
 
 #[test]
 fn withdrawal_rejections() {
     let mut a = MockSvmAdapter::new(ChainId::new(900), FinalityPolicy::new(2));
     a.set_now(10);
-    let req = sample_withdrawal();
+    let req = signed_withdrawal(1);
 
+    // Asset not yet supported.
     assert_eq!(
         a.build_withdrawal(&req),
         Err(AdapterError::UnsupportedAsset)
     );
-    a.support_asset(AssetId::new(3));
+    setup_withdrawals(&mut a);
 
-    let mut expired = req.clone();
+    // Expired.
+    let mut expired = signed_withdrawal(1);
     expired.expires_at = 5;
+    expired.user_signature = wallet().sign(expired.signing_hash().as_bytes()).to_vec();
     assert_eq!(a.build_withdrawal(&expired), Err(AdapterError::Expired));
 
-    a.consume_nonce(req.account_id.get(), req.nonce);
-    assert_eq!(a.build_withdrawal(&req), Err(AdapterError::ReplayedNonce));
+    // Empty and random signatures fail authorization.
+    let mut unsigned = signed_withdrawal(2);
+    unsigned.user_signature = vec![];
+    assert_eq!(
+        a.build_withdrawal(&unsigned),
+        Err(AdapterError::InvalidSignature)
+    );
+    let mut random = signed_withdrawal(2);
+    random.user_signature = vec![0x42; 64];
+    assert_eq!(
+        a.build_withdrawal(&random),
+        Err(AdapterError::InvalidSignature)
+    );
+
+    // Wrong-length destination address (not exactly 32 bytes).
+    let mut short = signed_withdrawal(3);
+    short.destination_address = vec![0xCD; 20];
+    short.user_signature = wallet().sign(short.signing_hash().as_bytes()).to_vec();
+    assert_eq!(
+        a.build_withdrawal(&short),
+        Err(AdapterError::InvalidRequest)
+    );
+
+    // Unbound account (wrong account) is unauthorized.
+    let mut foreign = signed_withdrawal(4);
+    foreign.account_id = AccountId::new(9);
+    assert_eq!(
+        a.build_withdrawal(&foreign),
+        Err(AdapterError::Unauthorized)
+    );
+
+    // Wrong destination chain.
+    let mut wrong_chain = signed_withdrawal(5);
+    wrong_chain.destination_chain = ChainId::new(2);
+    wrong_chain.user_signature = wallet()
+        .sign(wrong_chain.signing_hash().as_bytes())
+        .to_vec();
+    assert_eq!(
+        a.build_withdrawal(&wrong_chain),
+        Err(AdapterError::WrongChain)
+    );
+
+    // Reserving one nonce blocks a distinct request on the same nonce.
+    assert!(a.reserve_withdrawal(&signed_withdrawal(6)).unwrap().fresh);
+    let mut collide = signed_withdrawal(6);
+    collide.amount = Amount::from_raw(3_000_000);
+    collide.user_signature = wallet().sign(collide.signing_hash().as_bytes()).to_vec();
+    assert_eq!(
+        a.reserve_withdrawal(&collide),
+        Err(AdapterError::ReplayedNonce)
+    );
+}
+
+#[test]
+fn crash_retry_returns_same_tx_without_double_send() {
+    let mut a = MockSvmAdapter::new(ChainId::new(900), FinalityPolicy::new(2));
+    setup_withdrawals(&mut a);
+    let req = signed_withdrawal(1);
+    a.reserve_withdrawal(&req).unwrap();
+    let unsigned = a.build_withdrawal(&req).unwrap();
+
+    let tx1 = a.broadcast_withdrawal(&unsigned).unwrap();
+    let unsigned2 = a.build_withdrawal(&req).unwrap();
+    let tx2 = a.broadcast_withdrawal(&unsigned2).unwrap();
+    assert_eq!(tx1, tx2);
+    assert_eq!(
+        a.observe_withdrawal(&tx1).unwrap(),
+        WithdrawalStatus::Pending
+    );
+}
+
+#[test]
+fn broadcast_requires_reservation() {
+    let mut a = MockSvmAdapter::new(ChainId::new(900), FinalityPolicy::new(2));
+    setup_withdrawals(&mut a);
+    let req = signed_withdrawal(1);
+    let unsigned = a.build_withdrawal(&req).unwrap();
+    assert_eq!(
+        a.broadcast_withdrawal(&unsigned),
+        Err(AdapterError::UnknownTx)
+    );
+}
+
+#[test]
+fn release_frees_nonce_for_retry() {
+    let mut a = MockSvmAdapter::new(ChainId::new(900), FinalityPolicy::new(2));
+    setup_withdrawals(&mut a);
+    let req = signed_withdrawal(1);
+    a.reserve_withdrawal(&req).unwrap();
+    a.release_withdrawal(req.id()).unwrap();
+    assert!(a.reserve_withdrawal(&req).unwrap().fresh);
+    let unsigned = a.build_withdrawal(&req).unwrap();
+    a.broadcast_withdrawal(&unsigned).unwrap();
+    assert_eq!(
+        a.release_withdrawal(req.id()),
+        Err(AdapterError::IllegalTransition)
+    );
 }
 
 #[test]
 fn failed_withdrawal_reported() {
     let mut a = MockSvmAdapter::new(ChainId::new(900), FinalityPolicy::new(2));
-    a.support_asset(AssetId::new(3));
+    setup_withdrawals(&mut a);
     a.set_now(0);
-    let unsigned = a.build_withdrawal(&sample_withdrawal()).unwrap();
-    let tx = a.broadcast_withdrawal(&unsigned);
+    let req = signed_withdrawal(1);
+    a.reserve_withdrawal(&req).unwrap();
+    let unsigned = a.build_withdrawal(&req).unwrap();
+    let tx = a.broadcast_withdrawal(&unsigned).unwrap();
     a.fail_withdrawal(&tx);
     assert_eq!(a.observe_withdrawal(&tx).unwrap(), WithdrawalStatus::Failed);
 }
@@ -218,7 +352,7 @@ fn deterministic_replay_of_event_log() {
 #[test]
 fn conformance_suite_passes() {
     let mut a = MockSvmAdapter::new(ChainId::new(900), FinalityPolicy::new(2));
-    a.support_asset(AssetId::new(3));
+    setup_withdrawals(&mut a);
     a.set_now(0);
     let ev = sample_deposit(9, 500);
     let tx = ev.source_tx.clone();
@@ -229,7 +363,7 @@ fn conformance_suite_passes() {
         adapter: &a,
         finalized_deposit_tx: tx,
         unknown_tx: TxId::new(vec![0xFF; 64]),
-        valid_withdrawal: sample_withdrawal(),
+        valid_withdrawal: signed_withdrawal(1),
     };
     run_conformance(&fixture).expect("adapter conforms");
 }
@@ -240,10 +374,12 @@ fn property_random_confirmation_sequences() {
     for _ in 0..200 {
         let min = 1 + lcg.small_u32();
         let mut a = MockSvmAdapter::new(ChainId::new(900), FinalityPolicy::new(min));
-        a.support_asset(AssetId::new(3));
+        setup_withdrawals(&mut a);
         a.set_now(0);
-        let unsigned = a.build_withdrawal(&sample_withdrawal()).unwrap();
-        let tx = a.broadcast_withdrawal(&unsigned);
+        let req = signed_withdrawal(1);
+        a.reserve_withdrawal(&req).unwrap();
+        let unsigned = a.build_withdrawal(&req).unwrap();
+        let tx = a.broadcast_withdrawal(&unsigned).unwrap();
 
         let mut total = 0u32;
         let mut finalized = false;

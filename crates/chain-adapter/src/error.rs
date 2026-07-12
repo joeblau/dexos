@@ -47,6 +47,13 @@ pub enum AdapterError {
     /// A user/owner signature failed verification.
     #[error("invalid signature")]
     InvalidSignature,
+    /// No wallet is bound to the debited account (or the binding is for a
+    /// different account), so the request cannot be authorized.
+    #[error("withdrawal not authorized for this account")]
+    Unauthorized,
+    /// The withdrawal's destination chain is not this adapter's chain.
+    #[error("wrong destination chain")]
+    WrongChain,
     /// A withdrawal status transition was not a legal edge.
     #[error("illegal status transition")]
     IllegalTransition,

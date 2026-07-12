@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 pub mod adapter;
+pub mod authorization;
 pub mod codec;
 pub mod conformance;
 pub mod deposit;
@@ -17,10 +18,12 @@ pub mod error;
 pub mod finality;
 pub mod ids;
 pub mod policy;
+pub mod reservation;
 pub mod wire;
 pub mod withdrawal;
 
 pub use adapter::ChainAdapter;
+pub use authorization::{verify_withdrawal_authorization, WalletBinding, WalletScheme};
 pub use codec::{Codec, CodecError, Reader, Writer};
 pub use conformance::{run_conformance, ConformanceFixture};
 pub use deposit::{
@@ -34,6 +37,7 @@ pub use finality::{
 };
 pub use ids::{AssetId, ChainId, TxId, MAX_TXID_LEN};
 pub use policy::{DepositTracker, FinalityPolicy, DEFAULT_TRACKER_CAPACITY};
+pub use reservation::{ReservationState, WithdrawalLedger, WithdrawalReservation};
 pub use withdrawal::{
     certify_withdrawal, UnsignedTx, WithdrawalCertificate, WithdrawalId, WithdrawalRequest,
     WithdrawalStatus, DOMAIN_WITHDRAWAL_CERT, DOMAIN_WITHDRAWAL_ID, MAX_ADDRESS_LEN,
@@ -517,7 +521,19 @@ mod tests {
         fn build_withdrawal(&self, _w: &WithdrawalRequest) -> Result<UnsignedTx, AdapterError> {
             Err(AdapterError::UnsupportedAsset)
         }
+        fn reserve_withdrawal(
+            &mut self,
+            _w: &WithdrawalRequest,
+        ) -> Result<WithdrawalReservation, AdapterError> {
+            Err(AdapterError::UnsupportedAsset)
+        }
         fn observe_withdrawal(&self, _tx: &TxId) -> Result<WithdrawalStatus, AdapterError> {
+            Err(AdapterError::UnknownTx)
+        }
+        fn finalize_withdrawal(&mut self, _id: WithdrawalId) -> Result<(), AdapterError> {
+            Err(AdapterError::UnknownTx)
+        }
+        fn release_withdrawal(&mut self, _id: WithdrawalId) -> Result<(), AdapterError> {
             Err(AdapterError::UnknownTx)
         }
     }
