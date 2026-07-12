@@ -42,7 +42,7 @@ toml = "1.1"
 sha2 = "0.10"
 sha3 = "0.10"
 postcard = { version = "1", features = ["use-std"] }
-ed25519-dalek = { version = "2", features = ["rand_core"] }
+ed25519-dalek = { version = "3", features = ["rand_core"] }
 k256 = { version = "0.13", features = ["ecdsa"] }
 # Authenticated transport encryption (peer session layer): ephemeral X25519 ECDH,
 # HKDF-SHA256 key derivation, ChaCha20-Poly1305 AEAD.
