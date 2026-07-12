@@ -96,10 +96,50 @@ impl ReliableOrder {
 /// ([`TransportConfig::accept_queue_capacity`]).
 pub const DEFAULT_ACCEPT_QUEUE: usize = 64;
 
+/// Default per-class retained-byte ceiling
+/// ([`TransportConfig::max_class_bytes`]): 4 MiB. With nine classes this bounds
+/// one direction of one connection to ~36 MiB of reliable payload plus at most
+/// one in-flight frame per class.
+pub const DEFAULT_MAX_CLASS_BYTES: usize = 4 * 1024 * 1024;
+
+/// Default per-peer reliable-byte ceiling ([`TransportConfig::max_peer_bytes`]):
+/// 64 MiB. One peer cannot retain more than this across all its reliable
+/// classes and directions, so it cannot consume the node-wide budget.
+pub const DEFAULT_MAX_PEER_BYTES: usize = 64 * 1024 * 1024;
+
+/// Default node-wide reliable-byte ceiling
+/// ([`TransportConfig::max_node_bytes`]): 1 GiB across every peer.
+pub const DEFAULT_MAX_NODE_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Default maximum datagram payload ([`TransportConfig::datagram_max_bytes`]):
+/// 64 KiB. Combined with the datagram frame-count capacity this bounds the
+/// best-effort path's memory without a per-byte channel.
+pub const DEFAULT_DATAGRAM_MAX_BYTES: usize = 64 * 1024;
+
+/// Default per-class semantic payload ceilings, indexed by
+/// [`TrafficClass::priority`] (P0..P8).
+///
+/// Votes, cancels, and orders carry small fixed-shape messages, so their
+/// ceilings are far below [`MAX_FRAME_PAYLOAD`]; historical sync is expected to
+/// be chunked/streamed by the application and keeps the full frame ceiling. A
+/// peer cannot smuggle a bulk payload into a high-priority class: an inbound
+/// reliable frame over its class ceiling is a protocol violation.
+pub const DEFAULT_SEMANTIC_MAX: [usize; NUM_CLASSES] = [
+    64 * 1024,         // P0 Consensus — votes / quorum certificates
+    16 * 1024,         // P1 RiskReducing — cancels / risk-reducing commands
+    64 * 1024,         // P2 Liquidation
+    32 * 1024,         // P3 NewOrder
+    64 * 1024,         // P4 ExecutionReceipt
+    128 * 1024,        // P5 OracleCert
+    1024 * 1024,       // P6 Checkpoint
+    256 * 1024,        // P7 MarketData
+    MAX_FRAME_PAYLOAD, // P8 Sync — chunked/streamed by the application
+];
+
 /// Tunables shared by all transports.
 #[derive(Debug, Clone, Copy)]
 pub struct TransportConfig {
-    /// Per-class reliable queue capacity (frames). Bounds memory per class.
+    /// Per-class reliable queue capacity (frames). Bounds frame count per class.
     pub queue_capacity: usize,
     /// Datagram channel capacity (frames).
     pub datagram_capacity: usize,
@@ -111,6 +151,20 @@ pub struct TransportConfig {
     /// A full queue causes [`crate::Transport::connect`] to return
     /// [`TransportError::Backpressure`] rather than grow memory without bound.
     pub accept_queue_capacity: usize,
+    /// Per-class retained-byte ceiling: accumulation in one reliable class is
+    /// capped by total payload bytes, not just frame count.
+    pub max_class_bytes: usize,
+    /// Per-peer reliable-byte ceiling across all classes and directions.
+    pub max_peer_bytes: usize,
+    /// Node-wide (process) reliable-byte ceiling across every peer.
+    pub max_node_bytes: usize,
+    /// Maximum accepted datagram payload.
+    pub datagram_max_bytes: usize,
+    /// Per-class semantic payload ceilings, indexed by
+    /// [`TrafficClass::priority`]. Oversized semantic messages are rejected
+    /// before a payload-sized allocation on send and before being copied into
+    /// the queue on receive.
+    pub semantic_max: [usize; NUM_CLASSES],
 }
 
 impl Default for TransportConfig {
@@ -121,7 +175,22 @@ impl Default for TransportConfig {
             dedup_window: crate::replay::DEFAULT_WINDOW,
             max_payload: MAX_FRAME_PAYLOAD,
             accept_queue_capacity: DEFAULT_ACCEPT_QUEUE,
+            max_class_bytes: DEFAULT_MAX_CLASS_BYTES,
+            max_peer_bytes: DEFAULT_MAX_PEER_BYTES,
+            max_node_bytes: DEFAULT_MAX_NODE_BYTES,
+            datagram_max_bytes: DEFAULT_DATAGRAM_MAX_BYTES,
+            semantic_max: DEFAULT_SEMANTIC_MAX,
         }
+    }
+}
+
+impl TransportConfig {
+    /// The semantic payload ceiling for `class` (its per-class byte contract).
+    pub fn semantic_max_for(&self, class: TrafficClass) -> usize {
+        self.semantic_max
+            .get(usize::from(class.priority()))
+            .copied()
+            .unwrap_or(self.max_payload)
     }
 }
 
@@ -144,6 +213,11 @@ pub struct Connection {
     order_reliable: Mutex<ReliableOrder>,
     dedup_datagram: Mutex<ReplayWindow>,
     max_payload: usize,
+    /// Per-class semantic payload ceilings (indexed by priority). Enforced
+    /// before a payload-sized allocation on send.
+    semantic_max: [usize; NUM_CLASSES],
+    /// Maximum datagram payload accepted on send.
+    datagram_max: usize,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -170,8 +244,19 @@ impl Connection {
             order_reliable: Mutex::new(ReliableOrder::new()),
             dedup_datagram: Mutex::new(ReplayWindow::new(cfg.dedup_window)),
             max_payload: cfg.max_payload.min(MAX_FRAME_PAYLOAD),
+            semantic_max: cfg.semantic_max,
+            datagram_max: cfg.datagram_max_bytes,
             tasks,
         }
+    }
+
+    /// The semantic payload ceiling for `class` (bounded by `max_payload`).
+    fn semantic_limit(&self, class: TrafficClass) -> usize {
+        self.semantic_max
+            .get(usize::from(class.priority()))
+            .copied()
+            .unwrap_or(self.max_payload)
+            .min(self.max_payload)
     }
 
     /// The authenticated identity of the peer on the far end.
@@ -196,7 +281,9 @@ impl Connection {
         msg_type: u16,
         message: &[u8],
     ) -> Result<(), TransportError> {
-        if message.len() > self.max_payload {
+        // Reject an over-contract message *before* the payload-sized `to_vec`
+        // copy below: an oversized semantic message never allocates a frame.
+        if message.len() > self.semantic_limit(class) {
             return Err(TransportError::MessageTooLarge);
         }
         let idx = usize::from(class.priority());
@@ -229,7 +316,10 @@ impl Connection {
     /// is full (the datagram is shed, not buffered) — lossy delivery never
     /// touches the reliable priority queues.
     pub fn send_datagram(&self, message: &[u8]) -> Result<(), TransportError> {
-        if message.len() > self.max_payload {
+        // Reject before the payload-sized copy. The datagram cap is far below
+        // `max_payload`, so the best-effort path's memory is bounded by
+        // `datagram_capacity * datagram_max_bytes` without a per-byte channel.
+        if message.len() > self.datagram_max.min(self.max_payload) {
             return Err(TransportError::MessageTooLarge);
         }
         let sequence = self.seq_datagram.fetch_add(1, Ordering::Relaxed);
@@ -306,6 +396,40 @@ impl Connection {
     /// Reliable frames currently buffered outbound (for tests / metrics).
     pub fn pending_outbound(&self) -> usize {
         self.out_reliable.pending()
+    }
+
+    /// Reliable payload bytes currently buffered outbound to this peer.
+    pub fn outbound_queued_bytes(&self) -> usize {
+        self.out_reliable.queued_bytes()
+    }
+
+    /// High-water mark of [`outbound_queued_bytes`](Self::outbound_queued_bytes).
+    pub fn outbound_queued_bytes_high_water(&self) -> usize {
+        self.out_reliable.queued_bytes_high_water()
+    }
+
+    /// Reliable payload bytes currently buffered inbound from this peer.
+    pub fn inbound_queued_bytes(&self) -> usize {
+        self.in_reliable.queued_bytes()
+    }
+
+    /// High-water mark of [`inbound_queued_bytes`](Self::inbound_queued_bytes).
+    pub fn inbound_queued_bytes_high_water(&self) -> usize {
+        self.in_reliable.queued_bytes_high_water()
+    }
+
+    /// Total reliable payload bytes currently retained for this peer across both
+    /// directions (the per-peer queued-byte metric).
+    pub fn queued_bytes(&self) -> usize {
+        self.out_reliable
+            .queued_bytes()
+            .saturating_add(self.in_reliable.queued_bytes())
+    }
+
+    /// Reliable payload bytes currently buffered inbound in one class (proves a
+    /// per-class flood cannot spill into another class).
+    pub fn inbound_class_bytes(&self, class: TrafficClass) -> usize {
+        self.in_reliable.class_bytes(class)
     }
 }
 
@@ -477,6 +601,93 @@ mod tests {
             .try_send(rframe(TrafficClass::Consensus, 0))
             .unwrap();
         assert_eq!(conn.recv().await.unwrap().sequence, 0);
+    }
+
+    /// Build a default config mutated by `f` (routed through a call so the
+    /// `field_reassign_with_default` lint does not fire on a bare `default()`).
+    fn cfg_with(f: impl FnOnce(&mut TransportConfig)) -> TransportConfig {
+        let mut cfg = TransportConfig::default();
+        f(&mut cfg);
+        cfg
+    }
+
+    fn conn_with_cfg(cfg: &TransportConfig) -> (Connection, Arc<AsyncPriorityChannel>) {
+        let out = Arc::new(AsyncPriorityChannel::new(64));
+        let (out_dtx, _out_drx) = mpsc::channel(4);
+        let (_in_dtx, in_drx) = mpsc::channel(4);
+        let conn = Connection::new(
+            PeerId::from([5u8; 32]),
+            out.clone(),
+            Arc::new(AsyncPriorityChannel::new(64)),
+            out_dtx,
+            in_drx,
+            cfg,
+            Vec::new(),
+        );
+        (conn, out)
+    }
+
+    #[test]
+    fn oversized_semantic_message_rejected_before_allocation() {
+        // A tight per-class semantic ceiling on the high-priority Consensus class.
+        let cfg = cfg_with(|c| {
+            c.semantic_max[usize::from(TrafficClass::Consensus.priority())] = 8;
+        });
+        let (conn, out) = conn_with_cfg(&cfg);
+
+        // A message over the class ceiling is rejected and never enqueued.
+        let err = conn
+            .send_priority(TrafficClass::Consensus, &[0u8; 9])
+            .unwrap_err();
+        assert!(matches!(err, TransportError::MessageTooLarge));
+        assert_eq!(out.pending(), 0, "rejected message must not be buffered");
+
+        // A message within the ceiling still sends.
+        conn.send_priority(TrafficClass::Consensus, &[0u8; 8])
+            .unwrap();
+        assert_eq!(out.pending(), 1);
+
+        // A different class keeps its own (larger, default) ceiling.
+        conn.send_priority(TrafficClass::MarketData, &[0u8; 9])
+            .unwrap();
+        assert_eq!(out.pending(), 2);
+    }
+
+    #[test]
+    fn oversized_datagram_rejected_before_allocation() {
+        let cfg = cfg_with(|c| c.datagram_max_bytes = 16);
+        let out = Arc::new(AsyncPriorityChannel::new(16));
+        let (out_dtx, _out_drx) = mpsc::channel(4);
+        let (_in_dtx, in_drx) = mpsc::channel(4);
+        let conn = Connection::new(
+            PeerId::from([6u8; 32]),
+            out,
+            Arc::new(AsyncPriorityChannel::new(16)),
+            out_dtx,
+            in_drx,
+            &cfg,
+            Vec::new(),
+        );
+        assert!(matches!(
+            conn.send_datagram(&[0u8; 17]),
+            Err(TransportError::MessageTooLarge)
+        ));
+        // At the cap it is accepted.
+        conn.send_datagram(&[0u8; 16]).unwrap();
+    }
+
+    #[test]
+    fn connection_reports_queued_bytes_and_high_water() {
+        let cfg = TransportConfig::default();
+        let (conn, _out) = conn_with_cfg(&cfg);
+        assert_eq!(conn.outbound_queued_bytes(), 0);
+        conn.send_priority(TrafficClass::NewOrder, &[0u8; 100])
+            .unwrap();
+        conn.send_priority(TrafficClass::NewOrder, &[0u8; 50])
+            .unwrap();
+        assert_eq!(conn.outbound_queued_bytes(), 150);
+        assert_eq!(conn.outbound_queued_bytes_high_water(), 150);
+        assert_eq!(conn.queued_bytes(), 150);
     }
 
     #[test]

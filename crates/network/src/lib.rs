@@ -46,6 +46,7 @@
 //! backpressure.
 
 pub mod batch;
+mod budget;
 mod channel;
 mod connection;
 mod error;
@@ -66,7 +67,12 @@ pub const CRATE_NAME: &str = "network";
 // directly for the common path.
 pub use codec::{Frame, TrafficClass};
 
-pub use connection::{Connection, TransportConfig, DEFAULT_ACCEPT_QUEUE, MSG_TYPE_DATAGRAM};
+pub use budget::ByteBudget;
+pub use connection::{
+    Connection, TransportConfig, DEFAULT_ACCEPT_QUEUE, DEFAULT_DATAGRAM_MAX_BYTES,
+    DEFAULT_MAX_CLASS_BYTES, DEFAULT_MAX_NODE_BYTES, DEFAULT_MAX_PEER_BYTES, DEFAULT_SEMANTIC_MAX,
+    MSG_TYPE_DATAGRAM,
+};
 pub use error::TransportError;
 pub use loopback::{LoopbackFabric, LoopbackTransport};
 pub use peer::{Peer, PeerId};

@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use tokio::sync::mpsc;
 use tokio::sync::Mutex as AsyncMutex;
 
+use crate::budget::ByteBudget;
 use crate::channel::AsyncPriorityChannel;
 use crate::connection::{Connection, TransportConfig};
 use crate::error::TransportError;
@@ -70,9 +71,28 @@ impl LoopbackFabric {
 /// endpoints (dialer's outbound == listener's inbound), which is what makes
 /// priority ordering deterministic: everything enqueued before the peer starts
 /// receiving is drained highest-priority-first.
-fn make_pair(a: PeerId, b: PeerId, cfg: &TransportConfig) -> (Connection, Connection) {
-    let chan_ab = Arc::new(AsyncPriorityChannel::new(cfg.queue_capacity));
-    let chan_ba = Arc::new(AsyncPriorityChannel::new(cfg.queue_capacity));
+fn make_pair(
+    a: PeerId,
+    b: PeerId,
+    cfg: &TransportConfig,
+    node_budget: &Arc<ByteBudget>,
+) -> (Connection, Connection) {
+    // Each direction is one peer's outbound reliable stream; give it a per-peer
+    // child budget under the shared node-wide budget so one peer cannot consume
+    // the whole process ceiling. The enqueue (`try_send`) charges the budget and
+    // the dequeue (`recv`) credits it, so it tracks live retained bytes.
+    let budget_ab = ByteBudget::child(cfg.max_peer_bytes, node_budget.clone());
+    let budget_ba = ByteBudget::child(cfg.max_peer_bytes, node_budget.clone());
+    let chan_ab = Arc::new(AsyncPriorityChannel::with_limits(
+        cfg.queue_capacity,
+        cfg.max_class_bytes,
+        Some(budget_ab),
+    ));
+    let chan_ba = Arc::new(AsyncPriorityChannel::with_limits(
+        cfg.queue_capacity,
+        cfg.max_class_bytes,
+        Some(budget_ba),
+    ));
 
     // A tokio bounded channel requires a non-zero buffer.
     let datagram_cap = cfg.datagram_capacity.max(1);
@@ -98,6 +118,9 @@ pub struct LoopbackTransport {
     fabric: LoopbackFabric,
     incoming: AsyncMutex<mpsc::Receiver<Connection>>,
     cfg: TransportConfig,
+    /// Node-wide reliable-byte budget shared by every connection this transport
+    /// dials, so no peer can retain more than the process ceiling.
+    node_budget: Arc<ByteBudget>,
 }
 
 impl LoopbackTransport {
@@ -111,6 +134,7 @@ impl LoopbackTransport {
             fabric,
             incoming: AsyncMutex::new(rx),
             cfg,
+            node_budget: ByteBudget::root(cfg.max_node_bytes),
         }
     }
 
@@ -122,6 +146,22 @@ impl LoopbackTransport {
     /// A [`Peer`] descriptor addressing this transport over the fabric.
     pub fn as_peer(&self) -> Peer {
         Peer::loopback(self.id)
+    }
+
+    /// Node-wide reliable bytes currently retained across every connection this
+    /// transport dialed.
+    pub fn node_queued_bytes(&self) -> usize {
+        self.node_budget.used()
+    }
+
+    /// High-water mark of [`node_queued_bytes`](Self::node_queued_bytes).
+    pub fn node_queued_bytes_high_water(&self) -> usize {
+        self.node_budget.high_water()
+    }
+
+    /// The node-wide reliable-byte ceiling.
+    pub fn node_byte_limit(&self) -> usize {
+        self.node_budget.limit()
     }
 }
 
@@ -137,7 +177,7 @@ impl Transport for LoopbackTransport {
             .fabric
             .inbox_for(&peer.id)
             .ok_or(TransportError::PeerUnreachable)?;
-        let (local, remote) = make_pair(self.id, peer.id, &self.cfg);
+        let (local, remote) = make_pair(self.id, peer.id, &self.cfg, &self.node_budget);
         match inbox.try_send(remote) {
             Ok(()) => Ok(local),
             Err(mpsc::error::TrySendError::Full(_)) => Err(TransportError::Backpressure {
@@ -308,6 +348,85 @@ mod tests {
         drop(held);
         assert_eq!(DEFAULT_ACCEPT_QUEUE, 64);
         assert_eq!(TransportConfig::default().accept_queue_capacity, 64);
+    }
+
+    #[tokio::test]
+    async fn per_class_byte_flood_is_bounded_and_does_not_starve_other_classes() {
+        // Tight per-class byte ceiling; frame count is deliberately not the
+        // limiter, so the class is bounded by *bytes* under a max-size flood.
+        let mut c = cfg();
+        c.max_class_bytes = 1000;
+        c.queue_capacity = 10_000;
+        let (a, _b) = connected_pair(c).await;
+
+        let mut sent = 0usize;
+        loop {
+            match a.send_priority(TrafficClass::MarketData, &[0u8; 100]) {
+                Ok(()) => sent += 1,
+                Err(TransportError::Backpressure {
+                    class: TrafficClass::MarketData,
+                }) => break,
+                Err(e) => panic!("unexpected error: {e:?}"),
+            }
+            assert!(sent <= 11, "byte cap failed to bound the class under flood");
+        }
+        // Ten 100-byte frames fill the 1000-byte class ceiling; the queue is
+        // bounded by retained bytes, not the (10,000) frame count.
+        assert_eq!(sent, 10);
+        assert_eq!(a.outbound_queued_bytes(), 1000);
+
+        // A different, higher-priority class keeps its own independent byte
+        // budget and is unaffected by the saturated MarketData backlog.
+        a.send_priority(TrafficClass::Consensus, &[0u8; 100])
+            .unwrap();
+        assert_eq!(a.outbound_queued_bytes(), 1100);
+    }
+
+    #[tokio::test]
+    async fn one_peer_cannot_exhaust_node_budget_or_starve_another_peer() {
+        // Per-peer ceiling well below the node-wide ceiling; per-class bytes are
+        // not the limiter here so the per-peer / node budgets are what bound.
+        let mut c = cfg();
+        c.max_peer_bytes = 1000;
+        c.max_node_bytes = 10_000;
+        c.max_class_bytes = usize::MAX;
+        c.queue_capacity = 10_000;
+
+        let fabric = LoopbackFabric::new();
+        let a = LoopbackTransport::new(fabric.clone(), PeerId::from([1u8; 32]), c);
+        let b = LoopbackTransport::new(fabric.clone(), PeerId::from([2u8; 32]), c);
+        let d = LoopbackTransport::new(fabric, PeerId::from([3u8; 32]), c);
+
+        let to_b = a.connect(&b.as_peer()).await.unwrap();
+        let _b_in = b.accept().await.unwrap();
+        let to_d = a.connect(&d.as_peer()).await.unwrap();
+        let _d_in = d.accept().await.unwrap();
+
+        // Flood peer B until its *per-peer* budget backpressures.
+        let mut sent_b = 0usize;
+        loop {
+            match to_b.send_priority(TrafficClass::MarketData, &[0u8; 100]) {
+                Ok(()) => sent_b += 1,
+                Err(TransportError::Backpressure { .. }) => break,
+                Err(e) => panic!("unexpected error: {e:?}"),
+            }
+            assert!(sent_b <= 11, "per-peer budget failed to bound the flood");
+        }
+        assert_eq!(
+            sent_b, 10,
+            "peer B capped at its 1000-byte per-peer ceiling"
+        );
+
+        // B consumed only its own share; the shared node budget still has room.
+        assert_eq!(a.node_queued_bytes(), 1000);
+        assert!(a.node_queued_bytes() < a.node_byte_limit());
+
+        // The honest peer D is NOT starved: it draws on the node budget's
+        // remaining headroom and sends successfully.
+        to_d.send_priority(TrafficClass::MarketData, &[0u8; 100])
+            .unwrap();
+        assert_eq!(a.node_queued_bytes(), 1100);
+        assert_eq!(a.node_queued_bytes_high_water(), 1100);
     }
 
     #[tokio::test]

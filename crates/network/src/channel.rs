@@ -17,13 +17,14 @@
 //! reliable frame.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use codec::Frame;
 use tokio::sync::Notify;
 
+use crate::budget::ByteBudget;
 use crate::error::TransportError;
-use crate::scheduler::PriorityScheduler;
+use crate::scheduler::{frame_cost, PriorityScheduler};
 
 /// A shared, bounded, strict-priority async frame channel.
 #[derive(Debug)]
@@ -35,29 +36,77 @@ pub(crate) struct AsyncPriorityChannel {
     /// class slot) or the channel closes.
     space: Notify,
     closed: AtomicBool,
+    /// Optional shared byte budget charged on [`try_send`](Self::try_send) and
+    /// credited on [`recv`](Self::recv). Only ever attached to a channel filled
+    /// via `try_send` (the outbound / loopback reliable paths); never to the
+    /// `send`-awaiting inbound reliable path, so an exhausted budget sheds back
+    /// to the *sender's* own flow control and never drops an inbound reliable
+    /// frame the far side already observed as delivered.
+    budget: Option<Arc<ByteBudget>>,
 }
 
 impl AsyncPriorityChannel {
-    /// Create a channel bounding each class to `capacity_per_class` frames.
+    /// Create a channel bounding each class to `capacity_per_class` frames, with
+    /// no per-class byte ceiling and no shared byte budget. Test-only shorthand
+    /// for [`with_limits`](Self::with_limits) with no byte bound.
+    #[cfg(test)]
     pub(crate) fn new(capacity_per_class: usize) -> Self {
         Self {
             inner: Mutex::new(PriorityScheduler::new(capacity_per_class)),
             notify: Notify::new(),
             space: Notify::new(),
             closed: AtomicBool::new(false),
+            budget: None,
+        }
+    }
+
+    /// Create a channel bounding each class to `capacity_per_class` frames and
+    /// `capacity_bytes_per_class` retained bytes, optionally charging a shared
+    /// [`ByteBudget`] on every enqueue.
+    pub(crate) fn with_limits(
+        capacity_per_class: usize,
+        capacity_bytes_per_class: usize,
+        budget: Option<Arc<ByteBudget>>,
+    ) -> Self {
+        Self {
+            inner: Mutex::new(PriorityScheduler::with_byte_cap(
+                capacity_per_class,
+                capacity_bytes_per_class,
+            )),
+            notify: Notify::new(),
+            space: Notify::new(),
+            closed: AtomicBool::new(false),
+            budget,
         }
     }
 
     /// Enqueue a frame; non-blocking. Errors with
-    /// [`TransportError::Backpressure`] if the frame's class is at capacity, or
+    /// [`TransportError::Backpressure`] if the frame's class is at its frame or
+    /// byte ceiling (or the shared byte budget is exhausted), or
     /// [`TransportError::ConnectionClosed`] if the channel is closed.
     pub(crate) fn try_send(&self, frame: Frame) -> Result<(), TransportError> {
         if self.closed.load(Ordering::Acquire) {
             return Err(TransportError::ConnectionClosed);
         }
+        let class = frame.class;
+        let cost = frame_cost(&frame);
+        // Reserve the shared budget *before* touching the queue; an exhausted
+        // node-wide or per-peer budget sheds here rather than growing memory.
+        if let Some(budget) = &self.budget {
+            if !budget.try_reserve(cost) {
+                return Err(TransportError::Backpressure { class });
+            }
+        }
         {
             let mut sched = self.inner.lock().expect("scheduler mutex poisoned");
-            sched.enqueue(frame)?;
+            if let Err(err) = sched.enqueue(frame) {
+                drop(sched);
+                // The per-class queue rejected it: return the budget we reserved.
+                if let Some(budget) = &self.budget {
+                    budget.release(cost);
+                }
+                return Err(err);
+            }
         }
         self.notify.notify_one();
         Ok(())
@@ -81,8 +130,12 @@ impl AsyncPriorityChannel {
                     return Err(TransportError::ConnectionClosed);
                 }
                 let mut sched = self.inner.lock().expect("scheduler mutex poisoned");
-                if sched.class_len(frame.class) < sched.capacity_per_class() {
-                    // Space is available, so this enqueue cannot backpressure.
+                if sched.has_capacity_for(&frame) {
+                    // Capacity (frame count *and* bytes) is available, so this
+                    // enqueue cannot backpressure. The never-shed inbound path is
+                    // deliberately not gated on the shared byte budget: it parks
+                    // on per-class byte space (bounding the peer) instead of
+                    // shedding a frame the far side already saw as delivered.
                     sched.enqueue(frame)?;
                     drop(sched);
                     self.notify.notify_one();
@@ -104,6 +157,11 @@ impl AsyncPriorityChannel {
                 let mut sched = self.inner.lock().expect("scheduler mutex poisoned");
                 if let Some(frame) = sched.dequeue() {
                     drop(sched);
+                    // The frame's bytes are no longer retained: credit the shared
+                    // budget so another peer / class can reserve the capacity.
+                    if let Some(budget) = &self.budget {
+                        budget.release(frame_cost(&frame));
+                    }
                     // A class slot just freed up: wake a sender blocked in `send`.
                     self.space.notify_one();
                     return Some(frame);
@@ -128,6 +186,42 @@ impl AsyncPriorityChannel {
     pub(crate) fn pending(&self) -> usize {
         self.inner.lock().expect("scheduler mutex poisoned").len()
     }
+
+    /// Payload bytes currently buffered across all classes.
+    pub(crate) fn queued_bytes(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("scheduler mutex poisoned")
+            .queued_bytes()
+    }
+
+    /// High-water mark of [`queued_bytes`](Self::queued_bytes).
+    pub(crate) fn queued_bytes_high_water(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("scheduler mutex poisoned")
+            .queued_bytes_high_water()
+    }
+
+    /// Payload bytes currently buffered in a single class.
+    pub(crate) fn class_bytes(&self, class: codec::TrafficClass) -> usize {
+        self.inner
+            .lock()
+            .expect("scheduler mutex poisoned")
+            .class_bytes(class)
+    }
+}
+
+impl Drop for AsyncPriorityChannel {
+    fn drop(&mut self) {
+        // Frames still buffered when the channel is torn down will never be
+        // dequeued, so credit their reservation back to the shared budget here —
+        // otherwise a churn of connections would leak the node-wide budget.
+        if let Some(budget) = &self.budget {
+            let remaining = self.inner.lock().map(|s| s.queued_bytes()).unwrap_or(0);
+            budget.release(remaining);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -139,6 +233,7 @@ mod tests {
     use tokio::time::timeout;
 
     use super::AsyncPriorityChannel;
+    use crate::budget::ByteBudget;
     use crate::error::TransportError;
 
     fn frame(class: TrafficClass, sequence: u64) -> Frame {
@@ -147,6 +242,15 @@ mod tests {
             msg_type: 0,
             sequence,
             payload: Vec::new(),
+        }
+    }
+
+    fn sized(class: TrafficClass, sequence: u64, bytes: usize) -> Frame {
+        Frame {
+            class,
+            msg_type: 0,
+            sequence,
+            payload: vec![0u8; bytes],
         }
     }
 
@@ -199,6 +303,60 @@ mod tests {
             .expect("close should wake a blocked send")
             .unwrap();
         assert!(matches!(res, Err(TransportError::ConnectionClosed)));
+    }
+
+    #[tokio::test]
+    async fn shared_budget_backpressures_try_send_and_frees_on_recv() {
+        // A shared node-wide budget of 250 bytes across a generous per-class
+        // queue: enqueue is bounded by the *budget*, not the frame count.
+        let budget = ByteBudget::root(250);
+        let ch = Arc::new(AsyncPriorityChannel::with_limits(
+            1024,
+            usize::MAX,
+            Some(budget.clone()),
+        ));
+        ch.try_send(sized(TrafficClass::MarketData, 0, 100))
+            .unwrap();
+        ch.try_send(sized(TrafficClass::MarketData, 1, 100))
+            .unwrap();
+        assert_eq!(budget.used(), 200);
+        assert_eq!(ch.queued_bytes(), 200);
+        // The third 100-byte frame would push the budget to 300 > 250: shed.
+        let err = ch
+            .try_send(sized(TrafficClass::MarketData, 2, 100))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            TransportError::Backpressure {
+                class: TrafficClass::MarketData
+            }
+        ));
+        // A failed reservation is fully rolled back — the budget is unchanged.
+        assert_eq!(budget.used(), 200);
+
+        // Draining a frame credits the shared budget so a new frame fits again.
+        let got = ch.recv().await.unwrap();
+        assert_eq!(got.payload.len(), 100);
+        assert_eq!(budget.used(), 100);
+        ch.try_send(sized(TrafficClass::MarketData, 3, 100))
+            .unwrap();
+        assert_eq!(budget.used(), 200);
+        assert_eq!(ch.queued_bytes_high_water(), 200);
+    }
+
+    #[test]
+    fn dropping_channel_returns_buffered_bytes_to_the_budget() {
+        // Buffered-but-undrained frames must not leak the shared budget when the
+        // channel is torn down (connection churn).
+        let budget = ByteBudget::root(10_000);
+        {
+            let ch = AsyncPriorityChannel::with_limits(1024, usize::MAX, Some(budget.clone()));
+            ch.try_send(sized(TrafficClass::Sync, 0, 400)).unwrap();
+            ch.try_send(sized(TrafficClass::Sync, 1, 600)).unwrap();
+            assert_eq!(budget.used(), 1000);
+        }
+        // The channel dropped with 1000 bytes still buffered: all credited back.
+        assert_eq!(budget.used(), 0);
     }
 
     #[tokio::test]

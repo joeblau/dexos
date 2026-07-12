@@ -45,6 +45,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
+use crate::budget::ByteBudget;
 use crate::channel::AsyncPriorityChannel;
 use crate::connection::{Connection, TransportConfig, MSG_TYPE_DATAGRAM};
 use crate::error::TransportError;
@@ -172,12 +173,29 @@ fn spawn_connection(
     peer: PeerId,
     session: Session,
     cfg: &TransportConfig,
+    node_budget: &Arc<ByteBudget>,
 ) -> Connection {
     let (mut read_half, mut write_half) = stream.into_split();
     let (mut sealer, mut opener) = session.split();
 
-    let out_reliable = Arc::new(AsyncPriorityChannel::new(cfg.queue_capacity));
-    let in_reliable = Arc::new(AsyncPriorityChannel::new(cfg.queue_capacity));
+    // A per-peer child budget under the node-wide budget bounds this peer's
+    // outbound reliable bytes and, together with the per-class byte caps on the
+    // inbound queue, keeps one peer from consuming the whole process ceiling.
+    // Only the outbound channel (filled via `try_send`) charges the budget; the
+    // inbound channel is filled via the never-shed `send` path and is bounded by
+    // its per-class byte caps instead, so a budget can never force a reliable
+    // frame the far side already saw to be dropped.
+    let peer_budget = ByteBudget::child(cfg.max_peer_bytes, node_budget.clone());
+    let out_reliable = Arc::new(AsyncPriorityChannel::with_limits(
+        cfg.queue_capacity,
+        cfg.max_class_bytes,
+        Some(peer_budget),
+    ));
+    let in_reliable = Arc::new(AsyncPriorityChannel::with_limits(
+        cfg.queue_capacity,
+        cfg.max_class_bytes,
+        None,
+    ));
     // A tokio bounded channel requires a non-zero buffer.
     let datagram_cap = cfg.datagram_capacity.max(1);
     let (out_dtx, mut out_drx) = mpsc::channel::<Frame>(datagram_cap);
@@ -219,19 +237,36 @@ fn spawn_connection(
     // Reader: frame inbound bytes and route by the reserved datagram msg_type.
     let reader_in = in_reliable.clone();
     let max_payload = cfg.max_payload;
+    let datagram_max = cfg.datagram_max_bytes;
+    let semantic_max = cfg.semantic_max;
     let reader = tokio::spawn(async move {
         // Loop ends when a record fails to read/open (EOF, malformed framing, or
         // AEAD authentication failure — any of which tears the link down).
         while let Ok(frame) = read_encrypted_frame(&mut read_half, &mut opener, max_payload).await {
             if frame.msg_type == MSG_TYPE_DATAGRAM {
-                // Best-effort: shed on backpressure or closed receiver.
-                let _ = in_dtx.try_send(frame);
-            } else if reader_in.send(frame).await.is_err() {
-                // Reliable frames are *never* shed: `send` awaits queue space, so
-                // a full inbound queue stops us draining the socket and closes the
-                // peer's TCP window instead of dropping a frame the sender already
-                // observed as delivered. An error means the stream is closed.
-                break;
+                // Best-effort: drop an over-cap datagram before it is enqueued,
+                // and shed on backpressure or a closed receiver.
+                if frame.payload.len() <= datagram_max {
+                    let _ = in_dtx.try_send(frame);
+                }
+            } else {
+                // A reliable frame over its class's semantic ceiling is a
+                // protocol violation (e.g. a peer trying to stuff a bulk payload
+                // into the high-priority consensus class): reject it *before* it
+                // is copied into the inbound queue by tearing the link down. This
+                // never silently sheds an acknowledged frame — it fails loudly.
+                let idx = usize::from(frame.class.priority());
+                let cap = semantic_max.get(idx).copied().unwrap_or(max_payload);
+                if frame.payload.len() > cap {
+                    break;
+                }
+                if reader_in.send(frame).await.is_err() {
+                    // Reliable frames are *never* shed: `send` awaits queue space,
+                    // so a full inbound queue stops us draining the socket and
+                    // closes the peer's TCP window instead of dropping a frame the
+                    // sender already observed as delivered. An error means closed.
+                    break;
+                }
             }
         }
         reader_in.close();
@@ -254,6 +289,8 @@ pub struct TcpTransport {
     keypair: Arc<KeyPair>,
     listener: TcpListener,
     cfg: TransportConfig,
+    /// Node-wide reliable-byte budget shared by every accepted/dialed peer.
+    node_budget: Arc<ByteBudget>,
 }
 
 impl TcpTransport {
@@ -271,6 +308,7 @@ impl TcpTransport {
             keypair,
             listener,
             cfg,
+            node_budget: ByteBudget::root(cfg.max_node_bytes),
         })
     }
 
@@ -283,6 +321,21 @@ impl TcpTransport {
     pub fn local_addr(&self) -> Result<SocketAddr, TransportError> {
         Ok(self.listener.local_addr()?)
     }
+
+    /// Node-wide reliable bytes currently retained across every peer.
+    pub fn node_queued_bytes(&self) -> usize {
+        self.node_budget.used()
+    }
+
+    /// High-water mark of [`node_queued_bytes`](Self::node_queued_bytes).
+    pub fn node_queued_bytes_high_water(&self) -> usize {
+        self.node_budget.high_water()
+    }
+
+    /// The node-wide reliable-byte ceiling.
+    pub fn node_byte_limit(&self) -> usize {
+        self.node_budget.limit()
+    }
 }
 
 impl Transport for TcpTransport {
@@ -292,14 +345,26 @@ impl Transport for TcpTransport {
         stream.set_nodelay(true).ok();
         let (verified, session) =
             mutual_handshake(&mut stream, &self.keypair, Some(peer.id), true).await?;
-        Ok(spawn_connection(stream, verified, session, &self.cfg))
+        Ok(spawn_connection(
+            stream,
+            verified,
+            session,
+            &self.cfg,
+            &self.node_budget,
+        ))
     }
 
     async fn accept(&self) -> Result<Connection, TransportError> {
         let (mut stream, _remote) = self.listener.accept().await?;
         stream.set_nodelay(true).ok();
         let (verified, session) = mutual_handshake(&mut stream, &self.keypair, None, false).await?;
-        Ok(spawn_connection(stream, verified, session, &self.cfg))
+        Ok(spawn_connection(
+            stream,
+            verified,
+            session,
+            &self.cfg,
+            &self.node_budget,
+        ))
     }
 }
 
@@ -459,6 +524,86 @@ mod tests {
             );
         }
         let _kept_alive = sender.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn inbound_over_semantic_ceiling_reliable_frame_tears_down_link() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        // The server enforces a tight consensus-class ceiling; the client's looser
+        // config lets it *send* an over-contract frame the server must reject.
+        let mut server_cfg = cfg();
+        server_cfg.semantic_max[usize::from(TrafficClass::Consensus.priority())] = 64;
+        let mut client_cfg = cfg();
+        client_cfg.semantic_max[usize::from(TrafficClass::Consensus.priority())] = 1024 * 1024;
+
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server = Arc::new(TcpTransport::bind(addr, kp(30), server_cfg).await.unwrap());
+        let client = Arc::new(TcpTransport::bind(addr, kp(31), client_cfg).await.unwrap());
+        let server_addr = server.local_addr().unwrap();
+        let server_id = server.id();
+
+        let acceptor = {
+            let server = server.clone();
+            tokio::spawn(async move { server.accept().await })
+        };
+        let client_conn = client
+            .connect(&Peer::dial(server_id, server_addr))
+            .await
+            .unwrap();
+        let server_conn = acceptor.await.unwrap().unwrap();
+
+        // A 500-byte consensus frame is within the client's ceiling but far over
+        // the server's 64-byte ceiling: the server rejects it on receipt.
+        client_conn
+            .send_priority(TrafficClass::Consensus, &[7u8; 500])
+            .unwrap();
+
+        // The server never delivers the over-ceiling frame; it tears the link
+        // down instead of copying a bulk payload into its high-priority queue.
+        let closed = timeout(Duration::from_secs(10), server_conn.recv())
+            .await
+            .expect("server must react to the over-ceiling frame");
+        assert!(matches!(closed, Err(TransportError::ConnectionClosed)));
+    }
+
+    #[tokio::test]
+    async fn inbound_oversized_datagram_is_dropped_before_delivery() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let mut server_cfg = cfg();
+        server_cfg.datagram_max_bytes = 16;
+        let mut client_cfg = cfg();
+        client_cfg.datagram_max_bytes = 1024;
+
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server = Arc::new(TcpTransport::bind(addr, kp(32), server_cfg).await.unwrap());
+        let client = Arc::new(TcpTransport::bind(addr, kp(33), client_cfg).await.unwrap());
+        let server_addr = server.local_addr().unwrap();
+        let server_id = server.id();
+
+        let acceptor = {
+            let server = server.clone();
+            tokio::spawn(async move { server.accept().await })
+        };
+        let client_conn = client
+            .connect(&Peer::dial(server_id, server_addr))
+            .await
+            .unwrap();
+        let server_conn = acceptor.await.unwrap().unwrap();
+
+        // The oversized datagram is dropped by the server's reader before it is
+        // enqueued; the following in-cap datagram is delivered normally.
+        client_conn.send_datagram(&[9u8; 600]).unwrap();
+        client_conn.send_datagram(b"ok").unwrap();
+
+        let got = timeout(Duration::from_secs(10), server_conn.recv_datagram())
+            .await
+            .expect("in-cap datagram must still be delivered")
+            .unwrap();
+        assert_eq!(got, b"ok", "only the in-cap datagram is delivered");
     }
 
     #[test]
