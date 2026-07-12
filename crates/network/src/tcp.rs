@@ -108,6 +108,7 @@ pub(crate) async fn mutual_handshake(
     stream: &mut TcpStream,
     keypair: &KeyPair,
     expected: Option<PeerId>,
+    is_initiator: bool,
 ) -> Result<(PeerId, Session), TransportError> {
     let our_pub = keypair.public();
     let our_nonce = make_nonce(&our_pub);
@@ -158,8 +159,14 @@ pub(crate) async fn mutual_handshake(
 
     // Both ephemeral keys are now authenticated; complete the ECDH and derive
     // the directional session ciphers.
-    let session =
-        ephemeral.into_session(&their_eph, &our_pub, &their_pub, &our_nonce, &their_nonce);
+    let session = ephemeral.into_session(
+        is_initiator,
+        &their_eph,
+        &our_pub,
+        &their_pub,
+        &our_nonce,
+        &their_nonce,
+    );
     Ok((PeerId::from(their_pub), session))
 }
 
@@ -291,14 +298,14 @@ impl Transport for TcpTransport {
         let mut stream = TcpStream::connect(addr).await?;
         stream.set_nodelay(true).ok();
         let (verified, session) =
-            mutual_handshake(&mut stream, &self.keypair, Some(peer.id)).await?;
+            mutual_handshake(&mut stream, &self.keypair, Some(peer.id), true).await?;
         Ok(spawn_connection(stream, verified, session, &self.cfg))
     }
 
     async fn accept(&self) -> Result<Connection, TransportError> {
         let (mut stream, _remote) = self.listener.accept().await?;
         stream.set_nodelay(true).ok();
-        let (verified, session) = mutual_handshake(&mut stream, &self.keypair, None).await?;
+        let (verified, session) = mutual_handshake(&mut stream, &self.keypair, None, false).await?;
         Ok(spawn_connection(stream, verified, session, &self.cfg))
     }
 }

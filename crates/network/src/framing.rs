@@ -88,8 +88,8 @@ mod tests {
         let b_eph = Ephemeral::generate().unwrap();
         let a_pub = a_eph.public();
         let b_pub = b_eph.public();
-        let a_sess = a_eph.into_session(&b_pub, &a_static, &b_static, &a_nonce, &b_nonce);
-        let b_sess = b_eph.into_session(&a_pub, &b_static, &a_static, &b_nonce, &a_nonce);
+        let a_sess = a_eph.into_session(true, &b_pub, &a_static, &b_static, &a_nonce, &b_nonce);
+        let b_sess = b_eph.into_session(false, &a_pub, &b_static, &a_static, &b_nonce, &a_nonce);
         let (sealer, _) = a_sess.split();
         let (_, opener) = b_sess.split();
         (sealer, opener)

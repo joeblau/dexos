@@ -64,14 +64,20 @@ impl Ephemeral {
     /// Complete the ECDH against the peer's ephemeral public key and derive the
     /// directional session ciphers.
     ///
-    /// `initiator` orders the two static identities so both peers agree on which
-    /// direction is which regardless of who dialed. `local_static` /
-    /// `remote_static` are the ed25519 identity public keys; `local_nonce` /
-    /// `remote_nonce` are the handshake nonces. All four are already
-    /// authenticated by the ed25519 handshake, so binding them here ties the
-    /// session keys to both peer identities and both nonces.
+    /// `is_initiator` is the unambiguous handshake role — the dialer
+    /// ([`crate::Transport::connect`]) is the initiator, the accepter
+    /// ([`crate::Transport::accept`]) the responder. The key schedule is ordered
+    /// by that role (initiator material first) and each side takes the *opposite*
+    /// send/recv key, so the two peers can NEVER pick the same send key — even if
+    /// their static identities or handshake nonces collide (misconfiguration or a
+    /// reflection attempt). This eliminates any keystream/nonce reuse across the
+    /// two senders. `local_static` / `remote_static` are the ed25519 identity
+    /// public keys and `local_nonce` / `remote_nonce` the handshake nonces; all
+    /// are already authenticated by the ed25519 handshake, so binding them here
+    /// ties the session keys to both peer identities and both nonces.
     pub(crate) fn into_session(
         self,
+        is_initiator: bool,
         remote_eph: &[u8; EPH_PUBLIC_LEN],
         local_static: &[u8; 32],
         remote_static: &[u8; 32],
@@ -80,28 +86,29 @@ impl Ephemeral {
     ) -> Session {
         let shared = self.secret.diffie_hellman(&PublicKey::from(*remote_eph));
 
-        // Canonically order the two identities so both sides compute an identical
-        // salt/info independent of dial direction.
-        let (lo_id, hi_id, lo_nonce, hi_nonce) = if local_static <= remote_static {
+        // Order the key-schedule inputs by ROLE (initiator first) so both peers
+        // derive identical directional keys regardless of who dialed.
+        let (init_id, resp_id, init_nonce, resp_nonce) = if is_initiator {
             (local_static, remote_static, local_nonce, remote_nonce)
         } else {
             (remote_static, local_static, remote_nonce, local_nonce)
         };
 
         let mut salt = [0u8; 64];
-        salt[..32].copy_from_slice(lo_nonce);
-        salt[32..].copy_from_slice(hi_nonce);
+        salt[..32].copy_from_slice(init_nonce);
+        salt[32..].copy_from_slice(resp_nonce);
         let hk = Hkdf::<Sha256>::new(Some(&salt), shared.as_bytes());
 
-        let key_lo_to_hi = expand_key(&hk, SESSION_DOMAIN, b"lo->hi", lo_id, hi_id);
-        let key_hi_to_lo = expand_key(&hk, SESSION_DOMAIN, b"hi->lo", lo_id, hi_id);
+        let key_init_to_resp = expand_key(&hk, SESSION_DOMAIN, b"init->resp", init_id, resp_id);
+        let key_resp_to_init = expand_key(&hk, SESSION_DOMAIN, b"resp->init", init_id, resp_id);
 
-        // The lexicographically-smaller identity always sends on lo->hi.
-        let local_is_lo = local_static <= remote_static;
-        let (send_key, recv_key) = if local_is_lo {
-            (key_lo_to_hi, key_hi_to_lo)
+        // The initiator sends on init->resp; the responder takes the mirror. The
+        // two directional keys always differ (distinct HKDF `info` labels), so
+        // the peers' send keys are guaranteed distinct.
+        let (send_key, recv_key) = if is_initiator {
+            (key_init_to_resp, key_resp_to_init)
         } else {
-            (key_hi_to_lo, key_lo_to_hi)
+            (key_resp_to_init, key_init_to_resp)
         };
 
         Session {
@@ -242,8 +249,8 @@ mod tests {
         let b_eph = Ephemeral::generate().unwrap();
         let a_pub = a_eph.public();
         let b_pub = b_eph.public();
-        let a_sess = a_eph.into_session(&b_pub, &a_static, &b_static, &a_nonce, &b_nonce);
-        let b_sess = b_eph.into_session(&a_pub, &b_static, &a_static, &b_nonce, &a_nonce);
+        let a_sess = a_eph.into_session(true, &b_pub, &a_static, &b_static, &a_nonce, &b_nonce);
+        let b_sess = b_eph.into_session(false, &a_pub, &b_static, &a_static, &b_nonce, &a_nonce);
         let (a_send, a_recv) = a_sess.split();
         let (b_send, b_recv) = b_sess.split();
         (a_send, b_recv, b_send, a_recv)
@@ -305,9 +312,16 @@ mod tests {
 mod adversarial_probe {
     use super::*;
 
+    /// Regression test for keystream reuse under colliding static identities.
+    ///
+    /// If two endpoints share the SAME identity keypair (misconfiguration or a
+    /// reflection attempt), a naive "order by identity" role assignment ties and
+    /// both peers would send under the same key + nonce, reusing the ChaCha20
+    /// keystream — catastrophic for a stream cipher. Role-based key assignment
+    /// (initiator vs responder) guarantees distinct send keys regardless, so the
+    /// keystreams MUST differ.
     #[test]
-    fn equal_identity_both_send_same_key_nonce_reuse() {
-        // Two endpoints sharing the SAME identity keypair (misconfig / reflection).
+    fn equal_identity_senders_do_not_reuse_keystream() {
         let same_static = [0x33u8; 32];
         let x_nonce = [0xC1u8; 32];
         let y_nonce = [0xD2u8; 32];
@@ -315,43 +329,35 @@ mod adversarial_probe {
         let y_eph = Ephemeral::generate().unwrap();
         let x_pub = x_eph.public();
         let y_pub = y_eph.public();
-        // X views itself as local=same_static, remote=same_static.
-        let x_sess = x_eph.into_session(&y_pub, &same_static, &same_static, &x_nonce, &y_nonce);
-        let y_sess = y_eph.into_session(&x_pub, &same_static, &same_static, &y_nonce, &x_nonce);
-        let (mut x_send, _x_recv) = x_sess.split();
-        let (mut y_send, _y_recv) = y_sess.split();
+        // X dials (initiator), Y accepts (responder) — the unambiguous roles the
+        // TCP transport passes through from connect()/accept().
+        let x_sess =
+            x_eph.into_session(true, &y_pub, &same_static, &same_static, &x_nonce, &y_nonce);
+        let y_sess = y_eph.into_session(
+            false,
+            &x_pub,
+            &same_static,
+            &same_static,
+            &y_nonce,
+            &x_nonce,
+        );
+        let (mut x_send, mut x_recv) = x_sess.split();
+        let (mut y_send, mut y_recv) = y_sess.split();
 
-        // Both seal DIFFERENT plaintexts as their first record (counter 0).
+        // Both seal DIFFERENT plaintexts as their first record (counter 0). The
+        // ChaCha20-Poly1305 ciphertext body is plaintext XOR keystream, so
+        // recovering keystream = ciphertext XOR plaintext reveals reuse if any.
         let p_x = b"XXXX-plaintext-from-x";
         let p_y = b"YYYY-plaintext-from-y";
         let ct_x = x_send.seal(p_x).unwrap();
         let ct_y = y_send.seal(p_y).unwrap();
-
-        // If they share (key, nonce), the ChaCha20 keystream is identical, so the
-        // ciphertext bodies XOR to the plaintext XOR. Demonstrate keystream reuse.
         let n = p_x.len();
-        let ks_x: Vec<u8> = ct_x[..n]
-            .iter()
-            .zip(p_x.iter())
-            .map(|(c, p)| c ^ p)
-            .collect();
-        let ks_y: Vec<u8> = ct_y[..n]
-            .iter()
-            .zip(p_y.iter())
-            .map(|(c, p)| c ^ p)
-            .collect();
-        assert_eq!(
-            ks_x, ks_y,
-            "KEYSTREAM REUSE: same key+nonce across two senders"
-        );
+        let ks_x: Vec<u8> = ct_x[..n].iter().zip(p_x).map(|(c, p)| c ^ p).collect();
+        let ks_y: Vec<u8> = ct_y[..n].iter().zip(p_y).map(|(c, p)| c ^ p).collect();
+        assert_ne!(ks_x, ks_y, "keystreams must differ — no key/nonce reuse");
 
-        // And XOR of the two ciphertext bodies == XOR of the two plaintexts.
-        let ct_xor: Vec<u8> = ct_x[..n]
-            .iter()
-            .zip(ct_y[..n].iter())
-            .map(|(a, b)| a ^ b)
-            .collect();
-        let pt_xor: Vec<u8> = p_x.iter().zip(p_y.iter()).map(|(a, b)| a ^ b).collect();
-        assert_eq!(ct_xor, pt_xor, "passive observer recovers P_x XOR P_y");
+        // The sessions are still a correct pair: each opens the other's record.
+        assert_eq!(y_recv.open(&ct_x).unwrap(), p_x);
+        assert_eq!(x_recv.open(&ct_y).unwrap(), p_y);
     }
 }
