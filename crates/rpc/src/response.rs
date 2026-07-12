@@ -15,6 +15,18 @@ use crate::wire::{
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RpcResponse {
     /// Correlation id copied from the request.
+    ///
+    /// Every reply to a successfully **decoded** request echoes that request's
+    /// id — success and error alike, including dispatch timeouts
+    /// ([`crate::error::RpcError::Backpressure`]) and dispatch join failures
+    /// ([`crate::error::RpcError::Internal`]) — so a pipelining client can
+    /// correlate each reply with its in-flight request.
+    ///
+    /// `0` appears **only** when no request could be attributed: pre-decode /
+    /// pre-admission replies such as an oversize frame, an undecodable frame,
+    /// or an admission (backpressure) rejection, where either no request id
+    /// exists yet or decode work is deliberately not spent on unadmitted
+    /// frames.
     pub request_id: u64,
     /// The method outcome.
     pub result: RpcResult,

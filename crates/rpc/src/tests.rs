@@ -2406,6 +2406,200 @@ async fn dispatch_timeout_fails_connection_closed_and_holds_work_budget() {
     assert_eq!(work.in_flight_bytes(), 0);
 }
 
+/// A backend whose `get_network_status` unwinds on the blocking pool, so the
+/// dispatch task dies with a `JoinError` instead of returning a response.
+/// `resume_unwind` skips the global panic hook, keeping the intentional death
+/// out of test output. Every other method is unused by the test.
+struct PanickingBackend;
+
+impl RpcBackend for PanickingBackend {
+    fn get_node_info(&self) -> Result<NodeInfo, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn get_peers(&self) -> Result<Vec<PeerInfo>, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn get_markets(&self, _page: PageParams) -> Result<Vec<MarketSummary>, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn get_market(&self, _market: MarketId) -> Result<MarketDetail, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn get_market_book(&self, _market: MarketId, _depth: u32) -> Result<Book, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn get_market_trades(
+        &self,
+        _market: MarketId,
+        _page: PageParams,
+    ) -> Result<Vec<Trade>, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn get_market_status(&self, _market: MarketId) -> Result<MarketStatus, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn get_oracle_status(&self, _market: MarketId) -> Result<OracleStatus, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn get_checkpoint(&self, _height: u64) -> Result<Checkpoint, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn get_latest_checkpoint(&self) -> Result<Checkpoint, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn get_account(&self, _account: AccountId) -> Result<Account, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn get_account_proof(&self, _account: AccountId) -> Result<AccountProof, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn get_position(&self, _account: AccountId, _market: MarketId) -> Result<Position, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn get_orders(&self, _account: AccountId, _page: PageParams) -> Result<Vec<Order>, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn get_execution_receipt(&self, _command_hash: Hash) -> Result<ExecutionReceipt, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn get_deposit_status(&self, _tx_hash: Hash) -> Result<DepositStatus, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn get_withdrawal_status(&self, _request_hash: Hash) -> Result<WithdrawalStatus, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn get_network_status(&self) -> Result<NetworkStatus, RpcError> {
+        std::panic::resume_unwind(Box::new("intentional dispatch death"))
+    }
+    fn submit_order(
+        &self,
+        _meta: &ControlMeta,
+        _params: &SubmitOrderParams,
+    ) -> Result<CommandAck, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn cancel_order(
+        &self,
+        _meta: &ControlMeta,
+        _params: &CancelOrderParams,
+    ) -> Result<CommandAck, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn cancel_all(
+        &self,
+        _meta: &ControlMeta,
+        _params: &CancelAllParams,
+    ) -> Result<CommandAck, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn replace_order(
+        &self,
+        _meta: &ControlMeta,
+        _params: &ReplaceOrderParams,
+    ) -> Result<CommandAck, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn submit_basket(
+        &self,
+        _meta: &ControlMeta,
+        _params: &BasketParams,
+    ) -> Result<CommandAck, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn authorize_session(
+        &self,
+        _meta: &ControlMeta,
+        _params: &AuthorizeSessionParams,
+    ) -> Result<CommandAck, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn revoke_session(
+        &self,
+        _meta: &ControlMeta,
+        _params: &RevokeSessionParams,
+    ) -> Result<CommandAck, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn bind_wallet(
+        &self,
+        _meta: &ControlMeta,
+        _params: &BindWalletParams,
+    ) -> Result<CommandAck, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn request_withdrawal(
+        &self,
+        _meta: &ControlMeta,
+        _params: &RequestWithdrawalParams,
+    ) -> Result<CommandAck, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn create_market(
+        &self,
+        _meta: &ControlMeta,
+        _params: &CreateMarketParams,
+    ) -> Result<CommandAck, RpcError> {
+        Err(RpcError::NotFound)
+    }
+    fn stake_market(
+        &self,
+        _meta: &ControlMeta,
+        _params: &StakeMarketParams,
+    ) -> Result<CommandAck, RpcError> {
+        Err(RpcError::NotFound)
+    }
+}
+
+/// Regression (#421): a post-decode dispatch failure — the blocking dispatch
+/// task dies with a `JoinError` — must echo the decoded request's id, not 0.
+/// A pipelining client correlates in-flight requests by `request_id`; an
+/// uncorrelated error reply would be attributed to the wrong request. Two
+/// pipelined requests with distinct ids each get an `Internal` dispatch-join
+/// reply carrying their own id, in order.
+#[tokio::test]
+async fn dispatch_join_error_echoes_request_id() {
+    use tokio::io::AsyncWriteExt;
+
+    let backend: Arc<dyn RpcBackend> = Arc::new(PanickingBackend);
+    let cfg = budget_config(4);
+
+    let (mut client, server_io) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move {
+        crate::server::handle_connection_with(server_io, backend, RpcMode::Full, &cfg, None).await
+    });
+
+    // Pipeline two requests with distinctive ids before reading any reply.
+    for id in [42u64, 43] {
+        let req = RpcRequest::new(id, RpcMethod::GetNetworkStatus);
+        let out = encode_request(&req).unwrap();
+        client.write_all(&out).await.unwrap();
+    }
+    client.flush().await.unwrap();
+
+    // Each dispatch dies on the blocking pool; each reply must still carry the
+    // id of the request it answers.
+    for expected_id in [42u64, 43] {
+        let frame = read_one_frame(&mut client).await.unwrap();
+        let resp = decode_response(&frame).unwrap();
+        assert_eq!(
+            resp.request_id, expected_id,
+            "post-decode error replies must echo the request id for pipelining correlation"
+        );
+        match resp.result {
+            Err(RpcError::Internal(msg)) => assert!(
+                msg.contains("dispatch join"),
+                "expected a dispatch-join error, got: {msg}"
+            ),
+            other => panic!("expected Internal dispatch-join error, got {other:?}"),
+        }
+    }
+
+    // A join error fails only that request, not the connection: the handler
+    // exits cleanly once the client hangs up.
+    drop(client);
+    assert!(server.await.unwrap().is_ok());
+}
+
 // ---------------------------------------------------------------------------
 // P1 #355: stream fanout byte-bounded, sharded, copy-light
 // ---------------------------------------------------------------------------
