@@ -1,10 +1,14 @@
 # DexOS — Decentralized Market Operating System
 
-A production-oriented, globally-distributed **exchange kernel** in Rust. Not a
+A pre-production, globally-distributed **exchange-kernel research project** in Rust. Not a
 general-purpose blockchain — a purpose-built market network optimized for
 deterministic execution, low latency, continuous sequencing, quorum-signed
 checkpoints, self-custodied stablecoin collateral, and permissionless sponsored
 markets (perpetuals, prediction, decision, scalar, and custom payout markets).
+
+> **Status:** `marketd` is a composition skeleton, not production exchange
+> software. It must not custody real assets or accept public trading traffic.
+> See [the security status](docs/SECURITY.md) for current limitations.
 
 ## Design in one paragraph
 
@@ -85,7 +89,7 @@ cargo build --release --bin marketd     # produces target/release/marketd
 ./target/release/marketd run --config config/dev.toml            # full node
 ./target/release/marketd run --light --config config/light.toml  # read-only light node
 ./target/release/marketd run --role validator --role sequencer   # multiple roles
-./target/release/marketd benchmark --suite all --output results.json
+cargo run --release --bin marketd --features dev-tools -- benchmark --suite all --output results.json
 ./target/release/marketd replay --snapshot <path> --log <path>
 ./target/release/marketd verify  --snapshot <path>
 ./target/release/marketd keygen
@@ -119,4 +123,5 @@ silent integer truncation (`cast_possible_truncation` is a hard clippy error); n
 panics on untrusted input (typed `thiserror` errors everywhere); bounded queues;
 no benchmark claims without reproducible scripts.
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/SECURITY.md](docs/SECURITY.md).
+See [architecture](docs/ARCHITECTURE.md), [security status](docs/SECURITY.md),
+[build features](docs/FEATURES.md), and [performance profiling](docs/PERFORMANCE.md).

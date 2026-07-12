@@ -51,6 +51,7 @@ pub const SUBSYSTEMS: &[&str] = &[
     discovery::CRATE_NAME,
     rpc::CRATE_NAME,
     light_client::CRATE_NAME,
+    #[cfg(feature = "dev-tools")]
     loadgen::CRATE_NAME,
 ];
 

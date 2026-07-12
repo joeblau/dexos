@@ -37,8 +37,15 @@ wildcards = "deny"
 # which cargo-deny counts as a wildcard. Exempt path deps; registry wildcards
 # are still denied.
 allow-wildcard-paths = true
-# Generic-blockchain frameworks are a non-goal; keep them out of the tree entirely.
-deny = []
+# Generic blockchain frameworks and dynamic TLS implementations are intentionally
+# outside the architecture. Adding one requires an explicit, reviewed policy change.
+deny = [
+    { name = "ethers" },
+    { name = "web3" },
+    { name = "solana-sdk" },
+    { name = "substrate-api-client" },
+    { name = "openssl" },
+]
 
 [sources]
 unknown-registry = "deny"

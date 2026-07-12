@@ -27,7 +27,8 @@ struct Cli {
 enum Command {
     /// Run a full network node (add --light for a read-only light node).
     Run(RunArgs),
-    /// Run reproducible benchmarks and emit a machine-readable report.
+    /// Run reproducible benchmarks and emit a machine-readable report (dev-tools only).
+    #[cfg(feature = "dev-tools")]
     Benchmark(BenchmarkArgs),
     /// Deterministically replay a command log against a snapshot.
     Replay(ReplayArgs),
@@ -81,6 +82,7 @@ struct RunArgs {
 }
 
 #[derive(Args, Debug)]
+#[cfg(feature = "dev-tools")]
 struct BenchmarkArgs {
     /// Benchmark suite to run (e.g. `all`, `orderbook`).
     #[arg(long, default_value = "all")]
@@ -159,6 +161,7 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
             );
             Ok(())
         }
+        #[cfg(feature = "dev-tools")]
         Command::Benchmark(a) => run_benchmark(&a, benchmarks::Config::default()),
         Command::Replay(a) => {
             println!(
@@ -223,6 +226,7 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
 
 /// The reserved suite selector that runs every registered suite and enforces the
 /// spec-target gate.
+#[cfg(feature = "dev-tools")]
 const SUITE_ALL: &str = "all";
 
 /// Run the benchmark subcommand: honour `--suite` and `--config`, and exit nonzero
@@ -231,6 +235,7 @@ const SUITE_ALL: &str = "all";
 /// Suite selection genuinely changes what runs: `all` runs every suite (and gates on
 /// the spec targets), a specific name runs exactly that suite, and an unknown name is
 /// rejected rather than silently falling back to a full pass.
+#[cfg(feature = "dev-tools")]
 fn run_benchmark(args: &BenchmarkArgs, config: benchmarks::Config) -> anyhow::Result<()> {
     // `--config` is no longer ignored: an invalid benchmarked-node config aborts the
     // run (nonzero) instead of being silently discarded.
@@ -481,6 +486,7 @@ mod tests {
     }
 
     /// A small benchmark config so suite-selection tests run fast.
+    #[cfg(feature = "dev-tools")]
     fn tiny_bench() -> benchmarks::Config {
         benchmarks::Config {
             iterations: 16,
@@ -488,6 +494,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "dev-tools")]
     fn bench_args(suite: &str, output: PathBuf, config: Option<PathBuf>) -> BenchmarkArgs {
         BenchmarkArgs {
             suite: suite.to_string(),
@@ -496,6 +503,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "dev-tools")]
     #[test]
     fn unknown_benchmark_suite_is_rejected() {
         let out = unique_temp_path("bench-unknown");
@@ -513,6 +521,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "dev-tools")]
     #[test]
     fn single_suite_selection_runs_exactly_that_suite() {
         let out = unique_temp_path("bench-single");
@@ -525,6 +534,7 @@ mod tests {
         let _ = std::fs::remove_file(&out);
     }
 
+    #[cfg(feature = "dev-tools")]
     #[test]
     fn all_selection_runs_the_full_suite_set() {
         let out = unique_temp_path("bench-all");
@@ -541,6 +551,7 @@ mod tests {
         let _ = std::fs::remove_file(&out);
     }
 
+    #[cfg(feature = "dev-tools")]
     #[test]
     fn invalid_config_aborts_the_benchmark() {
         let out = unique_temp_path("bench-cfg");

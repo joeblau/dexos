@@ -64,3 +64,12 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 panic = "unwind"
+
+# Production-equivalent optimization with symbols for `perf`/flamegraphs.
+[profile.release-with-debug]
+inherits = "release"
+debug = 1
+
+[profile.bench]
+inherits = "release"
+debug = 1
