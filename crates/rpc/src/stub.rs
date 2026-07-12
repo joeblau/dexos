@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crypto::MerkleTree;
-use types::{AccountId, Amount, Hash, MarketId, OrderId, Price, Quantity, SequenceNumber, Side};
+use types::{AccountId, Amount, Hash, MarketId, OrderId, Price, Quantity, SequenceNumber};
 
 use crate::backend::RpcBackend;
 use crate::command::{
@@ -663,13 +663,13 @@ pub fn fixture_book(market: MarketId, bid: Price, ask: Price, qty: Quantity) -> 
     }
 }
 
-/// Build a fixture position.
+/// Build a fixture position. `size` is signed exposure: positive = long,
+/// negative = short.
 pub fn fixture_position(account: u32, market: u32, size: Quantity) -> Position {
     Position {
         account_id: AccountId::new(account),
         market_id: MarketId::new(market),
         size,
-        side: Side::Bid,
         entry_price: Price::ONE,
         unrealized_pnl: Amount::ZERO,
     }

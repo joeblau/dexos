@@ -308,16 +308,22 @@ impl AccountProof {
 }
 
 /// An open position.
+///
+/// The side of the position is *not* a separate field: it is fully determined
+/// by the sign of [`size`](Position::size). Carrying a redundant side enum
+/// would let the two encodings disagree on the wire (e.g. a negative size
+/// labelled as a long), so the contradictory state is made unrepresentable
+/// instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Position {
     /// Owning account.
     pub account_id: AccountId,
     /// Market of the position.
     pub market_id: MarketId,
-    /// Signed size (side captured separately for clarity).
+    /// Signed exposure: positive = long, negative = short. Mirrors the
+    /// canonical internal model (`risk::PerpPosition::net_qty`), which is the
+    /// single source of truth for position direction.
     pub size: Quantity,
-    /// Position side.
-    pub side: Side,
     /// Volume-weighted entry price.
     pub entry_price: Price,
     /// Unrealized profit and loss.
@@ -489,6 +495,47 @@ mod tests {
         let bytes = codec::encode(&proof).unwrap();
         let back: AccountProof = codec::decode(&bytes).unwrap();
         assert_eq!(proof, back);
+    }
+
+    /// Issue #442: a [`Position`] carries direction solely as the sign of
+    /// `size` — there is no separable `side` field left to disagree with the
+    /// sign, so a payload like "negative size labelled long" is
+    /// unrepresentable. Both a long (positive) and a short (negative)
+    /// position round-trip through the codec, and the exhaustive
+    /// destructuring below is the compile-time proof that no extra field
+    /// (such as the removed `side`) exists on the struct.
+    #[test]
+    fn position_side_is_derived_from_signed_size() {
+        let long = Position {
+            account_id: AccountId::new(1),
+            market_id: MarketId::new(2),
+            size: Quantity::from_raw(5_000_000),
+            entry_price: Price::ONE,
+            unrealized_pnl: Amount::ZERO,
+        };
+        let bytes = codec::encode(&long).unwrap();
+        let back: Position = codec::decode(&bytes).unwrap();
+        assert_eq!(long, back);
+
+        // Exhaustive pattern: compilation fails if a `side` field (or any
+        // other field) is ever reintroduced.
+        let Position {
+            account_id: _,
+            market_id: _,
+            size,
+            entry_price: _,
+            unrealized_pnl: _,
+        } = back;
+        assert!(size.raw() > 0, "positive size reads as long exposure");
+
+        let short = Position {
+            size: Quantity::from_raw(-5_000_000),
+            ..long
+        };
+        let bytes = codec::encode(&short).unwrap();
+        let back: Position = codec::decode(&bytes).unwrap();
+        assert_eq!(short, back);
+        assert!(back.size.raw() < 0, "negative size reads as short exposure");
     }
 
     /// An out-of-range leaf index yields `ProofInvalid` instead of panicking.
