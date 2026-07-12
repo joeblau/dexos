@@ -2,6 +2,19 @@
 # Run in CI via `cargo deny check`. See scripts/check-core-deps.sh for the
 # deterministic-core dependency-direction gate that cargo-deny cannot express per-crate.
 
+[graph]
+# The native desktop/mobile frontends (`dexos-desktop`, `dexos-mobile`) pull the
+# unavoidable Dioxus GUI stack — GTK3/webkit2gtk/wry on Linux — which brings
+# crates that violate the NODE's deliberately strict supply-chain policy:
+# unmaintained gtk-rs bindings, an NCSA-licensed crate, and openssl (explicitly
+# banned below as a dynamic-TLS implementation the exchange never links). Those
+# constraints exist for the production node artifact, not a desktop GUI, so the
+# two native app crates are excluded from the audited graph. Everything that
+# ships in the node — and the wasm-safe `dexos-web` / `dexos-ui` frontends — stays
+# fully audited. Adding a real supply-chain dependency to the node still requires
+# an explicit, reviewed policy change here.
+exclude = ["dexos-desktop", "dexos-mobile"]
+
 [advisories]
 version = 2
 yanked = "deny"

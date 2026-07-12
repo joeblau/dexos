@@ -1,0 +1,13 @@
+# Frontend (wasm) build configuration.
+#
+# The crypto tree (ed25519-dalek / k256, pulled in transitively) reaches
+# `getrandom`, which needs an explicit backend on `wasm32-unknown-unknown`. This
+# selects the JS backend for getrandom 0.3+/0.4 so any wasm build that links the
+# crypto tree compiles. (getrandom 0.2, reached via k256, additionally needs its
+# `js` cargo feature enabled by the linking crate.)
+#
+# In the chosen architecture the web wasm client does NOT sign locally — it calls
+# server functions that hold the client + crypto server-side — so this is
+# insurance for future direct-wasm crypto use rather than a hard requirement.
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']

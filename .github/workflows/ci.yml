@@ -37,7 +37,14 @@ jobs:
       - name: rustfmt
         run: cargo fmt --all --check
       - name: clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        # The Dioxus `ui/*` frontends are gated by the dedicated `apps` job
+        # (they need a wasm target / desktop system libraries the engine gates
+        # deliberately avoid). Keep them out of every engine `--workspace` gate.
+        run: >-
+          cargo clippy --workspace --all-targets --locked
+          --exclude dexos-ui --exclude dexos-web
+          --exclude dexos-desktop --exclude dexos-mobile
+          -- -D warnings
 
   test:
     name: test
@@ -49,7 +56,11 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
       - name: test
-        run: cargo test --workspace --locked
+        # ui/* frontends are gated by the `apps` job (see the clippy step).
+        run: >-
+          cargo test --workspace --locked
+          --exclude dexos-ui --exclude dexos-web
+          --exclude dexos-desktop --exclude dexos-mobile
 
   docs:
     name: cargo doc
@@ -63,7 +74,52 @@ jobs:
       - name: docs (fail on warnings)
         env:
           RUSTDOCFLAGS: "-D warnings"
-        run: cargo doc --workspace --no-deps --locked
+        # ui/* frontends are gated by the `apps` job (see the clippy step).
+        run: >-
+          cargo doc --workspace --no-deps --locked
+          --exclude dexos-ui --exclude dexos-web
+          --exclude dexos-desktop --exclude dexos-mobile
+
+  # Dedicated gate for the Dioxus `ui/*` frontends, kept out of the engine
+  # `--workspace` jobs above: the web app is a wasm32 target and the native
+  # desktop/mobile apps need the wry/webkit system libraries. The renderer-
+  # agnostic `dexos-ui` shared crate is linted and tested like an engine crate;
+  # the app crates are compiled for their real targets.
+  apps:
+    name: dioxus frontends
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          components: clippy
+          target: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+      - name: shared crate (clippy + test)
+        run: |
+          cargo clippy -p dexos-ui --all-targets --locked -- -D warnings
+          cargo test -p dexos-ui --locked
+      - name: web app (wasm build)
+        env:
+          # The workflow-level `RUSTFLAGS: -D warnings` REPLACES the target
+          # rustflags in `.cargo/config.toml` (Cargo does not merge the two), so
+          # the getrandom wasm backend cfg must be repeated here — without it the
+          # crypto tree (getrandom 0.3+/0.4, reached via ed25519/k256 through
+          # `proto`) fails to compile for wasm.
+          RUSTFLAGS: '-D warnings --cfg getrandom_backend="wasm_js"'
+        run: cargo build -p dexos-web --target wasm32-unknown-unknown --locked
+      - name: native app system libraries (wry / webkit2gtk)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev \
+            libgtk-3-dev libsoup-3.0-dev libxdo-dev
+      - name: desktop + mobile apps (check)
+        run: |
+          cargo check -p dexos-desktop --locked
+          cargo check -p dexos-mobile --locked
 
   state-roots:
     name: state-root agreement
@@ -94,8 +150,12 @@ jobs:
           tool: cargo-llvm-cov
       - name: workspace coverage (lcov)
         run: |
+          # ui/* frontends are gated by the `apps` job; the coverage floors
+          # below only concern the deterministic engine crates.
           cargo llvm-cov --workspace --locked --lcov --output-path lcov.info \
-            --ignore-filename-regex '(tests?/|target/)'
+            --ignore-filename-regex '(tests?/|target/)' \
+            --exclude dexos-ui --exclude dexos-web \
+            --exclude dexos-desktop --exclude dexos-mobile
           test -s lcov.info
           # Floor: report must mention real crates (not empty).
           grep -q 'SF:.*crates/' lcov.info
@@ -328,7 +388,12 @@ jobs:
       - name: development marketd
         run: cargo build --release --locked --bin marketd --all-features
       - name: workspace
-        run: cargo build --release --workspace --locked
+        # ui/* frontends are built by the `apps` job (see the lint job's clippy
+        # step); the engine's release gate stays free of the Dioxus tree.
+        run: >-
+          cargo build --release --workspace --locked
+          --exclude dexos-ui --exclude dexos-web
+          --exclude dexos-desktop --exclude dexos-mobile
       - name: release profile is panic=abort
         run: |
           grep -q 'panic = "abort"' Cargo.toml
@@ -375,7 +440,11 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
       - name: test (locked)
-        run: cargo test --workspace --locked
+        # ui/* frontends are gated by the `apps` job (see the lint job).
+        run: >-
+          cargo test --workspace --locked
+          --exclude dexos-ui --exclude dexos-web
+          --exclude dexos-desktop --exclude dexos-mobile
       - name: safety gates
         run: |
           ./scripts/check-no-float.sh

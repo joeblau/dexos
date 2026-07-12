@@ -1,0 +1,32 @@
+[package]
+name = "dexos-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# The browser (wasm) frontend. Built explicitly for wasm32 (`dx build` /
+# `cargo build -p dexos-web --target wasm32-unknown-unknown`) — never by the
+# engine's default `cargo build`. It links only the wasm-safe `dexos-ui` +
+# `proto`; it does NOT depend on `client` (tokio/rustls). Live data will arrive
+# through Dioxus server functions that call `client` server-side.
+[dependencies]
+dioxus = { workspace = true, features = ["web"] }
+dexos-ui = { path = "../shared" }
+proto = { path = "../../crates/proto" }
+
+# `proto` reaches `getrandom` 0.2 transitively (via k256 in `crypto`). On
+# wasm32 that crate needs its `js` backend feature turned on by the final
+# binary; enabling it here is what lets the crypto tree link into the web app.
+# (getrandom 0.3+/0.4 is handled instead by the `getrandom_backend` rustflag in
+# `.cargo/config.toml`.) Native targets don't take this dependency.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+
+[[bin]]
+name = "dexos-web"
+path = "src/main.rs"

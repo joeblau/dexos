@@ -1,0 +1,21 @@
+[package]
+name = "dexos-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# Renderer-agnostic Dioxus components and view models shared by the web,
+# desktop, and mobile apps. Depends only on `dioxus` (no renderer feature — the
+# launching app selects web/desktop/mobile) and the transport-free `proto` wire
+# types, so it is wasm-safe: it never links the async `client`/`rpc` stack.
+# Platform-specific data fetching (server functions on web, the native `client`
+# on desktop/mobile) lives in the app crates and feeds these components props.
+[dependencies]
+dioxus = { workspace = true }
+proto = { path = "../../crates/proto" }
+types = { path = "../../crates/types" }

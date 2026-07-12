@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/*", "bin/*"]
+members = ["crates/*", "bin/*", "ui/*"]
+# Bare `cargo build`/`test`/`run` (no `-p`/`--workspace`) operate on the engine
+# only, so day-to-day engine work never compiles the heavy Dioxus `ui/*` tree.
+# CI builds the apps in a dedicated `apps` job (wasm web + native desktop/mobile);
+# the engine's `--workspace` gates pass `--exclude dexos-{ui,web,desktop,mobile}`
+# so they never pull in the Dioxus tree. See `.github/workflows/ci.yml`.
+default-members = ["bin/marketd", "bin/dexos", "bin/market-loadgen", "crates/types"]
 
 [workspace.package]
 version = "0.0.1"
@@ -57,6 +63,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "json"] }
 thiserror = "2.0"
 anyhow = "1.0"
+# Dioxus 0.7 multiplatform UI. Only the `ui/*` frontend crates depend on this;
+# the deterministic engine never does. Each app selects its renderer via the
+# per-crate `dioxus` features (web/desktop/mobile/server + fullstack).
+dioxus = { version = "0.7" }
 
 # Thin release profile suitable for latency benchmarking later phases will tune.
 # Exchange kernels abort on panic so a single task panic cannot unwind across
