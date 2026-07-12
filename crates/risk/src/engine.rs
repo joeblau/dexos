@@ -29,8 +29,8 @@ use types::{AccountId, Amount, MarketId, PayoutVector, Price, Quantity};
 
 use crate::config::{MarginMode, OrderPriority, RiskConfig};
 use crate::error::RiskError;
-use crate::liquidation::{InsuranceFund, LiquidationOutcome, LiquidationQueue};
-use crate::math::{abs_amount, neg_amount};
+use crate::liquidation::{AdlFill, InsuranceFund, LiquidationOutcome, LiquidationQueue};
+use crate::math::{abs_amount, neg_amount, neg_i64};
 use crate::position::PerpPosition;
 use crate::scenario::PayoutPosition;
 
@@ -239,6 +239,19 @@ impl RiskEngine {
         price: Price,
     ) -> Result<(), RiskError> {
         let i = self.active_index(account)?;
+        self.fill_index(i, market, signed_qty, price)
+    }
+
+    /// Apply a signed fill to the account at slab index `i`. Shared by the public
+    /// [`RiskEngine::apply_fill`] and the internal auto-deleverage path, which
+    /// operates on already-resolved indices.
+    fn fill_index(
+        &mut self,
+        i: usize,
+        market: MarketId,
+        signed_qty: Quantity,
+        price: Price,
+    ) -> Result<(), RiskError> {
         let pos_idx = self.position_slot(i, market);
         let realized = self.perp[i][pos_idx].apply_fill(signed_qty, price)?;
         self.collateral[i] = self.collateral[i].checked_add(realized)?;
@@ -415,6 +428,19 @@ impl RiskEngine {
         Ok(self.collateral[self.read_index(account)?])
     }
 
+    /// Signed net perp position for `account` in `market` (positive long,
+    /// negative short, zero if flat). Readable for closed accounts so callers can
+    /// reconcile external position mirrors after a liquidation.
+    pub fn position(&self, account: AccountId, market: MarketId) -> Result<Quantity, RiskError> {
+        let i = self.read_index(account)?;
+        for pos in &self.perp[i] {
+            if pos.market == market {
+                return Ok(pos.net_qty);
+            }
+        }
+        Ok(Quantity::ZERO)
+    }
+
     /// Worst-case equity across all payout-vector outcomes, holding perp
     /// positions at mark. This is the required-collateral basis for
     /// multi-outcome exposure.
@@ -480,37 +506,273 @@ impl RiskEngine {
         self.liq_queue.len()
     }
 
-    /// Liquidate an account: close its book at mark, then cover any shortfall
-    /// from the insurance fund first and socialize only the uncovered
-    /// remainder. Solvent accounts have their residual equity returned.
+    /// True if `account` is at or below its maintenance-margin liquidation
+    /// threshold (`equity < maintenance_margin`). The account must be open.
+    pub fn is_liquidatable(&self, account: AccountId) -> Result<bool, RiskError> {
+        let i = self.active_index(account)?;
+        Ok(self.cached_equity[i].raw() < self.cached_mm[i].raw())
+    }
+
+    /// Total backed system value: Σ equity over open accounts plus the insurance
+    /// fund. This is the quantity the liquidation pipeline conserves — the
+    /// bankrupt account's negative equity is exactly matched by the insurance
+    /// draw and the solvent-collateral haircut.
+    pub fn total_value(&self) -> Result<Amount, RiskError> {
+        let mut v = self.insurance.balance();
+        for i in 0..self.used.len() {
+            if self.open[i] {
+                v = v.checked_add(self.cached_equity[i])?;
+            }
+        }
+        Ok(v)
+    }
+
+    /// Liquidate an account through the full pipeline:
+    ///
+    /// 1. **auto-deleverage** — every open perp position is closed at the mark,
+    ///    transferring the opposite exposure to solvent counterparties ranked by
+    ///    unrealized profit (descending, ties broken by account index). Closing
+    ///    at the mark is value-neutral, so ADL never moves system value.
+    /// 2. the account's own remaining collateral absorbs the loss first,
+    /// 3. the insurance fund covers any residual shortfall,
+    /// 4. a pro-rata haircut of solvent accounts' collateral socializes whatever
+    ///    the fund could not cover.
+    ///
+    /// A solvent account (non-negative post-ADL equity) has its residual
+    /// collateral returned rather than absorbed. Total system value
+    /// ([`RiskEngine::total_value`]) is conserved: for a bankrupt account the
+    /// shortfall equals `insurance_drawn + socialized_charged` whenever solvent
+    /// collateral suffices; for a solvent account the returned collateral is the
+    /// only value leaving the risk system.
     pub fn liquidate(&mut self, account: AccountId) -> Result<LiquidationOutcome, RiskError> {
         let i = self.active_index(account)?;
+
+        // Phase 1: auto-deleverage the account's perp book at the mark.
+        let adl_fills = self.auto_deleverage(i)?;
+        // Multi-outcome payout liabilities do not contribute to mark equity;
+        // drop them so the account closes flat.
+        self.payout[i].clear();
+        self.recompute(i)?;
         let final_equity = self.cached_equity[i];
 
-        let (insurance_drawn, socialized_loss, returned_collateral) = if final_equity.is_negative()
-        {
+        let mut insurance_drawn = Amount::ZERO;
+        let mut socialized_loss = Amount::ZERO;
+        let mut socialized_charged = Amount::ZERO;
+        let mut returned_collateral = Amount::ZERO;
+        let mut haircuts = Vec::new();
+        if final_equity.is_negative() {
+            // Phase 3: insurance fund draw for the shortfall.
             let shortfall = neg_amount(final_equity)?;
             let (drawn, uncovered) = self.insurance.cover(shortfall)?;
+            insurance_drawn = drawn;
+            socialized_loss = uncovered;
             self.socialized_total = self.socialized_total.checked_add(uncovered)?;
-            (drawn, uncovered, Amount::ZERO)
+            // Phase 4: pro-rata haircut of solvent collateral for the remainder.
+            let (charged, hc) = self.socialize(i, uncovered)?;
+            socialized_charged = charged;
+            haircuts = hc;
         } else {
-            (Amount::ZERO, Amount::ZERO, final_equity)
-        };
+            returned_collateral = final_equity;
+        }
 
-        // Bankrupt / close the account and clear its book.
+        // Close the account and clear its (already flattened) book.
         self.perp[i].clear();
         self.payout[i].clear();
         self.collateral[i] = Amount::ZERO;
         self.open[i] = false;
         self.recompute(i)?;
+        self.liq_queue.remove(account);
 
         Ok(LiquidationOutcome {
             account,
             final_equity,
             insurance_drawn,
             socialized_loss,
+            socialized_charged,
             returned_collateral,
+            adl_fills,
+            haircuts,
         })
+    }
+
+    /// Close every open perp position of the account at slab index `i` by
+    /// transferring the opposite exposure to solvent counterparties, at the mark.
+    ///
+    /// Counterparties holding the opposite side in each market are ranked by
+    /// unrealized profit (descending, ties broken by ascending account index) —
+    /// the standard ADL ordering that deleverages the most-profitable positions
+    /// first. Each transfer applies a reducing fill to both legs at the same mark
+    /// price, which is value-neutral. Any residual the counterparties cannot
+    /// absorb (an unbalanced book) is closed on the liquidated account alone at
+    /// the mark, which is likewise neutral for that account.
+    fn auto_deleverage(&mut self, i: usize) -> Result<Vec<AdlFill>, RiskError> {
+        let mut fills = Vec::new();
+        // Snapshot the liquidated account's non-flat legs up front; the loop
+        // mutates the perp book as it closes each one.
+        let legs: Vec<(MarketId, i64, Price)> = self.perp[i]
+            .iter()
+            .filter(|p| p.net_qty.raw() != 0)
+            .map(|p| (p.market, p.net_qty.raw(), p.avg_entry))
+            .collect();
+
+        for (market, victim_signed, entry) in legs {
+            let Some(mark) = self.mark_for(market) else {
+                // No reference price: close the victim's leg at its own entry,
+                // which realizes zero PnL and leaves counterparties untouched.
+                let close = neg_i64(victim_signed)?;
+                self.fill_index(i, market, Quantity::from_raw(close), entry)?;
+                continue;
+            };
+
+            // Rank opposite-side solvent counterparties: (unrealized profit,
+            // account index, signed quantity).
+            let mut ranked: Vec<(i128, usize, i64)> = Vec::new();
+            for j in 0..self.used.len() {
+                if j == i || !self.open[j] {
+                    continue;
+                }
+                if let Some((cj, profit)) = self.market_leg(j, market, mark)? {
+                    let opposite = (cj > 0) != (victim_signed > 0);
+                    if opposite {
+                        ranked.push((profit, j, cj));
+                    }
+                }
+            }
+            // Most-profitable first; deterministic tie-break by account index.
+            ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+
+            let mut remaining: i128 = i128::from(victim_signed);
+            for (_, j, cj) in ranked {
+                if remaining == 0 {
+                    break;
+                }
+                let want = remaining.unsigned_abs();
+                let have = i128::from(cj).unsigned_abs();
+                let transfer = i64::try_from(want.min(have))
+                    .map_err(|_| RiskError::Arith(types::ArithError::OutOfRange))?;
+                if transfer == 0 {
+                    continue;
+                }
+                // Reduce the counterparty toward flat, then the victim, both at
+                // the same mark (value-neutral).
+                let cp_fill = if cj > 0 { -transfer } else { transfer };
+                let victim_fill = if victim_signed > 0 {
+                    -transfer
+                } else {
+                    transfer
+                };
+                self.fill_index(j, market, Quantity::from_raw(cp_fill), mark)?;
+                self.fill_index(i, market, Quantity::from_raw(victim_fill), mark)?;
+                remaining = remaining
+                    .checked_add(i128::from(victim_fill))
+                    .ok_or(RiskError::Arith(types::ArithError::Overflow))?;
+                fills.push(AdlFill {
+                    counterparty: AccountId::from_index(j)?,
+                    market,
+                    quantity: Quantity::from_raw(transfer),
+                    price: mark,
+                });
+            }
+
+            // Close any residual on the victim alone at the mark.
+            if remaining != 0 {
+                let close = i64::try_from(-remaining)
+                    .map_err(|_| RiskError::Arith(types::ArithError::OutOfRange))?;
+                self.fill_index(i, market, Quantity::from_raw(close), mark)?;
+            }
+        }
+        Ok(fills)
+    }
+
+    /// The account at slab index `j`'s signed quantity and unrealized PnL (raw)
+    /// in `market` at `mark`, or `None` if it holds no position there.
+    fn market_leg(
+        &self,
+        j: usize,
+        market: MarketId,
+        mark: Price,
+    ) -> Result<Option<(i64, i128)>, RiskError> {
+        for pos in &self.perp[j] {
+            if pos.market == market {
+                return Ok(Some((pos.net_qty.raw(), pos.unrealized(mark)?.raw())));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Socialize `amount` of uncovered loss as a pro-rata haircut of solvent
+    /// accounts' collateral (every open account other than `exclude` with
+    /// positive collateral). Returns `(charged, per_account_haircuts)` where
+    /// `charged == min(amount, Σ solvent collateral)`; the haircut is
+    /// distributed by collateral weight with integer rounding, the floor
+    /// remainder handed out deterministically in ascending account order so no
+    /// account is driven below zero collateral. Solvent collateral is reduced by
+    /// exactly `charged`, conserving system value against the removed shortfall.
+    fn socialize(
+        &mut self,
+        exclude: usize,
+        amount: Amount,
+    ) -> Result<(Amount, Vec<(AccountId, Amount)>), RiskError> {
+        if amount.raw() <= 0 {
+            return Ok((Amount::ZERO, Vec::new()));
+        }
+        // Ascending-index pool of solvent accounts with positive collateral.
+        let mut pool: Vec<(usize, i128)> = Vec::new();
+        let mut total_base: i128 = 0;
+        for j in 0..self.used.len() {
+            if j == exclude || !self.open[j] {
+                continue;
+            }
+            let c = self.collateral[j].raw();
+            if c > 0 {
+                pool.push((j, c));
+                total_base = total_base
+                    .checked_add(c)
+                    .ok_or(RiskError::Arith(types::ArithError::Overflow))?;
+            }
+        }
+        if total_base <= 0 {
+            return Ok((Amount::ZERO, Vec::new()));
+        }
+        let to_distribute = amount.raw().min(total_base);
+        // Floor shares by collateral weight.
+        let mut shares: Vec<i128> = Vec::with_capacity(pool.len());
+        let mut assigned: i128 = 0;
+        for &(_, c) in &pool {
+            let share = to_distribute
+                .checked_mul(c)
+                .ok_or(RiskError::Arith(types::ArithError::Overflow))?
+                / total_base;
+            shares.push(share);
+            assigned += share;
+        }
+        // Hand out the floor remainder deterministically, respecting each
+        // account's remaining collateral slack.
+        let mut remainder = to_distribute - assigned;
+        for (k, &(_, c)) in pool.iter().enumerate() {
+            if remainder == 0 {
+                break;
+            }
+            let slack = c - shares[k];
+            let give = remainder.min(slack);
+            shares[k] += give;
+            remainder -= give;
+        }
+
+        let mut charged = Amount::ZERO;
+        let mut haircuts = Vec::new();
+        for (k, &(j, _)) in pool.iter().enumerate() {
+            let s = shares[k];
+            if s <= 0 {
+                continue;
+            }
+            let debit = Amount::from_raw(s);
+            self.collateral[j] = self.collateral[j].checked_sub(debit)?;
+            self.recompute(j)?;
+            charged = charged.checked_add(debit)?;
+            haircuts.push((AccountId::from_index(j)?, debit));
+        }
+        Ok((charged, haircuts))
     }
 
     /// Current insurance-fund balance.
@@ -1274,5 +1536,154 @@ mod tests {
         let incremental = e.state_root();
         e.recompute_all().unwrap();
         assert_eq!(e.state_root(), incremental);
+    }
+
+    // -------------------------------------------------- liquidation pipeline
+
+    #[test]
+    fn adl_transfers_to_ranked_counterparties() {
+        let mut e = engine();
+        // Victim long 10 @100 on thin collateral.
+        e.open_account(acct(1), amt(50)).unwrap();
+        // Three short counterparties entered at different prices, so at mark 90
+        // they carry different unrealized profits and rank deterministically.
+        e.open_account(acct(2), amt(10_000)).unwrap();
+        e.open_account(acct(3), amt(10_000)).unwrap();
+        e.open_account(acct(4), amt(10_000)).unwrap();
+        e.set_mark_price(mkt(1), price(100)).unwrap();
+        e.apply_fill(acct(1), mkt(1), qty(10), price(100)).unwrap();
+        e.apply_fill(acct(2), mkt(1), qty(-4), price(110)).unwrap();
+        e.apply_fill(acct(3), mkt(1), qty(-4), price(100)).unwrap();
+        e.apply_fill(acct(4), mkt(1), qty(-2), price(95)).unwrap();
+        e.set_mark_price(mkt(1), price(90)).unwrap();
+        assert!(e.is_liquidatable(acct(1)).unwrap());
+
+        let before = e.total_value().unwrap();
+        let outcome = e.liquidate(acct(1)).unwrap();
+
+        // Ranked by profit descending at mark 90:
+        //   acct2 (110-90)*4 = 80, acct3 (100-90)*4 = 40, acct4 (95-90)*2 = 10.
+        let ranking: Vec<(AccountId, Quantity)> = outcome
+            .adl_fills
+            .iter()
+            .map(|f| (f.counterparty, f.quantity))
+            .collect();
+        assert_eq!(
+            ranking,
+            vec![(acct(2), qty(4)), (acct(3), qty(4)), (acct(4), qty(2))]
+        );
+        // Victim and every deleveraged counterparty end flat.
+        assert_eq!(e.position(acct(1), mkt(1)).unwrap(), Quantity::ZERO);
+        for a in [2u32, 3, 4] {
+            assert_eq!(e.position(acct(a), mkt(1)).unwrap(), Quantity::ZERO);
+        }
+        // ADL at the mark plus insurance/socialization conserves system value.
+        assert_eq!(e.total_value().unwrap(), before);
+    }
+
+    #[test]
+    fn socialized_loss_haircuts_solvent_collateral() {
+        let mut e = engine();
+        // Bankrupt victim: long 5 @100, collateral 10; mark crashes to 96.
+        e.open_account(acct(1), amt(10)).unwrap();
+        // Two absorbers with a 3:1 collateral ratio and no positions.
+        e.open_account(acct(2), amt(30)).unwrap();
+        e.open_account(acct(3), amt(10)).unwrap();
+        e.set_mark_price(mkt(1), price(100)).unwrap();
+        e.apply_fill(acct(1), mkt(1), qty(5), price(100)).unwrap();
+        e.set_mark_price(mkt(1), price(96)).unwrap();
+        assert_eq!(e.equity(acct(1)).unwrap(), amt(-10));
+
+        let before = e.total_value().unwrap();
+        let outcome = e.liquidate(acct(1)).unwrap();
+
+        // No insurance: the whole 10 shortfall is socialized and fully charged.
+        assert_eq!(outcome.insurance_drawn, Amount::ZERO);
+        assert_eq!(outcome.socialized_loss, amt(10));
+        assert_eq!(outcome.socialized_charged, amt(10));
+        // Pro-rata by collateral 30:10 -> 7.5 : 2.5 (units at the 6-dp scale).
+        assert_eq!(
+            outcome.haircuts,
+            vec![
+                (acct(2), Amount::from_raw(7_500_000)),
+                (acct(3), Amount::from_raw(2_500_000)),
+            ]
+        );
+        assert_eq!(e.collateral(acct(2)).unwrap(), Amount::from_raw(22_500_000));
+        assert_eq!(e.collateral(acct(3)).unwrap(), Amount::from_raw(7_500_000));
+        // The removed shortfall equals the haircut sum: value is conserved.
+        assert_eq!(e.total_value().unwrap(), before);
+        assert_eq!(e.socialized_loss(), amt(10));
+    }
+
+    #[test]
+    fn liquidation_within_insurance_leaves_solvent_untouched() {
+        let mut e = engine();
+        e.fund_insurance(amt(100)).unwrap();
+        e.open_account(acct(1), amt(10)).unwrap();
+        e.open_account(acct(2), amt(500)).unwrap();
+        e.set_mark_price(mkt(1), price(100)).unwrap();
+        e.apply_fill(acct(1), mkt(1), qty(5), price(100)).unwrap();
+        e.set_mark_price(mkt(1), price(96)).unwrap();
+        let before = e.total_value().unwrap();
+        let outcome = e.liquidate(acct(1)).unwrap();
+        // Insurance fully covers the 10 shortfall; nothing is socialized.
+        assert_eq!(outcome.insurance_drawn, amt(10));
+        assert_eq!(outcome.socialized_loss, Amount::ZERO);
+        assert!(outcome.haircuts.is_empty());
+        assert_eq!(e.collateral(acct(2)).unwrap(), amt(500));
+        assert_eq!(e.total_value().unwrap(), before);
+    }
+
+    // Deterministic pseudo-random liquidation soak: every liquidation preserves
+    // total system value and closes the account flat, over a randomized book.
+    #[test]
+    fn soak_liquidations_preserve_total_value() {
+        let mut e = engine();
+        e.fund_insurance(amt(1_000)).unwrap();
+        for a in 1..=8u32 {
+            e.open_account(acct(a), amt(1_000)).unwrap();
+        }
+        e.set_mark_price(mkt(1), price(100)).unwrap();
+        let mut r = Lcg(0x50A4_1111);
+        // Build a roughly balanced book of opposing positions.
+        for _ in 0..200 {
+            let a = u32::try_from(r.range(1, 8)).unwrap();
+            let q = r.range(-4, 4);
+            let px = r.range(80, 120);
+            let _ = e.apply_fill(acct(a), mkt(1), qty(q), price(px));
+        }
+        // Walk the mark around and liquidate whoever falls below maintenance,
+        // asserting conservation across every single liquidation.
+        for step in 0..40 {
+            let px = 100 + r.range(-30, 30);
+            e.set_mark_price(mkt(1), price(px)).unwrap();
+            let candidates = e.liquidation_candidates();
+            for c in candidates {
+                if !e.is_liquidatable(c).unwrap_or(false) {
+                    continue;
+                }
+                let before = e.total_value().unwrap();
+                let outcome = e.liquidate(c).unwrap();
+                // Bookkeeping identity across a liquidation:
+                //   after = before - returned_collateral + written_off_bad_debt,
+                // where returned collateral leaves the risk system and any
+                // shortfall no solvent account could absorb is written off.
+                let written_off = outcome
+                    .socialized_loss
+                    .checked_sub(outcome.socialized_charged)
+                    .unwrap();
+                let expected = before
+                    .checked_sub(outcome.returned_collateral)
+                    .unwrap()
+                    .checked_add(written_off)
+                    .unwrap();
+                assert_eq!(e.total_value().unwrap(), expected);
+                // The liquidated account is flat and closed.
+                assert_eq!(e.position(c, mkt(1)).unwrap(), Quantity::ZERO);
+                assert_eq!(e.equity(c).unwrap(), Amount::ZERO);
+                let _ = step;
+            }
+        }
     }
 }

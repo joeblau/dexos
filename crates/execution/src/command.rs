@@ -237,6 +237,18 @@ pub struct ProtocolUpgrade {
     pub target_version: u16,
 }
 
+/// Liquidate a distressed account. A privileged, keeper-triggered command (like
+/// [`SetMarkPrice`], it carries no per-account authorization — the sequenced
+/// origin is trusted). The engine cancels the account's resting orders, closes
+/// its positions via auto-deleverage, draws the insurance fund, and socializes
+/// any residual shortfall across solvent accounts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Liquidate {
+    /// The account to liquidate. Must currently be at or below maintenance
+    /// margin.
+    pub account: AccountId,
+}
+
 /// The deterministic command set applied by the engine.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Command {
@@ -272,6 +284,8 @@ pub enum Command {
     RedeemCompleteSet(CompleteSetOp),
     /// Upgrade the protocol version.
     ProtocolUpgrade(ProtocolUpgrade),
+    /// Liquidate a distressed account.
+    Liquidate(Liquidate),
 }
 
 impl Command {
@@ -294,6 +308,7 @@ impl Command {
             Command::MintCompleteSet(_) => 14,
             Command::RedeemCompleteSet(_) => 15,
             Command::ProtocolUpgrade(_) => 16,
+            Command::Liquidate(_) => 17,
         }
     }
 }
@@ -328,6 +343,15 @@ pub enum ReceiptKind {
     WalletBound,
     /// The protocol was upgraded to this version.
     ProtocolUpgraded(u16),
+    /// An account was liquidated: `(account, insurance_drawn, socialized_loss)`.
+    Liquidated {
+        /// The liquidated account.
+        account: AccountId,
+        /// Amount drawn from the insurance fund.
+        insurance_drawn: types::Amount,
+        /// Shortfall socialized after the insurance fund was exhausted.
+        socialized_loss: types::Amount,
+    },
 }
 
 /// The result of applying one command.

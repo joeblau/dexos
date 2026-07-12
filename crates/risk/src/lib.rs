@@ -37,7 +37,7 @@ mod scenario;
 pub use config::{MarginMode, OrderPriority, RiskConfig};
 pub use engine::RiskEngine;
 pub use error::RiskError;
-pub use liquidation::{InsuranceFund, LiquidationOutcome, LiquidationQueue};
+pub use liquidation::{AdlFill, InsuranceFund, LiquidationOutcome, LiquidationQueue};
 pub use position::PerpPosition;
 pub use scenario::{
     best_case_scenario_pnl, required_collateral, scenario_values, worst_case_scenario_pnl,

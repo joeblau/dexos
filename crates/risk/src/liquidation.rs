@@ -1,18 +1,26 @@
-//! Liquidation queue, insurance fund, and socialized-loss fallback.
+//! Liquidation queue, insurance fund, socialized-loss fallback, and the
+//! auto-deleverage (ADL) transfer record.
 //!
-//! When an account is liquidated its positions are closed at mark and its final
-//! equity computed. A non-negative result is solvent. A negative result is a
-//! shortfall, covered in strict priority order:
+//! When an account is liquidated the pipeline runs, in strict order:
 //!
-//! 1. the account's own remaining collateral (already reflected in equity),
-//! 2. the **insurance fund**,
-//! 3. **socialized loss** — the explicit final fallback, drawn only after the
-//!    insurance fund is exhausted.
+//! 1. **auto-deleverage** — the account's open perp positions are closed at the
+//!    mark, transferring the opposite exposure to solvent counterparties ranked
+//!    deterministically (most-profitable first, ties broken by account index).
+//!    Closing at the mark is value-neutral, so ADL never moves system value.
+//! 2. the account's own remaining collateral absorbs the loss first (it is
+//!    already reflected in the post-ADL equity),
+//! 3. the **insurance fund** covers any shortfall,
+//! 4. **socialized loss** — the explicit final fallback, a pro-rata haircut of
+//!    solvent accounts' collateral, drawn only after the insurance fund is
+//!    exhausted.
 //!
-//! Total system value (collateral + insurance fund - socialized loss) is
-//! conserved to the unit across this process.
+//! Total system value (Σ open equity + insurance fund) is conserved to the unit
+//! across the whole pipeline: the bankrupt account's negative equity is exactly
+//! matched by the insurance draw plus the solvent-collateral haircut.
 
-use types::{AccountId, Amount};
+use std::collections::{HashSet, VecDeque};
+
+use types::{AccountId, Amount, MarketId, Price, Quantity};
 
 use crate::error::RiskError;
 use crate::math::min_amount;
@@ -58,19 +66,42 @@ impl InsuranceFund {
     }
 }
 
-/// The disposition of a single liquidation.
+/// One auto-deleverage transfer: a counterparty position reduced at the mark to
+/// absorb part of the liquidated account's opposite exposure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdlFill {
+    /// The solvent account whose position was reduced.
+    pub counterparty: AccountId,
+    /// The market the transfer occurred in.
+    pub market: MarketId,
+    /// Absolute quantity transferred (always positive).
+    pub quantity: Quantity,
+    /// The mark price the transfer executed at.
+    pub price: Price,
+}
+
+/// The disposition of a single liquidation.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiquidationOutcome {
     /// The account that was liquidated.
     pub account: AccountId,
-    /// Final equity at liquidation (negative implies a shortfall).
+    /// Final equity after auto-deleverage (negative implies a shortfall).
     pub final_equity: Amount,
     /// Amount drawn from the insurance fund to cover a shortfall.
     pub insurance_drawn: Amount,
-    /// Amount that had to be socialized after the fund was exhausted.
+    /// Shortfall left uncovered after the insurance fund was exhausted (the
+    /// amount that had to be socialized).
     pub socialized_loss: Amount,
+    /// Portion of `socialized_loss` actually charged to solvent accounts. Equals
+    /// `socialized_loss` whenever solvent collateral was sufficient; a smaller
+    /// value indicates residual bad debt no solvent account could absorb.
+    pub socialized_charged: Amount,
     /// Collateral returned to a solvent liquidated account.
     pub returned_collateral: Amount,
+    /// The auto-deleverage transfers, in deterministic ranking order.
+    pub adl_fills: Vec<AdlFill>,
+    /// Per-account socialization debits, in ascending account order.
+    pub haircuts: Vec<(AccountId, Amount)>,
 }
 
 impl LiquidationOutcome {
@@ -81,34 +112,58 @@ impl LiquidationOutcome {
     }
 }
 
-/// A FIFO liquidation queue. Distressed accounts are enqueued once and drained
-/// in insertion order by the engine.
+/// A FIFO liquidation queue with O(1) membership and pop-front.
+///
+/// Distressed accounts are enqueued once (deduplicated through the membership
+/// set) and drained in insertion order by the engine. Backed by a [`VecDeque`]
+/// for O(1) `pop`-front and a [`HashSet`] for O(1) `contains`.
 #[derive(Debug, Clone, Default)]
 pub struct LiquidationQueue {
-    queue: Vec<AccountId>,
+    queue: VecDeque<AccountId>,
+    present: HashSet<AccountId>,
 }
 
 impl LiquidationQueue {
     /// An empty queue.
     #[inline]
     pub fn new() -> Self {
-        Self { queue: Vec::new() }
+        Self {
+            queue: VecDeque::new(),
+            present: HashSet::new(),
+        }
     }
 
-    /// Enqueue an account if it is not already queued (idempotent).
+    /// Enqueue an account if it is not already queued (idempotent, O(1)).
     pub fn enqueue(&mut self, account: AccountId) {
-        if !self.queue.contains(&account) {
-            self.queue.push(account);
+        if self.present.insert(account) {
+            self.queue.push_back(account);
         }
     }
 
-    /// Pop the next account to liquidate (FIFO).
+    /// Pop the next account to liquidate (FIFO, O(1)).
     pub fn pop(&mut self) -> Option<AccountId> {
-        if self.queue.is_empty() {
-            None
+        let account = self.queue.pop_front()?;
+        self.present.remove(&account);
+        Some(account)
+    }
+
+    /// Remove a specific account from the queue if present, returning whether it
+    /// was queued. Used to drop an account once it has been liquidated.
+    pub fn remove(&mut self, account: AccountId) -> bool {
+        if self.present.remove(&account) {
+            if let Some(pos) = self.queue.iter().position(|&a| a == account) {
+                self.queue.remove(pos);
+            }
+            true
         } else {
-            Some(self.queue.remove(0))
+            false
         }
+    }
+
+    /// True if `account` is currently queued (O(1)).
+    #[inline]
+    pub fn contains(&self, account: AccountId) -> bool {
+        self.present.contains(&account)
     }
 
     /// Number of queued accounts.
@@ -121,12 +176,6 @@ impl LiquidationQueue {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
-    }
-
-    /// A snapshot of the queued accounts in order.
-    #[inline]
-    pub fn as_slice(&self) -> &[AccountId] {
-        &self.queue
     }
 }
 
@@ -170,7 +219,28 @@ mod tests {
         q.enqueue(AccountId::new(2));
         q.enqueue(AccountId::new(1)); // dup ignored
         assert_eq!(q.len(), 2);
+        assert!(q.contains(AccountId::new(1)));
         assert_eq!(q.pop(), Some(AccountId::new(1)));
+        assert!(!q.contains(AccountId::new(1)));
+        assert_eq!(q.pop(), Some(AccountId::new(2)));
+        assert_eq!(q.pop(), None);
+    }
+
+    #[test]
+    fn queue_remove_targets_specific_account() {
+        let mut q = LiquidationQueue::new();
+        q.enqueue(AccountId::new(1));
+        q.enqueue(AccountId::new(2));
+        q.enqueue(AccountId::new(3));
+        // Remove the middle account; the rest keep FIFO order and re-enqueue is
+        // allowed after removal.
+        assert!(q.remove(AccountId::new(2)));
+        assert!(!q.remove(AccountId::new(2))); // idempotent
+        assert!(!q.contains(AccountId::new(2)));
+        assert_eq!(q.len(), 2);
+        q.enqueue(AccountId::new(2)); // goes to the back
+        assert_eq!(q.pop(), Some(AccountId::new(1)));
+        assert_eq!(q.pop(), Some(AccountId::new(3)));
         assert_eq!(q.pop(), Some(AccountId::new(2)));
         assert_eq!(q.pop(), None);
     }

@@ -124,6 +124,13 @@ impl Engine {
         &self.risk
     }
 
+    /// Number of orders currently resting in `market`'s book, or `None` if the
+    /// market is unknown. Used to observe that liquidation cancelled an account's
+    /// resting orders.
+    pub fn market_resting_len(&self, market: MarketId) -> Option<usize> {
+        self.books.get(&market.get()).map(OrderBook::resting_len)
+    }
+
     fn position(&self, account: AccountId, market: MarketId) -> Quantity {
         self.positions
             .get(&(account.get(), market.get()))
@@ -594,6 +601,70 @@ impl DeterministicEngine for Engine {
                 }
                 self.protocol_version = c.target_version;
                 Ok(self.receipt(seq, ReceiptKind::ProtocolUpgraded(c.target_version)))
+            }
+            Command::Liquidate(c) => {
+                if !self.ledger.contains(c.account) {
+                    return Err(ExecutionError::UnknownAccount);
+                }
+                // Only a distressed (at/below maintenance margin) account may be
+                // liquidated; a keeper acting on a healthy account is rejected
+                // before any state changes.
+                if !self.risk.is_liquidatable(c.account)? {
+                    return Err(ExecutionError::AccountNotLiquidatable);
+                }
+                // Phase 1: cancel every resting order the account holds, across
+                // all markets, so a dead account leaves nothing on the books.
+                let market_ids: Vec<u32> = {
+                    let mut ids: Vec<u32> = self.books.keys().copied().collect();
+                    ids.sort_unstable();
+                    ids
+                };
+                for m in &market_ids {
+                    if let Some(book) = self.books.get_mut(m) {
+                        book.cancel_all(c.account);
+                    }
+                }
+                // Phases 2-4: auto-deleverage, insurance draw, and socialization
+                // are settled by the risk engine.
+                let outcome = self.risk.liquidate(c.account)?;
+                // Reconcile the external position mirror for every account the
+                // pipeline touched (the victim plus each ADL counterparty).
+                let mut affected: Vec<AccountId> = Vec::with_capacity(outcome.adl_fills.len() + 1);
+                affected.push(c.account);
+                for f in &outcome.adl_fills {
+                    affected.push(f.counterparty);
+                }
+                for (a, _) in &outcome.haircuts {
+                    affected.push(*a);
+                }
+                affected.sort_by_key(|a| a.get());
+                affected.dedup();
+                for a in &affected {
+                    for m in &market_ids {
+                        let market = MarketId::new(*m);
+                        let qty = self.risk.position(*a, market).unwrap_or(Quantity::ZERO);
+                        let key = (a.get(), *m);
+                        if qty.raw() == 0 {
+                            self.positions.remove(&key);
+                        } else {
+                            self.positions.insert(key, qty);
+                        }
+                    }
+                    self.commit_account(*a)?;
+                }
+                // Cancelled orders and reconciled book positions change every
+                // touched market root.
+                for m in &market_ids {
+                    self.commit_market(MarketId::new(*m))?;
+                }
+                Ok(self.receipt(
+                    seq,
+                    ReceiptKind::Liquidated {
+                        account: c.account,
+                        insurance_drawn: outcome.insurance_drawn,
+                        socialized_loss: outcome.socialized_loss,
+                    },
+                ))
             }
         }
     }

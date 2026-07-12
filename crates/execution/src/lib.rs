@@ -14,8 +14,8 @@ pub mod session;
 pub use command::{
     Authorization, AuthorizeSession, BindWallet, CancelAll, CancelOrder, Command, CompleteSetOp,
     CreateAccount, CreateMarket, DepositCredit, DeterministicEngine, ExecutionReceipt,
-    FinalizeWithdrawal, PlaceOrder, ProtocolUpgrade, ReceiptKind, ReplaceOrder, RequestWithdrawal,
-    RevokeSession, SetMarkPrice, Timestamp,
+    FinalizeWithdrawal, Liquidate, PlaceOrder, ProtocolUpgrade, ReceiptKind, ReplaceOrder,
+    RequestWithdrawal, RevokeSession, SetMarkPrice, Timestamp,
 };
 pub use engine::{Engine, EngineConfig, WalletBinding};
 pub use error::ExecutionError;
@@ -1117,6 +1117,144 @@ mod tests {
         assert_eq!(
             e.wallet_binding(AccountId::new(0)).map(|b| b.chain_id),
             Some(2)
+        );
+    }
+
+    // A crossed perp book where the taker becomes bankrupt after the mark moves
+    // against it. Account 0 is the solvent counterparty, account 1 the victim.
+    // The victim also holds a resting bid that never fills.
+    fn liquidation_script() -> Vec<Command> {
+        let market = MarketId::new(0);
+        let (maker, taker) = (AccountId::new(0), AccountId::new(1));
+        let order = |account, order_id, side, price, qty| {
+            Command::PlaceOrder(PlaceOrder {
+                account,
+                market,
+                order_id: OrderId::new(order_id),
+                side,
+                order_type: OrderType::Limit,
+                tif: TimeInForce::Gtc,
+                price: Price::from_raw(price),
+                quantity: Quantity::from_raw(qty),
+                client_id: order_id,
+                reduce_only: false,
+                auth: Authorization::Master,
+            })
+        };
+        vec![
+            Command::CreateAccount(CreateAccount {
+                initial_collateral: amt(1_000_000_000), // 1000.0
+            }),
+            Command::CreateAccount(CreateAccount {
+                initial_collateral: amt(60_000_000), // 60.0
+            }),
+            Command::CreateMarket(CreateMarket {
+                market,
+                market_type: MarketType::Perpetual,
+                outcomes: 1,
+                mark_price: Price::from_raw(100_000_000), // 100.0
+            }),
+            // Maker rests an ask; taker crosses -> maker short 5, taker long 5.
+            order(maker, 1, Side::Ask, 100_000_000, 5_000_000),
+            order(taker, 2, Side::Bid, 100_000_000, 5_000_000),
+            // Taker rests a bid below the mark that never fills.
+            order(taker, 3, Side::Bid, 90_000_000, 1_000_000),
+            // Mark crashes -> the taker's long is deeply underwater.
+            Command::SetMarkPrice(SetMarkPrice {
+                market,
+                price: Price::from_raw(80_000_000), // 80.0
+            }),
+            Command::Liquidate(Liquidate { account: taker }),
+        ]
+    }
+
+    #[test]
+    fn liquidation_cancels_orders_deleverages_and_socializes() {
+        let market = MarketId::new(0);
+        let (maker, taker) = (AccountId::new(0), AccountId::new(1));
+        let script = liquidation_script();
+        let mut e = engine();
+        // Apply everything up to (but not including) the liquidation.
+        let last = script.len() - 1;
+        for (i, c) in script[..last].iter().enumerate() {
+            e.execute(seq(i as u64 + 1), c.clone()).expect("apply");
+        }
+        // A healthy account cannot be liquidated.
+        assert_eq!(
+            e.risk().position(taker, market).unwrap(),
+            Quantity::from_raw(5_000_000)
+        );
+        assert_eq!(e.market_resting_len(market), Some(1));
+        let value_before = e.risk().total_value().unwrap();
+
+        // Now liquidate.
+        let receipt = e
+            .execute(seq(last as u64 + 1), script[last].clone())
+            .expect("liquidate");
+        assert_eq!(
+            receipt.kind,
+            ReceiptKind::Liquidated {
+                account: taker,
+                insurance_drawn: Amount::ZERO,
+                socialized_loss: amt(40_000_000),
+            }
+        );
+
+        // Acceptance: no resting orders remain for the dead account.
+        assert_eq!(e.market_resting_len(market), Some(0));
+        // Acceptance: positions closed via ADL — both legs flat.
+        assert_eq!(e.risk().position(taker, market).unwrap(), Quantity::ZERO);
+        assert_eq!(e.risk().position(maker, market).unwrap(), Quantity::ZERO);
+        // Acceptance: socialized loss debited the solvent counterparty. The maker
+        // gained 100 closing its short at 80, then absorbed the 40 shortfall.
+        assert_eq!(e.risk().socialized_loss(), amt(40_000_000));
+        assert_eq!(e.risk().collateral(maker).unwrap(), amt(1_060_000_000));
+        // The liquidated account is closed and flat.
+        assert_eq!(e.risk().equity(taker).unwrap(), Amount::ZERO);
+        // Acceptance: total system value conserved across the liquidation.
+        assert_eq!(e.risk().total_value().unwrap(), value_before);
+
+        // Re-liquidating a now-closed / healthy account is rejected.
+        assert!(matches!(
+            e.execute(seq(1_000), Command::Liquidate(Liquidate { account: maker })),
+            Err(ExecutionError::AccountNotLiquidatable)
+        ));
+    }
+
+    #[test]
+    fn liquidation_is_deterministic_under_replay() {
+        let script = liquidation_script();
+        assert_eq!(run(&script), run(&script));
+    }
+
+    #[test]
+    fn liquidating_healthy_account_is_rejected() {
+        let mut e = engine();
+        e.execute(
+            seq(1),
+            Command::CreateAccount(CreateAccount {
+                initial_collateral: amt(1_000_000),
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            e.execute(
+                seq(2),
+                Command::Liquidate(Liquidate {
+                    account: AccountId::new(0),
+                }),
+            ),
+            Err(ExecutionError::AccountNotLiquidatable)
+        );
+        // Unknown account is rejected too.
+        assert_eq!(
+            e.execute(
+                seq(3),
+                Command::Liquidate(Liquidate {
+                    account: AccountId::new(9),
+                }),
+            ),
+            Err(ExecutionError::UnknownAccount)
         );
     }
 }

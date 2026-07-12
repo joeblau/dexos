@@ -28,6 +28,13 @@ pub(crate) fn neg_amount(a: Amount) -> Result<Amount, RiskError> {
         .map_err(|_| RiskError::Arith(ArithError::Overflow))
 }
 
+/// Negate an `i64`, erroring at `i64::MIN` rather than wrapping.
+#[inline]
+pub(crate) fn neg_i64(v: i64) -> Result<i64, RiskError> {
+    v.checked_neg()
+        .ok_or(RiskError::Arith(ArithError::Overflow))
+}
+
 /// The larger of two amounts.
 #[inline]
 pub(crate) fn max_amount(a: Amount, b: Amount) -> Amount {

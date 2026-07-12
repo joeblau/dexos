@@ -56,6 +56,10 @@ pub enum ExecutionError {
     /// A cancel/replace targeted a resting order owned by a different account.
     #[error("order is not owned by the requesting account")]
     OrderNotOwned,
+    /// A liquidation was requested for an account that is not at or below its
+    /// maintenance-margin threshold.
+    #[error("account is not liquidatable")]
+    AccountNotLiquidatable,
     /// A command arrived with a sequence number that did not strictly advance
     /// the engine's last applied sequence (replay or out-of-order delivery).
     #[error("non-monotonic sequence: last {last}, got {got}")]
