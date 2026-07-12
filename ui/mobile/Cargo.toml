@@ -1,0 +1,23 @@
+[package]
+name = "dexos-mobile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# The mobile frontend (iOS/Android via Dioxus mobile). Like desktop it links the
+# native `client` and talks to a node directly. Built for a mobile target via
+# `dx serve --platform ios|android`; never by the engine's default `cargo build`.
+[dependencies]
+dioxus = { workspace = true, features = ["mobile"] }
+dexos-ui = { path = "../shared" }
+client = { path = "../../crates/client" }
+proto = { path = "../../crates/proto" }
+
+[[bin]]
+name = "dexos-mobile"
+path = "src/main.rs"

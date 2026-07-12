@@ -1444,20 +1444,8 @@ fn decode_never_panics_on_arbitrary_bytes() {
     }
 }
 
-#[test]
-fn no_floating_point_in_wire_types() {
-    // A grep-in-test guard mirroring the CI no-float gate for wire structs.
-    for src in [
-        include_str!("wire.rs"),
-        include_str!("command.rs"),
-        include_str!("request.rs"),
-        include_str!("response.rs"),
-        include_str!("stream.rs"),
-    ] {
-        assert!(!src.contains("f32"), "f32 found in a wire module");
-        assert!(!src.contains("f64"), "f64 found in a wire module");
-    }
-}
+// The `no_floating_point_in_wire_types` grep-in-test guard moved to the `proto`
+// crate alongside the wire modules it scans (see `proto/src/lib.rs`).
 
 // ---------------------------------------------------------------------------
 // Async server (Tokio)

@@ -1,0 +1,21 @@
+[package]
+name = "proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# Transport-free wire/protocol types shared by the async `rpc` server and any
+# client (native or wasm). Deliberately links no async runtime, TLS, or sockets —
+# only the deterministic-adjacent primitives — so a frontend can build, sign,
+# encode, and decode requests without dragging in tokio/rustls/ring.
+[dependencies]
+types = { path = "../types" }
+codec = { path = "../codec" }
+crypto = { path = "../crypto" }
+serde.workspace = true
+thiserror.workspace = true

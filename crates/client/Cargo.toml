@@ -1,0 +1,25 @@
+[package]
+name = "client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# A native RPC client for the DexOS node. Wraps the transport-free `proto` wire
+# types with `rpc`'s plaintext-TCP `round_trip` into a small typed `Client`,
+# generalizing the request-building + ed25519 signing that `bin/dexos` does
+# inline. Consumed by the native frontends (desktop/mobile) and the web app's
+# server side. Native only — it links `rpc` (tokio/rustls) and is not a wasm dep.
+[dependencies]
+proto = { path = "../proto" }
+rpc = { path = "../rpc" }
+crypto = { path = "../crypto" }
+types = { path = "../types" }
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }

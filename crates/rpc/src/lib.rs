@@ -27,21 +27,21 @@
 #![forbid(unsafe_code)]
 
 pub mod backend;
-pub mod command;
-pub mod error;
 pub mod idempotency;
 pub mod limits;
 pub mod metrics;
-pub mod request;
-pub mod response;
 pub mod server;
 pub mod session;
 pub mod stream;
 pub mod stub;
 pub mod tls;
-pub mod transport;
-pub mod wire;
 pub mod work;
+
+// The transport-free wire/protocol modules (`command`, `error`, `request`,
+// `response`, `transport`, `wire`) now live in the `proto` crate. Re-export them
+// as modules so both intra-crate (`crate::command::…`) and downstream
+// (`rpc::command::…`) paths keep resolving unchanged.
+pub use proto::{command, error, request, response, transport, wire};
 
 /// Crate identity, used by the node composition root for a startup manifest.
 pub const CRATE_NAME: &str = "rpc";

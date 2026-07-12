@@ -1,0 +1,24 @@
+[package]
+name = "dexos-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# The native desktop frontend (webview via Dioxus desktop). Unlike the wasm web
+# app it links the native `client` directly and talks to a node over TCP — no
+# server-function indirection. Built explicitly (`dx serve` / `cargo build -p
+# dexos-desktop`), never by the engine's default `cargo build`.
+[dependencies]
+dioxus = { workspace = true, features = ["desktop"] }
+dexos-ui = { path = "../shared" }
+client = { path = "../../crates/client" }
+proto = { path = "../../crates/proto" }
+
+[[bin]]
+name = "dexos-desktop"
+path = "src/main.rs"
