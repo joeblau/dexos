@@ -415,9 +415,6 @@ mod tests {
             sessions.authorize(&cmd, &wallets, SequenceNumber::new(3)),
             Err(CustodyError::ReplayedSession)
         );
-        assert_ne!(
-            CustodyError::ReplayedSession,
-            CustodyError::ReplayedBinding
-        );
+        assert_ne!(CustodyError::ReplayedSession, CustodyError::ReplayedBinding);
     }
 }

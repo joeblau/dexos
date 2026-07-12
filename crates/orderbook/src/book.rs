@@ -80,6 +80,14 @@ impl OrderBook {
         self.id_index.contains_key(&id)
     }
 
+    /// The account that owns the resting order `id`, if it is resting. Used by
+    /// the engine to enforce that a cancel/replace targets the caller's own
+    /// order.
+    #[must_use]
+    pub fn owner(&self, id: OrderId) -> Option<AccountId> {
+        self.id_index.get(&id).map(|loc| loc.account)
+    }
+
     /// The stubbed net position for `account` (positive long, negative short).
     /// Position tracking is external; the book consults this only for
     /// reduce-only handling.

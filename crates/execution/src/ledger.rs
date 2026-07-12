@@ -50,6 +50,11 @@ impl Ledger {
         self.available.len()
     }
 
+    /// Whether `account` has been allocated.
+    pub fn contains(&self, account: AccountId) -> bool {
+        self.idx(account).is_ok()
+    }
+
     /// Allocate the next account densely, crediting optional genesis collateral.
     pub fn create_account(&mut self, initial: Amount) -> Result<AccountId, ExecutionError> {
         non_negative(initial)?;

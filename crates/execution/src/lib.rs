@@ -12,12 +12,12 @@ pub mod ledger;
 pub mod session;
 
 pub use command::{
-    AuthorizeSession, BindWallet, CancelAll, CancelOrder, Command, CompleteSetOp, CreateAccount,
-    CreateMarket, DepositCredit, DeterministicEngine, ExecutionReceipt, FinalizeWithdrawal,
-    PlaceOrder, ProtocolUpgrade, ReceiptKind, ReplaceOrder, RequestWithdrawal, RevokeSession,
-    SetMarkPrice, Timestamp,
+    Authorization, AuthorizeSession, BindWallet, CancelAll, CancelOrder, Command, CompleteSetOp,
+    CreateAccount, CreateMarket, DepositCredit, DeterministicEngine, ExecutionReceipt,
+    FinalizeWithdrawal, PlaceOrder, ProtocolUpgrade, ReceiptKind, ReplaceOrder, RequestWithdrawal,
+    RevokeSession, SetMarkPrice, Timestamp,
 };
-pub use engine::{Engine, EngineConfig};
+pub use engine::{Engine, EngineConfig, WalletBinding};
 pub use error::ExecutionError;
 pub use ledger::Ledger;
 pub use session::SessionRegistry;
@@ -58,6 +58,7 @@ mod tests {
                 quantity: Quantity::from_raw(qty),
                 client_id: order_id,
                 reduce_only: false,
+                auth: Authorization::Master,
             })
         };
         vec![
@@ -86,6 +87,7 @@ mod tests {
                 nonce: 1,
                 destination_chain: 1,
                 destination_address: vec![1, 2, 3],
+                auth: Authorization::Master,
             }),
         ]
     }
@@ -196,6 +198,7 @@ mod tests {
                     nonce: 1,
                     destination_chain: 1,
                     destination_address: vec![1, 2, 3],
+                    auth: Authorization::Master,
                 }),
             )
             .unwrap();
@@ -316,6 +319,7 @@ mod tests {
                 quantity: Quantity::from_raw(1_000_000),
                 client_id: 1,
                 reduce_only: false,
+                auth: Authorization::Master,
             }),
         )
         .unwrap();
@@ -333,6 +337,7 @@ mod tests {
                     quantity: Quantity::from_raw(1_000_000),
                     client_id: 2,
                     reduce_only: false,
+                    auth: Authorization::Master,
                 }),
             )
             .unwrap();
@@ -377,6 +382,7 @@ mod tests {
                 quantity: Quantity::from_raw(1_000_000),
                 client_id,
                 reduce_only: false,
+                auth: Authorization::Master,
             })
         };
         // First order rests and advances the committed state root.
@@ -420,6 +426,7 @@ mod tests {
                 quantity: Quantity::from_raw(2_000_000),
                 client_id: 1,
                 reduce_only: false,
+                auth: Authorization::Master,
             }),
             Command::PlaceOrder(PlaceOrder {
                 account: types::AccountId::new(1),
@@ -432,6 +439,7 @@ mod tests {
                 quantity: Quantity::from_raw(1_000_000),
                 client_id: 2,
                 reduce_only: false,
+                auth: Authorization::Master,
             }),
             Command::DepositCredit(DepositCredit {
                 source_chain: 1,
@@ -528,6 +536,7 @@ mod tests {
                 quantity: Quantity::from_raw(2_000_000),
                 client_id: 1,
                 reduce_only: false,
+                auth: Authorization::Master,
             }),
         )
         .unwrap();
@@ -544,6 +553,7 @@ mod tests {
                 quantity: Quantity::from_raw(2_000_000),
                 client_id: 2,
                 reduce_only: false,
+                auth: Authorization::Master,
             }),
         )
         .unwrap();
@@ -723,5 +733,390 @@ mod tests {
             })
         );
         assert_eq!(e.protocol_version(), 2);
+    }
+
+    // -------- Session-key authorization enforcement (issue #277) --------
+
+    const SESSION_KEY: [u8; 32] = [7u8; 32];
+
+    // A 100.0-collateral account, two perp markets (0 and 1) at mark 1.0, and a
+    // session key for account 0 scoped to market 0 with a 2.0 per-order notional
+    // cap, expiry 1000, and nonces 0..=10. Returns the engine and next sequence.
+    fn session_fixture() -> (Engine, u64) {
+        let mut e = engine();
+        e.execute(
+            seq(1),
+            Command::CreateAccount(CreateAccount {
+                initial_collateral: amt(100_000_000),
+            }),
+        )
+        .unwrap();
+        for (n, m) in [(2u64, 0u32), (3, 1)] {
+            e.execute(
+                seq(n),
+                Command::CreateMarket(CreateMarket {
+                    market: MarketId::new(m),
+                    market_type: MarketType::Perpetual,
+                    outcomes: 1,
+                    mark_price: Price::from_raw(1_000_000),
+                }),
+            )
+            .unwrap();
+        }
+        e.execute(
+            seq(4),
+            Command::AuthorizeSession(AuthorizeSession {
+                account: AccountId::new(0),
+                session_key: SESSION_KEY,
+                allowed_markets: vec![MarketId::new(0)],
+                max_notional: amt(2_000_000),
+                expires_at: 1000,
+                nonce_start: 0,
+                nonce_end: 10,
+            }),
+        )
+        .unwrap();
+        (e, 5)
+    }
+
+    fn sess(nonce: u64, now: u64) -> Authorization {
+        Authorization::Session {
+            session_key: SESSION_KEY,
+            nonce,
+            now,
+        }
+    }
+
+    // A resting bid on `market` (price 0.9, so it never crosses) for account 0.
+    fn place_bid(market: u32, order_id: u64, qty: i64, auth: Authorization) -> Command {
+        Command::PlaceOrder(PlaceOrder {
+            account: AccountId::new(0),
+            market: MarketId::new(market),
+            order_id: OrderId::new(order_id),
+            side: Side::Bid,
+            order_type: OrderType::Limit,
+            tif: TimeInForce::Gtc,
+            price: Price::from_raw(900_000),
+            quantity: Quantity::from_raw(qty),
+            client_id: order_id,
+            reduce_only: false,
+            auth,
+        })
+    }
+
+    // Acceptance criteria: a PlaceOrder must present a session that is known,
+    // in-scope for the market, under the notional cap, unexpired, and whose
+    // nonce has not been used — or the account master key.
+    #[test]
+    fn place_order_enforces_session_scope_expiry_notional_and_nonce() {
+        let (mut e, mut n) = session_fixture();
+        // A valid session order rests.
+        let r = e
+            .execute(seq(n), place_bid(0, 1, 1_000_000, sess(0, 500)))
+            .unwrap();
+        assert!(matches!(r.kind, ReceiptKind::OrderApplied { .. }));
+        n += 1;
+        // Replaying nonce 0 is rejected.
+        assert_eq!(
+            e.execute(seq(n), place_bid(0, 2, 1_000_000, sess(0, 500))),
+            Err(ExecutionError::BadNonce)
+        );
+        n += 1;
+        // An unknown session key is rejected.
+        assert_eq!(
+            e.execute(
+                seq(n),
+                place_bid(
+                    0,
+                    3,
+                    1_000_000,
+                    Authorization::Session {
+                        session_key: [9u8; 32],
+                        nonce: 1,
+                        now: 500,
+                    },
+                ),
+            ),
+            Err(ExecutionError::UnknownSession)
+        );
+        n += 1;
+        // Over the per-order notional cap (0.9 * 3.0 = 2.7 > 2.0).
+        assert_eq!(
+            e.execute(seq(n), place_bid(0, 4, 3_000_000, sess(1, 500))),
+            Err(ExecutionError::NotionalExceeded)
+        );
+        n += 1;
+        // A market outside the session scope.
+        assert_eq!(
+            e.execute(seq(n), place_bid(1, 5, 1_000_000, sess(2, 500))),
+            Err(ExecutionError::MarketNotAuthorized)
+        );
+        n += 1;
+        // After the session expiry.
+        assert_eq!(
+            e.execute(seq(n), place_bid(0, 6, 1_000_000, sess(3, 2000))),
+            Err(ExecutionError::SessionExpired)
+        );
+        n += 1;
+        // The master key is always accepted.
+        let r = e
+            .execute(seq(n), place_bid(0, 7, 1_000_000, Authorization::Master))
+            .unwrap();
+        assert!(matches!(r.kind, ReceiptKind::OrderApplied { .. }));
+    }
+
+    // Acceptance criterion (withdraw path): a scoped session key cannot move
+    // funds out of custody; only the master key may withdraw.
+    #[test]
+    fn withdrawal_requires_master_key() {
+        let (mut e, mut n) = session_fixture();
+        let acct = AccountId::new(0);
+        assert_eq!(
+            e.execute(
+                seq(n),
+                Command::RequestWithdrawal(RequestWithdrawal {
+                    account: acct,
+                    amount: amt(1_000_000),
+                    nonce: 1,
+                    destination_chain: 1,
+                    destination_address: vec![9, 9, 9],
+                    auth: sess(0, 500),
+                }),
+            ),
+            Err(ExecutionError::SessionCannotWithdraw)
+        );
+        // Nothing was reserved by the rejected session withdrawal.
+        assert_eq!(e.ledger().reserved(acct).unwrap(), amt(0));
+        n += 1;
+        let r = e
+            .execute(
+                seq(n),
+                Command::RequestWithdrawal(RequestWithdrawal {
+                    account: acct,
+                    amount: amt(1_000_000),
+                    nonce: 1,
+                    destination_chain: 1,
+                    destination_address: vec![9, 9, 9],
+                    auth: Authorization::Master,
+                }),
+            )
+            .unwrap();
+        assert!(matches!(r.kind, ReceiptKind::WithdrawalRequested(_)));
+        assert_eq!(e.ledger().reserved(acct).unwrap(), amt(1_000_000));
+    }
+
+    // Cancel/replace enforce both ownership (defense in depth) and, when a
+    // session key is used, the session's market scope and nonce.
+    #[test]
+    fn cancel_and_replace_enforce_ownership_and_session_scope() {
+        let mut e = engine();
+        let mut n = 1u64;
+        for _ in 0..2 {
+            e.execute(
+                seq(n),
+                Command::CreateAccount(CreateAccount {
+                    initial_collateral: amt(100_000_000),
+                }),
+            )
+            .unwrap();
+            n += 1;
+        }
+        for m in [0u32, 1] {
+            e.execute(
+                seq(n),
+                Command::CreateMarket(CreateMarket {
+                    market: MarketId::new(m),
+                    market_type: MarketType::Perpetual,
+                    outcomes: 1,
+                    mark_price: Price::from_raw(1_000_000),
+                }),
+            )
+            .unwrap();
+            n += 1;
+        }
+        for oid in [1u64, 2] {
+            e.execute(seq(n), place_bid(0, oid, 1_000_000, Authorization::Master))
+                .unwrap();
+            n += 1;
+        }
+        // Account 1 may neither cancel nor replace account 0's order.
+        assert_eq!(
+            e.execute(
+                seq(n),
+                Command::CancelOrder(CancelOrder {
+                    market: MarketId::new(0),
+                    account: AccountId::new(1),
+                    order_id: OrderId::new(1),
+                    auth: Authorization::Master,
+                }),
+            ),
+            Err(ExecutionError::OrderNotOwned)
+        );
+        n += 1;
+        assert_eq!(
+            e.execute(
+                seq(n),
+                Command::ReplaceOrder(ReplaceOrder {
+                    market: MarketId::new(0),
+                    account: AccountId::new(1),
+                    order_id: OrderId::new(1),
+                    price: Price::from_raw(800_000),
+                    quantity: Quantity::from_raw(1_000_000),
+                    auth: Authorization::Master,
+                }),
+            ),
+            Err(ExecutionError::OrderNotOwned)
+        );
+        n += 1;
+        // Authorize a market-0 session for account 0.
+        e.execute(
+            seq(n),
+            Command::AuthorizeSession(AuthorizeSession {
+                account: AccountId::new(0),
+                session_key: SESSION_KEY,
+                allowed_markets: vec![MarketId::new(0)],
+                max_notional: amt(2_000_000),
+                expires_at: 1000,
+                nonce_start: 0,
+                nonce_end: 10,
+            }),
+        )
+        .unwrap();
+        n += 1;
+        // A market-0 session cannot act in market 1.
+        assert_eq!(
+            e.execute(
+                seq(n),
+                Command::CancelOrder(CancelOrder {
+                    market: MarketId::new(1),
+                    account: AccountId::new(0),
+                    order_id: OrderId::new(99),
+                    auth: sess(0, 500),
+                }),
+            ),
+            Err(ExecutionError::MarketNotAuthorized)
+        );
+        n += 1;
+        // The owner cancels its own order via the in-scope session (nonce 0).
+        let r = e
+            .execute(
+                seq(n),
+                Command::CancelOrder(CancelOrder {
+                    market: MarketId::new(0),
+                    account: AccountId::new(0),
+                    order_id: OrderId::new(1),
+                    auth: sess(0, 500),
+                }),
+            )
+            .unwrap();
+        assert_eq!(r.kind, ReceiptKind::Cancelled(1));
+        n += 1;
+        // Replaying that session nonce on a later cancel is rejected.
+        assert_eq!(
+            e.execute(
+                seq(n),
+                Command::CancelOrder(CancelOrder {
+                    market: MarketId::new(0),
+                    account: AccountId::new(0),
+                    order_id: OrderId::new(2),
+                    auth: sess(0, 500),
+                }),
+            ),
+            Err(ExecutionError::BadNonce)
+        );
+    }
+
+    // Defense in depth: the engine rejects a replayed or out-of-order sequence.
+    #[test]
+    fn non_monotonic_sequence_is_rejected() {
+        let mut e = engine();
+        e.execute(
+            seq(5),
+            Command::CreateAccount(CreateAccount {
+                initial_collateral: amt(1_000_000),
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            e.execute(
+                seq(5),
+                Command::CreateAccount(CreateAccount {
+                    initial_collateral: amt(0),
+                }),
+            ),
+            Err(ExecutionError::NonMonotonicSequence { last: 5, got: 5 })
+        );
+        assert_eq!(
+            e.execute(
+                seq(3),
+                Command::CreateAccount(CreateAccount {
+                    initial_collateral: amt(0),
+                }),
+            ),
+            Err(ExecutionError::NonMonotonicSequence { last: 5, got: 3 })
+        );
+        // A strictly greater sequence advances.
+        e.execute(
+            seq(6),
+            Command::CreateAccount(CreateAccount {
+                initial_collateral: amt(0),
+            }),
+        )
+        .unwrap();
+    }
+
+    // Recommendation: wallet bindings are persisted (no longer a no-op) and
+    // validated against account existence.
+    #[test]
+    fn bind_wallet_persists_and_validates_account() {
+        let mut e = engine();
+        e.execute(
+            seq(1),
+            Command::CreateAccount(CreateAccount {
+                initial_collateral: amt(0),
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            e.execute(
+                seq(2),
+                Command::BindWallet(BindWallet {
+                    account: AccountId::new(9),
+                    chain_id: 1,
+                    address: vec![0xaa; 20],
+                }),
+            ),
+            Err(ExecutionError::UnknownAccount)
+        );
+        e.execute(
+            seq(3),
+            Command::BindWallet(BindWallet {
+                account: AccountId::new(0),
+                chain_id: 1,
+                address: vec![0xaa; 20],
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            e.wallet_binding(AccountId::new(0)),
+            Some(&WalletBinding {
+                chain_id: 1,
+                address: vec![0xaa; 20],
+            })
+        );
+        // Rebinding overwrites the prior binding.
+        e.execute(
+            seq(4),
+            Command::BindWallet(BindWallet {
+                account: AccountId::new(0),
+                chain_id: 2,
+                address: vec![0xbb; 20],
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            e.wallet_binding(AccountId::new(0)).map(|b| b.chain_id),
+            Some(2)
+        );
     }
 }

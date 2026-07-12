@@ -410,12 +410,12 @@ impl StreamHub {
     /// 2. If at capacity, drop topics with zero live receivers.
     /// 3. If still at capacity, evict the topic with the lowest
     ///    `receiver_count` (ties broken by first match) until there is room.
-    fn topic_entry<'a>(
-        channels: &'a mut HashMap<Topic, TopicChannel>,
+    fn topic_entry(
+        channels: &mut HashMap<Topic, TopicChannel>,
         topic: Topic,
         capacity: usize,
         max_topics: usize,
-    ) -> &'a mut TopicChannel {
+    ) -> &mut TopicChannel {
         if channels.contains_key(&topic) {
             return channels.get_mut(&topic).expect("topic just checked");
         }

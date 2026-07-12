@@ -49,6 +49,22 @@ pub enum ExecutionError {
     /// The order notional exceeds the session's max notional.
     #[error("order exceeds session notional limit")]
     NotionalExceeded,
+    /// A scoped session key was presented to authorize a withdrawal. Session
+    /// keys are trading-only; only the account master key may withdraw funds.
+    #[error("session keys cannot authorize withdrawals")]
+    SessionCannotWithdraw,
+    /// A cancel/replace targeted a resting order owned by a different account.
+    #[error("order is not owned by the requesting account")]
+    OrderNotOwned,
+    /// A command arrived with a sequence number that did not strictly advance
+    /// the engine's last applied sequence (replay or out-of-order delivery).
+    #[error("non-monotonic sequence: last {last}, got {got}")]
+    NonMonotonicSequence {
+        /// Last sequence the engine applied.
+        last: u64,
+        /// Sequence just presented.
+        got: u64,
+    },
     /// Referenced market does not exist.
     #[error("unknown market")]
     UnknownMarket,

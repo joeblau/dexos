@@ -12,7 +12,7 @@ use risk::{RiskConfig, RiskEngine};
 use state_tree::{LeafWriter, StateTree};
 use types::{AccountId, Amount, Hash, MarketId, MarketType, Quantity, SequenceNumber, Side};
 
-use crate::command::{Command, DeterministicEngine, ExecutionReceipt, ReceiptKind};
+use crate::command::{Authorization, Command, DeterministicEngine, ExecutionReceipt, ReceiptKind};
 use crate::error::ExecutionError;
 use crate::ledger::Ledger;
 use crate::session::SessionRegistry;
@@ -56,6 +56,15 @@ struct Withdrawal {
     finalized: bool,
 }
 
+/// A persisted external-wallet binding for an account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalletBinding {
+    /// External chain id.
+    pub chain_id: u32,
+    /// External wallet address bytes.
+    pub address: Vec<u8>,
+}
+
 /// The deterministic exchange engine.
 pub struct Engine {
     ledger: Ledger,
@@ -70,6 +79,8 @@ pub struct Engine {
     withdrawals: HashMap<u64, Withdrawal>,
     next_withdrawal_id: u64,
     protocol_version: u16,
+    wallets: HashMap<u32, WalletBinding>,
+    last_seq: Option<u64>,
 }
 
 impl Engine {
@@ -88,6 +99,8 @@ impl Engine {
             withdrawals: HashMap::new(),
             next_withdrawal_id: 0,
             protocol_version: 1,
+            wallets: HashMap::new(),
+            last_seq: None,
         }
     }
 
@@ -99,6 +112,11 @@ impl Engine {
     /// Read-only ledger access.
     pub fn ledger(&self) -> &Ledger {
         &self.ledger
+    }
+
+    /// The persisted external-wallet binding for `account`, if one exists.
+    pub fn wallet_binding(&self, account: AccountId) -> Option<&WalletBinding> {
+        self.wallets.get(&account.get())
     }
 
     /// Read-only risk access.
@@ -259,6 +277,34 @@ impl Engine {
             state_root: self.tree.root(),
         }
     }
+
+    /// Enforce authorization for a mutating trade command acting on `account` in
+    /// `market` with the given per-order `notional`.
+    ///
+    /// [`Authorization::Master`] carries the account owner's own authority (its
+    /// signature is verified upstream) and is always accepted. A
+    /// [`Authorization::Session`] command is validated against the scoped
+    /// session key via [`SessionRegistry::consume`], which enforces expiry,
+    /// market scope, the notional cap, and single-use nonce, and mutates the
+    /// session only on success — so a rejected command leaves no state behind.
+    fn authorize(
+        &mut self,
+        account: AccountId,
+        market: MarketId,
+        notional: Amount,
+        auth: &Authorization,
+    ) -> Result<(), ExecutionError> {
+        match auth {
+            Authorization::Master => Ok(()),
+            Authorization::Session {
+                session_key,
+                nonce,
+                now,
+            } => self
+                .sessions
+                .consume(account, *session_key, *nonce, market, notional, *now),
+        }
+    }
 }
 
 impl DeterministicEngine for Engine {
@@ -268,6 +314,15 @@ impl DeterministicEngine for Engine {
         command: Command,
     ) -> Result<ExecutionReceipt, ExecutionError> {
         let seq = sequence.get();
+        // Defense in depth: the sequencer assigns a strictly increasing sequence
+        // to every log entry, so a replayed or out-of-order command is rejected
+        // before it can touch any state.
+        if let Some(last) = self.last_seq {
+            if seq <= last {
+                return Err(ExecutionError::NonMonotonicSequence { last, got: seq });
+            }
+        }
+        self.last_seq = Some(seq);
         match command {
             Command::CreateAccount(c) => {
                 let id = self.ledger.create_account(c.initial_collateral)?;
@@ -275,7 +330,19 @@ impl DeterministicEngine for Engine {
                 self.commit_account(id)?;
                 Ok(self.receipt(seq, ReceiptKind::AccountCreated(id)))
             }
-            Command::BindWallet(_c) => Ok(self.receipt(seq, ReceiptKind::WalletBound)),
+            Command::BindWallet(c) => {
+                if !self.ledger.contains(c.account) {
+                    return Err(ExecutionError::UnknownAccount);
+                }
+                self.wallets.insert(
+                    c.account.get(),
+                    WalletBinding {
+                        chain_id: c.chain_id,
+                        address: c.address,
+                    },
+                );
+                Ok(self.receipt(seq, ReceiptKind::WalletBound))
+            }
             Command::AuthorizeSession(c) => {
                 self.sessions.authorize(
                     c.account,
@@ -307,6 +374,11 @@ impl DeterministicEngine for Engine {
                 Ok(self.receipt(seq, ReceiptKind::Credited(c.account, c.amount)))
             }
             Command::RequestWithdrawal(c) => {
+                // Withdrawals move funds out of custody: only the account master
+                // key may authorize them. Trading-only session keys are rejected.
+                if !matches!(c.auth, Authorization::Master) {
+                    return Err(ExecutionError::SessionCannotWithdraw);
+                }
                 self.ledger.reserve(c.account, c.amount)?;
                 self.risk.debit_collateral(c.account, c.amount)?;
                 let id = self.next_withdrawal_id;
@@ -375,6 +447,9 @@ impl DeterministicEngine for Engine {
                 } else {
                     meta.mark_price.notional(c.quantity)?
                 };
+                // Authenticate before any business logic so a rejected order
+                // leaves no state behind.
+                self.authorize(c.account, c.market, notional, &c.auth)?;
                 self.risk
                     .check_order_in_market(c.account, c.market, notional, c.reduce_only)?;
                 let pos = self.position(c.account, c.market);
@@ -407,6 +482,19 @@ impl DeterministicEngine for Engine {
                 Ok(self.receipt(seq, ReceiptKind::OrderApplied { filled, rested }))
             }
             Command::CancelOrder(c) => {
+                let owner = self
+                    .books
+                    .get(&c.market.get())
+                    .ok_or(ExecutionError::UnknownMarket)?
+                    .owner(c.order_id);
+                // Defense in depth: a caller may only cancel its own resting
+                // orders.
+                if matches!(owner, Some(o) if o != c.account) {
+                    return Err(ExecutionError::OrderNotOwned);
+                }
+                // Cancellation carries no notional, but still requires an
+                // in-scope, unexpired, non-replayed session (or the master key).
+                self.authorize(c.account, c.market, Amount::ZERO, &c.auth)?;
                 let book = self
                     .books
                     .get_mut(&c.market.get())
@@ -420,6 +508,11 @@ impl DeterministicEngine for Engine {
                 Ok(self.receipt(seq, ReceiptKind::Cancelled(count)))
             }
             Command::CancelAll(c) => {
+                // Ensure the market exists before authorizing.
+                if !self.books.contains_key(&c.market.get()) {
+                    return Err(ExecutionError::UnknownMarket);
+                }
+                self.authorize(c.account, c.market, Amount::ZERO, &c.auth)?;
                 let book = self
                     .books
                     .get_mut(&c.market.get())
@@ -429,6 +522,20 @@ impl DeterministicEngine for Engine {
                 Ok(self.receipt(seq, ReceiptKind::Cancelled(count)))
             }
             Command::ReplaceOrder(c) => {
+                let owner = self
+                    .books
+                    .get(&c.market.get())
+                    .ok_or(ExecutionError::UnknownMarket)?
+                    .owner(c.order_id);
+                // Defense in depth: a caller may only replace its own resting
+                // orders.
+                if matches!(owner, Some(o) if o != c.account) {
+                    return Err(ExecutionError::OrderNotOwned);
+                }
+                // A replace re-establishes an order, so it is bounded by the
+                // session's per-order notional cap like a fresh placement.
+                let notional = c.price.notional(c.quantity)?;
+                self.authorize(c.account, c.market, notional, &c.auth)?;
                 let book = self
                     .books
                     .get_mut(&c.market.get())

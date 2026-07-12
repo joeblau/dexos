@@ -11,6 +11,35 @@ use crate::error::ExecutionError;
 /// Network timestamp in nanoseconds (assigned by the sequencer, part of the log).
 pub type Timestamp = u64;
 
+/// How a mutating trade or withdraw command is authorized.
+///
+/// Cryptographic signatures are verified upstream (RPC / sequencer) before a
+/// command enters the canonical log, so the deterministic engine trusts the
+/// sequenced origin. It still enforces the *stateful* half of authorization that
+/// a signature alone cannot express: a scoped session key's expiry, market
+/// scope, per-order notional cap, and single-use nonce.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Authorization {
+    /// The account owner's master key: full authority over the account. The
+    /// owner's signature is verified upstream; no session scope is applied.
+    Master,
+    /// A scoped session key. Before the command mutates any state the engine
+    /// calls [`SessionRegistry::consume`] to enforce the session's expiry,
+    /// market scope, per-order notional cap, and monotonic-nonce replay
+    /// protection.
+    ///
+    /// [`SessionRegistry::consume`]: crate::SessionRegistry::consume
+    Session {
+        /// The authorized session public key (ed25519).
+        session_key: [u8; 32],
+        /// Single-use nonce within the session's authorized inclusive range.
+        nonce: u64,
+        /// Sequencer-assigned network time (nanoseconds) evaluated against the
+        /// session's expiry.
+        now: Timestamp,
+    },
+}
+
 /// Create a new internal account, funded with `initial_collateral` credited from
 /// an already-verified source (test / genesis). Real funds arrive via deposits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,6 +115,10 @@ pub struct RequestWithdrawal {
     pub destination_chain: u32,
     /// Destination address bytes.
     pub destination_address: Vec<u8>,
+    /// Authorization. Withdrawals move funds out of custody and are therefore
+    /// restricted to the account's master key; scoped session keys (which are
+    /// trading-only) cannot authorize a withdrawal.
+    pub auth: Authorization,
 }
 
 /// Finalize a previously requested withdrawal (custody signed & broadcast).
@@ -140,6 +173,8 @@ pub struct PlaceOrder {
     pub client_id: u64,
     /// Reduce-only flag.
     pub reduce_only: bool,
+    /// Authorization (master key or scoped session key).
+    pub auth: Authorization,
 }
 
 /// Cancel a resting order.
@@ -147,8 +182,12 @@ pub struct PlaceOrder {
 pub struct CancelOrder {
     /// Market.
     pub market: MarketId,
+    /// Owning account (must own the resting order).
+    pub account: AccountId,
     /// Order id.
     pub order_id: OrderId,
+    /// Authorization (master key or scoped session key).
+    pub auth: Authorization,
 }
 
 /// Cancel all of an account's resting orders in a market.
@@ -158,6 +197,8 @@ pub struct CancelAll {
     pub market: MarketId,
     /// Account.
     pub account: AccountId,
+    /// Authorization (master key or scoped session key).
+    pub auth: Authorization,
 }
 
 /// Atomically cancel-replace a resting order.
@@ -165,12 +206,16 @@ pub struct CancelAll {
 pub struct ReplaceOrder {
     /// Market.
     pub market: MarketId,
+    /// Owning account (must own the resting order).
+    pub account: AccountId,
     /// Order id.
     pub order_id: OrderId,
     /// New price.
     pub price: Price,
     /// New quantity.
     pub quantity: Quantity,
+    /// Authorization (master key or scoped session key).
+    pub auth: Authorization,
 }
 
 /// Mint or redeem `count` complete sets in a market.
