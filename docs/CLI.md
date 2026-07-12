@@ -50,7 +50,7 @@ These apply to every subcommand and may appear before or after it.
 | `--key <PATH>` | — | Hex ed25519 seed file that signs control methods with the account root key |
 | `--session-key <PATH>` | — | Hex ed25519 seed file for a delegated session key (signs instead of `--key`) |
 | `--client-id <ID>` | `1` | Stable per-client id; part of the exactly-once idempotency key |
-| `--nonce <N>` | `0` | Monotonic per-client nonce for the next control command |
+| `--nonce <N>` | — (required for control methods) | Monotonic per-client nonce for the next control command; ignored by queries |
 | `--request-id <ID>` | `1` | Correlation id echoed back on the response |
 
 ## Queries (unsigned)
@@ -81,12 +81,18 @@ Read-only methods need no key. Results are pretty-printed.
 ## Control methods (signed)
 
 Control methods require a signing key (`--key`, or `--session-key` for a
-delegated key). `dexos` builds the canonical `Command`, signs the domain-tagged
-bytes (`dexos.rpc.control.v1`) with ed25519, and attaches a `ControlMeta`
+delegated key) and an explicit `--nonce` — there is deliberately no default, so
+two commands can never silently collide on the same idempotency key. `dexos`
+builds the canonical `Command`, signs the domain-tagged bytes
+(`dexos.rpc.control.v1`) with ed25519, and attaches a `ControlMeta`
 (`client_id`, `nonce`, optional `session_pubkey`, `signer`, `signature`). The
 server verifies the signature before dispatch and dedupes `(client_id, nonce)`
 for exactly-once semantics — reuse the same nonce to retransmit, increment it for
-a new command. Every control method returns a `CommandAck`.
+a new command. Reusing a consumed nonce for a *different* command is rejected
+(`nonce already consumed by a different command`) rather than answered with the
+earlier command's stale ack. Every control method returns a `CommandAck`;
+`dexos` additionally verifies the ack's `command_hash` matches the command it
+actually sent and exits nonzero on a mismatch.
 
 | Subcommand | Arguments | Notes |
 |---|---|---|

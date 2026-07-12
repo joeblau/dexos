@@ -560,6 +560,20 @@ impl StakeMarketParams {
     }
 }
 
+/// The canonical hash of a [`Command`]: the domain-tagged
+/// ([`crypto::DOMAIN_COMMAND`]) hash of its [`codec`]-encoded bytes.
+///
+/// This is the single definition shared by the server (which stamps it into
+/// every [`CommandAck::command_hash`] and compares it on idempotency-key
+/// reuse), the `dexos` CLI (which re-derives it client-side to verify an ack
+/// acknowledges the command that was actually sent), and tests. Two commands
+/// hash equal iff their canonical encodings are identical, so an ack for one
+/// command can never be mistaken for an ack for another.
+pub fn command_hash(command: &Command) -> Hash {
+    let encoded = codec::encode(command).unwrap_or_default();
+    crypto::hash_domain(crypto::DOMAIN_COMMAND, &encoded)
+}
+
 /// The acknowledgement returned by every control method.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandAck {

@@ -782,6 +782,49 @@ fn commands_are_idempotent_by_client_id_and_nonce() {
     assert_eq!(b.ingested_count(), 2);
 }
 
+/// Issue #409: reusing a consumed `(client_id, nonce)` for a *different*,
+/// validly signed command must fail closed with [`RpcError::NonceReused`] —
+/// never answer with the earlier command's stale ack, which would report
+/// "Accepted" for a command that was silently dropped. An identical retransmit
+/// (same canonical command hash) is still exactly-once and gets the cached ack.
+#[test]
+fn nonce_reuse_by_a_different_command_fails_closed() {
+    let b = StubBackend::new(RpcMode::Full);
+    let kp = account_kp();
+    b.register_account_key(a(1), kp.public());
+
+    let params = sample_submit();
+    let cmd = params.to_command();
+    let meta = signed_meta(&kp, 1, 1, &cmd);
+    let ack1 = b.submit_order(&meta, &params).unwrap();
+    assert_eq!(ack1.command_hash, command_hash(&cmd));
+    assert_eq!(b.ingested_count(), 1);
+
+    // A different command, signed afresh over the same (client_id, nonce):
+    // the dedupe hit's stored hash no longer matches the incoming command.
+    let cancel = CancelAllParams {
+        account: a(1),
+        market: None,
+    };
+    let cancel_cmd = cancel.to_command();
+    assert_ne!(command_hash(&cancel_cmd), command_hash(&cmd));
+    let cancel_meta = signed_meta(&kp, 1, 1, &cancel_cmd);
+    assert_eq!(
+        b.cancel_all(&cancel_meta, &cancel),
+        Err(RpcError::NonceReused)
+    );
+    assert_eq!(
+        b.ingested_count(),
+        1,
+        "the conflicting command must not execute"
+    );
+
+    // An identical retransmit still returns the cached ack unchanged.
+    let ack2 = b.submit_order(&meta, &params).unwrap();
+    assert_eq!(ack1, ack2, "retransmit must return the original ack");
+    assert_eq!(b.ingested_count(), 1);
+}
+
 #[test]
 fn saturated_ingress_returns_backpressure() {
     let b = StubBackend::new(RpcMode::Full);

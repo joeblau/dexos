@@ -57,6 +57,19 @@ pub enum RpcError {
     /// An internal backend failure that is safe to surface to callers.
     #[error("internal error: {0}")]
     Internal(String),
+    /// A control command reused a `(client_id, nonce)` idempotency key that a
+    /// *different* command already consumed: the stored ack's command hash does
+    /// not match the incoming command's canonical hash. Returned instead of the
+    /// stale ack so a client that forgot to advance its nonce learns its new
+    /// command was **not** executed (fail closed, no silent lost write). An
+    /// identical retransmit (same command bytes) is not an error and still
+    /// yields the cached ack.
+    ///
+    /// This variant is appended at the end of the enum deliberately: the wire
+    /// encoding (postcard) serializes the variant *index*, so inserting it
+    /// mid-enum would break wire compatibility with older peers.
+    #[error("nonce already consumed by a different command")]
+    NonceReused,
 }
 
 impl From<codec::CodecError> for RpcError {
