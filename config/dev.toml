@@ -8,8 +8,8 @@ roles = ["validator", "sequencer", "witness", "gateway"]
 [network]
 listen = "0.0.0.0:9000"
 bootstrap_peers = []
-# QUIC sessions and datagram dissemination are not implemented yet; leaving them
-# enabled would fail closed at startup. Set true once the transport lands.
+# QUIC (independent streams) + native datagrams. Requires a binary built with
+# the `quic` feature (default for node/marketd). TCP fallback has reduced HOL guarantees.
 enable_quic = false
 enable_datagrams = false
 

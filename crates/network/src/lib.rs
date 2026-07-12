@@ -25,18 +25,20 @@
 //! * [`LoopbackTransport`] — in-process, tokio-mpsc-backed, deterministic;
 //!   used by the simulator and tests.
 //! * [`TcpTransport`] — real sockets with length-prefixed [`codec::Frame`]
-//!   framing and a mutually-authenticated ed25519 handshake.
+//!   framing and a mutually-authenticated ed25519 handshake. **Reduced
+//!   guarantees vs QUIC:** every traffic class and the application "datagram"
+//!   path share one ordered TCP byte stream, so a large P8 sync frame can
+//!   head-of-line-block P0 consensus for the full transmit time of the payload.
+//! * [`QuicTransport`] *(feature = `"quic"`)* — quinn/rustls QUIC with
+//!   independent bidirectional streams per [`TrafficClass`], native RFC 9221
+//!   DATAGRAM frames for lossy market data, and stream/connection flow-control
+//!   sized so sync credit cannot starve consensus. Mutually authenticated via
+//!   the same ed25519 handshake as TCP on a control stream.
 //!
-//! ## Future: QUIC adapter
-//!
-//! A QUIC transport (native multiplexed streams for the reliable classes plus a
-//! true unreliable datagram path, 0-RTT resumption, and connection migration) is
-//! a planned future implementation behind the very same [`Transport`] trait. It
-//! is intentionally **not** built yet: no `quinn`/QUIC dependency is introduced
-//! at this phase. The [`Connection`] surface (priority send, datagram send,
-//! per-peer dedup) was shaped so a QUIC backend drops in without changing
-//! callers — the [`TcpTransport`] multiplexes both streams over one ordered
-//! connection today; QUIC would map them onto independent streams natively.
+//! Compile-time availability is advertised by [`quic_supported`]. Production
+//! configs that set `enable_quic` / `enable_datagrams` must be built with the
+//! `quic` feature; the node composition root rejects those flags fail-closed
+//! when the feature is absent (never a silent no-op).
 //!
 //! # Safety & robustness
 //!
@@ -63,8 +65,20 @@ mod tcp;
 mod transport;
 mod util;
 
+#[cfg(feature = "quic")]
+mod quic;
+
 /// Crate identity, used by the node composition root for a startup manifest.
 pub const CRATE_NAME: &str = "network";
+
+/// Whether this build includes a real QUIC transport (`quinn`).
+///
+/// Used by the node config loader to fail closed when `enable_quic` /
+/// `enable_datagrams` are requested without the `quic` feature.
+#[must_use]
+pub const fn quic_supported() -> bool {
+    cfg!(feature = "quic")
+}
 
 // Re-export the wire types callers need so they need not depend on `codec`
 // directly for the common path.
@@ -99,6 +113,9 @@ pub use scheduler::{
 pub use tcp::{Membership, TcpTransport};
 pub use transport::Transport;
 
+#[cfg(feature = "quic")]
+pub use quic::QuicTransport;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,5 +133,10 @@ mod tests {
         let _cfg = TransportConfig::default();
         let _peer = Peer::loopback(PeerId::from([0u8; 32]));
         let _class = TrafficClass::Consensus;
+    }
+
+    #[test]
+    fn quic_supported_matches_feature_flag() {
+        assert_eq!(quic_supported(), cfg!(feature = "quic"));
     }
 }
