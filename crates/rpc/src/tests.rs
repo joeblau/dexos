@@ -2601,6 +2601,171 @@ async fn dispatch_join_error_echoes_request_id() {
 }
 
 // ---------------------------------------------------------------------------
+// #416: RPC server metrics — the flood-facing shed paths are counted on a real
+// MetricsRegistry and rpc_connections_active tracks connection lifetime
+// ---------------------------------------------------------------------------
+
+/// Snapshot helper: the current value of counter `name` on `reg` (zero when
+/// the counter was never registered).
+fn counter_value(reg: &observability::MetricsRegistry, name: &str) -> u64 {
+    reg.snapshot()
+        .counters
+        .iter()
+        .find(|c| c.name == name)
+        .map(|c| c.value)
+        .unwrap_or_default()
+}
+
+/// Snapshot helper: the current value of gauge `name` on `reg`.
+fn gauge_value(reg: &observability::MetricsRegistry, name: &str) -> i64 {
+    reg.snapshot()
+        .gauges
+        .iter()
+        .find(|g| g.name == name)
+        .map(|g| g.value)
+        .unwrap_or_default()
+}
+
+/// Poll (bounded) until `rpc_connections_active` returns to zero: the closed
+/// connection's task has ended and its drop guard restored the gauge. The
+/// guard drops after the admission permits are released, so a zero gauge also
+/// means the next client can be admitted.
+async fn wait_active_zero(reg: &observability::MetricsRegistry) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while gauge_value(reg, "rpc_connections_active") != 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "rpc_connections_active never returned to 0 after the connection closed"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// Acceptance (#416): a server run with [`crate::RpcMetrics`] built from a
+/// real `MetricsRegistry` counts each shed path it takes — accept-time
+/// admission rejection, oversize frame, dispatch timeout — while untaken
+/// paths stay at zero, and `rpc_connections_active` rises while a connection
+/// is admitted and returns to 0 after every connection closes.
+#[tokio::test]
+async fn rpc_metrics_count_shed_paths_and_track_active_connections() {
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    let registry = Arc::new(observability::MetricsRegistry::new());
+    let metrics = Arc::new(crate::RpcMetrics::register(&registry));
+
+    // Stalling backend: `get_network_status` blocks on the blocking pool until
+    // released (driving the #396 dispatch-timeout path); every other method
+    // replies immediately.
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let backend: Arc<dyn RpcBackend> = Arc::new(StallingBackend {
+        release: std::sync::Mutex::new(release_rx),
+    });
+    // A budget of exactly one connection makes the accept-rejection path
+    // deterministic; a short dispatch timeout keeps the stall bounded.
+    let mut cfg = budget_config(1);
+    cfg.dispatch_timeout = Duration::from_millis(100);
+    let max_payload = cfg.max_payload;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn({
+        let metrics = Arc::clone(&metrics);
+        async move {
+            let _ = crate::server::serve_with_metrics(
+                listener,
+                backend,
+                RpcMode::Full,
+                cfg,
+                Some(metrics),
+                stop_rx,
+            )
+            .await;
+        }
+    });
+
+    // 1) Admit one connection and confirm it is being served (an immediate
+    //    NotFound reply), then observe the gauge at 1 while it stays parked.
+    let mut parked = TcpStream::connect(addr).await.unwrap();
+    let req = RpcRequest::new(1, RpcMethod::GetNodeInfo);
+    let out = encode_request(&req).unwrap();
+    parked.write_all(&out).await.unwrap();
+    parked.flush().await.unwrap();
+    let frame = read_one_frame(&mut parked).await.unwrap();
+    assert_eq!(
+        decode_response(&frame).unwrap().result,
+        Err(RpcError::NotFound)
+    );
+    assert_eq!(gauge_value(&registry, "rpc_connections_active"), 1);
+
+    // 2) Accept rejection: the budget is one connection, so a second client
+    //    is refused with a Backpressure notice — and counted. The rejected
+    //    connection never touches the gauge.
+    let mut excess = TcpStream::connect(addr).await.unwrap();
+    let frame = read_one_frame(&mut excess).await.unwrap();
+    assert_eq!(
+        decode_response(&frame).unwrap().result,
+        Err(RpcError::Backpressure)
+    );
+    assert_eq!(counter_value(&registry, "rpc_accept_rejections_total"), 1);
+    assert_eq!(gauge_value(&registry, "rpc_connections_active"), 1);
+
+    // Close the parked connection; its drop guard restores the gauge to 0.
+    drop(parked);
+    wait_active_zero(&registry).await;
+
+    // 3) Oversize: a header declaring a payload over the cap is answered with
+    //    MessageTooLarge, counted, and the connection is closed (EOF).
+    let mut oversize = TcpStream::connect(addr).await.unwrap();
+    let mut header = [0u8; codec::FRAME_HEADER_LEN];
+    let plen = u32::try_from(max_payload).unwrap().saturating_add(1);
+    header[15..19].copy_from_slice(&plen.to_le_bytes());
+    oversize.write_all(&header).await.unwrap();
+    oversize.flush().await.unwrap();
+    let frame = read_one_frame(&mut oversize).await.unwrap();
+    assert_eq!(
+        decode_response(&frame).unwrap().result,
+        Err(RpcError::MessageTooLarge)
+    );
+    assert_eq!(counter_value(&registry, "rpc_oversize_total"), 1);
+    let mut buf = [0u8; 1];
+    assert_eq!(oversize.read(&mut buf).await.unwrap(), 0);
+    wait_active_zero(&registry).await;
+
+    // 4) Dispatch timeout (#396 path): the stalled dispatch is answered with
+    //    Backpressure correlated to the request, counted on its dedicated
+    //    counter, and the connection is failed closed.
+    let mut stalled = TcpStream::connect(addr).await.unwrap();
+    let req = RpcRequest::new(42, RpcMethod::GetNetworkStatus);
+    let out = encode_request(&req).unwrap();
+    stalled.write_all(&out).await.unwrap();
+    stalled.flush().await.unwrap();
+    let frame = read_one_frame(&mut stalled).await.unwrap();
+    let resp = decode_response(&frame).unwrap();
+    assert_eq!(resp.request_id, 42);
+    assert_eq!(resp.result, Err(RpcError::Backpressure));
+    assert_eq!(counter_value(&registry, "rpc_dispatch_timeouts_total"), 1);
+    assert_eq!(stalled.read(&mut buf).await.unwrap(), 0);
+
+    // After every connection has closed, the gauge is restored to zero.
+    wait_active_zero(&registry).await;
+
+    // Paths never taken stayed at zero: the dispatch timeout was counted as a
+    // dispatch timeout, not smeared into backpressure or read timeouts.
+    assert_eq!(counter_value(&registry, "rpc_read_timeouts_total"), 0);
+    assert_eq!(counter_value(&registry, "rpc_backpressure_total"), 0);
+    // And the registry exports the rpc_* series by name.
+    let text = registry.export_text();
+    assert!(text.contains("rpc_dispatch_timeouts_total 1"));
+    assert!(text.contains("rpc_connections_active 0"));
+
+    // Release the orphaned blocking dispatch so runtime shutdown is not
+    // pinned on it (mirrors the #396 test).
+    release_tx.send(()).unwrap();
+}
+
+// ---------------------------------------------------------------------------
 // P1 #355: stream fanout byte-bounded, sharded, copy-light
 // ---------------------------------------------------------------------------
 

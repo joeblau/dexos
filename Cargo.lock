@@ -1342,6 +1342,7 @@ dependencies = [
  "codec",
  "crypto",
  "libc",
+ "observability",
  "rcgen",
  "rustls",
  "rustls-pemfile",
