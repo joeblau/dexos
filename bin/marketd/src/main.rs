@@ -110,6 +110,9 @@ struct InspectArgs {
     /// Sequence number to inspect (unsigned, never truncated).
     #[arg(long)]
     sequence: u64,
+    /// Durable WAL directory (`seg-*.log` files).
+    #[arg(long, value_name = "PATH")]
+    log: PathBuf,
 }
 
 #[derive(Args, Debug)]
@@ -163,21 +166,8 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
         }
         #[cfg(feature = "dev-tools")]
         Command::Benchmark(a) => run_benchmark(&a, benchmarks::Config::default()),
-        Command::Replay(a) => {
-            println!(
-                "replay: snapshot='{}' log='{}' [Phase 0 stub — deterministic replay lands in the storage epic]",
-                a.snapshot.display(),
-                a.log.display()
-            );
-            Ok(())
-        }
-        Command::Inspect(a) => {
-            println!(
-                "inspect: sequence={} [Phase 0 stub — command-log inspection lands in the storage epic]",
-                a.sequence
-            );
-            Ok(())
-        }
+        Command::Replay(a) => run_replay(&a),
+        Command::Inspect(a) => run_inspect(&a),
         Command::Keygen(a) => {
             let mut seed = [0u8; 32];
             fill_entropy(&mut seed)?;
@@ -204,24 +194,87 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Command::Snapshot(a) => {
-            println!(
-                "snapshot: output={} [Phase 0 stub — snapshots land in the storage epic]",
-                a.output
-                    .as_deref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "<default>".to_string())
+        Command::Snapshot(_a) => {
+            // Fail closed: engine serialize/restore is not wired into marketd yet.
+            // Operators must not believe a stub snapshot is crash-recovery safe.
+            anyhow::bail!(
+                "snapshot: fail-closed — engine state serialization is not implemented; \
+                 refuse to emit a non-authoritative snapshot (see storage::Snapshot for the on-disk format)"
             );
-            Ok(())
         }
-        Command::Verify(a) => {
-            println!(
-                "verify: snapshot='{}' [Phase 0 stub — state-root verification lands in the state-tree epic]",
-                a.snapshot.display()
-            );
-            Ok(())
-        }
+        Command::Verify(a) => run_verify(&a),
     }
+}
+
+/// Load a snapshot + durable WAL, verify integrity, and count applied records.
+fn run_replay(args: &ReplayArgs) -> anyhow::Result<()> {
+    let snap = storage::Snapshot::load(&args.snapshot)
+        .map_err(|e| anyhow::anyhow!("loading snapshot {}: {e}", args.snapshot.display()))?;
+    if !snap.verify(snap.state_root()) {
+        anyhow::bail!(
+            "snapshot {} failed self-verify (content digest / version)",
+            args.snapshot.display()
+        );
+    }
+
+    let log = storage::DurableLog::open(
+        storage::DurableConfig::new(&args.log).with_sync(storage::SyncPolicy::Never),
+    )
+    .map_err(|e| anyhow::anyhow!("opening durable log {}: {e}", args.log.display()))?;
+    log.verify()
+        .map_err(|e| anyhow::anyhow!("log integrity verify failed: {e}"))?;
+
+    let mut applied = 0u64;
+    let last = log
+        .replay(Some(snap.last_sequence()), |_| {
+            applied = applied.saturating_add(1);
+        })
+        .map_err(|e| anyhow::anyhow!("replay failed: {e}"))?;
+
+    println!(
+        "replay: snapshot_seq={} state_root={} applied={} last_seq={} log_records={}",
+        snap.last_sequence(),
+        to_hex(snap.state_root().as_bytes()),
+        applied,
+        last,
+        log.len()
+    );
+    Ok(())
+}
+
+/// Decode and self-verify a snapshot file (content digest + CRC).
+fn run_verify(args: &VerifyArgs) -> anyhow::Result<()> {
+    let snap = storage::Snapshot::load(&args.snapshot)
+        .map_err(|e| anyhow::anyhow!("loading snapshot {}: {e}", args.snapshot.display()))?;
+    if !snap.verify(snap.state_root()) {
+        anyhow::bail!("snapshot self-verify failed");
+    }
+    println!(
+        "verify: ok snapshot_seq={} state_root={} state_bytes={}",
+        snap.last_sequence(),
+        to_hex(snap.state_root().as_bytes()),
+        snap.state().len()
+    );
+    Ok(())
+}
+
+/// Inspect a single sequence from a durable WAL directory.
+fn run_inspect(args: &InspectArgs) -> anyhow::Result<()> {
+    let log = storage::DurableLog::open(
+        storage::DurableConfig::new(&args.log).with_sync(storage::SyncPolicy::Never),
+    )
+    .map_err(|e| anyhow::anyhow!("opening durable log {}: {e}", args.log.display()))?;
+    let rec = log
+        .find(args.sequence)
+        .map_err(|e| anyhow::anyhow!("inspect sequence {}: {e}", args.sequence))?;
+    println!(
+        "inspect: sequence={} timestamp={} command_type={} payload_len={}",
+        rec.sequence,
+        rec.timestamp,
+        rec.command_type,
+        rec.payload.len()
+    );
+    Ok(())
 }
 
 /// The reserved suite selector that runs every registered suite and enforces the
@@ -364,13 +417,18 @@ mod tests {
                 "c.log",
             ],
             &["marketd", "verify", "--snapshot", "s.snap"],
-            &["marketd", "inspect", "--sequence", "42"],
+            &["marketd", "inspect", "--sequence", "42", "--log", "/tmp/wal"],
             &["marketd", "keygen"],
             &["marketd", "snapshot"],
         ];
         for args in cases {
             assert!(Cli::try_parse_from(args).is_ok(), "should parse: {args:?}");
         }
+    }
+
+    #[test]
+    fn inspect_requires_log_path() {
+        assert!(Cli::try_parse_from(["marketd", "inspect", "--sequence", "1"]).is_err());
     }
 
     #[cfg(feature = "dev-tools")]
