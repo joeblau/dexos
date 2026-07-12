@@ -1815,27 +1815,15 @@ impl Engine {
                 let mark = meta.mark_price;
                 let rate = c.rate;
                 meta.last_funding_epoch = c.epoch;
-                // Collect holders from risk by scanning open accounts via
-                // liquidation candidates path is wrong; use market holders by
-                // probing positions for known accounts through ledger.
-                let accounts: Vec<AccountId> = {
-                    // Dense accounts 0..ledger count via risk account_count.
-                    let n = self.risk.account_count();
-                    let mut v = Vec::new();
-                    for i in 0..n {
-                        if let Ok(a) = AccountId::from_index(i) {
-                            if self
-                                .risk
-                                .position(a, c.market)
-                                .map(|q| q.raw() != 0)
-                                .unwrap_or(false)
-                            {
-                                v.push(a);
-                            }
-                        }
-                    }
-                    v
-                };
+                // Holders come from the risk engine's market -> accounts
+                // reverse index: exactly the accounts with a non-zero position
+                // in this market, in ascending account-index order — the same
+                // set and sequence as the old dense 0..account_count() scan
+                // filtered by non-zero position, so per-holder funding
+                // accumulation, rounding, and commit order stay byte-identical
+                // while the work scales with the market's holders instead of
+                // accounts x positions (#430).
+                let accounts: Vec<AccountId> = self.risk.market_holders(c.market)?;
                 for a in &accounts {
                     let qty = self.risk.position(*a, c.market)?;
                     // payment positive => account pays (long when rate > 0).
@@ -2123,9 +2111,9 @@ mod tests {
 
     use super::*;
     use crate::command::{
-        CancelAll, CancelOrder, CompleteSetOp, CreateAccount, CreateMarket, DepositCredit,
-        FinalizeWithdrawal, Liquidate, PlaceOrder, ReplaceOrder, RequestWithdrawal, ResolveMarket,
-        SetMarkPrice, SettleMarket,
+        ApplyFundingEpoch, CancelAll, CancelOrder, CompleteSetOp, CreateAccount, CreateMarket,
+        DepositCredit, FinalizeWithdrawal, Liquidate, PlaceOrder, ReplaceOrder, RequestWithdrawal,
+        ResolveMarket, SetMarkPrice, SettleMarket,
     };
     use state_tree::{verify_account, verify_market};
     use std::collections::HashMap;
@@ -4023,6 +4011,116 @@ mod tests {
         assert_eq!(
             hex::encode(e.state_root().as_bytes()),
             "16873ec5c49c71a33f4efb6f8e73d1d714ed5a8dc34644d76efdb8b14bd60693",
+        );
+    }
+
+    // #430 byte-identity golden: a multi-holder funding epoch driven by the
+    // risk engine's market_holders reverse index must pay every holder — and
+    // only the holders — exactly what the old dense 0..account_count() scan
+    // paid, in the same ascending-account order, reproducing the state root
+    // captured from the pre-#430 implementation.
+    #[test]
+    fn funding_epoch_multi_holder_matches_dense_scan_golden_430() {
+        // Five accounts: three end holding distinct signed positions, one
+        // opens a position and flattens it (leaves the holder index), one
+        // never trades. All fills execute at the mark, so pre-funding
+        // collateral is untouched and the funding deltas below are exact.
+        let script: Vec<Command> = vec![
+            create_account(100_000_000), // 0: ends long 4.5
+            create_account(100_000_000), // 1: ends short 2.5
+            create_account(100_000_000), // 2: ends short 2.0
+            create_account(100_000_000), // 3: opens short 1.0, then flattens
+            create_account(100_000_000), // 4: never trades
+            create_perp(0, 1_000_000),
+            // Account 0 rests a 3.5 bid; accounts 1 and 2 sell into it.
+            place(0, 0, 1, Side::Bid, 1_000_000, 3_500_000),
+            place(1, 0, 2, Side::Ask, 1_000_000, 1_500_000),
+            place(2, 0, 3, Side::Ask, 1_000_000, 2_000_000),
+            // Account 3 opens short 1.0 against account 0's fresh bid...
+            place(0, 0, 4, Side::Bid, 1_000_000, 1_000_000),
+            place(3, 0, 5, Side::Ask, 1_000_000, 1_000_000),
+            // ...then buys it back from account 1, leaving itself flat.
+            place(1, 0, 6, Side::Ask, 1_000_000, 1_000_000),
+            place(3, 0, 7, Side::Bid, 1_000_000, 1_000_000),
+        ];
+        let run = |cmds: &[Command]| -> Engine {
+            let mut e = engine_with_caps(8, 4);
+            for (i, c) in cmds.iter().enumerate() {
+                e.execute(seq(i as u64 + 1), c.clone()).unwrap();
+            }
+            e
+        };
+        let mut e = run(&script);
+        for (a, q) in [
+            (0u32, 4_500_000i64),
+            (1, -2_500_000),
+            (2, -2_000_000),
+            (3, 0),
+            (4, 0),
+        ] {
+            assert_eq!(
+                e.risk
+                    .position(AccountId::new(a), MarketId::new(0))
+                    .unwrap(),
+                Quantity::from_raw(q),
+                "account {a} position",
+            );
+        }
+
+        // Reference: the pre-#430 dense scan — probe every account in
+        // ascending index order, and for each non-zero position debit
+        // mark.notional(position) * rate — evaluated against live state
+        // right before the epoch.
+        let mark = Price::from_raw(1_000_000);
+        let rate = types::Ratio::from_bps(100).unwrap(); // 1%
+        let mut expected: Vec<(u32, Amount)> = Vec::new();
+        for i in 0..e.risk.account_count() {
+            let a = AccountId::from_index(i).unwrap();
+            let q = e.risk.position(a, MarketId::new(0)).unwrap();
+            let mut c = e.risk.collateral(a).unwrap();
+            if q.raw() != 0 {
+                let pay = mark.notional(q).unwrap().mul_ratio(rate).unwrap();
+                c = c.checked_sub(pay).unwrap();
+            }
+            expected.push((a.get(), c));
+        }
+
+        let funding = Command::ApplyFundingEpoch(ApplyFundingEpoch {
+            market: MarketId::new(0),
+            epoch: 1,
+            rate,
+        });
+        e.execute(seq(script.len() as u64 + 1), funding.clone())
+            .unwrap();
+
+        let got: Vec<(u32, Amount)> = (0..e.risk.account_count())
+            .map(|i| {
+                let a = AccountId::from_index(i).unwrap();
+                (a.get(), e.risk.collateral(a).unwrap())
+            })
+            .collect();
+        assert_eq!(got, expected, "funding must match the dense-scan reference");
+        // Longs pay, shorts receive, the flattened and idle accounts move by
+        // exactly nothing: 4.5 * 1% = 0.045; 2.5 * 1% = 0.025; 2 * 1% = 0.02.
+        let collateral = |e: &Engine, a: u32| e.risk.collateral(AccountId::new(a)).unwrap().raw();
+        assert_eq!(collateral(&e, 0), 100_000_000 - 45_000);
+        assert_eq!(collateral(&e, 1), 100_000_000 + 25_000);
+        assert_eq!(collateral(&e, 2), 100_000_000 + 20_000);
+        assert_eq!(collateral(&e, 3), 100_000_000);
+        assert_eq!(collateral(&e, 4), 100_000_000);
+        check_invariants(&e);
+
+        // Deterministic replay: an identical stream reproduces the root bit
+        // for bit.
+        let mut e2 = run(&script);
+        e2.execute(seq(script.len() as u64 + 1), funding).unwrap();
+        assert_eq!(e.state_root(), e2.state_root());
+
+        // Golden root captured from the pre-#430 dense-scan implementation:
+        // the reverse-index holder set must commit byte-identical state.
+        assert_eq!(
+            hex::encode(e.state_root().as_bytes()),
+            "9d8cc0493262dfa45301dad8a340af19148e53b9ba63437dea98bb630af61699",
         );
     }
 }
