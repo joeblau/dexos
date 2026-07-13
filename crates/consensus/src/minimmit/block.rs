@@ -31,7 +31,7 @@
 //!   `step()`; its verdict re-enters the replica as data (a
 //!   `ProposalVerified`-style input, §7.1).
 //!
-//! The consensus core only ever sees the header plus its [`hash`]
+//! The consensus core only ever sees the header plus its [`BlockHeader::hash`]
 //! (`BlockHeader::hash`) — both travel on the wire inside `Propose` (#517);
 //! every other message references the 32-byte hash alone.
 

@@ -12,7 +12,7 @@
 //!
 //! - **Propose-build seam:** leaders do not build blocks in-core. Entering a
 //!   view this replica leads emits [`Effect::NeedProposal`]; the node builds
-//!   the [`BlockHeader`](super::BlockHeader) deterministically, signs
+//!   the [`BlockHeader`] deterministically, signs
 //!   `notarize_sig` + `propose_sig`, and re-injects the result as
 //!   `Input::Message(Propose)` — so the leader's own propose flows through
 //!   the same admission/tally path as everyone else's and its implicit
@@ -137,7 +137,7 @@ pub enum Effect {
         view: u64,
     },
     /// This replica leads the entered view: the node must build a
-    /// [`BlockHeader`](super::BlockHeader) extending `parent`, sign it, and
+    /// [`BlockHeader`] extending `parent`, sign it, and
     /// re-inject it as `Input::Message(Propose)` (§7.2, R1).
     NeedProposal {
         /// The notarized parent (or genesis `⊥`) the proposal must extend.
@@ -1159,7 +1159,7 @@ impl MinimmitReplica {
     /// threshold, which would silently collapse the two-threshold protocol
     /// (§12 risk 3). The certificate's `message` is the notarize digest, so
     /// it slots directly into a
-    /// [`Notarization`](super::Notarization) wire message.
+    /// [`Notarization`] wire message.
     #[must_use]
     pub fn try_form_notarization(
         &self,
@@ -1182,7 +1182,7 @@ impl MinimmitReplica {
     /// stays caller-selected: formation is threshold-parameterized across
     /// **both** dimensions, with no hardcoded bar anywhere (§12 risk 3).
     /// The certificate's `message` is the nullify digest, so it slots
-    /// directly into a [`Nullification`](super::Nullification) wire message.
+    /// directly into a [`Nullification`] wire message.
     #[must_use]
     pub fn try_form_nullification(&self, view: u64, kind: ThresholdKind) -> Option<Certificate> {
         let digest = nullify_digest(self.epoch, view);
