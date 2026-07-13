@@ -47,14 +47,16 @@ pub use bft::{
 };
 pub use checkpoint::{
     build_checkpoint_header, checkpoint_hash, detect_checkpoint_fork, links_to, seal_checkpoint,
-    state_root_over_shards, verify_chain, verify_checkpoint, witness_digest, Checkpoint,
-    CheckpointError, CheckpointHeader, WitnessCollector, WitnessReceipt,
-    DEFAULT_WITNESS_MAX_ENTRIES, DEFAULT_WITNESS_SEQUENCE_HORIZON, DOMAIN_CHECKPOINT,
-    DOMAIN_WITNESS,
+    seal_minimmit_checkpoint, state_root_over_shards, verify_chain, verify_checkpoint,
+    verify_minimmit_chain, verify_minimmit_checkpoint, witness_digest, Checkpoint, CheckpointError,
+    CheckpointHeader, WitnessCollector, WitnessReceipt, DEFAULT_WITNESS_MAX_ENTRIES,
+    DEFAULT_WITNESS_SEQUENCE_HORIZON, DOMAIN_CHECKPOINT, DOMAIN_WITNESS,
 };
 pub use minimmit::{
-    notarize_digest, nullify_digest, propose_auth, Certificate, MinimmitCommittee, MinimmitReplica,
-    ThresholdKind, DOMAIN_NOTARIZE, DOMAIN_NULLIFY, DOMAIN_PROPOSE,
+    notarize_digest, nullify_digest, propose_auth, BlockHeader, Certificate, ConsensusMessage,
+    Effect as MinimmitEffect, ExecAttest, Input as MinimmitInput, MinimmitCommittee,
+    MinimmitReplica, Notarization, Notarize, Nullification, Nullify, ParentRef, Proof, Propose,
+    TallyOutcome, ThresholdKind, WireError, DOMAIN_NOTARIZE, DOMAIN_NULLIFY, DOMAIN_PROPOSE,
 };
 pub use sequencer::{detect_gap, CommandRecord, CommandStatus, Sequencer, SequencerError};
 pub use vote::{
@@ -896,6 +898,37 @@ mod tests {
             ),
             Err(CheckpointError::LengthMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn minimmit_checkpoint_binds_the_finalize_set() {
+        let ts = ThresholdSigners::from_seeds(
+            &[[0; 32], [1; 32], [2; 32], [3; 32], [4; 32], [5; 32]],
+            5,
+        );
+        let committee =
+            MinimmitCommittee::new_unit(0, ts.validator_set().validators().to_vec()).unwrap();
+        assert_ne!(
+            committee.advance_set().commitment(),
+            committee.finalize_set().commitment()
+        );
+        let header = sample_header(0, 3, Hash::ZERO, Hash::from_bytes([8; 32]));
+        let l_checkpoint = seal_minimmit_checkpoint(
+            header.clone(),
+            ts.sign(header.hash(), vec![0, 1, 2, 3, 4]),
+            &committee,
+        )
+        .unwrap();
+        assert!(verify_minimmit_checkpoint(&l_checkpoint, &committee).is_ok());
+
+        assert_eq!(
+            seal_minimmit_checkpoint(
+                header.clone(),
+                ts.sign(header.hash(), vec![0, 1, 2]),
+                &committee,
+            ),
+            Err(CheckpointError::Quorum)
+        );
     }
 
     #[test]

@@ -69,8 +69,9 @@ mod tests {
 
     use consensus::{
         build_checkpoint_header, seal_checkpoint, Checkpoint, CheckpointError, CheckpointHeader,
+        MinimmitCommittee,
     };
-    use crypto::ThresholdSigners;
+    use crypto::{hash_domain, ThresholdSigners, DOMAIN_VALIDATOR_SET_TRANSITION};
     use state_tree::StateTree;
     use types::{AccountId, Hash, MarketId, MarketType, ShardId};
 
@@ -105,8 +106,8 @@ mod tests {
     // ---- helpers ----------------------------------------------------------
 
     fn signers() -> ThresholdSigners {
-        // 4 validators, threshold weight 3 (2f+1 with f=1).
-        ThresholdSigners::from_seeds(&[[0; 32], [1; 32], [2; 32], [3; 32]], 3)
+        // 6 validators, Minimmit L = n-f = 5 with f=1.
+        ThresholdSigners::from_seeds(&[[0; 32], [1; 32], [2; 32], [3; 32], [4; 32], [5; 32]], 5)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -138,7 +139,11 @@ mod tests {
             0,
         )
         .unwrap();
-        let qc = ts.sign(header.hash(), signer_indices.to_vec());
+        let mut signer_indices = signer_indices.to_vec();
+        if signer_indices == [0, 1, 2] {
+            signer_indices.extend_from_slice(&[3, 4]);
+        }
+        let qc = ts.sign(header.hash(), signer_indices);
         seal_checkpoint(header, qc)
     }
 
@@ -272,7 +277,10 @@ mod tests {
     fn wrong_committee_for_epoch_rejected() {
         let ts = signers();
         // A different committee registered for epoch 0.
-        let other = ThresholdSigners::from_seeds(&[[9; 32], [8; 32], [7; 32], [6; 32]], 3);
+        let other = ThresholdSigners::from_seeds(
+            &[[9; 32], [8; 32], [7; 32], [6; 32], [5; 32], [4; 32]],
+            5,
+        );
         let shard = ShardId::new(0);
         let mut sync = ShardSync::new(shard, Hash::ZERO);
         sync.register_validator_set(0, other.validator_set());
@@ -561,10 +569,10 @@ mod tests {
             &[0, 1, 2],
         );
         let msg = cp.hash();
-        let set_seeds: [[u8; 32]; 4] = [[0; 32], [1; 32], [2; 32], [3; 32]];
+        let set_seeds: [[u8; 32]; 6] = [[0; 32], [1; 32], [2; 32], [3; 32], [4; 32], [5; 32]];
         let keys: Vec<crypto::KeyPair> = set_seeds.iter().map(crypto::KeyPair::from_seed).collect();
 
-        // Batch input: the three signers over the same message.
+        // Batch input: the five L-threshold signers over the same message.
         let mut batch = Vec::new();
         let sigs = &cp.quorum_certificate.signatures;
         for (i, sig) in sigs.iter().enumerate() {
@@ -983,8 +991,12 @@ mod tests {
     #[test]
     fn unsolicited_validator_set_replacement_rejected() {
         let ts = signers();
-        let other =
-            ThresholdSigners::from_seeds(&[[20u8; 32], [21u8; 32], [22u8; 32], [23u8; 32]], 3);
+        let other = ThresholdSigners::from_seeds(
+            &[
+                [20u8; 32], [21u8; 32], [22u8; 32], [23u8; 32], [24u8; 32], [25u8; 32],
+            ],
+            5,
+        );
         let shard = ShardId::new(0);
         let mut sync = ShardSync::new(shard, Hash::ZERO);
         sync.bootstrap_validator_set(0, ts.validator_set()).unwrap();
@@ -1002,18 +1014,47 @@ mod tests {
     #[test]
     fn quorum_proven_validator_set_transition() {
         let ts = signers();
-        let next =
-            ThresholdSigners::from_seeds(&[[30u8; 32], [31u8; 32], [32u8; 32], [33u8; 32]], 3);
+        let next = ThresholdSigners::from_seeds(
+            &[
+                [30u8; 32], [31u8; 32], [32u8; 32], [33u8; 32], [34u8; 32], [35u8; 32],
+            ],
+            5,
+        );
         let shard = ShardId::new(0);
         let mut sync = ShardSync::new(shard, Hash::ZERO);
-        sync.bootstrap_validator_set(0, ts.validator_set()).unwrap();
-        let new_set = next.validator_set();
-        let digest = validator_set_transition_digest(0, 1, &new_set);
-        let certificate = ts.sign(digest, vec![0, 1, 2]);
+        let old_committee =
+            MinimmitCommittee::new_unit(0, ts.validator_set().validators().to_vec()).unwrap();
+        assert_eq!(
+            sync.bootstrap_validator_set(0, old_committee.advance_set().clone()),
+            Err(LightClientError::NonCanonicalValidatorSet { epoch: 0 })
+        );
+        sync.bootstrap_minimmit_committee(&old_committee).unwrap();
+        let new_committee =
+            MinimmitCommittee::new_unit(1, next.validator_set().validators().to_vec()).unwrap();
+        assert_ne!(
+            new_committee.advance_set().commitment(),
+            new_committee.finalize_set().commitment()
+        );
+        let mut m_preimage = Vec::new();
+        m_preimage.extend_from_slice(&0u64.to_le_bytes());
+        m_preimage.extend_from_slice(&1u64.to_le_bytes());
+        m_preimage.extend_from_slice(new_committee.advance_set().commitment().as_bytes());
+        let m_digest = hash_domain(DOMAIN_VALIDATOR_SET_TRANSITION, &m_preimage);
+        let m_bound_certificate = ts.sign(m_digest, vec![0, 1, 2, 3, 4]);
+        assert!(sync
+            .apply_validator_set_transition(ValidatorSetTransition {
+                old_epoch: 0,
+                new_epoch: 1,
+                new_committee: new_committee.clone(),
+                certificate: m_bound_certificate,
+            })
+            .is_err());
+        let digest = validator_set_transition_digest(0, 1, &new_committee);
+        let certificate = ts.sign(digest, vec![0, 1, 2, 3, 4]);
         sync.apply_validator_set_transition(ValidatorSetTransition {
             old_epoch: 0,
             new_epoch: 1,
-            new_set: new_set.clone(),
+            new_committee: new_committee.clone(),
             certificate,
         })
         .unwrap();
@@ -1024,7 +1065,11 @@ mod tests {
             .apply_validator_set_transition(ValidatorSetTransition {
                 old_epoch: 1,
                 new_epoch: 2,
-                new_set: ts.validator_set(),
+                new_committee: MinimmitCommittee::new_unit(
+                    2,
+                    ts.validator_set().validators().to_vec(),
+                )
+                .unwrap(),
                 certificate: bad_cert,
             })
             .is_err());

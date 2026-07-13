@@ -20,6 +20,7 @@ use crypto::{hash_domain, merkle_root, verify_ed25519, QuorumCertificate, Valida
 use state_tree::checkpoint_root;
 use types::{Hash, ShardId, StateRoot};
 
+use crate::minimmit::MinimmitCommittee;
 use crate::vote::{Committee, MAX_VALIDATORS};
 
 /// Domain tag for checkpoint header hashing.
@@ -283,6 +284,18 @@ pub fn seal_checkpoint(
     }
 }
 
+/// Seal a Minimmit checkpoint only when the supplied QC satisfies the
+/// committee's canonical L threshold.
+pub fn seal_minimmit_checkpoint(
+    header: CheckpointHeader,
+    quorum_certificate: QuorumCertificate,
+    committee: &MinimmitCommittee,
+) -> Result<Checkpoint, CheckpointError> {
+    let checkpoint = seal_checkpoint(header, quorum_certificate);
+    verify_minimmit_checkpoint(&checkpoint, committee)?;
+    Ok(checkpoint)
+}
+
 /// Verify a checkpoint against a validator set.
 ///
 /// Rejects (in order) an out-of-order range, a QC whose message is not the
@@ -306,6 +319,18 @@ pub fn verify_checkpoint(
         .map_err(|_| CheckpointError::Quorum)
 }
 
+/// Verify a Minimmit checkpoint against the committee's canonical L-set.
+///
+/// [`ValidatorSet::commitment`] binds its threshold, so accepting an M-set at
+/// this boundary would create a different checkpoint and epoch trust root.
+/// Requiring the committee makes the L-set selection structural.
+pub fn verify_minimmit_checkpoint(
+    checkpoint: &Checkpoint,
+    committee: &MinimmitCommittee,
+) -> Result<(), CheckpointError> {
+    verify_checkpoint(checkpoint, committee.finalize_set())
+}
+
 /// Whether `child` chains directly onto `parent`: same shard, contiguous
 /// sequence ranges, and `child.previous_state_root == parent.new_state_root`.
 #[must_use]
@@ -321,6 +346,20 @@ pub fn links_to(child: &Checkpoint, parent: &Checkpoint) -> bool {
 pub fn verify_chain(chain: &[Checkpoint], set: &ValidatorSet) -> Result<(), CheckpointError> {
     for (i, cp) in chain.iter().enumerate() {
         verify_checkpoint(cp, set)?;
+        if i > 0 && !links_to(cp, &chain[i - 1]) {
+            return Err(CheckpointError::BrokenAncestry);
+        }
+    }
+    Ok(())
+}
+
+/// Verify a Minimmit checkpoint chain exclusively against the canonical L-set.
+pub fn verify_minimmit_chain(
+    chain: &[Checkpoint],
+    committee: &MinimmitCommittee,
+) -> Result<(), CheckpointError> {
+    for (i, cp) in chain.iter().enumerate() {
+        verify_minimmit_checkpoint(cp, committee)?;
         if i > 0 && !links_to(cp, &chain[i - 1]) {
             return Err(CheckpointError::BrokenAncestry);
         }
