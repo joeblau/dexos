@@ -27,6 +27,7 @@ use crate::vote::{VoteError, MAX_VALIDATORS};
 /// through this alias and assembled / verified behind [`MinimmitCommittee`]
 /// so a future constant-size BLS certificate can drop in without touching the
 /// replica's rules (`docs/CONSENSUS_MINIMMIT.md` §13.2).
+// SEAM: docs/ADR_MINIMMIT_BLS_CERTIFICATES.md defines the demand-gated BLS swap.
 pub type Certificate = QuorumCertificate;
 
 /// Which of the two Minimmit verification bars a certificate is checked

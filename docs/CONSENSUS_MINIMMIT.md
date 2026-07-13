@@ -688,6 +688,12 @@ calls it — it uses explicit M and L (#511).
 5. **Phase 6** (#544, #545): quint conformance (or its documented deferral, with
    the S1–S4 property tests as interim oracle) and the BLS seam design note.
 
+Phase 6 selected the documented deferral. See
+[`MINIMMIT_CONFORMANCE.md`](MINIMMIT_CONFORMANCE.md) for the interim oracle and
+revisit triggers, and
+[`ADR_MINIMMIT_BLS_CERTIFICATES.md`](ADR_MINIMMIT_BLS_CERTIFICATES.md) for the
+certificate-backend and validator-cap decision.
+
 ### §13.4 Config
 
 `[consensus] delta_ms` (serde-defaulted, §12) feeds the node's 2Δ timer;
