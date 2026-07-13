@@ -33,10 +33,10 @@
 //! `{ genesis_hash, ⊥ }` parent when this replica leads view 0) alongside the
 //! replica, so no wall-clock or build decision ever happens in-core.
 //!
-//! # Scope boundaries (Phase 2 siblings)
+//! # Phase 2 rule surface
 //!
 //! This module owns the state shape, the enums, the constructor, the `step`
-//! dispatch skeleton (#521), the locking predicates + view lifecycle
+//! reactor (#521), the locking predicates + view lifecycle
 //! (#522): [`MinimmitReplica::select_parent`] /
 //! [`MinimmitReplica::valid_parent`] (§6.3–§6.4, the safety core replacing
 //! HotStuff's high-QC locking) and the internal `enter_view` / `prune`
@@ -48,20 +48,28 @@
 //! block-less nullify dimension, and **threshold-parameterized** certificate
 //! formation ([`MinimmitReplica::try_form_notarization`] /
 //! [`MinimmitReplica::try_form_nullification`] — never a single hardcoded
-//! threshold, §12 risk 3). The rule bodies land in later issues and the
-//! dispatch arms are deterministic no-ops until they do: rules R1–R3 (#524),
-//! R4–R7 (#525, #526), the exec-cert ladder (#528), and epoch rotation
-//! (#529).
+//! threshold, §12 risk 3), rules R1–R7 (#524–#526), the safety oracles (#527),
+//! the mandatory execution-certificate ladder (#528), and atomic epoch
+//! rotation (#529).
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crypto::KeyPair;
 use types::Hash;
 
-use crate::vote::{SlashEvidence, VoteError, DEFAULT_VIEW_HORIZON, DEFAULT_VOTE_QUOTA};
+use crate::bft::ValidatorSetUpdate;
+use crate::vote::{
+    Equivocation, SlashEvidence, SlashKind, VoteError, VotePhase, DEFAULT_VIEW_HORIZON,
+    DEFAULT_VOTE_QUOTA,
+};
 
+use super::block::BlockHeader;
 use super::committee::{Certificate, MinimmitCommittee, ThresholdKind};
 use super::digest::{notarize_digest, nullify_digest};
-use super::wire::{ConsensusMessage, Notarize, Nullify, ParentRef, Proof, BOTTOM_VIEW};
+use super::wire::{
+    ConsensusMessage, ExecAttest, Notarization, Notarize, Nullification, Nullify, ParentRef, Proof,
+    Propose, BOTTOM_VIEW,
+};
 
 /// An event injected into the replica by the node/network driver
 /// (`docs/CONSENSUS_MINIMMIT.md` §7).
@@ -156,6 +164,37 @@ pub enum Effect {
     /// Slashable misbehavior was detected (equivocation / proposal fork);
     /// the node gossips the evidence.
     Slash(SlashEvidence),
+}
+
+/// Monotone per-height finality state (§10).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinalityStage {
+    /// An L-notarization fixed ordering, but the execution L-certificate has
+    /// not yet arrived.
+    ConsensusFinal { view: u64, block: Hash },
+    /// Both the ordering and execution L-certificates exist.
+    Finalized {
+        view: u64,
+        block: Hash,
+        execution_root: Hash,
+        execution_cert: Certificate,
+    },
+}
+
+/// A deterministic epoch-rotation rejection. The pending update is retained
+/// after every error so the node may retry once the activation gate clears.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum EpochError {
+    #[error("no validator-set update is scheduled")]
+    NoPendingUpdate,
+    #[error("scheduled update activates at epoch {activation}, not {requested}")]
+    WrongActivationEpoch { activation: u64, requested: u64 },
+    #[error("pre-boundary consensus-final heights are still awaiting execution certificates")]
+    ExecutionCertificatesPending,
+    #[error("new validator set is invalid: {0}")]
+    InvalidCommittee(VoteError),
+    #[error("this replica is not a member of the new validator set")]
+    ReplicaRemoved,
 }
 
 /// The result of admitting one vote into a [`Tally`] (#523).
@@ -376,6 +415,9 @@ pub struct MinimmitReplica {
     committee: MinimmitCommittee,
     /// This replica's index in the committee's canonical membership order.
     self_index: u16,
+    /// Local consensus signing key. `None` is supported for read-only replay;
+    /// a voting replica is constructed with [`Self::new_with_signer`].
+    signer: Option<KeyPair>,
     /// The well-known genesis hash (height 0, finalized by definition).
     genesis_hash: Hash,
     /// Current view; starts at 0.
@@ -384,6 +426,14 @@ pub struct MinimmitReplica {
     notarized: Option<Hash>,
     /// Whether this replica nullified THIS view.
     nullified: bool,
+    /// Statelessly admitted proposals awaiting node-side block verification.
+    pending_proposals: BTreeMap<u64, Propose>,
+    /// First authenticated proposal observed per view, retained to produce
+    /// proposal-fork evidence even after its verification verdict arrives.
+    seen_proposals: BTreeMap<u64, Propose>,
+    /// Authenticated block metadata indexed by hash, retained for ancestry
+    /// traversal when an L-notarization finalizes a tip and its ancestors.
+    blocks: BTreeMap<Hash, (u64, BlockHeader)>,
     /// view -> the single chosen proof (notarization or nullification).
     proofs: BTreeMap<u64, Proof>,
     /// view -> per-block notarize tally (candidates keyed by block hash).
@@ -393,6 +443,17 @@ pub struct MinimmitReplica {
     nullify_votes: BTreeMap<u64, Tally>,
     /// height -> exec-attestation tally toward the exec L-cert (fed by #528).
     exec_votes: BTreeMap<u64, Tally>,
+    /// First execution attestation candidate retained per height/digest.
+    exec_candidates: BTreeMap<(u64, Hash), ExecAttest>,
+    /// Fully assembled execution L-certificates, parked until the matching
+    /// block becomes consensus-final when attestations arrive first.
+    exec_certificates: BTreeMap<u64, (Hash, Certificate)>,
+    /// Per-height monotone consensus-final -> fully-finalized ladder.
+    finality: BTreeMap<u64, FinalityStage>,
+    /// Proof views already emitted by R7 on a periodic tick.
+    redisseminated: BTreeSet<u64>,
+    /// Validator-set update waiting for explicit boundary activation.
+    pending_update: Option<ValidatorSetUpdate>,
     /// The highest prune horizon applied: votes for views below it are
     /// outside the admission window — the HotStuff
     /// [`crate::vote::CollectorWindow`] watermark re-derived for the view
@@ -449,14 +510,23 @@ impl MinimmitReplica {
             epoch,
             committee,
             self_index,
+            signer: None,
             genesis_hash,
             view: 0,
             notarized: None,
             nullified: false,
+            pending_proposals: BTreeMap::new(),
+            seen_proposals: BTreeMap::new(),
+            blocks: BTreeMap::new(),
             proofs: BTreeMap::new(),
             notarize_votes: BTreeMap::new(),
             nullify_votes: BTreeMap::new(),
             exec_votes: BTreeMap::new(),
+            exec_candidates: BTreeMap::new(),
+            exec_certificates: BTreeMap::new(),
+            finality: BTreeMap::new(),
+            redisseminated: BTreeSet::new(),
+            pending_update: None,
             view_floor: 0,
             per_validator: BTreeMap::new(),
             halted: BTreeSet::new(),
@@ -470,6 +540,29 @@ impl MinimmitReplica {
         Ok((replica, effects))
     }
 
+    /// Construct a voting replica with its local ed25519 consensus key.
+    ///
+    /// The key must match `committee[self_index]`. Keeping signing inside the
+    /// pure reactor is deterministic and avoids introducing a callback into
+    /// `step`; the node still owns block building and block verification.
+    pub fn new_with_signer(
+        committee: MinimmitCommittee,
+        self_index: u16,
+        genesis_hash: Hash,
+        epoch: u64,
+        signer: KeyPair,
+    ) -> Result<(Self, Vec<Effect>), VoteError> {
+        let expected = committee
+            .public_key(self_index)
+            .ok_or(VoteError::ForeignSigner(u32::from(self_index)))?;
+        if expected != signer.public() {
+            return Err(VoteError::InvalidSignature);
+        }
+        let (mut replica, effects) = Self::new(committee, self_index, genesis_hash, epoch)?;
+        replica.signer = Some(signer);
+        Ok((replica, effects))
+    }
+
     /// The single reactor entry point: apply one [`Input`], return the
     /// [`Effect`]s the node must execute (§7).
     ///
@@ -479,9 +572,8 @@ impl MinimmitReplica {
     /// No arm invokes a callback; verify verdicts arrive as
     /// [`Input::ProposalVerified`] data (§7.1).
     ///
-    /// Dispatch skeleton (#521): every arm is a deterministic no-op stub
-    /// until its rule issue lands (R1–R3 #524, R4–R7 #525/#526, exec-cert
-    /// #528, epoch #529).
+    /// All Phase 2 rule arms are implemented here: R1–R7, execution-certified
+    /// finality, and explicit epoch rotation.
     pub fn step(&mut self, input: Input) -> Vec<Effect> {
         match input {
             Input::Message(message) => self.on_message(message),
@@ -499,35 +591,496 @@ impl MinimmitReplica {
     fn on_message(&mut self, message: ConsensusMessage) -> Vec<Effect> {
         match message {
             // R1 self-admission + R2 stateless guards and buffering (#524).
-            ConsensusMessage::Propose(_propose) => Vec::new(),
+            ConsensusMessage::Propose(propose) => self.on_propose(propose),
             // R4 form path: tally, M-cert assembly, L finalization (#523, #525).
-            ConsensusMessage::Notarize(_notarize) => Vec::new(),
+            ConsensusMessage::Notarize(notarize) => self.on_notarize(notarize),
             // R5 form path + R6 contradiction observation (#523, #525, #526).
-            ConsensusMessage::Nullify(_nullify) => Vec::new(),
+            ConsensusMessage::Nullify(nullify) => self.on_nullify(nullify),
             // R4 ingest path: verified inbound notarization (#525).
-            ConsensusMessage::Notarization(_notarization) => Vec::new(),
+            ConsensusMessage::Notarization(notarization) => {
+                self.on_notarization(notarization, false)
+            }
             // R5 ingest path: verified inbound nullification (#525).
-            ConsensusMessage::Nullification(_nullification) => Vec::new(),
+            ConsensusMessage::Nullification(nullification) => {
+                self.on_nullification(nullification, false)
+            }
             // Exec-attestation tally toward the exec L-cert (#528).
-            ConsensusMessage::ExecAttest(_attest) => Vec::new(),
+            ConsensusMessage::ExecAttest(attest) => self.on_exec_attest(attest),
         }
     }
 
     /// The node's 2Δ timer for `view` expired — R3 nullify-by-timeout (#524).
     /// Stale fires for superseded views are guard no-ops.
-    fn on_timer_fired(&mut self, _view: u64) -> Vec<Effect> {
-        Vec::new()
+    fn on_timer_fired(&mut self, view: u64) -> Vec<Effect> {
+        if view != self.view || self.notarized.is_some() || self.nullified {
+            return Vec::new();
+        }
+        let Some(signer) = self.signer.as_ref() else {
+            return Vec::new();
+        };
+        let mut vote = Nullify {
+            epoch: self.epoch,
+            view,
+            validator_index: self.self_index,
+            signature: [0; 64],
+        };
+        vote.signature = signer.sign(vote.digest().as_bytes());
+        self.nullified = true;
+        let mut effects = vec![Effect::Broadcast(ConsensusMessage::Nullify(vote.clone()))];
+        effects.extend(self.on_nullify(vote));
+        effects
     }
 
     /// Periodic driver pulse — R7 proof re-dissemination (#525).
     fn on_tick(&mut self) -> Vec<Effect> {
-        Vec::new()
+        let floor = self.view.saturating_sub(DEFAULT_VIEW_HORIZON);
+        let views: Vec<u64> = self
+            .proofs
+            .range(floor..=self.view)
+            .map(|(&view, _)| view)
+            .filter(|view| !self.redisseminated.contains(view))
+            .collect();
+        let mut effects = Vec::with_capacity(views.len());
+        for view in views {
+            let Some(proof) = self.proofs.get(&view).cloned() else {
+                continue;
+            };
+            self.redisseminated.insert(view);
+            let message = match proof {
+                Proof::Notarization(value) => ConsensusMessage::Notarization(value),
+                Proof::Nullification(value) => ConsensusMessage::Nullification(value),
+            };
+            effects.push(Effect::Broadcast(message));
+        }
+        effects
     }
 
     /// Node-side block-validity verdict for a buffered proposal — completes
     /// R2 (§7.1, #524).
-    fn on_proposal_verified(&mut self, _view: u64, _block_hash: Hash, _valid: bool) -> Vec<Effect> {
+    fn on_proposal_verified(&mut self, view: u64, block_hash: Hash, valid: bool) -> Vec<Effect> {
+        let Some(propose) = self.pending_proposals.remove(&view) else {
+            return Vec::new();
+        };
+        if propose.block_hash != block_hash || !valid || view != self.view {
+            return Vec::new();
+        }
+        // Re-check the mutable guards: the timer may have fired while the
+        // node verified the block.
+        if self.notarized.is_some() || self.nullified || !self.valid_parent(view, &propose.parent) {
+            return Vec::new();
+        }
+
+        let signature = if propose.proposer_index == self.self_index {
+            propose.notarize_sig
+        } else {
+            let Some(signer) = self.signer.as_ref() else {
+                return Vec::new();
+            };
+            signer.sign(propose.notarize_digest().as_bytes())
+        };
+        let vote = Notarize {
+            epoch: self.epoch,
+            view,
+            block_hash,
+            validator_index: self.self_index,
+            signature,
+        };
+        self.notarized = Some(block_hash);
+        self.blocks.insert(block_hash, (view, propose.block));
+        let mut effects = if propose.proposer_index == self.self_index {
+            vec![Effect::Broadcast(ConsensusMessage::Propose(
+                propose.clone(),
+            ))]
+        } else {
+            vec![Effect::Broadcast(ConsensusMessage::Notarize(vote.clone()))]
+        };
+        effects.extend(self.on_notarize(Notarize {
+            epoch: propose.epoch,
+            view: propose.view,
+            block_hash,
+            validator_index: propose.proposer_index,
+            signature: propose.notarize_sig,
+        }));
+        if propose.proposer_index != self.self_index {
+            effects.extend(self.on_notarize(vote));
+        }
+        effects
+    }
+
+    /// R1/R2 stateless proposal admission and verify-injection buffering.
+    fn on_propose(&mut self, propose: Propose) -> Vec<Effect> {
+        if propose.epoch != self.epoch
+            || propose.view != self.view
+            || propose.view == BOTTOM_VIEW
+            || propose.proposer_index != self.committee.leader(propose.view)
+            || propose.block.hash() != propose.block_hash
+            || propose.block.parent_hash != propose.parent.parent_hash
+        {
+            return Vec::new();
+        }
+        let Some(key) = self.committee.cached_key(propose.proposer_index) else {
+            return Vec::new();
+        };
+        if key
+            .verify(propose.notarize_digest().as_bytes(), &propose.notarize_sig)
+            .is_err()
+            || key
+                .verify(propose.auth_digest().as_bytes(), &propose.propose_sig)
+                .is_err()
+        {
+            return Vec::new();
+        }
+
+        if let Some(first) = self.seen_proposals.get(&propose.view) {
+            if first.block_hash == propose.block_hash {
+                return Vec::new();
+            }
+            let evidence = Equivocation {
+                validator_index: u32::from(propose.proposer_index),
+                epoch: propose.epoch,
+                view: propose.view,
+                height: propose.block.height,
+                phase: VotePhase::Prepare,
+                first_block: first.block_hash,
+                second_block: propose.block_hash,
+                first_signature: Some(first.propose_sig),
+                second_signature: Some(propose.propose_sig),
+            };
+            self.halt(propose.proposer_index);
+            return vec![Effect::Slash(SlashEvidence {
+                kind: SlashKind::ProposalFork,
+                equivocation: Some(evidence),
+                epoch: propose.epoch,
+            })];
+        }
+        if self.notarized.is_some()
+            || self.nullified
+            || !self.valid_parent(propose.view, &propose.parent)
+        {
+            return Vec::new();
+        }
+        self.seen_proposals.insert(propose.view, propose.clone());
+        self.pending_proposals.insert(propose.view, propose);
         Vec::new()
+    }
+
+    /// R4 vote admission, M-certificate formation, and L finalization.
+    fn on_notarize(&mut self, notarize: Notarize) -> Vec<Effect> {
+        let outcome = match self.admit_notarize(&notarize) {
+            Ok(outcome) => outcome,
+            Err(_) => return Vec::new(),
+        };
+        let mut effects = Vec::new();
+        if let TallyOutcome::Equivocated {
+            first,
+            first_signature,
+        } = outcome
+        {
+            effects.push(self.vote_equivocation(&notarize, first, first_signature));
+            return effects;
+        }
+
+        if let Some(cert) =
+            self.try_form_notarization(notarize.view, notarize.block_hash, ThresholdKind::Advance)
+        {
+            let formed = Notarization {
+                epoch: notarize.epoch,
+                view: notarize.view,
+                block_hash: notarize.block_hash,
+                cert,
+            };
+            effects.extend(self.on_notarization(formed, true));
+        }
+
+        // R6 observes accepted, distinct contradicting notarize/nullify
+        // senders even after the M proof for this view advanced other peers.
+        effects.extend(self.maybe_nullify_by_contradiction(notarize.view));
+        effects
+    }
+
+    /// R5 vote admission and M-nullification formation.
+    fn on_nullify(&mut self, nullify: Nullify) -> Vec<Effect> {
+        if self.admit_nullify(&nullify).is_err() {
+            return Vec::new();
+        }
+        let mut effects = Vec::new();
+        if let Some(cert) = self.try_form_nullification(nullify.view, ThresholdKind::Advance) {
+            let formed = Nullification {
+                epoch: nullify.epoch,
+                view: nullify.view,
+                cert,
+            };
+            effects.extend(self.on_nullification(formed, true));
+        }
+        effects.extend(self.maybe_nullify_by_contradiction(nullify.view));
+        effects
+    }
+
+    /// Symmetric R4 form/ingest path. `formed_here` controls the one immediate
+    /// certificate broadcast; later ticks provide bounded re-dissemination.
+    fn on_notarization(&mut self, notarization: Notarization, formed_here: bool) -> Vec<Effect> {
+        if notarization.epoch != self.epoch || notarization.verify(&self.committee).is_err() {
+            return Vec::new();
+        }
+        let view = notarization.view;
+        let block = notarization.block_hash;
+        if self.proofs.get(&view).is_some_and(
+            |proof| !matches!(proof, Proof::Notarization(value) if value.block_hash == block),
+        ) {
+            return Vec::new();
+        }
+
+        let mut effects = Vec::new();
+        let incoming_is_l = self
+            .committee
+            .verify(&notarization.cert, ThresholdKind::Finalize)
+            .is_ok();
+        let existing_is_l = self.proofs.get(&view).is_some_and(|proof| match proof {
+            Proof::Notarization(value) => self
+                .committee
+                .verify(&value.cert, ThresholdKind::Finalize)
+                .is_ok(),
+            Proof::Nullification(_) => false,
+        });
+        let is_new = !self.proofs.contains_key(&view);
+        let is_upgrade = incoming_is_l && !existing_is_l;
+        if is_new || is_upgrade {
+            self.proofs
+                .insert(view, Proof::Notarization(notarization.clone()));
+            self.redisseminated.remove(&view);
+            if is_new {
+                effects.push(Effect::CancelTimer { view });
+            }
+            if formed_here {
+                self.redisseminated.insert(view);
+                effects.push(Effect::Broadcast(ConsensusMessage::Notarization(
+                    notarization.clone(),
+                )));
+            }
+            if is_new {
+                effects.extend(self.enter_view(view.saturating_add(1)));
+            }
+        }
+
+        if incoming_is_l {
+            effects.extend(self.consensus_finalize(view, block));
+        }
+        effects
+    }
+
+    /// Symmetric R5 form/ingest path.
+    fn on_nullification(&mut self, nullification: Nullification, formed_here: bool) -> Vec<Effect> {
+        if nullification.epoch != self.epoch || nullification.verify(&self.committee).is_err() {
+            return Vec::new();
+        }
+        let view = nullification.view;
+        if self.proofs.contains_key(&view) {
+            return Vec::new();
+        }
+        self.proofs
+            .insert(view, Proof::Nullification(nullification.clone()));
+        let mut effects = vec![Effect::CancelTimer { view }];
+        if formed_here {
+            self.redisseminated.insert(view);
+            effects.push(Effect::Broadcast(ConsensusMessage::Nullification(
+                nullification,
+            )));
+        }
+        effects.extend(self.enter_view(view.saturating_add(1)));
+        effects
+    }
+
+    fn vote_equivocation(&self, vote: &Notarize, first: Hash, first_signature: [u8; 64]) -> Effect {
+        let height = self
+            .blocks
+            .get(&vote.block_hash)
+            .map_or(0, |(_, block)| block.height);
+        Effect::Slash(SlashEvidence {
+            kind: SlashKind::VoteEquivocation,
+            equivocation: Some(Equivocation {
+                validator_index: u32::from(vote.validator_index),
+                epoch: vote.epoch,
+                view: vote.view,
+                height,
+                phase: VotePhase::Prepare,
+                first_block: first,
+                second_block: vote.block_hash,
+                first_signature: Some(first_signature),
+                second_signature: Some(vote.signature),
+            }),
+            epoch: vote.epoch,
+        })
+    }
+
+    /// R6's non-slashable second vote: after this replica notarized `c`, a
+    /// distinct M-weight union of nullifiers and notarizers for `c' != c`
+    /// proves `c` cannot reach L.
+    fn maybe_nullify_by_contradiction(&mut self, view: u64) -> Vec<Effect> {
+        if view != self.view || self.nullified {
+            return Vec::new();
+        }
+        let Some(ours) = self.notarized else {
+            return Vec::new();
+        };
+        let mut contradictors = BTreeSet::new();
+        if let Some(tally) = self.nullify_votes.get(&view) {
+            for per in tally.votes().values() {
+                contradictors.extend(per.keys().copied());
+            }
+        }
+        if let Some(tally) = self.notarize_votes.get(&view) {
+            for (&candidate, per) in tally.votes() {
+                if candidate != ours {
+                    contradictors.extend(per.keys().copied());
+                }
+            }
+        }
+        let weight = contradictors
+            .into_iter()
+            .filter_map(|index| self.committee.weight(index))
+            .fold(0u64, u64::saturating_add);
+        if weight < self.committee.advance_threshold() {
+            return Vec::new();
+        }
+        let Some(signer) = self.signer.as_ref() else {
+            return Vec::new();
+        };
+        let mut vote = Nullify {
+            epoch: self.epoch,
+            view,
+            validator_index: self.self_index,
+            signature: [0; 64],
+        };
+        vote.signature = signer.sign(vote.digest().as_bytes());
+        self.nullified = true;
+        let mut effects = vec![Effect::Broadcast(ConsensusMessage::Nullify(vote.clone()))];
+        // The local R6 vote participates in R5 exactly once, but the split
+        // tally deliberately prevents it from becoming slash evidence.
+        if self.admit_nullify(&vote).is_ok() {
+            if let Some(cert) = self.try_form_nullification(view, ThresholdKind::Advance) {
+                effects.extend(self.on_nullification(
+                    Nullification {
+                        epoch: self.epoch,
+                        view,
+                        cert,
+                    },
+                    true,
+                ));
+            }
+        }
+        effects
+    }
+
+    /// Turn an L-notarized tip into ordered, per-height consensus-final
+    /// events, walking authenticated parent headers back to the existing
+    /// chain. If metadata is still missing, finalization waits for proposal
+    /// re-delivery rather than inventing a height.
+    fn consensus_finalize(&mut self, view: u64, tip: Hash) -> Vec<Effect> {
+        if self.finalized_tip.0 != BOTTOM_VIEW && view <= self.finalized_tip.0 {
+            return Vec::new();
+        }
+        let mut cursor = tip;
+        let mut path = Vec::new();
+        loop {
+            if self.chain.values().any(|known| *known == cursor) {
+                break;
+            }
+            let Some(&(block_view, block)) = self.blocks.get(&cursor) else {
+                return Vec::new();
+            };
+            path.push((block.height, block_view, cursor));
+            cursor = block.parent_hash;
+        }
+        path.reverse();
+        let mut effects = Vec::new();
+        for (height, block_view, block) in path {
+            if self.chain.get(&height).is_some_and(|known| *known != block) {
+                return Vec::new();
+            }
+            if self.finality.contains_key(&height) {
+                continue;
+            }
+            self.chain.insert(height, block);
+            self.finality.insert(
+                height,
+                FinalityStage::ConsensusFinal {
+                    view: block_view,
+                    block,
+                },
+            );
+            effects.push(Effect::ConsensusFinal { block, height });
+            effects.extend(self.try_complete_finality(height));
+        }
+        self.finalized_tip = (view, tip);
+        self.prune(view.saturating_sub(DEFAULT_VIEW_HORIZON));
+        effects
+    }
+
+    /// Collect execution attestations at L and complete the mandatory
+    /// execution-finality gate if ordering is already consensus-final.
+    fn on_exec_attest(&mut self, attest: ExecAttest) -> Vec<Effect> {
+        if attest.epoch != self.epoch || attest.verify(&self.committee).is_err() {
+            return Vec::new();
+        }
+        let Some(&(view, block)) = self.blocks.get(&attest.block_hash) else {
+            return Vec::new();
+        };
+        if view != attest.view || block.height != attest.height {
+            return Vec::new();
+        }
+        let digest = attest.digest();
+        let tally = self.exec_votes.entry(attest.height).or_default();
+        let outcome = match tally.admit(attest.validator_index, digest, attest.signature, true) {
+            Ok(outcome) => outcome,
+            Err(_) => return Vec::new(),
+        };
+        if matches!(outcome, TallyOutcome::Equivocated { .. }) {
+            self.halt(attest.validator_index);
+            return Vec::new();
+        }
+        self.exec_candidates
+            .entry((attest.height, digest))
+            .or_insert(attest.clone());
+        let Some(cert) = self.exec_votes.get(&attest.height).and_then(|tally| {
+            tally.try_form(&self.committee, digest, digest, ThresholdKind::Finalize)
+        }) else {
+            return Vec::new();
+        };
+        if self
+            .committee
+            .verify(&cert, ThresholdKind::Finalize)
+            .is_err()
+        {
+            return Vec::new();
+        }
+        self.exec_certificates
+            .entry(attest.height)
+            .or_insert((attest.execution_root, cert));
+        self.try_complete_finality(attest.height)
+    }
+
+    fn try_complete_finality(&mut self, height: u64) -> Vec<Effect> {
+        let Some((execution_root, execution_cert)) = self.exec_certificates.get(&height).cloned()
+        else {
+            return Vec::new();
+        };
+        let Some(FinalityStage::ConsensusFinal { view, block }) =
+            self.finality.get(&height).cloned()
+        else {
+            return Vec::new();
+        };
+        self.finality.insert(
+            height,
+            FinalityStage::Finalized {
+                view,
+                block,
+                execution_root,
+                execution_cert,
+            },
+        );
+        self.exec_votes.remove(&height);
+        self.exec_candidates.retain(|(h, _), _| *h != height);
+        vec![Effect::Finalized { block, height }]
     }
 
     // ─── Two-tally vote machinery (§5, §8 R4/R5 feed, #523) ───
@@ -836,9 +1389,6 @@ impl MinimmitReplica {
     /// the view being left is the **caller's** concern (R4/R5 emit it
     /// alongside the certificate, #525); a stale fire is an R3 guard no-op
     /// either way.
-    // Wired in by R4/R5 (#525) and epoch rotation (#529); the allow keeps the
-    // staged migration clippy-clean until then and leaves with #525.
-    #[allow(dead_code)]
     fn enter_view(&mut self, next: u64) -> Vec<Effect> {
         if next <= self.view {
             return Vec::new();
@@ -880,9 +1430,6 @@ impl MinimmitReplica {
     /// `exec_votes` is keyed by **height**, not view, and prunes when its
     /// height finalizes (§10, #528); `chain` is the finalized chain itself
     /// and only ever grows.
-    // Wired in by R4 (#525); the allow keeps the staged migration
-    // clippy-clean until then and leaves with #525.
-    #[allow(dead_code)]
     fn prune(&mut self, horizon: u64) {
         self.view_floor = self.view_floor.max(horizon);
         // `split_off(&horizon)` keeps exactly the keys `>= horizon` — one
@@ -911,6 +1458,78 @@ impl MinimmitReplica {
                 }
             }
         }
+    }
+
+    /// Schedule a validator-set update for an explicit epoch boundary.
+    pub fn schedule_update(&mut self, update: ValidatorSetUpdate) {
+        self.pending_update = Some(update);
+    }
+
+    /// Whether a validator-set update is waiting for activation.
+    #[must_use]
+    pub fn has_pending_update(&self) -> bool {
+        self.pending_update.is_some()
+    }
+
+    /// Activate the scheduled unit-weight validator set at `new_epoch`.
+    ///
+    /// Activation is drain-before-swap: every consensus-final height must
+    /// already have its old-committee execution L-certificate. The committee
+    /// and local index are validated before any state changes, so failure is
+    /// atomic and leaves the pending update installed.
+    pub fn activate_epoch(&mut self, new_epoch: u64) -> Result<Vec<Effect>, EpochError> {
+        let update = self
+            .pending_update
+            .as_ref()
+            .ok_or(EpochError::NoPendingUpdate)?;
+        if update.activation_epoch != new_epoch {
+            return Err(EpochError::WrongActivationEpoch {
+                activation: update.activation_epoch,
+                requested: new_epoch,
+            });
+        }
+        if self
+            .finality
+            .values()
+            .any(|stage| matches!(stage, FinalityStage::ConsensusFinal { .. }))
+        {
+            return Err(EpochError::ExecutionCertificatesPending);
+        }
+        let committee = MinimmitCommittee::new_unit(new_epoch, update.validators.clone())
+            .map_err(EpochError::InvalidCommittee)?;
+        let new_index = if let Some(signer) = self.signer.as_ref() {
+            committee
+                .validators()
+                .iter()
+                .position(|validator| validator.public_key == signer.public())
+                .and_then(|index| u16::try_from(index).ok())
+                .ok_or(EpochError::ReplicaRemoved)?
+        } else if usize::from(self.self_index) < committee.len() {
+            self.self_index
+        } else {
+            return Err(EpochError::ReplicaRemoved);
+        };
+
+        self.pending_update = None;
+        self.epoch = new_epoch;
+        self.committee = committee;
+        self.self_index = new_index;
+        self.view = 0;
+        self.notarized = None;
+        self.nullified = false;
+        self.pending_proposals.clear();
+        self.seen_proposals.clear();
+        self.proofs.clear();
+        self.notarize_votes.clear();
+        self.nullify_votes.clear();
+        self.exec_votes.clear();
+        self.exec_candidates.clear();
+        self.exec_certificates.clear();
+        self.redisseminated.clear();
+        self.per_validator.clear();
+        self.halted.clear();
+        self.view_floor = 0;
+        Ok(self.view_entry_effects(0))
     }
 
     /// The replica's current epoch.
@@ -979,6 +1598,12 @@ impl MinimmitReplica {
     #[must_use]
     pub fn exec_votes(&self) -> &BTreeMap<u64, Tally> {
         &self.exec_votes
+    }
+
+    /// Per-height monotone ordering/execution finality state.
+    #[must_use]
+    pub fn finality(&self) -> &BTreeMap<u64, FinalityStage> {
+        &self.finality
     }
 
     /// Total retained vote entries across the notarize + nullify tallies
@@ -2006,5 +2631,323 @@ mod tests {
         assert!(replica.notarize_votes().is_empty());
         assert!(replica.nullify_votes().is_empty());
         assert!(replica.halted_offenders().is_empty());
+    }
+
+    // ─── #524: R1 propose, R2 injected verification, R3 timeout ───
+
+    fn voting_replica(index: u16) -> MinimmitReplica {
+        MinimmitReplica::new_with_signer(
+            committee(EPOCH),
+            index,
+            genesis(),
+            EPOCH,
+            keys6()[usize::from(index)].clone(),
+        )
+        .unwrap()
+        .0
+    }
+
+    fn signed_propose(block: BlockHeader) -> Propose {
+        let mut propose = Propose {
+            epoch: EPOCH,
+            view: 0,
+            block,
+            block_hash: block.hash(),
+            parent: ParentRef::genesis(genesis()),
+            proposer_index: 0,
+            notarize_sig: [0; 64],
+            propose_sig: [0; 64],
+        };
+        propose.notarize_sig = keys6()[0].sign(propose.notarize_digest().as_bytes());
+        propose.propose_sig = keys6()[0].sign(propose.auth_digest().as_bytes());
+        propose
+    }
+
+    #[test]
+    fn r1_leader_propose_is_verified_broadcast_and_self_tallied() {
+        let mut replica = voting_replica(0);
+        let propose = signed_propose(block_header());
+        let hash = propose.block_hash;
+        assert!(replica
+            .step(Input::Message(ConsensusMessage::Propose(propose.clone())))
+            .is_empty());
+        assert_eq!(replica.notarized(), None, "verdict is an explicit input");
+
+        assert_eq!(
+            replica.step(Input::ProposalVerified {
+                view: 0,
+                block_hash: hash,
+                valid: true,
+            }),
+            vec![Effect::Broadcast(ConsensusMessage::Propose(propose))]
+        );
+        assert_eq!(replica.notarized(), Some(hash));
+        assert_eq!(
+            replica.notarize_votes()[&0].weight_for(replica.committee(), hash),
+            1
+        );
+    }
+
+    #[test]
+    fn r2_follower_waits_for_valid_verdict_and_broadcasts_signed_notarize() {
+        let mut replica = voting_replica(1);
+        let propose = signed_propose(block_header());
+        let hash = propose.block_hash;
+        replica.step(Input::Message(ConsensusMessage::Propose(propose)));
+        let effects = replica.step(Input::ProposalVerified {
+            view: 0,
+            block_hash: hash,
+            valid: true,
+        });
+        let [Effect::Broadcast(ConsensusMessage::Notarize(vote))] = effects.as_slice() else {
+            panic!("expected one notarize broadcast: {effects:?}");
+        };
+        assert_eq!(vote.validator_index, 1);
+        assert_eq!(vote.block_hash, hash);
+        assert_eq!(replica.admit_notarize(vote), Ok(TallyOutcome::Duplicate));
+        assert_eq!(replica.notarized(), Some(hash));
+
+        let mut rejected = voting_replica(1);
+        rejected.step(Input::Message(ConsensusMessage::Propose(signed_propose(
+            block_header(),
+        ))));
+        assert!(rejected
+            .step(Input::ProposalVerified {
+                view: 0,
+                block_hash: hash,
+                valid: false,
+            })
+            .is_empty());
+        assert_eq!(rejected.notarized(), None);
+    }
+
+    #[test]
+    fn r2_rejects_bad_guards_and_slashes_authenticated_proposal_fork() {
+        let mut replica = voting_replica(1);
+        let first = signed_propose(block_header());
+
+        let mut bad_signature = first.clone();
+        bad_signature.propose_sig[0] ^= 1;
+        assert!(replica
+            .step(Input::Message(ConsensusMessage::Propose(bad_signature)))
+            .is_empty());
+
+        replica.step(Input::Message(ConsensusMessage::Propose(first.clone())));
+        let mut conflicting_block = block_header();
+        conflicting_block.payload_root = hash(0x42);
+        let conflict = signed_propose(conflicting_block);
+        let effects = replica.step(Input::Message(ConsensusMessage::Propose(conflict)));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Slash(SlashEvidence {
+                kind: SlashKind::ProposalFork,
+                ..
+            })]
+        ));
+        assert!(replica.halted_offenders().contains(&0));
+    }
+
+    #[test]
+    fn r3_current_timer_nullifies_once_and_stale_timer_is_noop() {
+        let mut replica = voting_replica(2);
+        assert!(replica.step(Input::TimerFired { view: 9 }).is_empty());
+        let effects = replica.step(Input::TimerFired { view: 0 });
+        let [Effect::Broadcast(ConsensusMessage::Nullify(vote))] = effects.as_slice() else {
+            panic!("expected one nullify broadcast: {effects:?}");
+        };
+        assert_eq!(vote.validator_index, 2);
+        assert_eq!(replica.admit_nullify(vote), Ok(TallyOutcome::Duplicate));
+        assert!(replica.nullified());
+        assert!(replica.step(Input::TimerFired { view: 0 }).is_empty());
+    }
+
+    fn signed_exec(
+        view: u64,
+        height: u64,
+        block_hash: Hash,
+        execution_root: Hash,
+        index: u16,
+    ) -> ExecAttest {
+        let mut attest = ExecAttest {
+            epoch: EPOCH,
+            view,
+            height,
+            block_hash,
+            execution_root,
+            validator_index: index,
+            signature: [0; 64],
+        };
+        attest.signature = keys6()[usize::from(index)].sign(attest.digest().as_bytes());
+        attest
+    }
+
+    #[test]
+    fn r4_forms_m_advances_at_m_and_consensus_finalizes_only_at_l() {
+        let mut replica = voting_replica(5);
+        let proposal = signed_propose(block_header());
+        let block = proposal.block_hash;
+        replica.step(Input::Message(ConsensusMessage::Propose(proposal)));
+        replica.step(Input::ProposalVerified {
+            view: 0,
+            block_hash: block,
+            valid: true,
+        });
+        // Leader + self are already tallied. The third vote reaches M.
+        let effects = replica.step(Input::Message(ConsensusMessage::Notarize(signed_notarize(
+            0, block, 1,
+        ))));
+        assert!(matches!(
+            replica.proofs().get(&0),
+            Some(Proof::Notarization(_))
+        ));
+        assert_eq!(replica.view(), 1);
+        assert!(effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Broadcast(ConsensusMessage::Notarization(_)))));
+        assert!(!effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::ConsensusFinal { .. })));
+
+        replica.step(Input::Message(ConsensusMessage::Notarize(signed_notarize(
+            0, block, 2,
+        ))));
+        let effects = replica.step(Input::Message(ConsensusMessage::Notarize(signed_notarize(
+            0, block, 3,
+        ))));
+        assert!(effects.contains(&Effect::ConsensusFinal { block, height: 1 }));
+        assert_eq!(replica.chain().get(&1), Some(&block));
+        assert!(matches!(
+            replica.finality().get(&1),
+            Some(FinalityStage::ConsensusFinal { .. })
+        ));
+        assert!(!effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Finalized { .. })));
+    }
+
+    #[test]
+    fn execution_l_certificate_is_mandatory_and_finalized_fires_once() {
+        let mut replica = voting_replica(5);
+        let proposal = signed_propose(block_header());
+        let block = proposal.block_hash;
+        replica.step(Input::Message(ConsensusMessage::Propose(proposal)));
+        replica.step(Input::ProposalVerified {
+            view: 0,
+            block_hash: block,
+            valid: true,
+        });
+        for index in [1u16, 2, 3] {
+            replica.step(Input::Message(ConsensusMessage::Notarize(signed_notarize(
+                0, block, index,
+            ))));
+        }
+        let root = hash(0xE1);
+        for index in [0u16, 1, 2, 3] {
+            let effects = replica.step(Input::Message(ConsensusMessage::ExecAttest(signed_exec(
+                0, 1, block, root, index,
+            ))));
+            assert!(!effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Finalized { .. })));
+        }
+        let effects = replica.step(Input::Message(ConsensusMessage::ExecAttest(signed_exec(
+            0, 1, block, root, 4,
+        ))));
+        assert_eq!(effects, vec![Effect::Finalized { block, height: 1 }]);
+        assert!(matches!(
+            replica.finality().get(&1),
+            Some(FinalityStage::Finalized {
+                execution_root,
+                ..
+            }) if *execution_root == root
+        ));
+        assert!(replica
+            .step(Input::Message(ConsensusMessage::ExecAttest(signed_exec(
+                0, 1, block, root, 5,
+            ))))
+            .is_empty());
+    }
+
+    #[test]
+    fn r5_ingests_nullification_and_r7_redisseminates_once() {
+        let keys = keys6();
+        let digest = nullify_digest(EPOCH, 0);
+        let signers: Vec<_> = [0u16, 1, 2]
+            .into_iter()
+            .map(|index| (index, keys[usize::from(index)].sign(digest.as_bytes())))
+            .collect();
+        let proof = Nullification {
+            epoch: EPOCH,
+            view: 0,
+            cert: committee(EPOCH).assemble(digest, &signers).unwrap(),
+        };
+        let mut replica = voting_replica(5);
+        let effects = replica.step(Input::Message(ConsensusMessage::Nullification(
+            proof.clone(),
+        )));
+        assert_eq!(replica.view(), 1);
+        assert!(effects.contains(&Effect::CancelTimer { view: 0 }));
+        assert_eq!(
+            replica.step(Input::Tick),
+            vec![Effect::Broadcast(ConsensusMessage::Nullification(proof))]
+        );
+        assert!(replica.step(Input::Tick).is_empty());
+    }
+
+    #[test]
+    fn r6_notarize_then_nullify_is_non_slashable() {
+        let mut replica = voting_replica(4);
+        let proposal = signed_propose(block_header());
+        let ours = proposal.block_hash;
+        replica.step(Input::Message(ConsensusMessage::Propose(proposal)));
+        replica.step(Input::ProposalVerified {
+            view: 0,
+            block_hash: ours,
+            valid: true,
+        });
+        replica.step(Input::Message(ConsensusMessage::Nullify(signed_nullify(
+            0, 1,
+        ))));
+        replica.step(Input::Message(ConsensusMessage::Nullify(signed_nullify(
+            0, 2,
+        ))));
+        let effects = replica.step(Input::Message(ConsensusMessage::Notarize(signed_notarize(
+            0,
+            hash(0xCC),
+            3,
+        ))));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Broadcast(ConsensusMessage::Nullify(Nullify {
+                validator_index: 4,
+                ..
+            }))
+        )));
+        assert!(replica.halted_offenders().is_empty());
+        assert!(matches!(
+            replica.proofs().get(&0),
+            Some(Proof::Nullification(_))
+        ));
+    }
+
+    #[test]
+    fn epoch_rotation_is_atomic_and_rejects_old_epoch_votes() {
+        let mut replica = voting_replica(2);
+        replica.schedule_update(ValidatorSetUpdate {
+            activation_epoch: 1,
+            validators: committee(1).validators().to_vec(),
+        });
+        assert!(matches!(
+            replica.activate_epoch(2),
+            Err(EpochError::WrongActivationEpoch { .. })
+        ));
+        let effects = replica.activate_epoch(1).unwrap();
+        assert_eq!(replica.epoch(), 1);
+        assert_eq!(replica.view(), 0);
+        assert_eq!(effects, vec![Effect::ArmTimer { view: 0 }]);
+        assert_eq!(
+            replica.admit_nullify(&signed_nullify(0, 0)),
+            Err(VoteError::EpochMismatch)
+        );
     }
 }

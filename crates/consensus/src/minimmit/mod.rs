@@ -29,7 +29,7 @@ pub use committee::{Certificate, MinimmitCommittee, ThresholdKind};
 pub use digest::{
     notarize_digest, nullify_digest, propose_auth, DOMAIN_NOTARIZE, DOMAIN_NULLIFY, DOMAIN_PROPOSE,
 };
-pub use replica::{Effect, Input, MinimmitReplica, Tally, TallyOutcome};
+pub use replica::{Effect, EpochError, FinalityStage, Input, MinimmitReplica, Tally, TallyOutcome};
 pub use wire::{
     msg_type, CertError, ConsensusMessage, ExecAttest, Notarization, Notarize, Nullification,
     Nullify, ParentRef, Proof, Propose, WireError, BOTTOM_VIEW,
