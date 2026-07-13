@@ -661,7 +661,26 @@ impl MinimmitReplica {
         let Some(propose) = self.pending_proposals.remove(&view) else {
             return Vec::new();
         };
-        if propose.block_hash != block_hash || !valid || view != self.view {
+        if propose.block_hash != block_hash || !valid {
+            return Vec::new();
+        }
+        self.blocks.insert(block_hash, (view, propose.block));
+        if view != self.view {
+            let l_proof = self.proofs.get(&view).and_then(|proof| match proof {
+                Proof::Notarization(value) if value.block_hash == block_hash => {
+                    Some(value.cert.clone())
+                }
+                _ => None,
+            });
+            if let Some(cert) = l_proof {
+                if self
+                    .committee
+                    .verify(&cert, ThresholdKind::Finalize)
+                    .is_ok()
+                {
+                    return self.consensus_finalize(view, block_hash);
+                }
+            }
             return Vec::new();
         }
         // Re-check the mutable guards: the timer may have fired while the
@@ -686,7 +705,6 @@ impl MinimmitReplica {
             signature,
         };
         self.notarized = Some(block_hash);
-        self.blocks.insert(block_hash, (view, propose.block));
         let mut effects = if propose.proposer_index == self.self_index {
             vec![Effect::Broadcast(ConsensusMessage::Propose(
                 propose.clone(),
@@ -710,8 +728,8 @@ impl MinimmitReplica {
     /// R1/R2 stateless proposal admission and verify-injection buffering.
     fn on_propose(&mut self, propose: Propose) -> Vec<Effect> {
         if propose.epoch != self.epoch
-            || propose.view != self.view
             || propose.view == BOTTOM_VIEW
+            || propose.view > self.view
             || propose.proposer_index != self.committee.leader(propose.view)
             || propose.block.hash() != propose.block_hash
             || propose.block.parent_hash != propose.parent.parent_hash
@@ -752,6 +770,16 @@ impl MinimmitReplica {
                 equivocation: Some(evidence),
                 epoch: propose.epoch,
             })];
+        }
+        if propose.view < self.view {
+            let matches_proof = self.proofs.get(&propose.view).is_some_and(
+                |proof| matches!(proof, Proof::Notarization(value) if value.block_hash == propose.block_hash),
+            );
+            if matches_proof {
+                self.seen_proposals.insert(propose.view, propose.clone());
+                self.pending_proposals.insert(propose.view, propose);
+            }
+            return Vec::new();
         }
         if self.notarized.is_some()
             || self.nullified
@@ -2892,6 +2920,45 @@ mod tests {
             vec![Effect::Broadcast(ConsensusMessage::Nullification(proof))]
         );
         assert!(replica.step(Input::Tick).is_empty());
+    }
+
+    #[test]
+    fn late_matching_proposal_completes_deferred_l_finalization_without_voting() {
+        let proposal = signed_propose(block_header());
+        let block = proposal.block_hash;
+        let digest = proposal.notarize_digest();
+        let signers: Vec<_> = (0u16..5)
+            .map(|index| (index, keys6()[usize::from(index)].sign(digest.as_bytes())))
+            .collect();
+        let notarization = Notarization {
+            epoch: EPOCH,
+            view: 0,
+            block_hash: block,
+            cert: committee(EPOCH).assemble(digest, &signers).unwrap(),
+        };
+        let mut lagging = voting_replica(5);
+        let effects = lagging.step(Input::Message(ConsensusMessage::Notarization(notarization)));
+        assert_eq!(lagging.view(), 1);
+        assert!(!effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::ConsensusFinal { .. })));
+
+        assert!(lagging
+            .step(Input::Message(ConsensusMessage::Propose(proposal)))
+            .is_empty());
+        assert_eq!(
+            lagging.step(Input::ProposalVerified {
+                view: 0,
+                block_hash: block,
+                valid: true,
+            }),
+            vec![Effect::ConsensusFinal { block, height: 1 }]
+        );
+        assert_eq!(
+            lagging.notarized(),
+            None,
+            "stale proposals never cast votes"
+        );
     }
 
     #[test]

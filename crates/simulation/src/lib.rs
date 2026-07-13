@@ -30,7 +30,15 @@
 //! set), all surviving honest nodes agree on identical finalized state roots,
 //! and re-running a seed reproduces byte-identical results.
 
+#[cfg(not(feature = "minimmit"))]
 pub mod cluster;
+#[cfg(feature = "minimmit")]
+#[path = "minimmit_cluster.rs"]
+pub mod cluster;
+#[cfg(not(feature = "minimmit"))]
+pub mod node;
+#[cfg(feature = "minimmit")]
+#[path = "minimmit_node.rs"]
 pub mod node;
 pub mod oracle;
 pub mod rng;
@@ -50,7 +58,7 @@ pub use transport::{LinkFaults, PriorityLink, Routing, Transport, TransportStats
 /// Crate identity, used by the node composition root for a startup manifest.
 pub const CRATE_NAME: &str = "simulation";
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "minimmit")))]
 mod tests {
     use super::*;
 
@@ -573,3 +581,6 @@ mod tests {
         assert!(r2.chance_permille(1000));
     }
 }
+
+#[cfg(all(test, feature = "minimmit"))]
+mod minimmit_tests;
