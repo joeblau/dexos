@@ -98,8 +98,7 @@ Surface the fault-tolerance-for-latency trade (~20% vs ~33%) loudly in
 
 ## §3 Module map (fixed layout)
 
-New code lands additively beside HotStuff (nothing HotStuff is deleted before
-Phase 5, §14):
+The completed implementation is laid out as follows:
 
 - `crates/crypto/src/quorum.rs` — `minimmit_thresholds` (#511), sizing guard
   (#512), dual-threshold test helper (#514), u16 bitmap + `MAX_VALIDATORS = 16`
@@ -595,9 +594,8 @@ Semantics mirror the existing `schedule_update`/`activate_epoch` contract
    (#546, §2.4).** Consequences: minimum committee **4 → 6**, `f_max = 3` at the
    16 cap, Byzantine tolerance ~19% at cap (vs ~31% for 3f+1 at 16) — the
    deliberate fault-tolerance-for-latency trade. Blast radius is *data*:
-   `config/validators.toml` ships **3** validators and every `n = 3/4/3f+1`
-   literal in tests/sim/bench under-provisions — the load-time guard (#536) fails
-   closed and Phase 3 sweeps the literals. The packed QC wire format breaks
+   `config/validators.toml` now ships **6** validators; the load-time guard
+   (#536) rejects smaller production descriptors. The packed QC wire format breaks
    (8-byte → 2-byte bitmap header) — hard-fork note in #543. Do not "optimize" to
    3f+1 (§2.1).
 2. **Execution-certified finalize — DECIDED: KEEP, mandatory, layered after
@@ -663,29 +661,28 @@ demo-only. Also replaced at Phase 5: `BftEngine`, `Proposal`/`ProposalOutcome`,
 
 ### §13.2 Retained as-is
 
-`checkpoint.rs` (all), `sequencer.rs` (all, incl. `CommandStatus`), `Fork`,
+`checkpoint.rs`, `sequencer.rs` (incl. `CommandStatus`), `Fork`,
 `ValidatorSetUpdate`, `Equivocation`/`SlashEvidence`/`SlashKind`/`SlashHook`,
 `crypto::{ValidatorSet, QuorumCertificate, KeyPair, CachedEd25519Key}`, the DoS
-`CollectorWindow`/quota machinery, `sig64`, `execution_commitment_digest`/
+bounded view/quota machinery, `sig64`, `execution_commitment_digest`/
 `DOMAIN_EXEC_COMMIT`/`certify_execution` semantics (§10), and the simulation
 substrate (transport/scheduler/rng/oracle). `bft_threshold` stays for its
 non-consensus callers (oracle/chain-adapter/decision-markets); Minimmit never
 calls it — it uses explicit M and L (#511).
 
-### §13.3 Rollout: additive coexistence, feature-flagged proof, then delete
+### §13.3 Completed rollout
 
 1. **Phases 0–2** (#546, #511–#529): Minimmit lands as new symbols beside
    HotStuff. Nothing is deleted; `main` stays green; the existing `consensus`
    tests keep compiling. The one invasive early change is #546's shared-QC bitmap
    shrink — its HotStuff call sites are updated in place.
-2. **Phase 3** (#530–#534): a new simulation driver behind
-   `--features minimmit` (in `simulation`/`benchmarks` only — it gates engine
-   *selection*, §3); CI runs both engines. The fault matrix (S1–S4 + L1–L4) is
+2. **Phase 3** (#530–#534): a feature-gated simulation driver proved the
+   fault matrix (S1–S4 + L1–L4) before the flag was retired. The matrix is
    the correctness gate — no consumer cuts over before it is green.
 3. **Phase 4** (#535–#540): benchmarks, node config (`delta_ms`, sizing
    validation, ≥ 6 validators), the checkpoint/light-client L-set contract, and
    the node wall-clock driver.
-4. **Phase 5** (#541–#543): delete HotStuff, retire the flag, rewrite
+4. **Phase 5** (#541–#543): deleted HotStuff, retired the flag, and rewrote
    `ARCHITECTURE.md`/`SECURITY.md`/`README.md`, CHANGELOG breaking-change +
    hard-fork note.
 5. **Phase 6** (#544, #545): quint conformance (or its documented deferral, with

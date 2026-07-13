@@ -5,7 +5,7 @@
 //!
 //! Minimmit's [`notarize_digest`](super::digest::notarize_digest) preimage is
 //! `epoch_le ‖ view_le ‖ block_hash[32]` — it deliberately drops the `height` /
-//! `phase` fields the HotStuff [`crate::vote::vote_digest`] carried. That is
+//! phase fields from the signed preimage. That is
 //! only safe because [`BlockHeader::hash`] binds `height` itself: a notarize
 //! digest over `block_hash` therefore cannot be replayed for the same payload
 //! at a different height.

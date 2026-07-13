@@ -34,7 +34,7 @@ storage engine. This is enforced mechanically (`scripts/check-core-deps.sh`,
   deterministic-replay tests).
 - **Finality** is produced separately: witnesses certify executed sequence
   ranges, and a validator quorum finalizes periodic **checkpoints** via
-  HotStuff-style quorum certificates. A command therefore moves through
+  Minimmit L-certificates. A command therefore moves through
   `ACCEPTED → EXECUTED → CERTIFIED → FINALIZED`.
 
 This split means expensive BFT does not run on every low-level operation;
@@ -50,37 +50,25 @@ finalized checkpoint root — never trusting a proxy.
 
 ## Consensus & checkpoints
 
-> **Migration in progress:** the consensus engine is migrating from the HotStuff
-> design described below to **Minimmit** (`M = 2f+1` advance / `L = n−f` finalize,
-> `n ≥ 5f+1`). See the design doc: [`docs/CONSENSUS_MINIMMIT.md`](CONSENSUS_MINIMMIT.md).
-> This section still describes the current HotStuff engine and will be rewritten
-> when the migration completes.
+`consensus` is a pure synchronous Minimmit reactor (no async or wall clock):
+continuous sequencing, deterministic round-robin leaders, epoch rotation, and
+fork/equivocation detection. A Byzantine-safe deployment uses `n ≥ 5f+1` with a
+minimum of six validators for `f=1`. One notarize round has two thresholds:
+`M=2f+1` advances the view and `L=n-f` finalizes ordering. A nullification at M
+abandons an unavailable view; `select_parent` and `valid_parent` require proofs
+for every skipped view. The node owns the `2Δ` timer, periodically injects `Tick`,
+and performs block build/verification outside the pure core.
 
-`consensus` is a pure synchronous state machine (no async): continuous sequencing
-with gap detection, deterministic round-robin leader selection, quorum-certificate
-formation, pipelined execution/finalization, epoch and validator-set transitions,
-and fork + double-sign/equivocation detection. `Checkpoint`s bind
+Ordering finality and state finality are deliberately separate. An
+`L` notarization emits `ConsensusFinal`; the node executes the block and submits
+an `ExecAttest`. Only an execution L-certificate emits `Finalized`. Checkpoints
+and validator-set transitions always bind the canonical L-set. `Checkpoint`s bind
 `{previous_state_root, new_state_root, command_root, execution_root, oracle_root}`
 under a quorum certificate and chain by ancestry.
 
-The `BftEngine` runs in one of two explicit `ConsensusMode`s, and the distinction
-is enforced in code, not just configuration:
-
-- **`CrashTolerant` (demo).** Single-phase `Commit` certification with simple
-  timeout view rotation. This is the mode the first demo runs across three
-  regional nodes for crash-tolerant replication. It is **not** Byzantine-safe on
-  its own and must not be relied on past crash faults; it needs no more than three
-  nodes.
-- **`ByzantineFaultTolerant` (production).** The full HotStuff/PBFT pipeline:
-  chained `Prepare → PreCommit → Commit` quorum certificates, a high-QC / locking
-  rule, `parent_hash` ancestry validation against the pipeline tip, refusal to
-  certify a forked round, view changes that require a `TimeoutCertificate` (a
-  quorum of signed timeouts — no replica can advance a view unilaterally), and a
-  `finalize` that is refused until an execution commitment is certified by a
-  quorum. Tolerating one Byzantine fault requires a `3f+1` set (**≥ 4
-  validators**); the safety property (no two honest replicas finalize different
-  blocks at a height under partitions and a Byzantine leader) is covered by the
-  `consensus` unit tests and the `simulation` fault matrix.
+The deterministic simulation covers clean execution, Byzantine equivocation,
+invalid signatures, leader crash/equivocation, partition healing, R7
+re-dissemination, execution finality, epoch change, and replay identity.
 
 ## Networking
 

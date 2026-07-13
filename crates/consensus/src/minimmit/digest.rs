@@ -4,16 +4,11 @@
 //! Every Minimmit vote signs a domain-separated digest built from
 //! little-endian integer encodings through [`crypto::hash_domain`], so the
 //! bytes are bit-identical across nodes and architectures — the exact builder
-//! pattern of the HotStuff [`crate::vote::vote_digest`]. There is **no**
+//! pattern used by every authenticated consensus message. There is **no**
 //! separate certificate domain: a certificate's
 //! [`Certificate::message`](super::Certificate) *is* the notarize / nullify
-//! digest it aggregates, mirroring how [`crate::vote::TimeoutCertificate`]
-//! carries the timeout digest.
-//!
-//! These constants coexist with the HotStuff `DOMAIN_VOTE` / `DOMAIN_PROPOSAL`
-//! / `DOMAIN_TIMEOUT` until Phase 5 of the migration; the retained
-//! [`crate::bft::DOMAIN_EXEC_COMMIT`] execution-attestation digest is
-//! untouched.
+//! digest it aggregates. The retained [`crate::bft::DOMAIN_EXEC_COMMIT`]
+//! execution-attestation digest remains separately domain-separated.
 
 use crypto::hash_domain;
 use types::Hash;
@@ -33,8 +28,8 @@ pub const DOMAIN_NULLIFY: &[u8] = b"dexos:consensus:minimmit:nullify:v1";
 ///
 /// Preimage: `epoch_le ‖ view_le ‖ block_hash[32]`. `block_hash` commits to
 /// the block header **including its `height`**, so the digest safely drops the
-/// `height` / `phase` fields the HotStuff [`crate::vote::vote_digest`]
-/// carried. `epoch` is bound so no vote or certificate can cross an epoch /
+/// height/phase fields: the block graph carries height. `epoch` is bound so no
+/// vote or certificate can cross an epoch /
 /// validator-set boundary.
 #[must_use]
 pub fn notarize_digest(epoch: u64, view: u64, block_hash: Hash) -> Hash {
@@ -88,8 +83,6 @@ pub fn propose_auth(
 mod tests {
     use super::*;
     use crate::bft::DOMAIN_EXEC_COMMIT;
-    use crate::vote::{timeout_digest, DOMAIN_TIMEOUT, DOMAIN_VOTE};
-    use crate::DOMAIN_PROPOSAL;
 
     const EPOCH: u64 = 7;
     const VIEW: u64 = 42;
@@ -109,16 +102,12 @@ mod tests {
         assert_eq!(DOMAIN_PROPOSE, b"dexos:consensus:minimmit:propose:v1");
         assert_eq!(DOMAIN_NOTARIZE, b"dexos:consensus:minimmit:notarize:v1");
         assert_eq!(DOMAIN_NULLIFY, b"dexos:consensus:minimmit:nullify:v1");
-        // Pairwise distinct among themselves and from every coexisting /
-        // retained consensus domain.
-        let domains: [&[u8]; 8] = [
+        // Pairwise distinct among themselves and from retained domains.
+        let domains: [&[u8]; 5] = [
             DOMAIN_PROPOSE,
             DOMAIN_NOTARIZE,
             DOMAIN_NULLIFY,
             super::super::block::DOMAIN_BLOCK,
-            DOMAIN_VOTE,
-            DOMAIN_TIMEOUT,
-            DOMAIN_PROPOSAL,
             DOMAIN_EXEC_COMMIT,
         ];
         for (i, a) in domains.iter().enumerate() {
@@ -183,9 +172,6 @@ mod tests {
         assert_ne!(notarize, nullify);
         assert_ne!(notarize, propose);
         assert_ne!(nullify, propose);
-        // The nullify preimage (epoch_le ‖ view_le) is byte-identical to the
-        // HotStuff timeout preimage — only the domain separates them.
-        assert_ne!(nullify, timeout_digest(EPOCH, VIEW));
     }
 
     #[test]

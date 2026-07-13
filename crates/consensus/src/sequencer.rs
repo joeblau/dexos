@@ -112,7 +112,7 @@ pub struct CommandRecord {
 /// log is therefore gap-free by construction. Finalized history strictly below
 /// a caller-supplied watermark can be reclaimed with
 /// [`Sequencer::prune_below`], which pops from the front and advances
-/// `base_sequence` — mirroring `BftEngine::prune_finalized` — so memory stays
+/// `base_sequence`, so memory stays
 /// proportional to the live (unpruned) suffix rather than the whole history.
 #[derive(Debug, Clone)]
 pub struct Sequencer {

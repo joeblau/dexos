@@ -1,8 +1,8 @@
 //! The Minimmit replica: a clock-free reactor `step(Input) -> Vec<Effect>`
 //! (`docs/CONSENSUS_MINIMMIT.md` §5, §7, #521).
 //!
-//! This inverts the HotStuff method-per-action [`crate::bft::BftEngine`] API
-//! into a single pure transition function: the node/network layer injects
+//! The node/network layer injects inputs into a single pure transition function
+//! and
 //! discrete [`Input`]s and executes the returned [`Effect`]s. The core never
 //! reads a clock, never sleeps, never does I/O, and **never invokes
 //! callbacks** — given the same ordered `Input` sequence it produces the same
@@ -38,8 +38,8 @@
 //! This module owns the state shape, the enums, the constructor, the `step`
 //! reactor (#521), the locking predicates + view lifecycle
 //! (#522): [`MinimmitReplica::select_parent`] /
-//! [`MinimmitReplica::valid_parent`] (§6.3–§6.4, the safety core replacing
-//! HotStuff's high-QC locking) and the internal `enter_view` / `prune`
+//! [`MinimmitReplica::valid_parent`] (§6.3–§6.4, the safety core) and the
+//! internal `enter_view` / `prune`
 //! transitions (§6.2, §6.6) the rules drive — and the two-tally vote
 //! machinery (#523): the **strictly separate** notarize / nullify [`Tally`]
 //! maps with `(validator_index, epoch, view)`-scoped equivocation detection
@@ -59,8 +59,7 @@ use types::Hash;
 
 use crate::bft::ValidatorSetUpdate;
 use crate::vote::{
-    Equivocation, SlashEvidence, SlashKind, VoteError, VotePhase, DEFAULT_VIEW_HORIZON,
-    DEFAULT_VOTE_QUOTA,
+    Equivocation, SlashEvidence, SlashKind, VoteError, DEFAULT_VIEW_HORIZON, DEFAULT_VOTE_QUOTA,
 };
 
 use super::block::BlockHeader;
@@ -80,7 +79,7 @@ use super::wire::{
 /// exact same [`Effect`] sequence.
 // A delivered wire message dwarfs the fixed-size timer/verdict variants; the
 // spec locks the `Message(ConsensusMessage)` shape (§7), so the disparity is
-// inherent — same precedent as `crate::vote::VoteOutcome`.
+// inherent to the protocol input shape.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Input {
@@ -199,8 +198,7 @@ pub enum EpochError {
 
 /// The result of admitting one vote into a [`Tally`] (#523).
 ///
-/// Mirrors the shape of the HotStuff [`crate::vote::VoteOutcome`], but an
-/// equivocation verdict carries the raw first-vote materials instead of a
+/// An equivocation verdict carries the raw first-vote materials instead of a
 /// pre-built [`crate::vote::Equivocation`]: Minimmit votes have no
 /// height/phase dimensions, so the rules that observe the verdict (#524–#526)
 /// assemble the [`SlashEvidence`] they emit from the conflicting vote they
@@ -238,9 +236,8 @@ pub enum TallyOutcome {
 ///
 /// Equivocation is keyed by `validator_index` alone because a tally instance
 /// is already scoped to one `(epoch, view)`: this is the
-/// `(validator_index, epoch, view)` retag of HotStuff's
-/// `(index, epoch, view, height, phase)` round key (§5) — the height and
-/// phase dimensions are gone.
+/// `(validator_index, epoch, view)` round key (§5); height and phase dimensions
+/// are absent.
 ///
 /// Signatures are **not** verified here: replica admission
 /// ([`MinimmitReplica::admit_notarize`] / [`MinimmitReplica::admit_nullify`])
@@ -455,9 +452,7 @@ pub struct MinimmitReplica {
     /// Validator-set update waiting for explicit boundary activation.
     pending_update: Option<ValidatorSetUpdate>,
     /// The highest prune horizon applied: votes for views below it are
-    /// outside the admission window — the HotStuff
-    /// [`crate::vote::CollectorWindow`] watermark re-derived for the view
-    /// dimension (#523).
+    /// outside the admission window; the watermark is view-scoped (#523).
     view_floor: u64,
     /// validator -> retained vote entries across the notarize + nullify
     /// tallies, for the per-validator DoS quota (#523).
@@ -758,7 +753,6 @@ impl MinimmitReplica {
                 epoch: propose.epoch,
                 view: propose.view,
                 height: propose.block.height,
-                phase: VotePhase::Prepare,
                 first_block: first.block_hash,
                 second_block: propose.block_hash,
                 first_signature: Some(first.propose_sig),
@@ -924,13 +918,12 @@ impl MinimmitReplica {
             .get(&vote.block_hash)
             .map_or(0, |(_, block)| block.height);
         Effect::Slash(SlashEvidence {
-            kind: SlashKind::VoteEquivocation,
+            kind: SlashKind::NotarizeEquivocation,
             equivocation: Some(Equivocation {
                 validator_index: u32::from(vote.validator_index),
                 epoch: vote.epoch,
                 view: vote.view,
                 height,
-                phase: VotePhase::Prepare,
                 first_block: first,
                 second_block: vote.block_hash,
                 first_signature: Some(first_signature),
@@ -1156,9 +1149,7 @@ impl MinimmitReplica {
     /// construction and a duplicate is idempotent. The DoS exposure is the
     /// *view* dimension instead — one signed `Nullify` per admissible view
     /// with no block to bind — so the same admission window and
-    /// per-validator quota bound a flooder exactly like the HotStuff
-    /// [`crate::vote::CollectorWindow`] / [`DEFAULT_VOTE_QUOTA`] machinery
-    /// bounded block votes (§5, #523).
+    /// per-validator quota bounds a flooder via [`DEFAULT_VOTE_QUOTA`] (§5, #523).
     ///
     /// Shares every check and failure mode of [`Self::admit_notarize`].
     ///
@@ -1286,8 +1277,7 @@ impl MinimmitReplica {
     /// Halt `validator_index` for in-tally equivocation: purge every vote
     /// they retained across **all** tallies (their weight never again counts
     /// toward a certificate) and reject their future votes fail-closed
-    /// ([`VoteError::HaltedOffender`]) — the HotStuff offender-halt carried
-    /// over (#523).
+    /// ([`VoteError::HaltedOffender`], #523).
     fn halt(&mut self, validator_index: u16) {
         self.halted.insert(validator_index);
         for tally in self.notarize_votes.values_mut() {
@@ -1351,8 +1341,7 @@ impl MinimmitReplica {
     }
 
     /// Whether `parent` is an admissible parent linkage for a proposal in
-    /// `view` — Minimmit's locking rule, replacing HotStuff's
-    /// `check_ancestry` / high-QC locking (`docs/CONSENSUS_MINIMMIT.md` §6.4).
+    /// `view` — Minimmit's locking rule (`docs/CONSENSUS_MINIMMIT.md` §6.4).
     ///
     /// True iff **both** hold:
     ///
@@ -1467,8 +1456,7 @@ impl MinimmitReplica {
             let kept = map.split_off(&horizon);
             let evicted = std::mem::replace(map, kept);
             // Release the evicted entries from the per-validator quota so a
-            // pruned view frees capacity exactly like the HotStuff
-            // `prune_finalized` accounting.
+            // pruned view frees capacity in the admission quota.
             for tally in evicted.values() {
                 for per in tally.votes().values() {
                     for index in per.keys() {

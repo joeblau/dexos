@@ -21,7 +21,7 @@ use state_tree::checkpoint_root;
 use types::{Hash, ShardId, StateRoot};
 
 use crate::minimmit::MinimmitCommittee;
-use crate::vote::{Committee, MAX_VALIDATORS};
+use crate::vote::MAX_VALIDATORS;
 
 /// Domain tag for checkpoint header hashing.
 pub const DOMAIN_CHECKPOINT: &[u8] = b"dexos:checkpoint:header:v1";
@@ -558,7 +558,7 @@ impl WitnessCollector {
     /// a genuinely new entry — enforces the retained-entry cap fail-closed.
     pub fn add_receipt(
         &mut self,
-        committee: &Committee,
+        committee: &MinimmitCommittee,
         receipt: &WitnessReceipt,
     ) -> Result<(), CheckpointError> {
         // Cheap admission-window checks before signature work.
@@ -582,7 +582,10 @@ impl WitnessCollector {
             return Err(CheckpointError::ForeignWitness(receipt.witness_index));
         }
         let public_key = committee
-            .public_key(receipt.witness_index)
+            .public_key(
+                u16::try_from(receipt.witness_index)
+                    .map_err(|_| CheckpointError::ForeignWitness(receipt.witness_index))?,
+            )
             .ok_or(CheckpointError::ForeignWitness(receipt.witness_index))?;
         receipt.verify(&public_key)?;
 
@@ -627,7 +630,7 @@ impl WitnessCollector {
     /// once `>= threshold` distinct witness weight has attested to the same root.
     pub fn certify(
         &self,
-        committee: &Committee,
+        committee: &MinimmitCommittee,
         digest: Hash,
     ) -> Result<QuorumCertificate, CheckpointError> {
         let per_digest = self
@@ -643,11 +646,13 @@ impl WitnessCollector {
             signatures.push(*signature);
             weight = weight.saturating_add(
                 committee
-                    .weight(index)
+                    .weight(
+                        u16::try_from(index).map_err(|_| CheckpointError::ForeignWitness(index))?,
+                    )
                     .ok_or(CheckpointError::ForeignWitness(index))?,
             );
         }
-        if weight < committee.threshold() {
+        if weight < committee.finalize_threshold() {
             return Err(CheckpointError::BelowThreshold);
         }
         let qc = QuorumCertificate {
@@ -656,7 +661,7 @@ impl WitnessCollector {
             signatures,
         };
         committee
-            .validator_set()
+            .finalize_set()
             .verify(&qc)
             .map_err(|_| CheckpointError::Quorum)?;
         Ok(qc)

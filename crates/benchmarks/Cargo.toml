@@ -16,7 +16,6 @@ workspace = true
 # `default-features = false`; the allocation columns then read as "unmeasured".
 default = ["count-alloc"]
 count-alloc = []
-minimmit = []
 
 [dependencies]
 types = { path = "../types" }
