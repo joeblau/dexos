@@ -3,7 +3,7 @@
 //! (`docs/CONSENSUS_MINIMMIT.md` §4.2–§4.4, #517, #520).
 //!
 //! All types serialize through `serde` + `codec` (postcard) with 64-byte
-//! ed25519 signatures via the [`crate::sig64`] adapter — the exact wire
+//! ed25519 signatures via the private `crate::sig64` adapter — the exact wire
 //! conventions of the coexisting HotStuff [`crate::vote::Vote`] /
 //! [`crate::bft::Proposal`]. These messages land **additively**: no HotStuff
 //! wire type changes before Phase 5 of the migration.
@@ -14,7 +14,7 @@
 //! message — a deliberate break from HotStuff's `u32`, safe under the
 //! [`crate::vote::MAX_VALIDATORS`] = 16 cap and aligned with the 16-bit
 //! [`Certificate`] signer bitmap. An index at or beyond the committee size is
-//! rejectable through the [`MinimmitCommittee`](super::MinimmitCommittee)
+//! rejectable through the [`MinimmitCommittee`]
 //! accessors ([`public_key`](super::MinimmitCommittee::public_key) /
 //! [`cached_key`](super::MinimmitCommittee::cached_key) /
 //! [`weight`](super::MinimmitCommittee::weight) return `None`;

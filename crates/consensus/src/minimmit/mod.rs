@@ -11,13 +11,17 @@
 //!   ancestors.
 //!
 //! Both certificate kinds are the same [`committee::Certificate`] verified at
-//! two thresholds. This module lands **additively**: no HotStuff type is
-//! removed before Phase 5 of the migration. Protocol authority:
+//! two thresholds. The protocol is driven by the clock-free
+//! [`replica::MinimmitReplica`] reactor — `step(Input) -> Vec<Effect>` — with
+//! all wall-clock time, delivery, block build, and block verify owned by the
+//! node outside the core. This module lands **additively**: no HotStuff type
+//! is removed before Phase 5 of the migration. Protocol authority:
 //! `docs/CONSENSUS_MINIMMIT.md`.
 
 pub mod block;
 pub mod committee;
 pub mod digest;
+pub mod replica;
 pub mod wire;
 
 pub use block::{BlockHeader, DOMAIN_BLOCK};
@@ -25,6 +29,7 @@ pub use committee::{Certificate, MinimmitCommittee, ThresholdKind};
 pub use digest::{
     notarize_digest, nullify_digest, propose_auth, DOMAIN_NOTARIZE, DOMAIN_NULLIFY, DOMAIN_PROPOSE,
 };
+pub use replica::{Effect, EpochError, FinalityStage, Input, MinimmitReplica, Tally, TallyOutcome};
 pub use wire::{
     msg_type, CertError, ConsensusMessage, ExecAttest, Notarization, Notarize, Nullification,
     Nullify, ParentRef, Proof, Propose, WireError, BOTTOM_VIEW,
