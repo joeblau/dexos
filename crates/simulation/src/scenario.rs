@@ -86,10 +86,14 @@ pub fn packet_loss(
     cfg
 }
 
-/// `f` Byzantine equivocating voters (the highest-indexed, non-leader nodes) in
-/// a `3f+1` set. Honest nodes must still agree, and equivocation is detected.
+/// `f` Byzantine equivocating voters (the highest-indexed, non-leader nodes).
+/// The Minimmit feature uses its required `5f+1` sizing; the legacy lane keeps
+/// HotStuff's `3f+1` sizing.
 #[must_use]
 pub fn byzantine_equivocation(f: u32, heights: u64, seed: u64) -> SimConfig {
+    #[cfg(feature = "minimmit")]
+    let num_nodes = 5 * f + 1;
+    #[cfg(not(feature = "minimmit"))]
     let num_nodes = 3 * f + 1;
     let mut cfg = SimConfig::clean(num_nodes, heights, seed);
     let mut behaviors = Vec::new();
@@ -100,10 +104,13 @@ pub fn byzantine_equivocation(f: u32, heights: u64, seed: u64) -> SimConfig {
     cfg
 }
 
-/// `f` invalid-signing nodes in a `3f+1` set; their votes are rejected and
-/// honest nodes still reach agreement without panicking.
+/// `f` invalid-signing nodes in the engine's required committee size; their
+/// votes are rejected and honest nodes still reach agreement without panicking.
 #[must_use]
 pub fn invalid_signatures(f: u32, heights: u64, seed: u64) -> SimConfig {
+    #[cfg(feature = "minimmit")]
+    let num_nodes = 5 * f + 1;
+    #[cfg(not(feature = "minimmit"))]
     let num_nodes = 3 * f + 1;
     let mut cfg = SimConfig::clean(num_nodes, heights, seed);
     let mut behaviors = Vec::new();
