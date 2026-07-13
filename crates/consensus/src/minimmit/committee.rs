@@ -171,6 +171,15 @@ impl MinimmitCommittee {
         self.finalize_set.len()
     }
 
+    /// Canonical committee commitment for checkpoints and epoch transitions.
+    ///
+    /// This always binds the L threshold. The M-set commitment is intentionally
+    /// available only through the explicitly named [`Self::advance_set`].
+    #[must_use]
+    pub fn canonical_commitment(&self) -> Hash {
+        self.finalize_set.commitment()
+    }
+
     /// Whether the committee is empty (never true post-construction).
     #[must_use]
     pub fn is_empty(&self) -> bool {

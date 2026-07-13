@@ -1,20 +1,41 @@
 # Example validator-set descriptor for local demos.
 # Production deployments replace this with the signed genesis validator set.
 #
-# Schema is intentionally minimal until the consensus epic lands a full
-# validator identity / stake / endpoint structure.
+# Phase 4 uses explicit unit weights. Weighted fault bounds remain an operator
+# policy decision; the node rejects non-unit descriptors until one is supplied.
 
 [[validators]]
 name = "us-1"
-public_key = "0000000000000000000000000000000000000000000000000000000000000001"
+public_key = "3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29"
 region = "us-east"
+weight = 1
 
 [[validators]]
 name = "eu-1"
-public_key = "0000000000000000000000000000000000000000000000000000000000000002"
+public_key = "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c"
 region = "eu-central"
+weight = 1
 
 [[validators]]
 name = "tokyo-1"
-public_key = "0000000000000000000000000000000000000000000000000000000000000003"
+public_key = "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394"
 region = "ap-northeast"
+weight = 1
+
+[[validators]]
+name = "us-2"
+public_key = "ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1"
+region = "us-west"
+weight = 1
+
+[[validators]]
+name = "eu-2"
+public_key = "ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c"
+region = "eu-west"
+weight = 1
+
+[[validators]]
+name = "tokyo-2"
+public_key = "6e7a1cdd29b0b78fd13af4c5598feff4ef2a97166e3ca6f2e4fbfccd80505bf1"
+region = "ap-northeast"
+weight = 1

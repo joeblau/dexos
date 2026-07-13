@@ -105,6 +105,12 @@ pub enum LightClientError {
         /// Epoch the host tried to install.
         epoch: u64,
     },
+    /// A bootstrap set did not use Minimmit's canonical L threshold.
+    #[error("validator set for epoch {epoch} is not a canonical Minimmit L-set")]
+    NonCanonicalValidatorSet {
+        /// Epoch the invalid bootstrap attempted to install.
+        epoch: u64,
+    },
     /// A validator-set transition certificate failed verification or was
     /// malformed (wrong epochs, wrong digest, below-threshold QC).
     #[error("invalid validator-set transition {old_epoch} -> {new_epoch}")]

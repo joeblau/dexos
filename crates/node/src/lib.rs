@@ -9,6 +9,7 @@
 //! consumer applies backpressure instead of growing memory without limit.
 
 pub mod config;
+pub mod consensus_driver;
 pub mod error;
 pub mod lowering;
 pub mod metrics;
@@ -29,6 +30,7 @@ pub use config::{
     ConfigError, ConfigOverrides, ConsensusSection, LogFormat, NetworkSection, NodeConfig,
     NodeSection, ObservabilitySection, PerformanceSection, Role, RpcSection, StorageSection,
 };
+pub use consensus_driver::{ConsensusDriver, DriverError, DriverEvent};
 pub use error::NodeError;
 pub use lowering::{control_plane_produces, lower, LoweringError};
 pub use observability::{MetricsRegistry, TraceGen, TraceId};

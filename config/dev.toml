@@ -15,6 +15,7 @@ enable_datagrams = false
 
 [consensus]
 checkpoint_interval_ms = 100
+delta_ms = 100
 epoch_length = 100000
 validator_set_path = "validators.toml"
 

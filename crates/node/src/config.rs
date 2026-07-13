@@ -13,12 +13,22 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use consensus::MinimmitCommittee;
+use crypto::Validator;
 use serde::{Deserialize, Serialize};
 
 /// Checkpoint cadence is bounded to 50–100 ms by the consensus design.
 pub const CHECKPOINT_INTERVAL_MIN_MS: u64 = 50;
 /// Upper bound of the configurable checkpoint cadence.
 pub const CHECKPOINT_INTERVAL_MAX_MS: u64 = 100;
+/// Smallest meaningful network delay estimate (one millisecond).
+pub const DELTA_MIN_MS: u64 = 1;
+/// Maximum delay estimate accepted before startup (one minute).
+pub const DELTA_MAX_MS: u64 = 60_000;
+
+const fn default_delta_ms() -> u64 {
+    100
+}
 
 /// Smallest permitted log segment size, in megabytes. A zero-sized segment can
 /// never hold a framed record, so it is rejected rather than silently accepted.
@@ -140,6 +150,9 @@ impl Default for NetworkSection {
 pub struct ConsensusSection {
     /// Checkpoint cadence in milliseconds (bounded to 50–100).
     pub checkpoint_interval_ms: u64,
+    /// Estimated one-way network delay; view timers are armed for `2 * delta_ms`.
+    #[serde(default = "default_delta_ms")]
+    pub delta_ms: u64,
     /// Number of sequences per epoch.
     pub epoch_length: u64,
     /// Path to the validator-set descriptor.
@@ -150,6 +163,7 @@ impl Default for ConsensusSection {
     fn default() -> Self {
         Self {
             checkpoint_interval_ms: 100,
+            delta_ms: default_delta_ms(),
             epoch_length: 100_000,
             validator_set_path: "validators.toml".to_string(),
         }
@@ -499,6 +513,68 @@ pub enum ConfigError {
     },
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ValidatorFile {
+    validators: Vec<ValidatorEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ValidatorEntry {
+    #[allow(dead_code)]
+    name: String,
+    public_key: String,
+    #[allow(dead_code)]
+    region: String,
+    /// Minimmit voting weight (unit weight is the only supported policy today).
+    weight: u64,
+}
+
+/// Parse and validate the operator validator descriptor as a Minimmit committee.
+///
+/// The production default intentionally requires at least six members: smaller
+/// unit committees derive `f = 0` and therefore provide no Byzantine tolerance.
+fn load_minimmit_committee(path: &Path, epoch: u64) -> Result<MinimmitCommittee, ConfigError> {
+    let text = fs::read_to_string(path).map_err(|source| ConfigError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+    let descriptor: ValidatorFile = toml::from_str(&text)?;
+    if descriptor.validators.len() < 6 {
+        return Err(ConfigError::OutOfRange {
+            field: "consensus.validators.count",
+            value: u64::try_from(descriptor.validators.len()).unwrap_or(u64::MAX),
+            min: 6,
+            max: u64::from(u16::MAX),
+        });
+    }
+    let mut validators = Vec::with_capacity(descriptor.validators.len());
+    for entry in descriptor.validators {
+        let bytes = hex::decode(&entry.public_key).map_err(|_| {
+            ConfigError::Validation(format!(
+                "validator '{}' has a non-hex public_key",
+                entry.name
+            ))
+        })?;
+        let public_key: [u8; 32] = bytes.try_into().map_err(|_| {
+            ConfigError::Validation(format!(
+                "validator '{}' public_key must encode exactly 32 bytes",
+                entry.name
+            ))
+        })?;
+        validators.push(Validator {
+            public_key,
+            weight: entry.weight,
+        });
+    }
+    MinimmitCommittee::new_unit(epoch, validators).map_err(|err| {
+        ConfigError::Validation(format!(
+            "consensus validator set is not a valid unit-weight Minimmit committee: {err}"
+        ))
+    })
+}
+
 impl NodeConfig {
     /// Parse and validate a configuration from a TOML string (no filesystem checks).
     ///
@@ -582,6 +658,15 @@ impl NodeConfig {
                 max: CHECKPOINT_INTERVAL_MAX_MS,
             });
         }
+        let delta_ms = self.consensus.delta_ms;
+        if !(DELTA_MIN_MS..=DELTA_MAX_MS).contains(&delta_ms) {
+            return Err(ConfigError::OutOfRange {
+                field: "consensus.delta_ms",
+                value: delta_ms,
+                min: DELTA_MIN_MS,
+                max: DELTA_MAX_MS,
+            });
+        }
         if self.consensus.epoch_length == 0 {
             return Err(ConfigError::Validation(
                 "consensus.epoch_length must be greater than zero".to_string(),
@@ -628,6 +713,7 @@ impl NodeConfig {
                         .collect::<Vec<_>>()
                 )));
             }
+            load_minimmit_committee(path, 0)?;
         }
         if self.storage.data_dir.trim().is_empty() {
             return Err(ConfigError::Validation(
@@ -1233,6 +1319,26 @@ metrics_listen = "127.0.0.1:9100"
     }
 
     #[test]
+    fn delta_is_defaulted_and_bounded() {
+        let legacy = "[consensus]\ncheckpoint_interval_ms = 100\nepoch_length = 10\nvalidator_set_path = \"v\"";
+        assert_eq!(
+            NodeConfig::from_toml_str(legacy)
+                .unwrap()
+                .consensus
+                .delta_ms,
+            100
+        );
+        let invalid = "[consensus]\ncheckpoint_interval_ms = 100\ndelta_ms = 0\nepoch_length = 10\nvalidator_set_path = \"v\"";
+        assert!(matches!(
+            NodeConfig::from_toml_str(invalid),
+            Err(ConfigError::OutOfRange {
+                field: "consensus.delta_ms",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn rejects_unknown_role() {
         let toml = "[node]\nname=\"n\"\nregion=\"r\"\nlight=false\nroles=[\"banana\"]";
         assert!(matches!(
@@ -1507,7 +1613,28 @@ read_only = false
             "{err}"
         );
 
-        fs::write(&validators, "validators = []\n").unwrap();
+        let descriptor = |count: u8| {
+            (0u8..count)
+            .map(|i| {
+                let public_key = crypto::KeyPair::from_seed(&[i; 32]).public();
+                format!(
+                    "[[validators]]\nname = \"v{i}\"\npublic_key = \"{}\"\nregion = \"test\"\nweight = 1\n",
+                    hex::encode(public_key)
+                )
+            })
+            .collect::<String>()
+        };
+        fs::write(&validators, descriptor(3)).unwrap();
+        assert!(matches!(
+            NodeConfig::load(&cfg_path),
+            Err(ConfigError::OutOfRange {
+                field: "consensus.validators.count",
+                value: 3,
+                min: 6,
+                ..
+            })
+        ));
+        fs::write(&validators, descriptor(6)).unwrap();
         let cfg = NodeConfig::load(&cfg_path).expect("with validators file");
         assert!(Path::new(&cfg.consensus.validator_set_path).is_file());
         let _ = fs::remove_dir_all(&dir);

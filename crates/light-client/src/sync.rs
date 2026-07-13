@@ -25,7 +25,7 @@
 
 use std::collections::BTreeMap;
 
-use consensus::{verify_checkpoint, Checkpoint};
+use consensus::{verify_checkpoint, Checkpoint, MinimmitCommittee};
 use crypto::{hash_domain, QuorumCertificate, ValidatorSet, DOMAIN_VALIDATOR_SET_TRANSITION};
 use types::{Hash, ShardId, StateRoot};
 
@@ -38,17 +38,17 @@ pub const DEFAULT_BUFFER_LIMIT: usize = 256;
 
 /// Domain-separated digest the prior epoch signs to authorize a successor set.
 ///
-/// Binds `(old_epoch, new_epoch, new_set.commitment())`.
+/// Binds `(old_epoch, new_epoch, new_committee.finalize_set().commitment())`.
 #[must_use]
 pub fn validator_set_transition_digest(
     old_epoch: u64,
     new_epoch: u64,
-    new_set: &ValidatorSet,
+    new_committee: &MinimmitCommittee,
 ) -> Hash {
     let mut buf = Vec::with_capacity(8 + 8 + 32);
     buf.extend_from_slice(&old_epoch.to_le_bytes());
     buf.extend_from_slice(&new_epoch.to_le_bytes());
-    buf.extend_from_slice(new_set.commitment().as_bytes());
+    buf.extend_from_slice(new_committee.canonical_commitment().as_bytes());
     hash_domain(DOMAIN_VALIDATOR_SET_TRANSITION, &buf)
 }
 
@@ -56,14 +56,14 @@ pub fn validator_set_transition_digest(
 ///
 /// `certificate` must be a QC from the **old** epoch's set over
 /// [`validator_set_transition_digest`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ValidatorSetTransition {
     /// Epoch of the committee that signed the transition (must already be known).
     pub old_epoch: u64,
     /// Epoch being installed (`old_epoch + 1` or any strictly greater unused epoch).
     pub new_epoch: u64,
     /// The successor validator set.
-    pub new_set: ValidatorSet,
+    pub new_committee: MinimmitCommittee,
     /// Quorum certificate from `old_epoch` over the transition digest.
     pub certificate: QuorumCertificate,
 }
@@ -190,9 +190,29 @@ impl ShardSync {
         if !self.validator_sets.is_empty() {
             return Err(LightClientError::UnsolicitedValidatorSet { epoch });
         }
+        let n = u64::try_from(set.len()).unwrap_or(u64::MAX);
+        let f = n.saturating_sub(1) / 5;
+        let expected_l = n.saturating_sub(f);
+        if n < 6
+            || set
+                .validators()
+                .iter()
+                .any(|validator| validator.weight != 1)
+            || set.threshold() != expected_l
+        {
+            return Err(LightClientError::NonCanonicalValidatorSet { epoch });
+        }
         self.validator_sets.insert(epoch, set);
         self.latest_epoch = Some(epoch);
         Ok(())
+    }
+
+    /// Weak-subjectivity bootstrap using Minimmit's canonical L-set.
+    pub fn bootstrap_minimmit_committee(
+        &mut self,
+        committee: &MinimmitCommittee,
+    ) -> Result<(), LightClientError> {
+        self.bootstrap_validator_set(committee.epoch(), committee.finalize_set().clone())
     }
 
     /// Register a validator set — **bootstrap only** (no set installed yet).
@@ -240,7 +260,7 @@ impl ShardSync {
         if self.validator_sets.contains_key(&transition.new_epoch) {
             // Idempotent if identical.
             if let Some(existing) = self.validator_sets.get(&transition.new_epoch) {
-                if existing.commitment() == transition.new_set.commitment() {
+                if existing.commitment() == transition.new_committee.finalize_set().commitment() {
                     return Ok(());
                 }
             }
@@ -256,7 +276,7 @@ impl ShardSync {
         let digest = validator_set_transition_digest(
             transition.old_epoch,
             transition.new_epoch,
-            &transition.new_set,
+            &transition.new_committee,
         );
         if transition.certificate.message != digest {
             return Err(LightClientError::InvalidValidatorSetTransition {
@@ -270,8 +290,10 @@ impl ShardSync {
                 new_epoch: transition.new_epoch,
             }
         })?;
-        self.validator_sets
-            .insert(transition.new_epoch, transition.new_set);
+        self.validator_sets.insert(
+            transition.new_epoch,
+            transition.new_committee.finalize_set().clone(),
+        );
         self.latest_epoch = Some(self.latest_epoch.unwrap_or(0).max(transition.new_epoch));
         Ok(())
     }

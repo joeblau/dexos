@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 
 use codec::{Frame, TrafficClass};
 use consensus::{
-    build_checkpoint_header, checkpoint_hash, vote_digest, Committee, Vote, VoteCollector,
-    VotePhase,
+    build_checkpoint_header, checkpoint_hash, notarize_digest, MinimmitCommittee, MinimmitReplica,
+    Notarize,
 };
 use crypto::{verify_ed25519, verify_ed25519_all, KeyPair, Validator};
 use execution::{Command, DeterministicEngine, Engine, EngineConfig, SetMarkPrice};
@@ -143,8 +143,8 @@ pub fn registry() -> Vec<Suite> {
             run: market_data_fanout,
         },
         Suite {
-            name: "consensus-vote-handling",
-            run: consensus_vote_handling,
+            name: "consensus-notarize-handling",
+            run: consensus_notarize_handling,
         },
         Suite {
             name: "light-client-proof-verify",
@@ -289,9 +289,9 @@ pub fn provenance(name: &str) -> Option<SuiteProvenance> {
             "codec::Frame::encode → per-subscriber buffer copy",
             "64 subscribers, 1-slot queues; in-process, no sockets",
         ),
-        "consensus-vote-handling" => micro(
-            "consensus::VoteCollector::add_vote (verifies signature)",
-            "4-validator BFT committee, 1 vote per op",
+        "consensus-notarize-handling" => micro(
+            "consensus::MinimmitReplica::admit_notarize (verifies signature)",
+            "6-validator Minimmit committee, 1 notarize per op",
         ),
         "light-client-proof-verify" => micro(
             "state_tree::verify_account (Merkle proof)",
@@ -872,8 +872,8 @@ fn market_data_fanout(cfg: Config) -> BenchStat {
     })
 }
 
-fn consensus_vote_handling(cfg: Config) -> BenchStat {
-    const N: u32 = 4;
+fn consensus_notarize_handling(cfg: Config) -> BenchStat {
+    const N: u32 = 6;
     let mut kps = Vec::new();
     let mut vals = Vec::new();
     for i in 0..N {
@@ -884,33 +884,21 @@ fn consensus_vote_handling(cfg: Config) -> BenchStat {
         });
         kps.push(kp);
     }
-    let committee = Committee::new_bft(0, vals).unwrap_or_else(|_| {
-        // Should not happen with a valid non-empty set; fall back to a 1-node set.
-        let kp = KeyPair::from_seed(&[0u8; 32]);
-        Committee::new_bft(
-            0,
-            vec![Validator {
-                public_key: kp.public(),
-                weight: 1,
-            }],
-        )
-        .expect("single-validator committee")
-    });
+    let committee = MinimmitCommittee::new_unit(0, vals).expect("six-validator committee");
     let block = Hash::from_bytes([7u8; 32]);
-    let digest = vote_digest(0, 0, 1, VotePhase::Commit, block);
-    let vote = Vote {
+    let digest = notarize_digest(0, 0, block);
+    let vote = Notarize {
         epoch: 0,
         view: 0,
-        height: 1,
-        phase: VotePhase::Commit,
         block_hash: block,
         validator_index: 0,
         signature: kps[0].sign(digest.as_bytes()),
     };
-    bench("consensus-vote-handling", cfg, || {
-        // A fresh collector each op isolates the signature-verifying add_vote.
-        let mut collector = VoteCollector::new();
-        let r = collector.add_vote(&committee, &vote);
+    bench("consensus-notarize-handling", cfg, || {
+        // A fresh replica each op isolates signature-verifying tally admission.
+        let (mut replica, _) = MinimmitReplica::new(committee.clone(), 1, Hash::ZERO, 0)
+            .expect("valid benchmark replica");
+        let r = replica.admit_notarize(&vote);
         black_box(r.is_ok());
     })
 }
