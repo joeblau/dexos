@@ -27,6 +27,14 @@ of production safety.
 - **Consensus equivocation**: double-sign and proposal forks halt the offender's
   QC weight, record serializable slash evidence, and refuse certification for
   forked rounds.
+- **Minimmit fault model**: committees require `n ≥ 5f+1`; at 64 members this
+  permits `f ≤ 12` (the current ed25519 bitmap cap is 16, permitting `f ≤ 3`).
+  The roughly 20% Byzantine tolerance
+  (versus roughly 33% in three-phase protocols) buys one-round low-latency
+  finality through distinct `M=2f+1` and `L=n-f` thresholds.
+- **R6 is non-slashable**: a validator may notarize a block and later nullify
+  the same view. Only conflicting notarizes, or conflicting authenticated
+  leader proposals, are equivocation.
 
 ## Wallet / EIP-1271 trust model (honest)
 

@@ -1,4 +1,4 @@
-//! Minimmit consensus engine (migration in progress; additive beside HotStuff).
+//! The single Minimmit consensus engine.
 //!
 //! Minimmit is a two-threshold BFT protocol over a committee of total voting
 //! weight `W` tolerating at most `B` Byzantine weight (`W >= 5B + 1`; unit
@@ -14,9 +14,7 @@
 //! two thresholds. The protocol is driven by the clock-free
 //! [`replica::MinimmitReplica`] reactor — `step(Input) -> Vec<Effect>` — with
 //! all wall-clock time, delivery, block build, and block verify owned by the
-//! node outside the core. This module lands **additively**: no HotStuff type
-//! is removed before Phase 5 of the migration. Protocol authority:
-//! `docs/CONSENSUS_MINIMMIT.md`.
+//! node outside the core. Protocol authority: `docs/CONSENSUS_MINIMMIT.md`.
 
 pub mod block;
 pub mod committee;

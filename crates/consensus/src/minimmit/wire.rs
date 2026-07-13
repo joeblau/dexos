@@ -4,14 +4,12 @@
 //!
 //! All types serialize through `serde` + `codec` (postcard) with 64-byte
 //! ed25519 signatures via the private `crate::sig64` adapter — the exact wire
-//! conventions of the coexisting HotStuff [`crate::vote::Vote`] /
-//! [`crate::bft::Proposal`]. These messages land **additively**: no HotStuff
-//! wire type changes before Phase 5 of the migration.
+//! conventions of the consensus crate.
 //!
 //! # `u16` signer indices (deliberate wire break)
 //!
 //! `validator_index` / `proposer_index` are **`u16`** on every Minimmit
-//! message — a deliberate break from HotStuff's `u32`, safe under the
+//! message, safe under the
 //! [`crate::vote::MAX_VALIDATORS`] = 16 cap and aligned with the 16-bit
 //! [`Certificate`] signer bitmap. An index at or beyond the committee size is
 //! rejectable through the [`MinimmitCommittee`]
@@ -20,7 +18,7 @@
 //! [`weight`](super::MinimmitCommittee::weight) return `None`;
 //! [`assemble`](super::MinimmitCommittee::assemble) errors).
 //!
-//! # Scope boundaries (Phase 1 siblings)
+//! # Scope boundaries
 //!
 //! This module defines the data types with their digest accessors (#517), the
 //! [`msg_type`] tag registry with the [`ConsensusMessage`] encode/decode
@@ -242,7 +240,7 @@ impl Notarization {
     /// work, then routes the certificate through
     /// [`MinimmitCommittee::verify`] at [`ThresholdKind::Advance`], which
     /// re-checks every signature plus the signed-weight threshold. Models
-    /// [`crate::vote::TimeoutCertificate::verify`].
+    /// the committee's certificate verifier.
     ///
     /// L-threshold verification (finalization) is the Phase 2 finalize path:
     /// it re-verifies the *same* certificate via [`MinimmitCommittee::verify`]
@@ -294,7 +292,7 @@ impl Nullification {
     /// Asserts `cert.message == `[`Self::digest`] **before** any signature
     /// work, then routes the certificate through
     /// [`MinimmitCommittee::verify`] at [`ThresholdKind::Advance`]. Models
-    /// [`crate::vote::TimeoutCertificate::verify`]. `M` is the *only* bar a
+    /// the committee's certificate verifier. `M` is the *only* bar a
     /// nullification is ever checked against — finalization is exclusively an
     /// L-notarization concern.
     ///
@@ -361,9 +359,8 @@ impl ExecAttest {
         )
     }
 
-    /// Verify this attestation's signature against the signer's committee
-    /// key (single-signer; models the HotStuff
-    /// [`crate::vote::Vote::verify_cached`] admission path).
+    /// Verify this attestation's signature against the signer's cached
+    /// committee key before tally admission.
     ///
     /// The L-cert over a set of attestations is assembled and verified
     /// separately against the committee's `finalize_set` (#528 / Phase 4) —
@@ -386,10 +383,7 @@ impl ExecAttest {
 /// A Minimmit certificate verification failure ([`Notarization::verify`] /
 /// [`Nullification::verify`], #519).
 ///
-/// Mirrors the split the HotStuff
-/// [`crate::vote::TimeoutCertificate::verify`] makes with
-/// [`VoteError::TimeoutDigestMismatch`](crate::vote::VoteError) vs
-/// [`VoteError::TimeoutBelowThreshold`](crate::vote::VoteError): a
+/// Digest mismatch and a below-threshold certificate remain distinct errors: a
 /// wrong-message certificate is a **digest** error, distinguishable from
 /// every cryptographic / threshold failure — which this type preserves
 /// verbatim as the wrapped [`QuorumError`] instead of collapsing.

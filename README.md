@@ -16,7 +16,7 @@ Execution is separated from finality. A single-writer-per-shard deterministic
 state machine executes a canonical command stream over continuous sequence
 numbers, keeping canonical hot state in memory and persisting through an
 append-only command log plus periodic snapshots. Periodically the network
-produces quorum-signed checkpoints (HotStuff-style BFT). Everything in the
+produces quorum-signed checkpoints through Minimmit (`M=2f+1`, `L=n-f`). Everything in the
 deterministic core is fixed-point integer arithmetic — no floating point, no
 allocation on the hot path, no locks in matching, no database in the execution
 path.
@@ -35,7 +35,7 @@ crates/
   storage          append-only command log, snapshots, deterministic replay
   discovery        signed peer records, peer + market discovery, reputation
   network          async Transport (in-process + TCP), priority classes, backpressure
-  consensus        BFT sequencing, quorum certificates, checkpoints, witnesses
+  consensus        Minimmit sequencing, dual-threshold certificates, checkpoints, witnesses
   proto            transport-free RPC wire/protocol types (wasm-safe, no async)
   rpc              public binary RPC server + streaming subscription API
   client           native typed RPC client (proto + rpc round-trip, ed25519 signing)

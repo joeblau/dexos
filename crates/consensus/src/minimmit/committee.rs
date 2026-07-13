@@ -2,9 +2,8 @@
 //! both the advance (`M = 2B + 1`) and finalize (`L = W − B`) verification
 //! sets, plus the [`Certificate`] assembly / verification seam.
 //!
-//! Additive beside the HotStuff [`crate::vote::Committee`] until Phase 5 of
-//! the migration (`docs/CONSENSUS_MINIMMIT.md` §5.1). An M-certificate and an
-//! L-certificate are the **same** [`crypto::QuorumCertificate`] verified
+//! An M-certificate and an L-certificate are the **same**
+//! [`crypto::QuorumCertificate`] verified
 //! against two [`ValidatorSet`]s that differ only in threshold — zero new
 //! crypto primitives. The BLS drop-in seam is the [`Certificate`] alias held
 //! behind [`MinimmitCommittee::assemble`] / [`MinimmitCommittee::verify`]:
@@ -58,10 +57,8 @@ pub enum ThresholdKind {
 /// single canonical set for every commitment (checkpoints, epoch transitions,
 /// light-client verification) — never feed the M-set into a commitment.
 ///
-/// Mirrors the HotStuff [`crate::vote::Committee`] accessors (`epoch`,
-/// `leader`, `public_key`, `weight`, `len`, cached ed25519 keys); the HotStuff
-/// type is untouched. Validator indices are `u16`, matching the Minimmit wire
-/// standard and the 16-bit QC signer bitmap.
+/// Validator indices are `u16`, matching the Minimmit wire standard and the
+/// 16-bit certificate signer bitmap.
 #[derive(Debug, Clone)]
 pub struct MinimmitCommittee {
     epoch: u64,
@@ -79,8 +76,7 @@ impl MinimmitCommittee {
     /// Byzantine **weight** bound `B` (weighted-correct; for the common
     /// unit-weight committee use [`Self::new_unit`]).
     ///
-    /// Never panics on untrusted input (mirrors
-    /// [`crate::vote::Committee::new_bft`]). Rejects, in order:
+    /// Never panics on untrusted input. Rejects, in order:
     ///
     /// - an empty membership ([`VoteError::EmptyCommittee`]),
     /// - more than [`MAX_VALIDATORS`] members
@@ -253,10 +249,8 @@ impl MinimmitCommittee {
         self.validators().get(usize::from(index)).map(|v| v.weight)
     }
 
-    /// Deterministic round-robin leader for `view`: the **epoch-mixed**
-    /// `(epoch + view) mod n`, inherited from the HotStuff
-    /// [`crate::vote::Committee::leader`] (`docs/CONSENSUS_MINIMMIT.md` §6.1
-    /// reconciles this against the paper's bare `v mod n`; epoch-mixing wins).
+    /// Deterministic round-robin leader: `(epoch + view) mod n`
+    /// (`docs/CONSENSUS_MINIMMIT.md` §6.1).
     #[must_use]
     pub fn leader(&self, view: u64) -> u16 {
         let n = u64::try_from(self.len()).unwrap_or(1).max(1);

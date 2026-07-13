@@ -66,7 +66,7 @@ These are foundations, not evidence of production readiness until the composed s
 | PR-001 | Composition | `marketd` can appear healthy while providing no exchange service. | `crates/node/src/lib.rs:57-65,157-194,216-238` | [#312](https://github.com/joeblau/dexos/issues/312), [#348](https://github.com/joeblau/dexos/issues/348) |
 | PR-002 | Authentication | Public RPC control commands and sessions do not prove key possession for all mutations. | `crates/rpc/src/command.rs:12-24`, `stub.rs:260-300`, `session.rs:19-88` | [#267](https://github.com/joeblau/dexos/issues/267), [#268](https://github.com/joeblau/dexos/issues/268), [#277](https://github.com/joeblau/dexos/issues/277) |
 | PR-003 | Exactly-once / atomicity | Retries can reapply fills; multiple handlers mutate before later failure. | `orderbook/src/book.rs:94-106`, `execution/src/engine.rs:158-175,212-347` | [#322](https://github.com/joeblau/dexos/issues/322), [#324](https://github.com/joeblau/dexos/issues/324) |
-| PR-004 | Consensus | Current BFT permits unsafe proposal replacement/finalization and invalid committee construction. | `consensus/src/bft.rs:247-349`, `crypto/src/quorum.rs:48-68` | [#272](https://github.com/joeblau/dexos/issues/272), [#337](https://github.com/joeblau/dexos/issues/337), [#338](https://github.com/joeblau/dexos/issues/338) |
+| PR-004 | Consensus | Minimmit is implemented and simulation-gated; production node composition and external review remain release blockers. | `consensus/src/minimmit/`, `node/src/consensus_driver.rs` | [#509](https://github.com/joeblau/dexos/issues/509), [#312](https://github.com/joeblau/dexos/issues/312) |
 | PR-005 | Custody / chain | Withdrawal QCs do not bind the exact request; bindings/adapters/HSM paths are not production authorization. | `custody/src/withdrawal.rs:192-215`, `binding.rs:145-172,269-339`, `chain-adapter-*/src/lib.rs` | [#271](https://github.com/joeblau/dexos/issues/271), [#273](https://github.com/joeblau/dexos/issues/273), [#332](https://github.com/joeblau/dexos/issues/332), [#333](https://github.com/joeblau/dexos/issues/333) |
 | PR-006 | State / collateral | Published roots omit future-behavior state; risk and ledger balances diverge after trades. | `execution/src/engine.rs:60-149`, `ledger.rs:174-182`, `risk/src/engine.rs:521-535` | [#276](https://github.com/joeblau/dexos/issues/276), [#323](https://github.com/joeblau/dexos/issues/323) |
 | PR-007 | Market economics | Non-perp fills are booked as perps; payouts, sponsor escrow, fees/funding and liquidation are incomplete or unsafe. | `execution/src/engine.rs:307-419`, `markets/src/registry.rs:147-432`, `markets/src/payout.rs` | [#321](https://github.com/joeblau/dexos/issues/321), [#323](https://github.com/joeblau/dexos/issues/323), [#325](https://github.com/joeblau/dexos/issues/325), [#345](https://github.com/joeblau/dexos/issues/345) |
@@ -95,7 +95,7 @@ Do not treat P2/P3 optimization work as permission to defer any P0. Real-funds t
 - [#269](https://github.com/joeblau/dexos/issues/269) — Never silently drop reliable frames under inbound backpressure
 - [#270](https://github.com/joeblau/dexos/issues/270) — Cap RPC concurrent connections, per-IP limits, and I/O timeouts
 - [#271](https://github.com/joeblau/dexos/issues/271) — Bind custody withdrawal QC to full withdrawal authorization digest
-- [#272](https://github.com/joeblau/dexos/issues/272) — Complete HotStuff/PBFT-safe consensus (chained QCs, locks, view-change)
+- [#272](https://github.com/joeblau/dexos/issues/272) — Superseded by the Minimmit migration epic (#509)
 - [#273](https://github.com/joeblau/dexos/issues/273) — Replace mock HSM/soft custody keys with real HSM/KMS backends
 - [#274](https://github.com/joeblau/dexos/issues/274) — Production chain adapters must verify EVM/SVM finality (not mock self-assertions)
 - [#275](https://github.com/joeblau/dexos/issues/275) — Make order matching transactional under capacity failures
@@ -201,4 +201,3 @@ Do not treat P2/P3 optimization work as permission to defer any P0. Real-funds t
 ## Limitations and follow-up assurance
 
 This was a source-grounded engineering review, not a formal proof, independent cryptographic audit, external penetration test, chain-specific mainnet verification, or benchmark on production hardware. Before real funds, complete those independent reviews after the P0/P1 architecture is implemented; auditing mocks or disconnected components cannot establish end-to-end safety.
-

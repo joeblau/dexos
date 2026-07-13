@@ -86,15 +86,10 @@ pub fn packet_loss(
     cfg
 }
 
-/// `f` Byzantine equivocating voters (the highest-indexed, non-leader nodes).
-/// The Minimmit feature uses its required `5f+1` sizing; the legacy lane keeps
-/// HotStuff's `3f+1` sizing.
+/// `f` Byzantine equivocating voters in Minimmit's required `5f+1` committee.
 #[must_use]
 pub fn byzantine_equivocation(f: u32, heights: u64, seed: u64) -> SimConfig {
-    #[cfg(feature = "minimmit")]
     let num_nodes = 5 * f + 1;
-    #[cfg(not(feature = "minimmit"))]
-    let num_nodes = 3 * f + 1;
     let mut cfg = SimConfig::clean(num_nodes, heights, seed);
     let mut behaviors = Vec::new();
     for k in 0..f {
@@ -108,10 +103,7 @@ pub fn byzantine_equivocation(f: u32, heights: u64, seed: u64) -> SimConfig {
 /// votes are rejected and honest nodes still reach agreement without panicking.
 #[must_use]
 pub fn invalid_signatures(f: u32, heights: u64, seed: u64) -> SimConfig {
-    #[cfg(feature = "minimmit")]
     let num_nodes = 5 * f + 1;
-    #[cfg(not(feature = "minimmit"))]
-    let num_nodes = 3 * f + 1;
     let mut cfg = SimConfig::clean(num_nodes, heights, seed);
     let mut behaviors = Vec::new();
     for k in 0..f {

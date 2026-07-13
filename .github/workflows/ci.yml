@@ -62,8 +62,8 @@ jobs:
           --exclude dexos-ui --exclude dexos-web
           --exclude dexos-desktop --exclude dexos-mobile --exclude dexos-sdk-wasm --exclude dexos-sdk-py
 
-  minimmit-simulation:
-    name: minimmit simulation proof
+  consensus-simulation:
+    name: consensus simulation proof
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -71,10 +71,10 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
-      - name: Minimmit simulator and feature selection
+      - name: Minimmit simulator
         run: |
-          cargo test -p simulation --features minimmit --locked
-          cargo test -p benchmarks --features minimmit --locked
+          cargo test -p simulation --locked
+          cargo test -p benchmarks --locked
 
   docs:
     name: cargo doc
