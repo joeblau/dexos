@@ -23,7 +23,8 @@
 //!   ancestry verification, and threshold witness receipts.
 //! - [`minimmit`]: the Minimmit successor engine (migration in progress,
 //!   additive beside HotStuff): the dual-threshold `M = 2B + 1` advance /
-//!   `L = W − B` finalize committee and the certificate seam. See
+//!   `L = W − B` finalize committee, the certificate seam, and the clock-free
+//!   `MinimmitReplica` reactor (`step(Input) -> Vec<Effect>`). See
 //!   `docs/CONSENSUS_MINIMMIT.md`.
 //!
 //! # Determinism
@@ -52,8 +53,8 @@ pub use checkpoint::{
     DOMAIN_WITNESS,
 };
 pub use minimmit::{
-    notarize_digest, nullify_digest, propose_auth, Certificate, MinimmitCommittee, ThresholdKind,
-    DOMAIN_NOTARIZE, DOMAIN_NULLIFY, DOMAIN_PROPOSE,
+    notarize_digest, nullify_digest, propose_auth, Certificate, MinimmitCommittee, MinimmitReplica,
+    ThresholdKind, DOMAIN_NOTARIZE, DOMAIN_NULLIFY, DOMAIN_PROPOSE,
 };
 pub use sequencer::{detect_gap, CommandRecord, CommandStatus, Sequencer, SequencerError};
 pub use vote::{
