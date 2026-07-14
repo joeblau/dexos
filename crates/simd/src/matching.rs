@@ -77,7 +77,10 @@ pub fn matching_notionals(
         return false;
     }
 
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     let mut at = 0usize;
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    let at = 0usize;
     match backend {
         #[cfg(target_arch = "x86_64")]
         Backend::Avx512 if Backend::Avx512.is_available() => {
@@ -143,6 +146,7 @@ pub fn matching_notionals(
 }
 
 #[inline]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 fn chunk_fits_u32(prices: &[i64], quantities: &[i64]) -> bool {
     prices
         .iter()

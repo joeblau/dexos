@@ -538,6 +538,8 @@ const fn vector_width(backend: Backend) -> usize {
 /// Copy exactly the qualified backend width from non-overlapping valid ranges.
 #[allow(unsafe_code)]
 unsafe fn copy_vector(backend: Backend, source: *const u8, destination: *mut u8) {
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    let _ = (source, destination);
     match backend {
         #[cfg(target_arch = "aarch64")]
         Backend::Neon => {
@@ -561,6 +563,8 @@ unsafe fn copy_vector(backend: Backend, source: *const u8, destination: *mut u8)
 /// Compare exactly the qualified backend width from two valid ranges.
 #[allow(unsafe_code)]
 unsafe fn vectors_equal(backend: Backend, left: *const u8, right: *const u8) -> bool {
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    let _ = (left, right);
     match backend {
         #[cfg(target_arch = "aarch64")]
         Backend::Neon => {

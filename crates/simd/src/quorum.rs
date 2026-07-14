@@ -137,8 +137,9 @@ unsafe fn selected_weight_avx2_inner(
     let bitmap = _mm256_set1_epi32(i32::from(signer_bitmap));
     let low_bits = _mm256_setr_epi32(1, 2, 4, 8, 16, 32, 64, 128);
     let high_bits = _mm256_setr_epi32(256, 512, 1024, 2048, 4096, 8192, 16384, 32768);
-    // SAFETY: each load reads eight u32 values from offsets 0 and 8.
+    // SAFETY: the first load reads the eight u32 values at offsets 0..8.
     let low_weights = unsafe { _mm256_loadu_si256(weights.as_ptr().cast()) };
+    // SAFETY: the second load reads the eight u32 values at offsets 8..16.
     let high_weights = unsafe { _mm256_loadu_si256(weights.as_ptr().add(8).cast()) };
     let low_selected = _mm256_and_si256(
         low_weights,
