@@ -7,20 +7,26 @@
 //! ordering replays identically across runs.
 
 use std::hint::black_box;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
-use codec::{Frame, TrafficClass};
+use codec::{Frame, PackedOrder, TrafficClass};
 use consensus::{
-    build_checkpoint_header, checkpoint_hash, notarize_digest, MinimmitCommittee, MinimmitReplica,
-    Notarize,
+    build_checkpoint_header, checkpoint_hash, execution_commitment_digest, notarize_digest,
+    nullify_digest, ExecAttest, MinimmitCommittee, MinimmitReplica, Notarization, Notarize,
+    Nullification, Nullify, ThresholdKind,
 };
 use crypto::{verify_ed25519, verify_ed25519_all, KeyPair, Validator};
-use execution::{Command, DeterministicEngine, Engine, EngineConfig, SetMarkPrice};
+use execution::{
+    Authorization, Command, DeterministicEngine, Engine, EngineConfig, PlaceOrder, SetMarkPrice,
+};
 use orderbook::{BookConfig, NewOrder, OrderBook};
 use risk::{RiskConfig, RiskEngine};
 use state_tree::{verify_account, LeafWriter, StateTree};
-use storage::{replay, Record, SegmentedLog, Snapshot, PROTOCOL_VERSION};
+use storage::{
+    replay, DurableConfig, DurableLog, Record, SegmentedLog, Snapshot, SyncPolicy, PROTOCOL_VERSION,
+};
 use types::{
     AccountId, Amount, Hash, MarketId, OrderId, OrderType, Price, Quantity, Ratio, SequenceNumber,
     ShardId, Side, TimeInForce,
@@ -41,6 +47,7 @@ pub struct Suite {
 
 /// Fixed workload seed so every run replays the same operation ordering.
 const SEED: u64 = 0x0DEF_ACE0_1234_5678;
+static WAL_BENCHMARK_INSTANCE: AtomicU64 = AtomicU64::new(0);
 
 /// All registered suites, in a stable order.
 #[must_use]
@@ -79,8 +86,40 @@ pub fn registry() -> Vec<Suite> {
             run: market_order_fill_fanout,
         },
         Suite {
+            name: "market-depth-plan-materialized",
+            run: market_depth_plan_materialized,
+        },
+        Suite {
+            name: "market-depth-plan-summary",
+            run: market_depth_plan_summary,
+        },
+        Suite {
+            name: "market-depth-plan-summary-scalar",
+            run: market_depth_plan_summary_scalar,
+        },
+        Suite {
+            name: "market-depth-plan-summary-simd",
+            run: market_depth_plan_summary_simd,
+        },
+        Suite {
             name: "command-execution",
             run: command_execution,
+        },
+        Suite {
+            name: "engine-resting-order",
+            run: engine_resting_order,
+        },
+        Suite {
+            name: "shard-worker-order",
+            run: shard_worker_order,
+        },
+        Suite {
+            name: "packed-batch-admit-128",
+            run: packed_batch_admit_128,
+        },
+        Suite {
+            name: "authenticated-packed-batch-admit-128",
+            run: authenticated_packed_batch_admit_128,
         },
         Suite {
             name: "risk-check",
@@ -119,6 +158,10 @@ pub fn registry() -> Vec<Suite> {
             run: log_serialization,
         },
         Suite {
+            name: "durable-wal-append",
+            run: durable_wal_append,
+        },
+        Suite {
             name: "snapshot-create-restore",
             run: snapshot_create_restore,
         },
@@ -135,6 +178,114 @@ pub fn registry() -> Vec<Suite> {
             run: peer_message_decode,
         },
         Suite {
+            name: "packed-encode-scalar-32",
+            run: packed_encode_scalar_32,
+        },
+        Suite {
+            name: "packed-encode-dispatched-32",
+            run: packed_encode_simd_32,
+        },
+        Suite {
+            name: "packed-encode-scalar-64",
+            run: packed_encode_scalar_64,
+        },
+        Suite {
+            name: "packed-encode-dispatched-64",
+            run: packed_encode_simd_64,
+        },
+        Suite {
+            name: "packed-encode-scalar-128",
+            run: packed_encode_scalar_128,
+        },
+        Suite {
+            name: "packed-encode-dispatched-128",
+            run: packed_encode_simd_128,
+        },
+        Suite {
+            name: "packed-decode-scalar-32",
+            run: packed_decode_scalar_32,
+        },
+        Suite {
+            name: "packed-decode-dispatched-32",
+            run: packed_decode_simd_32,
+        },
+        Suite {
+            name: "packed-decode-scalar-64",
+            run: packed_decode_scalar_64,
+        },
+        Suite {
+            name: "packed-decode-dispatched-64",
+            run: packed_decode_simd_64,
+        },
+        Suite {
+            name: "packed-decode-scalar-128",
+            run: packed_decode_scalar_128,
+        },
+        Suite {
+            name: "packed-decode-dispatched-128",
+            run: packed_decode_simd_128,
+        },
+        Suite {
+            name: "order-batch-lz4-32",
+            run: order_batch_lz4_32,
+        },
+        Suite {
+            name: "order-batch-lz4-64",
+            run: order_batch_lz4_64,
+        },
+        Suite {
+            name: "order-batch-lz4-128",
+            run: order_batch_lz4_128,
+        },
+        Suite {
+            name: "order-batch-lz4-encode-scalar-32",
+            run: order_batch_lz4_encode_scalar_32,
+        },
+        Suite {
+            name: "order-batch-lz4-encode-dispatched-32",
+            run: order_batch_lz4_encode_simd_32,
+        },
+        Suite {
+            name: "order-batch-lz4-encode-scalar-64",
+            run: order_batch_lz4_encode_scalar_64,
+        },
+        Suite {
+            name: "order-batch-lz4-encode-dispatched-64",
+            run: order_batch_lz4_encode_simd_64,
+        },
+        Suite {
+            name: "order-batch-lz4-encode-scalar-128",
+            run: order_batch_lz4_encode_scalar_128,
+        },
+        Suite {
+            name: "order-batch-lz4-encode-dispatched-128",
+            run: order_batch_lz4_encode_simd_128,
+        },
+        Suite {
+            name: "order-batch-lz4-decode-scalar-32",
+            run: order_batch_lz4_decode_scalar_32,
+        },
+        Suite {
+            name: "order-batch-lz4-decode-dispatched-32",
+            run: order_batch_lz4_decode_simd_32,
+        },
+        Suite {
+            name: "order-batch-lz4-decode-scalar-64",
+            run: order_batch_lz4_decode_scalar_64,
+        },
+        Suite {
+            name: "order-batch-lz4-decode-dispatched-64",
+            run: order_batch_lz4_decode_simd_64,
+        },
+        Suite {
+            name: "order-batch-lz4-decode-scalar-128",
+            run: order_batch_lz4_decode_scalar_128,
+        },
+        Suite {
+            name: "order-batch-lz4-decode-dispatched-128",
+            run: order_batch_lz4_decode_simd_128,
+        },
+        Suite {
             name: "rpc-request-handling",
             run: rpc_request_handling,
         },
@@ -145,6 +296,78 @@ pub fn registry() -> Vec<Suite> {
         Suite {
             name: "consensus-notarize-handling",
             run: consensus_notarize_handling,
+        },
+        Suite {
+            name: "minimmit-digest-6",
+            run: minimmit_digest_6,
+        },
+        Suite {
+            name: "minimmit-digest-11",
+            run: minimmit_digest_11,
+        },
+        Suite {
+            name: "minimmit-digest-16",
+            run: minimmit_digest_16,
+        },
+        Suite {
+            name: "minimmit-vote-admission-6",
+            run: minimmit_vote_admission_6,
+        },
+        Suite {
+            name: "minimmit-vote-admission-11",
+            run: minimmit_vote_admission_11,
+        },
+        Suite {
+            name: "minimmit-vote-admission-16",
+            run: minimmit_vote_admission_16,
+        },
+        Suite {
+            name: "minimmit-certificate-assembly-6",
+            run: minimmit_certificate_assembly_6,
+        },
+        Suite {
+            name: "minimmit-certificate-assembly-11",
+            run: minimmit_certificate_assembly_11,
+        },
+        Suite {
+            name: "minimmit-certificate-assembly-16",
+            run: minimmit_certificate_assembly_16,
+        },
+        Suite {
+            name: "minimmit-certificate-verify-m-6",
+            run: minimmit_certificate_verify_m_6,
+        },
+        Suite {
+            name: "minimmit-certificate-verify-m-11",
+            run: minimmit_certificate_verify_m_11,
+        },
+        Suite {
+            name: "minimmit-certificate-verify-m-16",
+            run: minimmit_certificate_verify_m_16,
+        },
+        Suite {
+            name: "minimmit-certificate-verify-l-6",
+            run: minimmit_certificate_verify_l_6,
+        },
+        Suite {
+            name: "minimmit-certificate-verify-l-11",
+            run: minimmit_certificate_verify_l_11,
+        },
+        Suite {
+            name: "minimmit-certificate-verify-l-16",
+            run: minimmit_certificate_verify_l_16,
+        },
+        Suite {
+            name: "minimmit-certificate-invalid-mix-6",
+            run: minimmit_certificate_invalid_mix_6,
+        },
+        Suite {
+            name: "minimmit-certificate-invalid-mix-11",
+            run: minimmit_certificate_invalid_mix_11,
+        },
+        Suite {
+            name: "minimmit-certificate-invalid-mix-16",
+            run: minimmit_certificate_invalid_mix_16,
         },
         Suite {
             name: "light-client-proof-verify",
@@ -227,9 +450,37 @@ pub fn provenance(name: &str) -> Option<SuiteProvenance> {
             "orderbook::OrderBook::submit (crossing taker, 8 fills)",
             "8 maker levels swept per taker; fan-out of 8 fills from one submit",
         ),
+        "market-depth-plan-materialized" => micro(
+            "orderbook::OrderBook::plan_match (owned diagnostic plan)",
+            "128 ask levels and 128 maker fills; retains one PlannedFill per maker",
+        ),
+        "market-depth-plan-summary" | "market-depth-plan-summary-simd" => micro(
+            "orderbook::OrderBook::plan_match_summary (execution pre-trade risk path)",
+            "128 ask levels/fills; detected backend batches exact fixed-point products; no retained fill vector",
+        ),
+        "market-depth-plan-summary-scalar" => micro(
+            "orderbook::OrderBook::plan_match_summary (forced scalar reference)",
+            "same 128 ask levels/fills and arithmetic as the SIMD pair; no retained fill vector",
+        ),
         "command-execution" => micro(
             "execution::Engine::execute (SetMarkPrice → risk recompute)",
             "1 account, 1 perpetual market; engine-only, no sockets/journal",
+        ),
+        "engine-resting-order" => micro(
+            "execution::Engine::execute (PlaceOrder → orderbook/risk/state root/receipt)",
+            "1 funded account, 1 perpetual market; 2200 non-crossing bids, no sockets/journal",
+        ),
+        "shard-worker-order" => micro(
+            "node::ShardIngress → ShardWorker::step → ShardEgress",
+            "preallocated SPSC rings, 1 Engine owner, accepted resting order; no socket/journal",
+        ),
+        "packed-batch-admit-128" => micro(
+            "network::OrderBatchCodec::decode_into → node::PackedBatchIngress::try_admit → SPSC",
+            "128 authenticated-context records; LZ4/CRC/typed decode/lower/atomic ring publish; no signature/socket/Engine",
+        ),
+        "authenticated-packed-batch-admit-128" => micro(
+            "network::AuthenticatedOrderBatchCodec::verify → replay check → node::PackedBatchIngress::try_admit → SPSC",
+            "128 records; Ed25519 destination/session/account/sequence binding + LZ4/CRC/typed decode/lower/atomic ring publish; no socket/Engine",
         ),
         "risk-check" => micro(
             "risk::RiskEngine::check_order (pre-trade)",
@@ -265,6 +516,10 @@ pub fn provenance(name: &str) -> Option<SuiteProvenance> {
             "storage::Record::encode",
             "single 64-byte-payload record; in-memory, no fsync/disk",
         ),
+        "durable-wal-append" => micro(
+            "storage::DurableLog::append (borrowed payload into reusable frame)",
+            "single active segment, 64-byte payload, SyncPolicy::Never; file write included, fsync/rotation excluded",
+        ),
         "snapshot-create-restore" => micro(
             "storage::Snapshot::{encode,decode,verify}",
             "256-byte state; in-memory round trip, no disk",
@@ -281,6 +536,58 @@ pub fn provenance(name: &str) -> Option<SuiteProvenance> {
             "codec::Frame::decode",
             "single market-data frame; bytes only, no socket",
         ),
+        "packed-encode-scalar-32" | "packed-encode-scalar-64" | "packed-encode-scalar-128" => {
+            micro(
+                "codec::encode_batch_with_backend (scalar reference)",
+                "70/20/10 submit/cancel/replace corpus; batch size encoded in suite name",
+            )
+        }
+        "packed-encode-dispatched-32"
+        | "packed-encode-dispatched-64"
+        | "packed-encode-dispatched-128" => micro(
+            "codec::encode_batch_with_backend (runtime-dispatched backend)",
+            "same 70/20/10 corpus; production size qualification may select the scalar fallback",
+        ),
+        "packed-decode-scalar-32" | "packed-decode-scalar-64" | "packed-decode-scalar-128" => {
+            micro(
+                "codec::decode_batch_with_backend (scalar reference)",
+                "70/20/10 packed corpus; batch size encoded in suite name",
+            )
+        }
+        "packed-decode-dispatched-32"
+        | "packed-decode-dispatched-64"
+        | "packed-decode-dispatched-128" => micro(
+            "codec::decode_batch_with_backend (runtime-dispatched backend)",
+            "same packed corpus; production size qualification may select the scalar fallback",
+        ),
+        "order-batch-lz4-32" | "order-batch-lz4-64" | "order-batch-lz4-128" => micro(
+            "network::OrderBatchCodec::{encode,decode_into}",
+            "compressible 70/20/10 packed corpus; size encoded in suite name; no socket/AEAD",
+        ),
+        "order-batch-lz4-encode-scalar-32"
+        | "order-batch-lz4-encode-scalar-64"
+        | "order-batch-lz4-encode-scalar-128" => micro(
+            "network::OrderBatchCodec::encode_with_backend (scalar LZ4 reference)",
+            "70/20/10 packed corpus; fixed hash table and batch size encoded in suite name",
+        ),
+        "order-batch-lz4-encode-dispatched-32"
+        | "order-batch-lz4-encode-dispatched-64"
+        | "order-batch-lz4-encode-dispatched-128" => micro(
+            "network::OrderBatchCodec::encode_with_backend (runtime-qualified LZ4 encoder)",
+            "same packed corpus; vector match extension at qualified sizes, scalar fallback otherwise",
+        ),
+        "order-batch-lz4-decode-scalar-32"
+        | "order-batch-lz4-decode-scalar-64"
+        | "order-batch-lz4-decode-scalar-128" => micro(
+            "network::OrderBatchCodec::decode_into_with_backend (scalar LZ4 reference)",
+            "precompressed 70/20/10 packed corpus; batch size encoded in suite name",
+        ),
+        "order-batch-lz4-decode-dispatched-32"
+        | "order-batch-lz4-decode-dispatched-64"
+        | "order-batch-lz4-decode-dispatched-128" => micro(
+            "network::OrderBatchCodec::decode_into_with_backend (runtime vector LZ4 copy kernel)",
+            "same precompressed corpus; runtime AVX-512/AVX2/NEON selection with scalar fallback",
+        ),
         "rpc-request-handling" => micro(
             "codec decode → dispatch → encode (RPC hot path)",
             "single request; bytes only, no socket, no auth",
@@ -292,6 +599,40 @@ pub fn provenance(name: &str) -> Option<SuiteProvenance> {
         "consensus-notarize-handling" => micro(
             "consensus::MinimmitReplica::admit_notarize (verifies signature)",
             "6-validator Minimmit committee, 1 notarize per op",
+        ),
+        "minimmit-digest-6" | "minimmit-digest-11" | "minimmit-digest-16" => micro(
+            "consensus::{notarize_digest,nullify_digest,execution_commitment_digest}",
+            "fixed-stack canonical preimages; committee size encoded in suite name",
+        ),
+        "minimmit-vote-admission-6"
+        | "minimmit-vote-admission-11"
+        | "minimmit-vote-admission-16" => micro(
+            "consensus::{Notarize,Nullify,ExecAttest}::verify with cached committee keys",
+            "one valid vote of every kind plus one invalid signature; committee size encoded in suite name",
+        ),
+        "minimmit-certificate-assembly-6"
+        | "minimmit-certificate-assembly-11"
+        | "minimmit-certificate-assembly-16" => micro(
+            "consensus::MinimmitCommittee::assemble for M and L signer sets",
+            "fixed-stack dedup/bitmap accumulation and owned QC output; committee size encoded in suite name",
+        ),
+        "minimmit-certificate-verify-m-6"
+        | "minimmit-certificate-verify-m-11"
+        | "minimmit-certificate-verify-m-16" => micro(
+            "consensus::{Notarization,Nullification}::verify at advance threshold M",
+            "valid notarize and nullify certificates; committee size encoded in suite name",
+        ),
+        "minimmit-certificate-verify-l-6"
+        | "minimmit-certificate-verify-l-11"
+        | "minimmit-certificate-verify-l-16" => micro(
+            "consensus::MinimmitCommittee::verify_detailed plus ExecutionCertificate::verify at L",
+            "valid ordering and execution certificates; committee size encoded in suite name",
+        ),
+        "minimmit-certificate-invalid-mix-6"
+        | "minimmit-certificate-invalid-mix-11"
+        | "minimmit-certificate-invalid-mix-16" => micro(
+            "consensus::MinimmitCommittee::verify_detailed invalid-signer attribution",
+            "two corrupted signatures; deterministic first invalid index; committee size encoded in suite name",
         ),
         "light-client-proof-verify" => micro(
             "state_tree::verify_account (Merkle proof)",
@@ -410,6 +751,68 @@ fn order_cancellation(cfg: Config) -> BenchStat {
         let _ = book.submit(bid(next, next, px, 1));
         cursor += 1;
         next += 1;
+    })
+}
+
+fn depth_scan_fixture(backend: simd::Backend) -> (OrderBook, NewOrder) {
+    let mut book = OrderBook::new(BookConfig {
+        matching_backend: backend,
+        ..BookConfig::default()
+    });
+    for i in 0..128u64 {
+        let _ = book.submit(ask(
+            i + 1,
+            i + 1,
+            100 + i64::try_from(i).unwrap_or(0),
+            1,
+            u32::try_from(i + 1).unwrap_or(0),
+        ));
+    }
+    let taker = NewOrder {
+        order_id: OrderId::new(10_000),
+        account: AccountId::new(10_000),
+        side: Side::Bid,
+        order_type: OrderType::Market,
+        tif: TimeInForce::Ioc,
+        price: price(227),
+        quantity: qty(128),
+        client_id: 10_000,
+        reduce_only: false,
+    };
+    (book, taker)
+}
+
+/// Former risk path: retain a `PlannedFill` for every maker, then return an
+/// owned plan. Kept as a paired component baseline for the aggregate scan.
+fn market_depth_plan_materialized(cfg: Config) -> BenchStat {
+    let (book, taker) = depth_scan_fixture(simd::Backend::Scalar);
+    bench("market-depth-plan-materialized", cfg, || {
+        black_box(book.plan_match(&taker).is_ok());
+    })
+}
+
+/// Current risk path: same deterministic scan and arithmetic without retaining
+/// temporary price/fill vectors.
+fn market_depth_plan_summary(cfg: Config) -> BenchStat {
+    let (book, taker) = depth_scan_fixture(simd::detect());
+    bench("market-depth-plan-summary", cfg, || {
+        black_box(book.plan_match_summary(&taker).is_ok());
+    })
+}
+
+/// Full-width scalar reference paired against the detected SIMD summary.
+fn market_depth_plan_summary_scalar(cfg: Config) -> BenchStat {
+    let (book, taker) = depth_scan_fixture(simd::Backend::Scalar);
+    bench("market-depth-plan-summary-scalar", cfg, || {
+        black_box(book.plan_match_summary(&taker).is_ok());
+    })
+}
+
+/// Production match-planning summary with the best runnable SIMD backend.
+fn market_depth_plan_summary_simd(cfg: Config) -> BenchStat {
+    let (book, taker) = depth_scan_fixture(simd::detect());
+    bench("market-depth-plan-summary-simd", cfg, || {
+        black_box(book.plan_match_summary(&taker).is_ok());
     })
 }
 
@@ -551,6 +954,216 @@ fn command_execution(cfg: Config) -> BenchStat {
         );
         black_box(r.is_ok());
         seq += 1;
+    })
+}
+
+/// Accepted resting order through the complete synchronous execution core.
+fn engine_resting_order(cfg: Config) -> BenchStat {
+    let mut engine = Engine::new(EngineConfig::default());
+    let mut seq = 1u64;
+    engine
+        .execute(
+            SequenceNumber::new(seq),
+            Command::CreateAccount(execution::CreateAccount {
+                initial_collateral: amt(1_000_000),
+            }),
+        )
+        .unwrap();
+    seq += 1;
+    engine
+        .execute(
+            SequenceNumber::new(seq),
+            Command::CreateMarket(execution::CreateMarket {
+                market: MarketId::new(0),
+                market_type: types::MarketType::Perpetual,
+                outcomes: 1,
+                mark_price: price(100),
+            }),
+        )
+        .unwrap();
+    seq += 1;
+    let mut order_id = 1u64;
+    bench("engine-resting-order", cfg, || {
+        let result = engine.execute(
+            SequenceNumber::new(seq),
+            Command::PlaceOrder(PlaceOrder {
+                account: AccountId::new(0),
+                market: MarketId::new(0),
+                order_id: OrderId::new(order_id),
+                side: Side::Bid,
+                order_type: OrderType::Limit,
+                tif: TimeInForce::Gtc,
+                price: price(1),
+                quantity: qty(1),
+                client_id: order_id,
+                reduce_only: false,
+                instrument: 0,
+                auth: Authorization::Master,
+            }),
+        );
+        black_box(result.is_ok());
+        seq += 1;
+        order_id += 1;
+    })
+}
+
+/// Accepted order through the bounded lock-free shard-owner handoff.
+fn shard_worker_order(cfg: Config) -> BenchStat {
+    let mut engine = Engine::new(EngineConfig::default());
+    let mut seq = 1u64;
+    engine
+        .execute(
+            SequenceNumber::new(seq),
+            Command::CreateAccount(execution::CreateAccount {
+                initial_collateral: amt(1_000_000),
+            }),
+        )
+        .unwrap();
+    seq += 1;
+    engine
+        .execute(
+            SequenceNumber::new(seq),
+            Command::CreateMarket(execution::CreateMarket {
+                market: MarketId::new(0),
+                market_type: types::MarketType::Perpetual,
+                outcomes: 1,
+                mark_price: price(100),
+            }),
+        )
+        .unwrap();
+    seq += 1;
+    let (mut ingress, mut worker, mut egress) = node::shard_pipeline(engine, 1024, 1024).unwrap();
+    let mut order_id = 1u64;
+    bench("shard-worker-order", cfg, || {
+        let submitted = ingress.try_submit(node::ShardCommand {
+            sequence: SequenceNumber::new(seq),
+            command: Command::PlaceOrder(PlaceOrder {
+                account: AccountId::new(0),
+                market: MarketId::new(0),
+                order_id: OrderId::new(order_id),
+                side: Side::Bid,
+                order_type: OrderType::Limit,
+                tif: TimeInForce::Gtc,
+                price: price(1),
+                quantity: qty(1),
+                client_id: order_id,
+                reduce_only: false,
+                instrument: 0,
+                auth: Authorization::Master,
+            }),
+        });
+        black_box(submitted.is_ok());
+        black_box(worker.step());
+        if let Some(effect) = egress.try_recv() {
+            black_box(effect.result.is_ok());
+        }
+        seq += 1;
+        order_id += 1;
+    })
+}
+
+/// Authenticated compressed bytes through CRC, typed packed decode, faithful
+/// engine-command lowering, and atomic lock-free publication. The consumer is
+/// drained directly so this suite isolates admission from execution, which has
+/// its own `shard-worker-order` suite.
+fn packed_batch_admit_128(cfg: Config) -> BenchStat {
+    const COUNT: usize = 128;
+    let records = packed_corpus(COUNT);
+    let mut packed = vec![0u8; COUNT * codec::PACKED_SUBMIT_LEN];
+    let packed_len = codec::encode_batch_into(&records, &mut packed).unwrap();
+    let mut encoder = network::OrderBatchCodec::new();
+    let envelope = encoder
+        .encode(128, false, &packed[..packed_len])
+        .unwrap()
+        .bytes
+        .to_vec();
+    let (mut ingress, mut consumer) = node::shard_command_ring(256).unwrap();
+    let mut decoder = node::PackedBatchIngress::new();
+    let mut first_sequence = 1u64;
+
+    bench("packed-batch-admit-128", cfg, || {
+        let admitted = decoder
+            .try_admit(
+                &mut ingress,
+                &envelope,
+                node::AuthenticatedPackedBatch {
+                    session_ref: 7,
+                    account: AccountId::new(9),
+                    authority: node::PackedAuthority::Master,
+                    first_sequence: SequenceNumber::new(first_sequence),
+                    sequencer_now: 1,
+                },
+            )
+            .unwrap();
+        black_box(admitted);
+        for _ in 0..COUNT {
+            let command = consumer.try_pop().expect("preflighted batch must publish");
+            black_box((command.sequence, command.command.command_type()));
+        }
+        first_sequence = first_sequence.saturating_add(u64::try_from(COUNT).unwrap_or(u64::MAX));
+    })
+}
+
+/// Signed wrapper verification, strict replay/sequence admission, compressed
+/// decode, lowering, and atomic SPSC publication. Envelopes are prepared outside
+/// the timed closure so the suite measures the receive path, not load generation.
+fn authenticated_packed_batch_admit_128(cfg: Config) -> BenchStat {
+    const COUNT: usize = 128;
+    let records = packed_corpus(COUNT);
+    let mut packed = vec![0u8; COUNT * codec::PACKED_SUBMIT_LEN];
+    let packed_len = codec::encode_batch_into(&records, &mut packed).unwrap();
+    let signer = KeyPair::from_seed(&[11; 32]);
+    let total = usize::try_from(cfg.warmup.saturating_add(cfg.iterations)).unwrap_or(usize::MAX);
+    let mut encoder = network::AuthenticatedOrderBatchCodec::new();
+    let mut envelopes = Vec::with_capacity(total);
+    for index in 0..total {
+        let index = u64::try_from(index).unwrap_or(u64::MAX);
+        let first_sequence =
+            1u64.saturating_add(index.saturating_mul(u64::try_from(COUNT).unwrap_or(u64::MAX)));
+        envelopes.push(
+            encoder
+                .encode(
+                    network::OrderBatchBinding {
+                        destination: [5; 32],
+                        session_ref: 7,
+                        account: AccountId::new(9),
+                        batch_sequence: index,
+                        first_sequence,
+                    },
+                    &signer,
+                    128,
+                    false,
+                    &packed[..packed_len],
+                )
+                .unwrap()
+                .bytes
+                .to_vec(),
+        );
+    }
+    let (mut ingress, mut consumer) = node::shard_command_ring(256).unwrap();
+    let mut decoder = node::AuthenticatedPackedBatchIngress::new(node::PackedSession {
+        destination: [5; 32],
+        session_ref: 7,
+        account: AccountId::new(9),
+        signer: signer.public(),
+        authority: node::PackedAuthority::Master,
+        first_batch_sequence: 0,
+        first_command_sequence: SequenceNumber::new(1),
+        batch_sequence_stride: 1,
+        command_sequence_stride: 0,
+    });
+    let mut index = 0usize;
+
+    bench("authenticated-packed-batch-admit-128", cfg, || {
+        let admitted = decoder
+            .try_admit(&mut ingress, &envelopes[index], 1)
+            .unwrap();
+        black_box(admitted);
+        for _ in 0..COUNT {
+            let command = consumer.try_pop().expect("preflighted batch must publish");
+            black_box((command.sequence, command.command.command_type()));
+        }
+        index = index.saturating_add(1);
     })
 }
 
@@ -735,6 +1348,30 @@ fn log_serialization(cfg: Config) -> BenchStat {
     })
 }
 
+fn durable_wal_append(cfg: Config) -> BenchStat {
+    let instance = WAL_BENCHMARK_INSTANCE.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "dexos-durable-wal-benchmark-{}-{instance}",
+        std::process::id(),
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut log = DurableLog::open(
+        DurableConfig::new(&dir)
+            .with_sync(SyncPolicy::Never)
+            .with_segment_max_bytes(storage::DEFAULT_SEGMENT_BYTES),
+    )
+    .unwrap();
+    let payload = [0xAB; 64];
+    let mut sequence = 1u64;
+    let stat = bench("durable-wal-append", cfg, || {
+        log.append(sequence, sequence, 1, &payload).unwrap();
+        sequence = sequence.saturating_add(1);
+    });
+    drop(log);
+    let _ = std::fs::remove_dir_all(dir);
+    stat
+}
+
 fn snapshot_create_restore(cfg: Config) -> BenchStat {
     let state = vec![0x5Au8; 256];
     let mut seq: u64 = 0;
@@ -774,6 +1411,293 @@ fn command_replay(cfg: Config) -> BenchStat {
 }
 
 // ------------------------------------------------------------- codec/network
+
+fn packed_corpus(count: usize) -> Vec<PackedOrder> {
+    (0..count)
+        .map(|i| {
+            let id = u64::try_from(i + 1).unwrap_or(u64::MAX);
+            match i % 10 {
+                0..=6 => PackedOrder::Submit {
+                    session_ref: 7,
+                    nonce: id,
+                    client_id: id,
+                    account: AccountId::new(9),
+                    market: MarketId::new(3),
+                    side: if i & 1 == 0 { Side::Bid } else { Side::Ask },
+                    order_type: OrderType::Limit,
+                    price: price(100),
+                    quantity: qty(1),
+                    time_in_force: TimeInForce::Gtc,
+                    leverage: Ratio::ONE,
+                },
+                7..=8 => PackedOrder::Cancel {
+                    session_ref: 7,
+                    nonce: id,
+                    client_id: id,
+                    account: AccountId::new(9),
+                    market: MarketId::new(3),
+                    order_id: OrderId::new(id),
+                },
+                _ => PackedOrder::Replace {
+                    session_ref: 7,
+                    nonce: id,
+                    client_id: id,
+                    account: AccountId::new(9),
+                    market: MarketId::new(3),
+                    order_id: OrderId::new(id),
+                    new_price: price(101),
+                    new_quantity: qty(2),
+                },
+            }
+        })
+        .collect()
+}
+
+fn packed_encode_bench(
+    name: &'static str,
+    cfg: Config,
+    count: usize,
+    backend: simd::Backend,
+) -> BenchStat {
+    let records = packed_corpus(count);
+    let mut output = vec![0u8; count * codec::PACKED_SUBMIT_LEN];
+    bench(name, cfg, || {
+        let encoded = codec::encode_batch_with_backend(&records, backend, &mut output).unwrap();
+        black_box(encoded);
+    })
+}
+
+fn packed_decode_bench(
+    name: &'static str,
+    cfg: Config,
+    count: usize,
+    backend: simd::Backend,
+) -> BenchStat {
+    let records = packed_corpus(count);
+    let mut encoded = vec![0u8; count * codec::PACKED_SUBMIT_LEN];
+    let encoded_len =
+        codec::encode_batch_with_backend(&records, simd::Backend::Scalar, &mut encoded).unwrap();
+    let mut output = records.clone();
+    bench(name, cfg, || {
+        let decoded =
+            codec::decode_batch_with_backend(&encoded[..encoded_len], backend, &mut output)
+                .unwrap();
+        black_box(decoded);
+    })
+}
+
+macro_rules! packed_bench_wrappers {
+    ($count:literal, $enc_scalar:ident, $enc_simd:ident, $dec_scalar:ident, $dec_simd:ident) => {
+        fn $enc_scalar(cfg: Config) -> BenchStat {
+            packed_encode_bench(
+                concat!("packed-encode-scalar-", stringify!($count)),
+                cfg,
+                $count,
+                simd::Backend::Scalar,
+            )
+        }
+
+        fn $enc_simd(cfg: Config) -> BenchStat {
+            packed_encode_bench(
+                concat!("packed-encode-dispatched-", stringify!($count)),
+                cfg,
+                $count,
+                simd::detect(),
+            )
+        }
+
+        fn $dec_scalar(cfg: Config) -> BenchStat {
+            packed_decode_bench(
+                concat!("packed-decode-scalar-", stringify!($count)),
+                cfg,
+                $count,
+                simd::Backend::Scalar,
+            )
+        }
+
+        fn $dec_simd(cfg: Config) -> BenchStat {
+            packed_decode_bench(
+                concat!("packed-decode-dispatched-", stringify!($count)),
+                cfg,
+                $count,
+                simd::detect(),
+            )
+        }
+    };
+}
+
+packed_bench_wrappers!(
+    32,
+    packed_encode_scalar_32,
+    packed_encode_simd_32,
+    packed_decode_scalar_32,
+    packed_decode_simd_32
+);
+packed_bench_wrappers!(
+    64,
+    packed_encode_scalar_64,
+    packed_encode_simd_64,
+    packed_decode_scalar_64,
+    packed_decode_simd_64
+);
+packed_bench_wrappers!(
+    128,
+    packed_encode_scalar_128,
+    packed_encode_simd_128,
+    packed_decode_scalar_128,
+    packed_decode_simd_128
+);
+
+fn order_batch_lz4_bench(name: &'static str, cfg: Config, count: usize) -> BenchStat {
+    let records = packed_corpus(count);
+    let mut packed = vec![0u8; count * codec::PACKED_SUBMIT_LEN];
+    let packed_len =
+        codec::encode_batch_with_backend(&records, simd::Backend::Scalar, &mut packed).unwrap();
+    let mut batch_codec = network::OrderBatchCodec::new();
+    let mut decoded = vec![0u8; network::ORDER_BATCH_MAX_UNCOMPRESSED];
+    let record_count = u8::try_from(count).unwrap_or(u8::MAX);
+    bench(name, cfg, || {
+        let encoded = batch_codec
+            .encode(record_count, false, &packed[..packed_len])
+            .unwrap();
+        let result = network::OrderBatchCodec::decode_into(encoded.bytes, &mut decoded).unwrap();
+        black_box(result.records.len());
+    })
+}
+
+fn order_batch_lz4_32(cfg: Config) -> BenchStat {
+    order_batch_lz4_bench("order-batch-lz4-32", cfg, 32)
+}
+
+fn order_batch_lz4_64(cfg: Config) -> BenchStat {
+    order_batch_lz4_bench("order-batch-lz4-64", cfg, 64)
+}
+
+fn order_batch_lz4_128(cfg: Config) -> BenchStat {
+    order_batch_lz4_bench("order-batch-lz4-128", cfg, 128)
+}
+
+fn order_batch_lz4_encode_bench(
+    name: &'static str,
+    cfg: Config,
+    count: usize,
+    backend: simd::Backend,
+) -> BenchStat {
+    let records = packed_corpus(count);
+    let mut packed = vec![0u8; count * codec::PACKED_SUBMIT_LEN];
+    let packed_len =
+        codec::encode_batch_with_backend(&records, simd::Backend::Scalar, &mut packed).unwrap();
+    let mut batch_codec = network::OrderBatchCodec::new();
+    let record_count = u8::try_from(count).unwrap_or(u8::MAX);
+    bench(name, cfg, || {
+        let encoded = batch_codec
+            .encode_with_backend(record_count, false, &packed[..packed_len], backend)
+            .unwrap();
+        black_box((encoded.bytes.len(), encoded.raw));
+    })
+}
+
+macro_rules! lz4_encode_bench_wrappers {
+    ($count:literal, $scalar:ident, $vector:ident) => {
+        fn $scalar(cfg: Config) -> BenchStat {
+            order_batch_lz4_encode_bench(
+                concat!("order-batch-lz4-encode-scalar-", stringify!($count)),
+                cfg,
+                $count,
+                simd::Backend::Scalar,
+            )
+        }
+
+        fn $vector(cfg: Config) -> BenchStat {
+            order_batch_lz4_encode_bench(
+                concat!("order-batch-lz4-encode-dispatched-", stringify!($count)),
+                cfg,
+                $count,
+                simd::detect(),
+            )
+        }
+    };
+}
+
+lz4_encode_bench_wrappers!(
+    32,
+    order_batch_lz4_encode_scalar_32,
+    order_batch_lz4_encode_simd_32
+);
+lz4_encode_bench_wrappers!(
+    64,
+    order_batch_lz4_encode_scalar_64,
+    order_batch_lz4_encode_simd_64
+);
+lz4_encode_bench_wrappers!(
+    128,
+    order_batch_lz4_encode_scalar_128,
+    order_batch_lz4_encode_simd_128
+);
+
+fn order_batch_lz4_decode_bench(
+    name: &'static str,
+    cfg: Config,
+    count: usize,
+    backend: simd::Backend,
+) -> BenchStat {
+    let records = packed_corpus(count);
+    let mut packed = vec![0u8; count * codec::PACKED_SUBMIT_LEN];
+    let packed_len =
+        codec::encode_batch_with_backend(&records, simd::Backend::Scalar, &mut packed).unwrap();
+    let mut batch_codec = network::OrderBatchCodec::new();
+    let record_count = u8::try_from(count).unwrap_or(u8::MAX);
+    let envelope = batch_codec
+        .encode(record_count, false, &packed[..packed_len])
+        .unwrap()
+        .bytes
+        .to_vec();
+    let mut decoded = vec![0u8; network::ORDER_BATCH_MAX_UNCOMPRESSED];
+    bench(name, cfg, || {
+        let result =
+            network::OrderBatchCodec::decode_into_with_backend(&envelope, &mut decoded, backend)
+                .unwrap();
+        black_box(result.records.len());
+    })
+}
+
+macro_rules! lz4_decode_bench_wrappers {
+    ($count:literal, $scalar:ident, $vector:ident) => {
+        fn $scalar(cfg: Config) -> BenchStat {
+            order_batch_lz4_decode_bench(
+                concat!("order-batch-lz4-decode-scalar-", stringify!($count)),
+                cfg,
+                $count,
+                simd::Backend::Scalar,
+            )
+        }
+
+        fn $vector(cfg: Config) -> BenchStat {
+            order_batch_lz4_decode_bench(
+                concat!("order-batch-lz4-decode-dispatched-", stringify!($count)),
+                cfg,
+                $count,
+                simd::detect(),
+            )
+        }
+    };
+}
+
+lz4_decode_bench_wrappers!(
+    32,
+    order_batch_lz4_decode_scalar_32,
+    order_batch_lz4_decode_simd_32
+);
+lz4_decode_bench_wrappers!(
+    64,
+    order_batch_lz4_decode_scalar_64,
+    order_batch_lz4_decode_simd_64
+);
+lz4_decode_bench_wrappers!(
+    128,
+    order_batch_lz4_decode_scalar_128,
+    order_batch_lz4_decode_simd_128
+);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct MarketUpdate {
@@ -870,6 +1794,289 @@ fn market_data_fanout(cfg: Config) -> BenchStat {
         }
         black_box(queues[0].len());
     })
+}
+
+struct MinimmitBenchFixture {
+    committee: MinimmitCommittee,
+    notarize: Notarize,
+    nullify: Nullify,
+    exec_attest: ExecAttest,
+    invalid_notarize: Notarize,
+    m_signers: Vec<(u16, [u8; 64])>,
+    l_signers: Vec<(u16, [u8; 64])>,
+    m_notarization: Notarization,
+    m_nullification: Nullification,
+    l_notarization: Notarization,
+    execution_certificate: consensus::Certificate,
+    invalid_certificate: consensus::Certificate,
+}
+
+fn minimmit_fixture(n: usize) -> MinimmitBenchFixture {
+    let keys: Vec<_> = (0..n)
+        .map(|index| {
+            let seed = u8::try_from(index).unwrap_or(0).saturating_add(41);
+            KeyPair::from_seed(&[seed; 32])
+        })
+        .collect();
+    let validators = keys
+        .iter()
+        .map(|key| Validator {
+            public_key: key.public(),
+            weight: 1,
+        })
+        .collect();
+    let committee = MinimmitCommittee::new_unit(7, validators).expect("valid Minimmit fixture");
+    let block_hash = Hash::from_bytes([0x71; 32]);
+    let execution_root = Hash::from_bytes([0xE1; 32]);
+    let notarize_message = notarize_digest(7, 19, block_hash);
+    let nullify_message = nullify_digest(7, 19);
+    let execution_message = execution_commitment_digest(7, 19, 23, block_hash, execution_root);
+    let sign_prefix = |message: Hash, count: u64| {
+        (0..count)
+            .map(|index| {
+                let index = u16::try_from(index).expect("fixture index fits u16");
+                (index, keys[usize::from(index)].sign(message.as_bytes()))
+            })
+            .collect::<Vec<_>>()
+    };
+    let m_signers = sign_prefix(notarize_message, committee.advance_threshold());
+    let l_signers = sign_prefix(notarize_message, committee.finalize_threshold());
+    let m_notarization = Notarization {
+        epoch: 7,
+        view: 19,
+        block_hash,
+        cert: committee
+            .assemble(notarize_message, &m_signers)
+            .expect("valid M certificate"),
+    };
+    let m_nullification_signers = sign_prefix(nullify_message, committee.advance_threshold());
+    let m_nullification = Nullification {
+        epoch: 7,
+        view: 19,
+        cert: committee
+            .assemble(nullify_message, &m_nullification_signers)
+            .expect("valid nullification"),
+    };
+    let l_notarization = Notarization {
+        epoch: 7,
+        view: 19,
+        block_hash,
+        cert: committee
+            .assemble(notarize_message, &l_signers)
+            .expect("valid L certificate"),
+    };
+    let execution_signers = sign_prefix(execution_message, committee.finalize_threshold());
+    let execution_certificate = committee
+        .assemble(execution_message, &execution_signers)
+        .expect("valid execution certificate");
+    let notarize = Notarize {
+        epoch: 7,
+        view: 19,
+        block_hash,
+        validator_index: 0,
+        signature: keys[0].sign(notarize_message.as_bytes()),
+    };
+    let nullify = Nullify {
+        epoch: 7,
+        view: 19,
+        validator_index: 1,
+        signature: keys[1].sign(nullify_message.as_bytes()),
+    };
+    let exec_attest = ExecAttest {
+        epoch: 7,
+        view: 19,
+        height: 23,
+        block_hash,
+        execution_root,
+        validator_index: 2,
+        signature: keys[2].sign(execution_message.as_bytes()),
+    };
+    let mut invalid_notarize = notarize.clone();
+    invalid_notarize.signature[0] ^= 0x80;
+    let mut invalid_certificate = l_notarization.cert.clone();
+    invalid_certificate.signatures[1][3] ^= 0x40;
+    invalid_certificate.signatures[3][5] ^= 0x20;
+
+    MinimmitBenchFixture {
+        committee,
+        notarize,
+        nullify,
+        exec_attest,
+        invalid_notarize,
+        m_signers,
+        l_signers,
+        m_notarization,
+        m_nullification,
+        l_notarization,
+        execution_certificate,
+        invalid_certificate,
+    }
+}
+
+fn minimmit_digest(cfg: Config, n: usize, name: &'static str) -> BenchStat {
+    let block = Hash::from_bytes([0x71; 32]);
+    let execution = Hash::from_bytes([0xE1; 32]);
+    bench(name, cfg, || {
+        black_box(n);
+        black_box(notarize_digest(7, 19, block));
+        black_box(nullify_digest(7, 19));
+        black_box(execution_commitment_digest(7, 19, 23, block, execution));
+    })
+}
+
+fn verify_notarize_vote(vote: &Notarize, committee: &MinimmitCommittee) -> bool {
+    vote.epoch == committee.epoch()
+        && committee
+            .cached_key(vote.validator_index)
+            .is_some_and(|key| {
+                key.verify(
+                    notarize_digest(vote.epoch, vote.view, vote.block_hash).as_bytes(),
+                    &vote.signature,
+                )
+                .is_ok()
+            })
+}
+
+fn verify_nullify_vote(vote: &Nullify, committee: &MinimmitCommittee) -> bool {
+    vote.epoch == committee.epoch()
+        && committee
+            .cached_key(vote.validator_index)
+            .is_some_and(|key| {
+                key.verify(
+                    nullify_digest(vote.epoch, vote.view).as_bytes(),
+                    &vote.signature,
+                )
+                .is_ok()
+            })
+}
+
+fn minimmit_vote_admission(cfg: Config, n: usize, name: &'static str) -> BenchStat {
+    let fixture = minimmit_fixture(n);
+    bench(name, cfg, || {
+        black_box(verify_notarize_vote(&fixture.notarize, &fixture.committee));
+        black_box(verify_nullify_vote(&fixture.nullify, &fixture.committee));
+        black_box(fixture.exec_attest.verify(&fixture.committee).is_ok());
+        black_box(!verify_notarize_vote(
+            &fixture.invalid_notarize,
+            &fixture.committee,
+        ));
+    })
+}
+
+fn minimmit_certificate_assembly(cfg: Config, n: usize, name: &'static str) -> BenchStat {
+    let fixture = minimmit_fixture(n);
+    let message = notarize_digest(
+        fixture.m_notarization.epoch,
+        fixture.m_notarization.view,
+        fixture.m_notarization.block_hash,
+    );
+    bench(name, cfg, || {
+        black_box(
+            fixture
+                .committee
+                .assemble(message, &fixture.m_signers)
+                .is_ok(),
+        );
+        black_box(
+            fixture
+                .committee
+                .assemble(message, &fixture.l_signers)
+                .is_ok(),
+        );
+    })
+}
+
+fn minimmit_certificate_verify_m(cfg: Config, n: usize, name: &'static str) -> BenchStat {
+    let fixture = minimmit_fixture(n);
+    bench(name, cfg, || {
+        black_box(fixture.m_notarization.verify(&fixture.committee).is_ok());
+        black_box(fixture.m_nullification.verify(&fixture.committee).is_ok());
+    })
+}
+
+fn minimmit_certificate_verify_l(cfg: Config, n: usize, name: &'static str) -> BenchStat {
+    let fixture = minimmit_fixture(n);
+    bench(name, cfg, || {
+        black_box(
+            fixture
+                .committee
+                .verify_detailed(&fixture.l_notarization.cert, ThresholdKind::Finalize)
+                .is_ok(),
+        );
+        black_box(
+            fixture
+                .committee
+                .verify_detailed(&fixture.execution_certificate, ThresholdKind::Finalize)
+                .is_ok(),
+        );
+    })
+}
+
+fn minimmit_certificate_invalid_mix(cfg: Config, n: usize, name: &'static str) -> BenchStat {
+    let fixture = minimmit_fixture(n);
+    bench(name, cfg, || {
+        black_box(
+            fixture
+                .committee
+                .verify_detailed(&fixture.invalid_certificate, ThresholdKind::Finalize)
+                .is_err(),
+        );
+    })
+}
+
+fn minimmit_digest_6(cfg: Config) -> BenchStat {
+    minimmit_digest(cfg, 6, "minimmit-digest-6")
+}
+fn minimmit_digest_11(cfg: Config) -> BenchStat {
+    minimmit_digest(cfg, 11, "minimmit-digest-11")
+}
+fn minimmit_digest_16(cfg: Config) -> BenchStat {
+    minimmit_digest(cfg, 16, "minimmit-digest-16")
+}
+fn minimmit_vote_admission_6(cfg: Config) -> BenchStat {
+    minimmit_vote_admission(cfg, 6, "minimmit-vote-admission-6")
+}
+fn minimmit_vote_admission_11(cfg: Config) -> BenchStat {
+    minimmit_vote_admission(cfg, 11, "minimmit-vote-admission-11")
+}
+fn minimmit_vote_admission_16(cfg: Config) -> BenchStat {
+    minimmit_vote_admission(cfg, 16, "minimmit-vote-admission-16")
+}
+fn minimmit_certificate_assembly_6(cfg: Config) -> BenchStat {
+    minimmit_certificate_assembly(cfg, 6, "minimmit-certificate-assembly-6")
+}
+fn minimmit_certificate_assembly_11(cfg: Config) -> BenchStat {
+    minimmit_certificate_assembly(cfg, 11, "minimmit-certificate-assembly-11")
+}
+fn minimmit_certificate_assembly_16(cfg: Config) -> BenchStat {
+    minimmit_certificate_assembly(cfg, 16, "minimmit-certificate-assembly-16")
+}
+fn minimmit_certificate_verify_m_6(cfg: Config) -> BenchStat {
+    minimmit_certificate_verify_m(cfg, 6, "minimmit-certificate-verify-m-6")
+}
+fn minimmit_certificate_verify_m_11(cfg: Config) -> BenchStat {
+    minimmit_certificate_verify_m(cfg, 11, "minimmit-certificate-verify-m-11")
+}
+fn minimmit_certificate_verify_m_16(cfg: Config) -> BenchStat {
+    minimmit_certificate_verify_m(cfg, 16, "minimmit-certificate-verify-m-16")
+}
+fn minimmit_certificate_verify_l_6(cfg: Config) -> BenchStat {
+    minimmit_certificate_verify_l(cfg, 6, "minimmit-certificate-verify-l-6")
+}
+fn minimmit_certificate_verify_l_11(cfg: Config) -> BenchStat {
+    minimmit_certificate_verify_l(cfg, 11, "minimmit-certificate-verify-l-11")
+}
+fn minimmit_certificate_verify_l_16(cfg: Config) -> BenchStat {
+    minimmit_certificate_verify_l(cfg, 16, "minimmit-certificate-verify-l-16")
+}
+fn minimmit_certificate_invalid_mix_6(cfg: Config) -> BenchStat {
+    minimmit_certificate_invalid_mix(cfg, 6, "minimmit-certificate-invalid-mix-6")
+}
+fn minimmit_certificate_invalid_mix_11(cfg: Config) -> BenchStat {
+    minimmit_certificate_invalid_mix(cfg, 11, "minimmit-certificate-invalid-mix-11")
+}
+fn minimmit_certificate_invalid_mix_16(cfg: Config) -> BenchStat {
+    minimmit_certificate_invalid_mix(cfg, 16, "minimmit-certificate-invalid-mix-16")
 }
 
 fn consensus_notarize_handling(cfg: Config) -> BenchStat {
@@ -973,6 +2180,66 @@ mod tests {
         assert!(provenance("no-such-suite").is_none());
     }
 
+    #[cfg(feature = "count-alloc")]
+    #[test]
+    fn minimmit_accepted_vote_assembly_and_certificate_verification_are_allocation_free() {
+        for n in [6, 11, 16] {
+            let fixture = minimmit_fixture(n);
+            let (allocations, bytes) = crate::measure_allocations(|| {
+                black_box(notarize_digest(
+                    fixture.notarize.epoch,
+                    fixture.notarize.view,
+                    fixture.notarize.block_hash,
+                ));
+                black_box(nullify_digest(fixture.nullify.epoch, fixture.nullify.view));
+                black_box(
+                    fixture
+                        .committee
+                        .assemble(
+                            notarize_digest(
+                                fixture.m_notarization.epoch,
+                                fixture.m_notarization.view,
+                                fixture.m_notarization.block_hash,
+                            ),
+                            &fixture.m_signers,
+                        )
+                        .unwrap(),
+                );
+                black_box(
+                    fixture
+                        .committee
+                        .assemble(
+                            notarize_digest(
+                                fixture.l_notarization.epoch,
+                                fixture.l_notarization.view,
+                                fixture.l_notarization.block_hash,
+                            ),
+                            &fixture.l_signers,
+                        )
+                        .unwrap(),
+                );
+                assert!(verify_notarize_vote(&fixture.notarize, &fixture.committee));
+                assert!(verify_nullify_vote(&fixture.nullify, &fixture.committee));
+                fixture.exec_attest.verify(&fixture.committee).unwrap();
+                fixture.m_notarization.verify(&fixture.committee).unwrap();
+                fixture.m_nullification.verify(&fixture.committee).unwrap();
+                fixture
+                    .committee
+                    .verify_detailed(&fixture.l_notarization.cert, ThresholdKind::Finalize)
+                    .unwrap();
+                fixture
+                    .committee
+                    .verify_detailed(&fixture.execution_certificate, ThresholdKind::Finalize)
+                    .unwrap();
+            });
+            assert_eq!(
+                (allocations, bytes),
+                (0, 0),
+                "n={n} accepted Minimmit vote/QC processing allocated"
+            );
+        }
+    }
+
     #[test]
     fn fill_fanout_workload_produces_multiple_fills() {
         // Prove the fan-out matrix does real multi-fill work: 1 taker, 8 makers, 8 fills.
@@ -1041,6 +2308,92 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "count-alloc")]
+    #[test]
+    fn market_depth_summary_is_zero_alloc_after_warmup() {
+        let mut book = OrderBook::new(BookConfig::default());
+        for i in 0..128u64 {
+            book.submit(ask(
+                i + 1,
+                i + 1,
+                100 + i64::try_from(i).unwrap(),
+                1,
+                u32::try_from(i + 1).unwrap(),
+            ))
+            .unwrap();
+        }
+        let taker = NewOrder {
+            order_id: OrderId::new(10_000),
+            account: AccountId::new(10_000),
+            side: Side::Bid,
+            order_type: OrderType::Market,
+            tif: TimeInForce::Ioc,
+            price: price(227),
+            quantity: qty(128),
+            client_id: 10_000,
+            reduce_only: false,
+        };
+        let expected = book.plan_match_summary(&taker).unwrap();
+        let (allocations, bytes) = crate::measure_allocations(|| {
+            assert_eq!(book.plan_match_summary(&taker).unwrap(), expected);
+        });
+        assert_eq!(allocations, 0, "aggregate depth scan allocated");
+        assert_eq!(bytes, 0, "aggregate depth scan allocated bytes");
+    }
+
+    #[cfg(feature = "count-alloc")]
+    #[test]
+    fn engine_transaction_snapshot_is_zero_alloc() {
+        let engine = Engine::new(EngineConfig::default());
+        let (allocations, bytes) = crate::measure_allocations(|| {
+            black_box(engine.clone());
+        });
+        assert_eq!(allocations, 0, "Engine transaction snapshot allocated");
+        assert_eq!(bytes, 0, "Engine transaction snapshot allocated bytes");
+    }
+
+    #[cfg(feature = "count-alloc")]
+    #[test]
+    fn accepted_engine_resting_orders_are_zero_alloc_after_warmup() {
+        let stat = engine_resting_order(Config {
+            iterations: 256,
+            warmup: 64,
+        });
+        assert!(stat.alloc_measured);
+        assert_eq!(
+            stat.allocations, 0,
+            "accepted Engine::execute resting orders allocated"
+        );
+        assert_eq!(stat.bytes_allocated, 0, "accepted orders allocated bytes");
+    }
+
+    #[cfg(feature = "count-alloc")]
+    #[test]
+    fn shard_owner_handoff_is_zero_alloc_after_warmup() {
+        let stat = shard_worker_order(Config {
+            iterations: 256,
+            warmup: 64,
+        });
+        assert!(stat.alloc_measured);
+        assert_eq!(stat.allocations, 0, "shard owner path allocated");
+        assert_eq!(stat.bytes_allocated, 0, "shard owner path allocated bytes");
+    }
+
+    #[cfg(feature = "count-alloc")]
+    #[test]
+    fn packed_batch_admission_is_zero_alloc_after_construction() {
+        let stat = packed_batch_admit_128(Config {
+            iterations: 64,
+            warmup: 8,
+        });
+        assert!(stat.alloc_measured);
+        assert_eq!(stat.allocations, 0, "packed batch admission allocated");
+        assert_eq!(
+            stat.bytes_allocated, 0,
+            "packed batch admission allocated bytes"
+        );
+    }
+
     #[test]
     fn median_price_is_correct() {
         let mut odd = [price(1), price(3), price(2)];
@@ -1062,5 +2415,35 @@ mod tests {
         // Batch verifies 32 signatures per op, so a batch op costs more than one
         // single verification but far less than 32 of them (amortized speedup).
         assert!(batch.p50_ns >= single.p50_ns);
+    }
+
+    #[test]
+    fn production_order_batch_compression_sizes_are_pinned() {
+        for (count, expected_input, expected_payload, expected_wire) in [
+            (32usize, 1696usize, 531usize, 551usize),
+            (64, 3392, 988, 1008),
+            (128, 6768, 1927, 1947),
+        ] {
+            let records = packed_corpus(count);
+            let mut packed = vec![0u8; count * codec::PACKED_SUBMIT_LEN];
+            let packed_len =
+                codec::encode_batch_with_backend(&records, simd::Backend::Scalar, &mut packed)
+                    .unwrap();
+            let mut batch_codec = network::OrderBatchCodec::new();
+            let encoded = batch_codec
+                .encode(
+                    u8::try_from(count).unwrap_or(u8::MAX),
+                    false,
+                    &packed[..packed_len],
+                )
+                .unwrap();
+            assert_eq!(packed_len, expected_input);
+            assert_eq!(
+                encoded.bytes.len() - network::ORDER_BATCH_HEADER_LEN,
+                expected_payload
+            );
+            assert_eq!(encoded.bytes.len(), expected_wire);
+            assert!(!encoded.raw);
+        }
     }
 }

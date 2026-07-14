@@ -16,8 +16,8 @@
 //! inclusion proof exists that binds the request's digest to that root.
 
 use crypto::{
-    hash_domain, verify_proof, QuorumCertificate, ValidatorSet, DOMAIN_WITHDRAWAL_AUTH,
-    DOMAIN_WITHDRAWAL_ID,
+    hash_domain, verify_proof, QuorumCertificate, QuorumSignatures, ValidatorSet,
+    DOMAIN_WITHDRAWAL_AUTH, DOMAIN_WITHDRAWAL_ID, MAX_VALIDATORS,
 };
 use types::{AccountId, Amount, Hash, SequenceNumber};
 
@@ -238,12 +238,14 @@ impl WithdrawalCertificate {
         let count = usize::try_from(r.u32()?).map_err(|_| CustodyError::Decode)?;
         // Guard against a length field that would demand a huge allocation:
         // each signature is 64 bytes, so the buffer must have room for them.
-        if count > r.remaining() / 64 {
+        if count > MAX_VALIDATORS || count > r.remaining() / 64 {
             return Err(CustodyError::Decode);
         }
-        let mut signatures = Vec::with_capacity(count);
+        let mut signatures = QuorumSignatures::new();
         for _ in 0..count {
-            signatures.push(r.array::<64>()?);
+            signatures
+                .try_push(r.array::<64>()?)
+                .map_err(|_| CustodyError::Decode)?;
         }
         let confirmations = r.u32()?;
         let reserved_amount = Amount::from_raw(r.i128()?);

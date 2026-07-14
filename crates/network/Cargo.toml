@@ -20,6 +20,7 @@ quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:rustls-pki-types", "dep:byt
 types = { path = "../types" }
 codec = { path = "../codec" }
 crypto = { path = "../crypto" }
+simd = { path = "../simd" }
 tokio.workspace = true
 thiserror.workspace = true
 x25519-dalek.workspace = true
@@ -28,6 +29,7 @@ hkdf.workspace = true
 sha2.workspace = true
 getrandom.workspace = true
 serde.workspace = true
+lz4_flex.workspace = true
 socket2 = "0.6"
 # Optional QUIC stack (feature = "quic").
 quinn = { version = "0.11", optional = true, default-features = false, features = ["runtime-tokio", "rustls", "ring"] }

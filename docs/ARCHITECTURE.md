@@ -94,6 +94,14 @@ oracle. `prediction-markets` and `decision-markets` build market-type-specific
 settlement (binary/multi-outcome/scalar/dead-heat; action-contingent with a
 time-weighted decision price) on the shared primitives.
 
+The target hot-path representation keeps order instructions independent from
+product definitions: every ordinary or pre-registered-strategy operation is one
+fixed 64-byte record, while bounded multi-leg definitions use the same fixed
+stride and spot, derivative, prediction, event, and decision products use
+cache-line-sized static descriptor extensions. See
+[`docs/ORDER_AND_INSTRUMENT_FORMATS.md`](ORDER_AND_INSTRUMENT_FORMATS.md) for the
+taxonomy, exact byte offsets, LZ4 batch envelope, and 100 Gbit/s capacity table.
+
 ## Custody edge
 
 The internal ledger is stablecoin-denominated and chain-agnostic; external chains

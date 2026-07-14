@@ -20,9 +20,15 @@
 //! - [`impairment`] — network-impairment and adversarial-frame injection.
 //! - [`workload`] — oracle-update and market-data subscriber drivers.
 //! - [`engine`] — the deterministic **simulation** runner and [`LoadReport`].
-//! - [`measured`] — the real, socket-backed **measured mode** ([`run_measured`]),
-//!   which connects to the target, times real round trips, and reconciles counts
-//!   against server receipts. Unlike the simulation, an unreachable target fails.
+//! - [`live_rpc`] — the uncapped, non-blocking production signed-RPC runner with
+//!   persistent connections, bounded pipelining, TLS/source binding, and exact
+//!   offered/written/acknowledged/terminal accounting.
+//! - [`live_packed`] — authenticated packed-session runner with explicit sequence
+//!   leases and separate admission, execution, and checkpoint-finality evidence.
+//! - [`packed_adapter`] — bounded session state that emits authenticated 32-128
+//!   record packed batches and commits order lifecycle state only after admission.
+//! - [`reference_sink`] — a production-frame reference sink labelled so generator
+//!   capacity cannot be confused with validator capacity.
 //!
 //! `loadgen` is not part of the deterministic execution core, so the CLI-facing
 //! [`LoadConfig::cancel_ratio`] is an `f64`; it is converted once to a fixed-point
@@ -31,11 +37,17 @@
 
 pub mod command;
 pub mod config;
+pub mod distributed;
 pub mod engine;
 pub mod impairment;
-pub mod measured;
+pub mod live_packed;
+pub mod live_rpc;
 pub mod metrics;
+pub mod packed_adapter;
+pub mod realtime;
+pub mod reference_sink;
 pub mod rng;
+pub mod rpc_adapter;
 pub mod timing;
 pub mod util;
 pub mod workload;
@@ -49,14 +61,36 @@ pub use config::{
     Impairment, LoadConfig, LoadScenario, MarketDataWorkload, OracleWorkload, OrderMix,
     RegionConfig,
 };
+pub use distributed::{
+    partition_plan, AgentAssignment, AgentDescriptor, AgentHeartbeat, AgentState,
+    AssignmentReplayGuard, AuthenticatedAssignment, ControlAuthenticator, ControllerPlan,
+    ControllerRun, DistributedError, PhaseSchedule, MIN_START_LEAD_NS,
+};
 pub use engine::{run_blocking, run_scenario, LoadError, LoadReport, RegionReport, SyncBarrier};
 pub use impairment::{AdversarialGenerator, DedupSet, Impairer, PacketDisposition};
-pub use measured::{
-    decode_submit, receipt_frame, run_measured, submit_frame, MeasuredReport, MSG_RECEIPT,
-    MSG_RECONCILE, MSG_RECONCILE_ACK, MSG_SUBMIT,
+pub use live_packed::{
+    run_live_packed, DistributedPackedAgentReport, LivePackedConfig, LivePackedError,
+    LivePackedReport, PackedCompletionBoundary, PackedConnectionLease, PackedLifecycleCounters,
+    PackedSteadyInterval,
+};
+pub use live_rpc::{
+    run_live_rpc, ClientTlsIdentity, LiveRpcConfig, LiveRpcError, LiveRpcReport, LiveTransport,
 };
 pub use metrics::{percentile_permille, Percentiles, SampleSet};
+pub use packed_adapter::{
+    PackedAdapterError, PackedBatchOutcome, PackedSessionAdapter, PackedSessionConfig,
+    PreparedPackedBatch,
+};
+pub use realtime::{
+    ActionKind, ActionMetrics, IntervalMetrics, MetricsError, NanoHistogram, OperationCounters,
+    WorkerMetrics, HISTOGRAM_BUCKETS, HISTOGRAM_SCHEMA,
+};
+pub use reference_sink::{
+    serve_reference_sink, ReferenceSinkConfig, ReferenceSinkCounters, ReferenceSinkError,
+    ReferenceSinkSnapshot,
+};
 pub use rng::Lcg;
+pub use rpc_adapter::{AdapterOutcome, RpcAdapterError, RpcSessionAdapter, RpcSessionConfig};
 pub use timing::{ClockStamp, FullPathTimestamps, Stage, TimingError, STAGE_COUNT};
 pub use workload::{
     oracle_outranks_orders, oracle_update_count, oracle_update_time_ns, SubscriberState,

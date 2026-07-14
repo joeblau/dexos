@@ -38,8 +38,11 @@ pub use conditional::{
 };
 pub use error::{ConditionalError, OrderError, SlabError};
 pub use order::{
-    BookConfig, Fill, MatchPlan, MatchResult, NewOrder, OrderOutcome, PlannedFill, StpPolicy,
+    BookConfig, Fill, MatchPlan, MatchResult, MatchSummary, NewOrder, OrderOutcome, PlannedFill,
+    StpPolicy,
 };
+/// Runtime backend used only for pure, bit-identical match-planning kernels.
+pub use simd::Backend as MatchingBackend;
 
 /// Authenticated book-root schema version (v2 = multiset of per-order leaves).
 ///

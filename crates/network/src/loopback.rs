@@ -200,7 +200,14 @@ mod tests {
     use super::*;
     use crate::connection::DEFAULT_ACCEPT_QUEUE;
     use crate::replay::PeerDedup;
+    use crate::{
+        decode_authenticated_order_batch_frame_into, AuthenticatedOrderBatchCodec,
+        OrderBatchBinding, ORDER_BATCH_MAX_UNCOMPRESSED,
+    };
+    use codec::PackedOrder;
     use codec::TrafficClass;
+    use crypto::KeyPair;
+    use types::{AccountId, MarketId, OrderId};
 
     fn cfg() -> TransportConfig {
         TransportConfig::default()
@@ -215,6 +222,52 @@ mod tests {
         // The connections own their channels independently of the transports,
         // which may now be dropped.
         (dialer, listener)
+    }
+
+    #[tokio::test]
+    async fn packed_order_batch_uses_reliable_new_order_lane_end_to_end() {
+        let (sender, receiver) = connected_pair(cfg()).await;
+        let mut records = Vec::with_capacity(32 * 32);
+        for i in 0..32u64 {
+            let order = PackedOrder::Cancel {
+                session_ref: 7,
+                nonce: i + 1,
+                client_id: i + 1,
+                account: AccountId::new(9),
+                market: MarketId::new(11),
+                order_id: OrderId::new(i + 1),
+            };
+            let start = records.len();
+            records.resize(start + order.encoded_len(), 0);
+            order.encode_into(&mut records[start..]).unwrap();
+        }
+        let signer = KeyPair::from_seed(&[7; 32]);
+        let mut codec = AuthenticatedOrderBatchCodec::new();
+        let encoded = codec
+            .encode(
+                OrderBatchBinding {
+                    destination: [4; 32],
+                    session_ref: 7,
+                    account: AccountId::new(9),
+                    batch_sequence: 0,
+                    first_sequence: 1,
+                },
+                &signer,
+                32,
+                false,
+                &records,
+            )
+            .unwrap();
+        sender.send_order_batch(encoded).unwrap();
+
+        let frame = receiver.recv().await.unwrap();
+        assert_eq!(frame.class, TrafficClass::NewOrder);
+        assert_eq!(frame.msg_type, crate::MSG_TYPE_ORDER_BATCH);
+        let mut output = vec![0; ORDER_BATCH_MAX_UNCOMPRESSED];
+        let decoded =
+            decode_authenticated_order_batch_frame_into(&frame, &[4; 32], &mut output).unwrap();
+        assert_eq!(decoded.record_count, 32);
+        assert_eq!(decoded.records, records);
     }
 
     #[tokio::test]

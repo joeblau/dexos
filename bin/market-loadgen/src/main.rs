@@ -7,13 +7,19 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 use loadgen::{
-    ratio_from_unit_f64, run_measured, run_scenario, Adversarial, Impairment, LoadScenario,
-    OracleWorkload, RegionConfig,
+    partition_plan, ratio_from_unit_f64, run_live_packed, run_live_rpc, run_scenario,
+    serve_reference_sink, Adversarial, AgentDescriptor, AssignmentReplayGuard,
+    AuthenticatedAssignment, ClientTlsIdentity, ControlAuthenticator, ControllerPlan,
+    DistributedPackedAgentReport, Impairment, LivePackedConfig, LiveRpcConfig, LiveTransport,
+    LoadScenario, OracleWorkload, PackedCompletionBoundary, PackedConnectionLease,
+    PackedSessionConfig, ReferenceSinkConfig, ReferenceSinkCounters, RegionConfig,
 };
+use serde::Deserialize;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -25,7 +31,7 @@ struct Cli {
     /// Target node address. Used only with `--measured`; retained as provenance
     /// in simulation reports.
     #[arg(long, value_name = "ADDR")]
-    target: String,
+    target: Option<String>,
     /// Number of simulated users / persistent sessions (across all regions).
     #[arg(long, default_value_t = 1000)]
     users: u64,
@@ -41,6 +47,9 @@ struct Cli {
     /// Run duration, e.g. `60s`, `500ms`, `5m`.
     #[arg(long, value_parser = parse_duration, default_value = "60s")]
     duration: Duration,
+    /// Warm-up seconds before counters are collected in measured mode.
+    #[arg(long = "warmup-seconds", default_value_t = 60)]
+    warmup_seconds: u64,
     /// Number of regions to spread users across (first is same-region).
     #[arg(long, default_value_t = 1)]
     regions: u32,
@@ -59,11 +68,184 @@ struct Cli {
     /// Load a full TOML scenario file (overrides the flags above).
     #[arg(long, value_name = "PATH")]
     scenario: Option<PathBuf>,
-    /// Drive the real target over a live socket and measure it. An unreachable
-    /// target exits nonzero, and submitted commands are reconciled against server
-    /// receipts. Without this flag the run is a labelled deterministic *simulation*.
+    /// Drive the target with signed production RPC over persistent non-blocking
+    /// sockets. Without this flag the run is a labelled deterministic simulation.
     #[arg(long)]
     measured: bool,
+    /// Raw 32-byte ed25519 seed for measured production RPC. Never stored in reports.
+    #[arg(long = "signing-key-file", value_name = "PATH")]
+    signing_key_file: Option<PathBuf>,
+    /// Funded account authorized by the measured signing key.
+    #[arg(long = "account-id", default_value_t = 0)]
+    account_id: u32,
+    /// First disjoint measured client ID.
+    #[arg(long = "client-id-base", default_value_t = 1)]
+    client_id_base: u64,
+    /// Controller-assigned upper 32-bit nonce namespace.
+    #[arg(long = "nonce-namespace", default_value_t = 1)]
+    nonce_namespace: u32,
+    /// Persistent production-RPC connections for local measured mode.
+    #[arg(long = "connections", default_value_t = 1)]
+    connections: u32,
+    /// Bounded correlated request depth per connection.
+    #[arg(long = "max-in-flight", default_value_t = 8)]
+    max_in_flight: usize,
+    /// JSON array of server-issued packed session leases. When present, measured
+    /// mode uses authenticated 32-128 record batches instead of per-order RPC.
+    #[arg(long = "packed-leases", value_name = "PATH", requires = "measured")]
+    packed_leases: Option<PathBuf>,
+    /// Records per authenticated packed batch.
+    #[arg(long = "packed-batch-size", default_value_t = 128)]
+    packed_batch_size: u8,
+    /// Required packed receipt boundary: `executed` (component only) or `finalized`.
+    #[arg(long = "packed-completion", default_value = "finalized")]
+    packed_completion: String,
+    /// Explicitly label the target as `validator` or `reference-sink`.
+    #[arg(long = "target-profile", default_value = "validator")]
+    target_profile: String,
+    /// Explicit source IPs, round-robin across measured connections.
+    #[arg(long = "source-ip")]
+    source_ips: Vec<std::net::IpAddr>,
+    /// Explicitly allow plaintext only for local/reference-sink development.
+    #[arg(long = "dev-plaintext")]
+    dev_plaintext: bool,
+    /// TLS server DNS name used for certificate verification.
+    #[arg(long = "tls-server-name")]
+    tls_server_name: Option<String>,
+    /// PEM CA roots for TLS 1.3 server validation.
+    #[arg(long = "ca-cert", value_name = "PATH")]
+    ca_cert: Option<PathBuf>,
+    /// PEM client certificate chain for optional mTLS.
+    #[arg(long = "client-cert", value_name = "PATH", requires = "client_key")]
+    client_cert: Option<PathBuf>,
+    /// PEM client private key for optional mTLS.
+    #[arg(long = "client-key", value_name = "PATH", requires = "client_cert")]
+    client_key: Option<PathBuf>,
+    /// Distributed planning or agent-preflight mode. Without a subcommand, run
+    /// the local simulator/measured engine as before.
+    #[command(subcommand)]
+    distributed: Option<DistributedCommand>,
+}
+
+#[derive(Debug, Subcommand)]
+enum DistributedCommand {
+    /// Partition a run and emit authenticated, per-agent assignment envelopes.
+    Controller(ControllerArgs),
+    /// Authenticate and consume one assignment before starting an agent engine.
+    Agent(Box<AgentArgs>),
+    /// Run the production-protocol reference sink (never validator capacity).
+    ReferenceSink(ReferenceSinkArgs),
+}
+
+#[derive(Debug, Args)]
+struct ControllerArgs {
+    /// Controller run plan JSON.
+    #[arg(long, value_name = "PATH")]
+    plan: PathBuf,
+    /// JSON array of validated agent capacity/topology descriptors.
+    #[arg(long, value_name = "PATH")]
+    agents: PathBuf,
+    /// File containing at least 32 bytes of out-of-band control-plane key material.
+    #[arg(long = "control-key-file", value_name = "PATH")]
+    control_key_file: PathBuf,
+    /// Output JSON array of authenticated assignments.
+    #[arg(long, value_name = "PATH")]
+    output: PathBuf,
+    /// Override current Unix nanoseconds for deterministic tests/planning.
+    #[arg(long = "now-unix-ns")]
+    now_unix_ns: Option<u64>,
+}
+
+#[derive(Debug, Args)]
+struct AgentArgs {
+    /// Authenticated assignment-envelope JSON emitted by controller mode.
+    #[arg(long, value_name = "PATH")]
+    assignment: PathBuf,
+    /// Expected stable agent identity.
+    #[arg(long = "agent-id")]
+    agent_id: String,
+    /// File containing the shared out-of-band control-plane key.
+    #[arg(long = "control-key-file", value_name = "PATH")]
+    control_key_file: PathBuf,
+    /// Full TOML workload scenario; assignment rate/duration/targets override it.
+    #[arg(long, value_name = "PATH")]
+    scenario: PathBuf,
+    /// Raw 32-byte ed25519 signing seed for target RPC.
+    #[arg(long = "signing-key-file", value_name = "PATH")]
+    signing_key_file: PathBuf,
+    /// Funded account authorized by the target signing key.
+    #[arg(long = "account-id")]
+    account_id: u32,
+    /// Explicit target label: `validator` or `reference-sink`.
+    #[arg(long = "target-profile", default_value = "validator")]
+    target_profile: String,
+    /// Explicit source IPs, round-robin across assigned connections.
+    #[arg(long = "source-ip")]
+    source_ips: Vec<std::net::IpAddr>,
+    /// Optional server-issued packed leases for the optimized validator route.
+    #[arg(long = "packed-leases", value_name = "PATH")]
+    packed_leases: Option<PathBuf>,
+    /// Fixed records per authenticated packed batch.
+    #[arg(long = "packed-batch-size", default_value_t = 128)]
+    packed_batch_size: u8,
+    /// Required packed lifecycle boundary: `executed` or `finalized`.
+    #[arg(long = "packed-completion", default_value = "finalized")]
+    packed_completion: String,
+    /// Allow plaintext only for local/reference-sink development.
+    #[arg(long = "dev-plaintext")]
+    dev_plaintext: bool,
+    /// TLS server DNS name.
+    #[arg(long = "tls-server-name")]
+    tls_server_name: Option<String>,
+    /// PEM CA roots.
+    #[arg(long = "ca-cert", value_name = "PATH")]
+    ca_cert: Option<PathBuf>,
+    /// PEM client certificate chain for optional mTLS.
+    #[arg(long = "client-cert", value_name = "PATH", requires = "client_key")]
+    client_cert: Option<PathBuf>,
+    /// PEM client private key for optional mTLS.
+    #[arg(long = "client-key", value_name = "PATH", requires = "client_cert")]
+    client_key: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct ReferenceSinkArgs {
+    /// Explicit reference-sink listen address.
+    #[arg(long, default_value = "127.0.0.1:9100")]
+    listen: std::net::SocketAddr,
+    /// Maximum persistent connections accepted by this sink process.
+    #[arg(long = "max-connections", default_value_t = 16_384)]
+    max_connections: usize,
+}
+
+/// Non-secret portion of a server-issued packed connection/session lease.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PackedLeaseInput {
+    endpoint: std::net::SocketAddr,
+    #[serde(default)]
+    source_ip: Option<std::net::IpAddr>,
+    destination: [u8; 32],
+    session_ref: u32,
+    account_id: u32,
+    client_id: u64,
+    nonce_base: u64,
+    first_batch_sequence: u64,
+    first_command_sequence: u64,
+    #[serde(default = "default_batch_sequence_stride")]
+    batch_sequence_stride: u64,
+    #[serde(default)]
+    command_sequence_stride: u64,
+    #[serde(default = "default_packed_live_orders")]
+    max_live_orders: usize,
+}
+
+const fn default_packed_live_orders() -> usize {
+    1_024
+}
+
+const fn default_batch_sequence_stride() -> u64 {
+    1
 }
 
 /// Parse a duration with an `ms`, `s`, or `m` suffix into a [`Duration`].
@@ -113,7 +295,10 @@ fn scenario_from_cli(cli: &Cli) -> LoadScenario {
 
     LoadScenario {
         seed: cli.seed,
-        target: cli.target.clone(),
+        target: cli
+            .target
+            .clone()
+            .unwrap_or_else(|| "127.0.0.1:9000".to_string()),
         regions,
         market_count: cli.market_count.max(1),
         orders_per_second: cli.orders_per_second,
@@ -134,8 +319,22 @@ fn scenario_from_cli(cli: &Cli) -> LoadScenario {
     }
 }
 
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> ExitCode {
     let cli = Cli::parse();
+
+    if let Some(distributed) = &cli.distributed {
+        return match distributed {
+            DistributedCommand::Controller(args) => run_controller(args),
+            DistributedCommand::Agent(args) => run_agent(args).await,
+            DistributedCommand::ReferenceSink(args) => run_reference_sink(args).await,
+        };
+    }
+
+    if cli.scenario.is_none() && cli.target.is_none() {
+        eprintln!("error: --target is required for local execution without --scenario");
+        return ExitCode::FAILURE;
+    }
 
     let scenario = match &cli.scenario {
         Some(path) => match std::fs::read_to_string(path) {
@@ -155,13 +354,74 @@ fn main() -> ExitCode {
     };
 
     if cli.measured {
-        // Live measurement: a real socket to the real target. Unreachable targets and
-        // count mismatches fail loudly here instead of yielding a rosy report.
-        return match run_measured(&scenario) {
-            Ok(report) => {
-                println!("{}", report.to_json());
-                ExitCode::SUCCESS
-            }
+        let Some(key_path) = &cli.signing_key_file else {
+            return report_error("--signing-key-file is required with --measured");
+        };
+        let signing_seed = match read_signing_seed(key_path) {
+            Ok(seed) => seed,
+            Err(error) => return report_error(error),
+        };
+        let endpoint = match scenario.target.parse() {
+            Ok(endpoint) => endpoint,
+            Err(error) => return report_error(format!("invalid target socket address: {error}")),
+        };
+        let transport = match live_transport(&cli) {
+            Ok(transport) => transport,
+            Err(error) => return report_error(error),
+        };
+        if let Some(lease_path) = &cli.packed_leases {
+            let leases = match read_packed_leases(lease_path, signing_seed, cli.max_in_flight) {
+                Ok(value) => value,
+                Err(error) => return report_error(error),
+            };
+            let completion_boundary = match parse_packed_completion(&cli.packed_completion) {
+                Ok(value) => value,
+                Err(error) => return report_error(error),
+            };
+            let config = LivePackedConfig {
+                leases,
+                batch_size: cli.packed_batch_size,
+                max_in_flight_batches: cli.max_in_flight,
+                receipt_timeout: Duration::from_secs(10),
+                warmup_secs: cli.warmup_seconds,
+                start_lead: Duration::from_secs(1),
+                transport,
+                completion_boundary,
+            };
+            return match run_live_packed(&scenario, &config, &cli.target_profile).await {
+                Ok(report) => match serde_json::to_string(&report) {
+                    Ok(json) => {
+                        println!("{json}");
+                        ExitCode::SUCCESS
+                    }
+                    Err(error) => report_error(format!("cannot encode packed report: {error}")),
+                },
+                Err(error) => report_error(error.to_string()),
+            };
+        }
+        let config = LiveRpcConfig {
+            endpoints: vec![endpoint],
+            source_ips: cli.source_ips.clone(),
+            connections: cli.connections,
+            account: types::AccountId::new(cli.account_id),
+            client_id_base: cli.client_id_base,
+            nonce_namespace: cli.nonce_namespace,
+            signing_seed,
+            max_in_flight: cli.max_in_flight,
+            max_live_orders: 1_024,
+            response_timeout: Duration::from_secs(10),
+            warmup_secs: cli.warmup_seconds,
+            start_lead: Duration::from_secs(1),
+            transport,
+        };
+        return match run_live_rpc(&scenario, &config, &cli.target_profile).await {
+            Ok(report) => match serde_json::to_string(&report) {
+                Ok(json) => {
+                    println!("{json}");
+                    ExitCode::SUCCESS
+                }
+                Err(error) => report_error(format!("cannot encode live report: {error}")),
+            },
             Err(err) => {
                 eprintln!("error: {err}");
                 ExitCode::FAILURE
@@ -187,6 +447,406 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn read_signing_seed(path: &std::path::Path) -> Result<[u8; 32], String> {
+    let bytes = std::fs::read(path)
+        .map_err(|error| format!("cannot read signing key {}: {error}", path.display()))?;
+    bytes.try_into().map_err(|bytes: Vec<u8>| {
+        format!(
+            "signing key {} must contain exactly 32 raw bytes, got {}",
+            path.display(),
+            bytes.len()
+        )
+    })
+}
+
+fn read_packed_leases(
+    path: &std::path::Path,
+    signing_seed: [u8; 32],
+    max_in_flight_batches: usize,
+) -> Result<Vec<PackedConnectionLease>, String> {
+    let bytes = std::fs::read(path)
+        .map_err(|error| format!("cannot read packed leases {}: {error}", path.display()))?;
+    let inputs: Vec<PackedLeaseInput> = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("cannot parse packed leases {}: {error}", path.display()))?;
+    if inputs.is_empty() {
+        return Err("packed lease file must contain at least one lease".to_string());
+    }
+    Ok(inputs
+        .into_iter()
+        .map(|input| PackedConnectionLease {
+            endpoint: input.endpoint,
+            source_ip: input.source_ip,
+            session: PackedSessionConfig {
+                destination: input.destination,
+                session_ref: input.session_ref,
+                account: types::AccountId::new(input.account_id),
+                client_id: input.client_id,
+                nonce_base: input.nonce_base,
+                signing_seed,
+                first_batch_sequence: input.first_batch_sequence,
+                first_command_sequence: input.first_command_sequence,
+                batch_sequence_stride: input.batch_sequence_stride,
+                command_sequence_stride: input.command_sequence_stride,
+                max_in_flight_batches,
+                max_live_orders: input.max_live_orders,
+            },
+        })
+        .collect())
+}
+
+fn parse_packed_completion(value: &str) -> Result<PackedCompletionBoundary, String> {
+    match value {
+        "executed" => Ok(PackedCompletionBoundary::Executed),
+        "finalized" => Ok(PackedCompletionBoundary::Finalized),
+        _ => Err("--packed-completion must be `executed` or `finalized`".to_string()),
+    }
+}
+
+fn live_transport(cli: &Cli) -> Result<LiveTransport, String> {
+    if cli.dev_plaintext {
+        return Ok(LiveTransport::DevPlaintext);
+    }
+    let server_name = cli
+        .tls_server_name
+        .clone()
+        .ok_or_else(|| "--tls-server-name is required unless --dev-plaintext is set".to_string())?;
+    let ca_path = cli
+        .ca_cert
+        .as_ref()
+        .ok_or_else(|| "--ca-cert is required unless --dev-plaintext is set".to_string())?;
+    let ca_certificates_pem = std::fs::read(ca_path)
+        .map_err(|error| format!("cannot read CA certificate {}: {error}", ca_path.display()))?;
+    let client_identity = match (&cli.client_cert, &cli.client_key) {
+        (Some(cert), Some(key)) => Some(ClientTlsIdentity {
+            certificate_chain_pem: std::fs::read(cert).map_err(|error| {
+                format!("cannot read client certificate {}: {error}", cert.display())
+            })?,
+            private_key_pem: std::fs::read(key)
+                .map_err(|error| format!("cannot read client key {}: {error}", key.display()))?,
+        }),
+        (None, None) => None,
+        _ => return Err("--client-cert and --client-key must be provided together".to_string()),
+    };
+    Ok(LiveTransport::Tls13 {
+        server_name,
+        ca_certificates_pem,
+        client_identity,
+    })
+}
+
+fn run_controller(args: &ControllerArgs) -> ExitCode {
+    let plan: ControllerPlan = match read_json(&args.plan) {
+        Ok(value) => value,
+        Err(error) => return report_error(error),
+    };
+    let agents: Vec<AgentDescriptor> = match read_json(&args.agents) {
+        Ok(value) => value,
+        Err(error) => return report_error(error),
+    };
+    let key = match std::fs::read(&args.control_key_file) {
+        Ok(value) => value,
+        Err(error) => return report_error(format!("cannot read control key: {error}")),
+    };
+    let authenticator = match ControlAuthenticator::new(&key) {
+        Ok(value) => value,
+        Err(error) => return report_error(error.to_string()),
+    };
+    let now_unix_ns = match args.now_unix_ns {
+        Some(value) => value,
+        None => match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(value) => u64::try_from(value.as_nanos()).unwrap_or(u64::MAX),
+            Err(error) => return report_error(format!("system clock before Unix epoch: {error}")),
+        },
+    };
+    let assignments = match partition_plan(&plan, &agents, now_unix_ns) {
+        Ok(value) => value,
+        Err(error) => return report_error(error.to_string()),
+    };
+    let mut envelopes = Vec::with_capacity(assignments.len());
+    for assignment in assignments {
+        let mut challenge = [0u8; 32];
+        if let Err(error) = getrandom::getrandom(&mut challenge) {
+            return report_error(format!("cannot generate control challenge: {error}"));
+        }
+        envelopes.push(AuthenticatedAssignment::new(
+            assignment,
+            challenge,
+            &authenticator,
+        ));
+    }
+    let bytes = match serde_json::to_vec_pretty(&envelopes) {
+        Ok(value) => value,
+        Err(error) => return report_error(format!("cannot encode assignments: {error}")),
+    };
+    if let Err(error) = std::fs::write(&args.output, bytes) {
+        return report_error(format!("cannot write {}: {error}", args.output.display()));
+    }
+    println!(
+        "controller: wrote {} authenticated assignments to {}",
+        envelopes.len(),
+        args.output.display()
+    );
+    ExitCode::SUCCESS
+}
+
+async fn run_agent(args: &AgentArgs) -> ExitCode {
+    let envelope = match read_agent_assignment(&args.assignment, &args.agent_id) {
+        Ok(value) => value,
+        Err(error) => return report_error(error),
+    };
+    let key = match std::fs::read(&args.control_key_file) {
+        Ok(value) => value,
+        Err(error) => return report_error(format!("cannot read control key: {error}")),
+    };
+    let authenticator = match ControlAuthenticator::new(&key) {
+        Ok(value) => value,
+        Err(error) => return report_error(error.to_string()),
+    };
+    if let Err(error) = envelope.verify_for(&args.agent_id, &authenticator) {
+        return report_error(error.to_string());
+    }
+    let mut replay = AssignmentReplayGuard::default();
+    if let Err(error) = replay.consume(&envelope.assignment) {
+        return report_error(error.to_string());
+    }
+    let signing_seed = match read_signing_seed(&args.signing_key_file) {
+        Ok(value) => value,
+        Err(error) => return report_error(error),
+    };
+    let scenario_text = match std::fs::read_to_string(&args.scenario) {
+        Ok(value) => value,
+        Err(error) => {
+            return report_error(format!("cannot read {}: {error}", args.scenario.display()))
+        }
+    };
+    let mut scenario = match LoadScenario::from_toml(&scenario_text) {
+        Ok(value) => value,
+        Err(error) => return report_error(error),
+    };
+    let endpoints = match envelope
+        .assignment
+        .targets
+        .iter()
+        .map(|target| target.parse())
+        .collect::<Result<Vec<std::net::SocketAddr>, _>>()
+    {
+        Ok(value) => value,
+        Err(error) => return report_error(format!("invalid assigned target: {error}")),
+    };
+    let transport = match agent_transport(args) {
+        Ok(value) => value,
+        Err(error) => return report_error(error),
+    };
+    let now_unix_ns = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(value) => u64::try_from(value.as_nanos()).unwrap_or(u64::MAX),
+        Err(error) => return report_error(format!("system clock before Unix epoch: {error}")),
+    };
+    if envelope.assignment.start_unix_ns <= now_unix_ns {
+        return report_error("assignment warm-up start is not in the future");
+    }
+    scenario.orders_per_second = envelope.assignment.rate;
+    scenario.duration_secs = envelope.assignment.phases.steady_secs;
+    scenario.target = envelope.assignment.targets[0].clone();
+    scenario.regions = vec![RegionConfig {
+        name: envelope.assignment.region.clone(),
+        users: envelope.assignment.connections,
+        cross_region: false,
+        base_latency_us: 0,
+        jitter_us: 0,
+        clock_offset_us: 0,
+    }];
+    eprintln!(
+        "agent {}: authenticated run {}; waiting for synchronized warm-up; target traffic is direct",
+        envelope.assignment.agent_id, envelope.assignment.run_id
+    );
+    if let Some(path) = &args.packed_leases {
+        let leases = match read_packed_leases(path, signing_seed, 8) {
+            Ok(value) => value,
+            Err(error) => return report_error(error),
+        };
+        if leases.len() != usize::try_from(envelope.assignment.connections).unwrap_or(usize::MAX) {
+            return report_error(format!(
+                "packed lease count {} does not match assigned connections {}",
+                leases.len(),
+                envelope.assignment.connections
+            ));
+        }
+        if leases
+            .iter()
+            .any(|lease| !endpoints.contains(&lease.endpoint))
+        {
+            return report_error("packed lease endpoint is outside the authenticated assignment");
+        }
+        let completion_boundary = match parse_packed_completion(&args.packed_completion) {
+            Ok(value) => value,
+            Err(error) => return report_error(error),
+        };
+        let report = match run_live_packed(
+            &scenario,
+            &LivePackedConfig {
+                leases,
+                batch_size: args.packed_batch_size,
+                max_in_flight_batches: 8,
+                receipt_timeout: Duration::from_secs(10),
+                warmup_secs: envelope.assignment.phases.warmup_secs,
+                start_lead: Duration::from_nanos(envelope.assignment.start_unix_ns - now_unix_ns),
+                transport,
+                completion_boundary,
+            },
+            &args.target_profile,
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(error) => return report_error(error.to_string()),
+        };
+        let report = match DistributedPackedAgentReport::authenticated(
+            envelope.clone(),
+            report,
+            &authenticator,
+        ) {
+            Ok(value) => value,
+            Err(error) => return report_error(error.to_string()),
+        };
+        return match serde_json::to_string(&report) {
+            Ok(json) => {
+                println!("{json}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => report_error(format!("cannot encode packed agent report: {error}")),
+        };
+    }
+
+    let report = match run_live_rpc(
+        &scenario,
+        &LiveRpcConfig {
+            endpoints,
+            source_ips: args.source_ips.clone(),
+            connections: envelope.assignment.connections,
+            account: types::AccountId::new(args.account_id),
+            client_id_base: envelope.assignment.client_id_start,
+            nonce_namespace: envelope.assignment.nonce_namespace,
+            signing_seed,
+            max_in_flight: 8,
+            max_live_orders: 1_024,
+            response_timeout: Duration::from_secs(10),
+            warmup_secs: envelope.assignment.phases.warmup_secs,
+            start_lead: Duration::from_nanos(envelope.assignment.start_unix_ns - now_unix_ns),
+            transport,
+        },
+        &args.target_profile,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => return report_error(error),
+    };
+    match serde_json::to_string(&report) {
+        Ok(json) => {
+            println!("{json}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => report_error(format!("cannot encode agent report: {error}")),
+    }
+}
+
+fn read_agent_assignment(
+    path: &std::path::Path,
+    agent_id: &str,
+) -> Result<AuthenticatedAssignment, String> {
+    let bytes =
+        std::fs::read(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    if let Ok(envelope) = serde_json::from_slice::<AuthenticatedAssignment>(&bytes) {
+        return Ok(envelope);
+    }
+    let envelopes: Vec<AuthenticatedAssignment> = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("cannot parse {}: {error}", path.display()))?;
+    envelopes
+        .into_iter()
+        .find(|envelope| envelope.assignment.agent_id == agent_id)
+        .ok_or_else(|| format!("assignment file contains no entry for agent `{agent_id}`"))
+}
+
+fn agent_transport(args: &AgentArgs) -> Result<LiveTransport, String> {
+    if args.dev_plaintext {
+        return Ok(LiveTransport::DevPlaintext);
+    }
+    let server_name = args
+        .tls_server_name
+        .clone()
+        .ok_or_else(|| "--tls-server-name is required unless --dev-plaintext is set".to_string())?;
+    let ca_path = args
+        .ca_cert
+        .as_ref()
+        .ok_or_else(|| "--ca-cert is required unless --dev-plaintext is set".to_string())?;
+    let ca_certificates_pem = std::fs::read(ca_path)
+        .map_err(|error| format!("cannot read CA certificate {}: {error}", ca_path.display()))?;
+    let client_identity = match (&args.client_cert, &args.client_key) {
+        (Some(cert), Some(key)) => Some(ClientTlsIdentity {
+            certificate_chain_pem: std::fs::read(cert).map_err(|error| {
+                format!("cannot read client certificate {}: {error}", cert.display())
+            })?,
+            private_key_pem: std::fs::read(key)
+                .map_err(|error| format!("cannot read client key {}: {error}", key.display()))?,
+        }),
+        (None, None) => None,
+        _ => return Err("--client-cert and --client-key must be provided together".to_string()),
+    };
+    Ok(LiveTransport::Tls13 {
+        server_name,
+        ca_certificates_pem,
+        client_identity,
+    })
+}
+
+async fn run_reference_sink(args: &ReferenceSinkArgs) -> ExitCode {
+    let listener = match tokio::net::TcpListener::bind(args.listen).await {
+        Ok(listener) => listener,
+        Err(error) => return report_error(format!("cannot bind {}: {error}", args.listen)),
+    };
+    let counters = Arc::new(ReferenceSinkCounters::default());
+    let server_counters = counters.clone();
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let config = ReferenceSinkConfig {
+        max_connections: args.max_connections,
+        ..ReferenceSinkConfig::default()
+    };
+    eprintln!(
+        "reference-sink: listening on {}; this measures generator capacity, not validator throughput",
+        args.listen
+    );
+    let server = tokio::spawn(async move {
+        serve_reference_sink(listener, config, server_counters, stop_rx).await
+    });
+    if let Err(error) = tokio::signal::ctrl_c().await {
+        return report_error(format!("cannot install ctrl-c handler: {error}"));
+    }
+    let _ = stop_tx.send(true);
+    match server.await {
+        Ok(Ok(())) => match serde_json::to_string(&counters.snapshot()) {
+            Ok(json) => {
+                println!("{json}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => report_error(format!("cannot encode sink report: {error}")),
+        },
+        Ok(Err(error)) => report_error(error),
+        Err(error) => report_error(format!("reference sink task failed: {error}")),
+    }
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Result<T, String> {
+    let bytes =
+        std::fs::read(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| format!("cannot parse {}: {error}", path.display()))
+}
+
+fn report_error(error: impl std::fmt::Display) -> ExitCode {
+    eprintln!("error: {error}");
+    ExitCode::FAILURE
 }
 
 #[cfg(test)]
@@ -329,9 +989,9 @@ mod tests {
         assert!(meas.measured);
     }
 
-    #[test]
-    fn measured_run_against_unreachable_target_fails() {
-        use loadgen::LoadError;
+    #[tokio::test]
+    async fn measured_run_against_unreachable_target_fails() {
+        use loadgen::LiveRpcError;
         use std::net::TcpListener;
 
         // Bind then drop so the port is guaranteed closed and refuses connections.
@@ -352,7 +1012,55 @@ mod tests {
             "--measured",
         ])
         .unwrap();
-        let err = run_measured(&scenario_from_cli(&cli)).expect_err("unreachable must fail");
-        assert!(matches!(err, LoadError::Unreachable { .. }), "{err:?}");
+        let err = run_live_rpc(
+            &scenario_from_cli(&cli),
+            &LiveRpcConfig {
+                endpoints: vec![addr],
+                source_ips: Vec::new(),
+                connections: 1,
+                account: types::AccountId::new(1),
+                client_id_base: 1,
+                nonce_namespace: 1,
+                signing_seed: [1; 32],
+                max_in_flight: 1,
+                max_live_orders: 1,
+                response_timeout: Duration::from_secs(1),
+                warmup_secs: 0,
+                start_lead: Duration::ZERO,
+                transport: LiveTransport::Tls13 {
+                    server_name: "localhost".to_string(),
+                    ca_certificates_pem: Vec::new(),
+                    client_identity: None,
+                },
+            },
+            "validator",
+        )
+        .await
+        .expect_err("unreachable must fail");
+        assert!(matches!(err, LiveRpcError::Connect { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn checked_in_doublezero_examples_partition_exactly() {
+        let mut plan: ControllerPlan = serde_json::from_str(include_str!(
+            "../../../deploy/doublezero/loadgen-controller-plan.template.json"
+        ))
+        .unwrap();
+        plan.start_unix_ns = loadgen::MIN_START_LEAD_NS + 1;
+        let agents: Vec<AgentDescriptor> = serde_json::from_str(include_str!(
+            "../../../deploy/doublezero/loadgen-agents.json"
+        ))
+        .unwrap();
+        let assignments = partition_plan(&plan, &agents, 0).unwrap();
+        assert_eq!(assignments.len(), 3);
+        assert_eq!(
+            assignments.iter().map(|item| item.rate).sum::<u64>(),
+            24_000_000
+        );
+        assert_eq!(
+            assignments.iter().map(|item| item.connections).sum::<u32>(),
+            12_000
+        );
+        assert!(assignments.iter().all(|item| item.targets.len() == 2));
     }
 }

@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "artifact_type": "cross-architecture-determinism-test",
+  "qualification_status": "X86_64_REPLAY_ONLY_NOT_SIMD_PERFORMANCE",
+  "generated_date": "2026-07-13",
+  "exact_command": "RUSTC=$HOME/.rustup/toolchains/1.92.0-aarch64-apple-darwin/bin/rustc RUSTDOC=$HOME/.rustup/toolchains/1.92.0-aarch64-apple-darwin/bin/rustdoc rustup run 1.92.0 cargo test -p codec -p network -p node --target x86_64-apple-darwin --locked",
+  "provenance": {
+    "git_sha": "61cc7e6f392198e9e122807c5a87f53e7eff191f",
+    "git_dirty": true,
+    "cargo_lock_sha256": "99a1bead665d856984251f9f55ef51bd2bf1df5adc8cdf9f5ba2cb1d0669bf3c",
+    "rustc": "1.92.0 (ded5c06cf 2025-12-08)",
+    "llvm": "21.1.3",
+    "compile_target": "x86_64-apple-darwin",
+    "binary_format": "Mach-O 64-bit executable x86_64",
+    "runtime": "Rosetta 2 (sysctl.proc_translated=1 inside x86_64 process)",
+    "host_os": "macOS 27.0 build 26A5378j",
+    "kernel": "Darwin 27.0.0 RELEASE_ARM64_T6031",
+    "host_cpu": "Apple M3 Max",
+    "detected_simd_backend": "scalar"
+  },
+  "inputs": {
+    "workload_path": "crates/benchmarks/workloads/global-20m-v1.toml",
+    "workload_sha256": "269031ff79847f3e899099c38e08a6d2e8dadb1d03431f27e2f8d12a442cee1f",
+    "packed_order_source_sha256": "a0ef8a4daa35b719e023590513a8945a37adb5c6e1b8e380959c49caf0b42ef8"
+  },
+  "results": {
+    "codec_unit_tests": 20,
+    "network_unit_tests": 154,
+    "node_unit_tests": 105,
+    "node_integration_tests": 5,
+    "total_passed": 284,
+    "failed": 0,
+    "golden_wire_sha256": "92d538f543c319787c40a40e965d573705ef184c1472db03ec139080b57f8e55",
+    "covered": [
+      "packed golden bytes and digest",
+      "scalar/runtime byte and typed-error differential corpora",
+      "strict truncations, malformed bounds, replay, reorder, and redirect rejection",
+      "32/64/128 raw and compressed order batches",
+      "TCP and QUIC framing, authentication, priorities, and backpressure",
+      "durable packed execution, recovery, receipts, checkpoint-bound finality, and striped global ordering"
+    ]
+  },
+  "limitations": [
+    "Rosetta exposed no AVX2 or AVX-512 backend, so runtime selected scalar",
+    "this proves x86_64 wire/replay determinism, not x86 SIMD execution or performance",
+    "bare-metal x86 AVX2/AVX-512 cycles, branches, cache counters, throughput, and p99 remain required"
+  ]
+}

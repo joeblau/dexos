@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "artifact_type": "packed-wire-size-distribution",
+  "qualification_status": "WIRE_ONLY_NOT_COMPOSED",
+  "generated_date": "2026-07-13",
+  "provenance": {
+    "git_sha": "61cc7e6f392198e9e122807c5a87f53e7eff191f",
+    "git_dirty": true,
+    "rustc": "1.96.1 (31fca3adb 2026-06-26)",
+    "host_arch": "aarch64",
+    "workload_path": "crates/benchmarks/workloads/global-20m-v1.toml",
+    "workload_sha256": "269031ff79847f3e899099c38e08a6d2e8dadb1d03431f27e2f8d12a442cee1f",
+    "packed_order_source_sha256": "a0ef8a4daa35b719e023590513a8945a37adb5c6e1b8e380959c49caf0b42ef8"
+  },
+  "workload": {
+    "new_bps": 7000,
+    "cancel_bps": 2000,
+    "replace_bps": 1000
+  },
+  "record_bytes": {
+    "new": 56,
+    "cancel": 40,
+    "replace": 56,
+    "min": 40,
+    "mean": 52.8,
+    "p95": 56,
+    "p99": 56,
+    "max": 56
+  },
+  "fixed_frame_bytes": {
+    "inner_order_batch_header": 20,
+    "authenticated_binding_header": 100,
+    "ed25519_batch_signature": 64,
+    "peer_frame_header": 19,
+    "total": 203
+  },
+  "authenticated_precompression_frame_bytes_per_order": [
+    {
+      "records_per_batch": 32,
+      "fixed_overhead_per_order": 6.34375,
+      "min": 46.34375,
+      "mean": 59.14375,
+      "p95": 62.34375,
+      "p99": 62.34375,
+      "max": 62.34375
+    },
+    {
+      "records_per_batch": 64,
+      "fixed_overhead_per_order": 3.171875,
+      "min": 43.171875,
+      "mean": 55.971875,
+      "p95": 59.171875,
+      "p99": 59.171875,
+      "max": 59.171875
+    },
+    {
+      "records_per_batch": 128,
+      "fixed_overhead_per_order": 1.5859375,
+      "min": 41.5859375,
+      "mean": 54.3859375,
+      "p95": 57.5859375,
+      "p99": 57.5859375,
+      "max": 57.5859375
+    }
+  ],
+  "transport_boundary": {
+    "included": [
+      "per-record version, tag, length, flags, routing, session, replay, idempotency, and command fields",
+      "inner batch header",
+      "authenticated binding header",
+      "one amortized Ed25519 batch signature",
+      "peer frame header"
+    ],
+    "reported_separately_in_composed_campaign": [
+      "LZ4 compression outcome",
+      "TLS or QUIC AEAD overhead",
+      "TCP, QUIC, IP, Ethernet, VLAN, and DoubleZero encapsulation",
+      "retransmissions"
+    ],
+    "note": "The excluded transport values are negotiation- and topology-dependent; substituting assumed values would not be observed frame/L2 evidence."
+  },
+  "cross_architecture_golden": {
+    "record_hex": "01013805040302010c0b0a09080706050c0b0a090807060507000000090000004e61bc00000000003fb496000000000080841e0000000000",
+    "sha256": "92d538f543c319787c40a40e965d573705ef184c1472db03ec139080b57f8e55",
+    "test": "codec::packed_order::tests::golden_bytes_and_digest_are_stable"
+  },
+  "derivation": {
+    "record_mean": "(7000*56 + 2000*40 + 1000*56) / 10000",
+    "frame_stat": "record_stat + 203 / records_per_batch"
+  }
+}

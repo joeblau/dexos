@@ -23,10 +23,7 @@ pub fn chain_genesis() -> Hash {
 /// `frame` is the complete encoded record (length prefix through CRC).
 #[must_use]
 pub fn chain_mix(prev: Hash, frame: &[u8]) -> Hash {
-    let mut buf = Vec::with_capacity(32 + frame.len());
-    buf.extend_from_slice(prev.as_bytes());
-    buf.extend_from_slice(frame);
-    crypto::hash_domain(DOMAIN_WAL_CHAIN, &buf)
+    crypto::hash_domain_parts(DOMAIN_WAL_CHAIN, &[prev.as_bytes(), frame])
 }
 
 /// Fold every framed record in `records_region` into a chain tip.

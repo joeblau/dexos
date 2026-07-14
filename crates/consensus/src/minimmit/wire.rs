@@ -25,9 +25,9 @@
 //! entry point (#518), the certificate `verify` methods
 //! ([`Notarization::verify`] / [`Nullification::verify`], #519), and the
 //! retained execution attestation [`ExecAttest`] at tag `0x0006` (#520) —
-//! the wire half of the mandatory exec-cert flow. The reactor collection
-//! path that assembles exec L-certs from these attestations is Phase 2
-//! (#528); the sim self-feed is Phase 3.
+//! the wire half of the mandatory exec-cert flow. The replica assembles and
+//! verifies the corresponding execution L-certificate; the simulation driver
+//! exercises the self-feed path.
 
 use crypto::QuorumError;
 use serde::{Deserialize, Serialize};
@@ -647,8 +647,29 @@ mod tests {
         Certificate {
             message,
             signer_bitmap: 0b0000_0000_0010_1001,
-            signatures: vec![[0x55; 64], [0x66; 64], [0x77; 64]],
+            signatures: [[0x55; 64], [0x66; 64], [0x77; 64]].into_iter().collect(),
         }
+    }
+
+    #[derive(Serialize)]
+    struct LegacyVecCertificate {
+        message: Hash,
+        signer_bitmap: u16,
+        #[serde(serialize_with = "serialize_legacy_signatures")]
+        signatures: Vec<[u8; 64]>,
+    }
+
+    fn serialize_legacy_signatures<S: serde::Serializer>(
+        signatures: &[[u8; 64]],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+
+        let mut sequence = serializer.serialize_seq(Some(signatures.len()))?;
+        for signature in signatures {
+            sequence.serialize_element(signature.as_slice())?;
+        }
+        sequence.end()
     }
 
     /// A unit-weight 6-member committee (f = 1 ⇒ M = 3, L = 5) with its
@@ -724,6 +745,22 @@ mod tests {
         round_trip(&exec_attest());
         round_trip(&Proof::Notarization(notarization()));
         round_trip(&Proof::Nullification(nullification()));
+    }
+
+    #[test]
+    fn inline_certificate_preserves_the_legacy_vec_serde_bytes() {
+        let current = cert(Hash::from_bytes([0xA5; 32]));
+        let legacy = LegacyVecCertificate {
+            message: current.message,
+            signer_bitmap: current.signer_bitmap,
+            signatures: current.signatures.iter().copied().collect(),
+        };
+        let legacy_bytes = codec::encode(&legacy).unwrap();
+        assert_eq!(codec::encode(&current).unwrap(), legacy_bytes);
+        assert_eq!(
+            codec::decode::<Certificate>(&legacy_bytes).unwrap(),
+            current
+        );
     }
 
     #[test]

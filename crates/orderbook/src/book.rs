@@ -10,10 +10,104 @@ use crate::dedup::DedupCache;
 use crate::error::OrderError;
 use crate::level::{crosses, SideBook};
 use crate::order::{
-    BookConfig, Fill, MatchPlan, MatchResult, NewOrder, Node, OrderOutcome, PlannedFill, StpPolicy,
+    BookConfig, Fill, MatchPlan, MatchResult, MatchSummary, NewOrder, Node, OrderOutcome,
+    PlannedFill, StpPolicy,
 };
 use crate::slab::Slab;
 use crate::{BOOK_ROOT_HOT_PATH_HASH_BUDGET_BYTES, BOOK_ROOT_SCHEMA_VERSION};
+
+/// Fixed-stack aggregation state for the independent arithmetic portion of an
+/// ordered match scan. Traversal and STP decisions feed this in exact FIFO
+/// order; only a full block of already-decided price/quantity pairs is sent to
+/// the SIMD crate.
+struct SummaryBatch {
+    backend: simd::Backend,
+    taker_side: Side,
+    prices: [i64; simd::MATCH_BATCH_LANES],
+    quantities: [i64; simd::MATCH_BATCH_LANES],
+    notionals: [simd::MatchNotional; simd::MATCH_BATCH_LANES],
+    len: usize,
+    filled: Quantity,
+    worst: Option<Price>,
+    notional: Amount,
+    notional_ceil: Amount,
+}
+
+impl SummaryBatch {
+    fn new(backend: simd::Backend, taker_side: Side) -> Self {
+        Self {
+            backend,
+            taker_side,
+            prices: [0; simd::MATCH_BATCH_LANES],
+            quantities: [0; simd::MATCH_BATCH_LANES],
+            notionals: [simd::MatchNotional::default(); simd::MATCH_BATCH_LANES],
+            len: 0,
+            filled: Quantity::ZERO,
+            worst: None,
+            notional: Amount::ZERO,
+            notional_ceil: Amount::ZERO,
+        }
+    }
+
+    fn push(&mut self, price: Price, quantity: Quantity) -> Result<(), OrderError> {
+        self.prices[self.len] = price.raw();
+        self.quantities[self.len] = quantity.raw();
+        self.len += 1;
+        if self.len == simd::MATCH_BATCH_LANES {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), OrderError> {
+        if self.len == 0 {
+            return Ok(());
+        }
+        let converted = simd::matching_notionals(
+            self.backend,
+            &self.prices[..self.len],
+            &self.quantities[..self.len],
+            &mut self.notionals[..self.len],
+        );
+        debug_assert!(converted, "fixed matching batch slices have equal lengths");
+        if !converted {
+            return Err(OrderError::Overflow);
+        }
+        for lane in 0..self.len {
+            let price = Price::from_raw(self.prices[lane]);
+            let quantity = Quantity::from_raw(self.quantities[lane]);
+            self.filled = self.filled.saturating_add(quantity);
+            self.notional = self
+                .notional
+                .checked_add(self.notionals[lane].notional)
+                .map_err(|_| OrderError::Overflow)?;
+            self.notional_ceil = self
+                .notional_ceil
+                .checked_add(self.notionals[lane].notional_ceil)
+                .map_err(|_| OrderError::Overflow)?;
+            self.worst = Some(match self.worst {
+                None => price,
+                Some(worst) => match self.taker_side {
+                    Side::Bid if price.raw() > worst.raw() => price,
+                    Side::Ask if price.raw() < worst.raw() => price,
+                    _ => worst,
+                },
+            });
+        }
+        self.len = 0;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<MatchSummary, OrderError> {
+        self.flush()?;
+        Ok(MatchSummary {
+            filled_quantity: self.filled,
+            worst_price: self.worst,
+            notional: self.notional,
+            notional_ceil: self.notional_ceil,
+        })
+    }
+}
 
 /// Where a resting order lives, for O(1) lookup on cancel / replace.
 #[derive(Debug, Clone, Copy)]
@@ -121,6 +215,36 @@ impl OrderBook {
     #[must_use]
     pub fn contains(&self, id: OrderId) -> bool {
         self.id_index.contains_key(&id)
+    }
+
+    /// Whether a plain GTC limit can be inserted without matching or failing.
+    ///
+    /// This is a non-mutating preflight for the execution engine's common
+    /// transaction fast path. The caller still submits normally; this method
+    /// merely proves that any subsequent book delta is exactly one resting
+    /// insertion, which can be undone by cancelling that id if a later
+    /// subsystem commit fails.
+    pub fn can_rest_without_match(&self, order: &NewOrder) -> Result<bool, OrderError> {
+        if order.quantity.raw() <= 0 {
+            return Err(OrderError::NonPositiveQuantity);
+        }
+        if order.price.raw() <= 0 {
+            return Err(OrderError::NonPositivePrice);
+        }
+        if self.id_index.contains_key(&order.order_id) {
+            return Err(OrderError::DuplicateOrderId);
+        }
+        if self.slab.is_full() {
+            return Err(OrderError::CapacityExhausted);
+        }
+        let current = match order.side {
+            Side::Bid => self.bids.level_total(order.price),
+            Side::Ask => self.asks.level_total(order.price),
+        };
+        current
+            .checked_add(order.quantity)
+            .map_err(|_| OrderError::Overflow)?;
+        Ok(!self.would_cross(order.side, order.price))
     }
 
     /// The account that owns the resting order `id`, if it is resting. Used by
@@ -330,6 +454,55 @@ impl OrderBook {
     /// protection prices), and the requested quantity. Used by pre-trade risk
     /// so market-order margin is derived from executable depth.
     pub fn plan_match(&self, order: &NewOrder) -> Result<MatchPlan, OrderError> {
+        let mut fills = Vec::new();
+        let summary = self.scan_match(order, |fill| {
+            fills.push(fill);
+            Ok(())
+        })?;
+        Ok(MatchPlan {
+            fills,
+            filled_quantity: summary.filled_quantity,
+            worst_price: summary.worst_price,
+            notional: summary.notional,
+            notional_ceil: summary.notional_ceil,
+        })
+    }
+
+    /// Allocation-free aggregate dry-run of matching `order` against depth.
+    ///
+    /// Matching order, collars, STP boundaries, rounding, and overflow errors
+    /// are identical to [`Self::plan_match`]. The difference is ownership: no
+    /// per-maker records are retained, so pre-trade risk can scan depth in one
+    /// pass with no temporary price or fill vectors. On a vector-capable host,
+    /// blocks of already-ordered fixed-point products use the configured SIMD
+    /// backend; FIFO traversal, quantity clamps, STP, rounding, checked
+    /// accumulation, and mutation remain scalar.
+    pub fn plan_match_summary(&self, order: &NewOrder) -> Result<MatchSummary, OrderError> {
+        self.plan_match_summary_with_backend(order, self.config.matching_backend)
+    }
+
+    /// Explicit-backend counterpart to [`Self::plan_match_summary`].
+    ///
+    /// Intended for paired qualification and deterministic differential tests.
+    /// An unavailable backend safely executes the scalar arithmetic reference;
+    /// operator forcing remains fail-closed through [`simd::Backend::force`].
+    pub fn plan_match_summary_with_backend(
+        &self,
+        order: &NewOrder,
+        backend: simd::Backend,
+    ) -> Result<MatchSummary, OrderError> {
+        if matches!(backend, simd::Backend::Scalar) {
+            self.scan_match(order, |_| Ok(()))
+        } else {
+            self.scan_match_summary_batched(order, backend)
+        }
+    }
+
+    fn scan_match_summary_batched(
+        &self,
+        order: &NewOrder,
+        backend: simd::Backend,
+    ) -> Result<MatchSummary, OrderError> {
         if order.quantity.raw() <= 0 {
             return Err(OrderError::NonPositiveQuantity);
         }
@@ -337,38 +510,25 @@ impl OrderBook {
         if !is_market && order.price.raw() <= 0 {
             return Err(OrderError::NonPositivePrice);
         }
-        let mut fills = Vec::new();
+
         let mut remaining = order.quantity.raw();
+        let mut batch = SummaryBatch::new(backend, order.side);
+        let mut scan_error = None;
         let maker_side = order.side.opposite();
         let book = match maker_side {
             Side::Bid => &self.bids,
             Side::Ask => &self.asks,
         };
 
-        // Walk levels best-first; for bids of the maker book iterate high→low.
-        let mut level_prices: Vec<Price> = Vec::new();
-        book.for_each_level_price(|p| level_prices.push(p));
-        // for_each_level_price yields ascending; maker bids need descending.
-        if matches!(maker_side, Side::Bid) {
-            level_prices.reverse();
-        }
-
-        'levels: for price in level_prices {
-            if remaining <= 0 {
-                break;
+        book.for_each_level_best_first(|price, head| {
+            if remaining <= 0 || !crosses(order.side, is_market, order.price, price) {
+                return false;
             }
-            if !crosses(order.side, is_market, order.price, price) {
-                break;
-            }
-            let head = match book.head_at(price) {
-                Some(h) => h,
-                None => continue,
-            };
             let mut cur = head;
             while cur != crate::slab::NIL && remaining > 0 {
                 let maker = match self.slab.get(cur) {
-                    Some(n) => *n,
-                    None => break,
+                    Some(node) => *node,
+                    None => return false,
                 };
                 if maker.account == order.account {
                     match self.config.stp {
@@ -376,41 +536,105 @@ impl OrderBook {
                             cur = maker.next;
                             continue;
                         }
-                        StpPolicy::CancelTaker | StpPolicy::CancelBoth => break 'levels,
+                        StpPolicy::CancelTaker | StpPolicy::CancelBoth => return false,
                     }
                 }
                 let fill_qty = remaining.min(maker.remaining.raw());
-                fills.push(PlannedFill {
-                    maker_order: maker.order_id,
-                    maker_account: maker.account,
-                    price: maker.price,
-                    quantity: Quantity::from_raw(fill_qty),
-                });
+                if let Err(error) = batch.push(price, Quantity::from_raw(fill_qty)) {
+                    scan_error = Some(error);
+                    return false;
+                }
                 remaining = remaining.saturating_sub(fill_qty);
                 cur = maker.next;
             }
+            remaining > 0
+        });
+        if let Some(error) = scan_error {
+            return Err(error);
         }
+        batch.finish()
+    }
 
+    fn scan_match<F>(&self, order: &NewOrder, mut on_fill: F) -> Result<MatchSummary, OrderError>
+    where
+        F: FnMut(PlannedFill) -> Result<(), OrderError>,
+    {
+        if order.quantity.raw() <= 0 {
+            return Err(OrderError::NonPositiveQuantity);
+        }
+        let is_market = matches!(order.order_type, OrderType::Market);
+        if !is_market && order.price.raw() <= 0 {
+            return Err(OrderError::NonPositivePrice);
+        }
+        let mut remaining = order.quantity.raw();
         let mut notional = Amount::ZERO;
         let mut notional_ceil = Amount::ZERO;
         let mut filled = Quantity::ZERO;
         let mut worst: Option<Price> = None;
-        for f in &fills {
-            filled = filled.saturating_add(f.quantity);
-            notional = notional.checked_add(f.price.notional(f.quantity)?)?;
-            notional_ceil = notional_ceil.checked_add(f.price.notional_ceil(f.quantity)?)?;
-            worst = Some(match worst {
-                None => f.price,
-                Some(w) => match order.side {
-                    // Bid: worst is highest pay; Ask: worst is lowest receive.
-                    Side::Bid if f.price.raw() > w.raw() => f.price,
-                    Side::Ask if f.price.raw() < w.raw() => f.price,
-                    _ => w,
-                },
-            });
+        let mut scan_error = None;
+        let maker_side = order.side.opposite();
+        let book = match maker_side {
+            Side::Bid => &self.bids,
+            Side::Ask => &self.asks,
+        };
+
+        book.for_each_level_best_first(|price, head| {
+            if remaining <= 0 {
+                return false;
+            }
+            if !crosses(order.side, is_market, order.price, price) {
+                return false;
+            }
+            let mut cur = head;
+            while cur != crate::slab::NIL && remaining > 0 {
+                let maker = match self.slab.get(cur) {
+                    Some(n) => *n,
+                    None => return false,
+                };
+                if maker.account == order.account {
+                    match self.config.stp {
+                        StpPolicy::CancelMaker => {
+                            cur = maker.next;
+                            continue;
+                        }
+                        StpPolicy::CancelTaker | StpPolicy::CancelBoth => return false,
+                    }
+                }
+                let fill_qty = remaining.min(maker.remaining.raw());
+                let planned = PlannedFill {
+                    maker_order: maker.order_id,
+                    maker_account: maker.account,
+                    price: maker.price,
+                    quantity: Quantity::from_raw(fill_qty),
+                };
+                let quantity = planned.quantity;
+                let update = (|| {
+                    filled = filled.saturating_add(quantity);
+                    notional = notional.checked_add(price.notional(quantity)?)?;
+                    notional_ceil = notional_ceil.checked_add(price.notional_ceil(quantity)?)?;
+                    worst = Some(match worst {
+                        None => price,
+                        Some(w) => match order.side {
+                            Side::Bid if price.raw() > w.raw() => price,
+                            Side::Ask if price.raw() < w.raw() => price,
+                            _ => w,
+                        },
+                    });
+                    on_fill(planned)
+                })();
+                if let Err(error) = update {
+                    scan_error = Some(error);
+                    return false;
+                }
+                remaining = remaining.saturating_sub(fill_qty);
+                cur = maker.next;
+            }
+            remaining > 0
+        });
+        if let Some(error) = scan_error {
+            return Err(error);
         }
-        Ok(MatchPlan {
-            fills,
+        Ok(MatchSummary {
             filled_quantity: filled,
             worst_price: worst,
             notional,
@@ -761,7 +985,11 @@ impl OrderBook {
                 account: order.account,
             },
         );
-        let ids = self.account_orders.entry(order.account).or_default();
+        let per_book_capacity = self.config.capacity;
+        let ids = self
+            .account_orders
+            .entry(order.account)
+            .or_insert_with(|| Vec::with_capacity(per_book_capacity));
         let position = ids.binary_search(&order.order_id).unwrap_or_else(|p| p);
         ids.insert(position, order.order_id);
         Ok(())
@@ -785,9 +1013,8 @@ impl OrderBook {
             if let Ok(position) = ids.binary_search(&oid) {
                 ids.remove(position);
             }
-            if ids.is_empty() {
-                self.account_orders.remove(&account);
-            }
+            // Retain the bounded per-account buffer after the final cancel so
+            // a later order from this warmed account does not allocate again.
         }
     }
 }

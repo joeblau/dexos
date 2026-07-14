@@ -83,6 +83,23 @@ pub struct MatchPlan {
     pub notional_ceil: types::Amount,
 }
 
+/// Allocation-free aggregate of a deterministic dry-run match.
+///
+/// This is the hot-path counterpart to [`MatchPlan`]. It contains exactly the
+/// values pre-trade risk needs, without retaining one heap-backed record per
+/// maker fill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MatchSummary {
+    /// Total quantity that would fill.
+    pub filled_quantity: Quantity,
+    /// Worst (least favorable for the taker) price among planned fills.
+    pub worst_price: Option<Price>,
+    /// Sum of `price.notional(qty)` over planned fills (toward zero).
+    pub notional: types::Amount,
+    /// Sum of `price.notional_ceil(qty)` — conservative margin base.
+    pub notional_ceil: types::Amount,
+}
+
 /// The disposition of a submitted order after matching.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OrderOutcome {
@@ -161,6 +178,9 @@ pub struct BookConfig {
     pub dedup_capacity: usize,
     /// Maximum legs in a single basket submission.
     pub max_basket_legs: usize,
+    /// Backend for pure match-planning arithmetic. Stateful FIFO/STP mutation
+    /// remains scalar, and every backend is required to be bit-identical.
+    pub matching_backend: crate::MatchingBackend,
 }
 
 impl Default for BookConfig {
@@ -170,6 +190,7 @@ impl Default for BookConfig {
             stp: StpPolicy::CancelMaker,
             dedup_capacity: 1 << 12,
             max_basket_legs: 64,
+            matching_backend: simd::detect(),
         }
     }
 }

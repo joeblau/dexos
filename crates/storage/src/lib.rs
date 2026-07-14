@@ -104,15 +104,13 @@ mod tests {
             let mut log = SegmentedLog::new(1 + lcg.upto(256));
 
             let mut expected = Vec::new();
-            let mut seq = lcg.next_u64() % 100;
-            for _ in 0..count {
+            let first_seq = lcg.next_u64() % 100;
+            for seq in (first_seq..).take(count) {
                 let ts = lcg.next_u64();
                 let cmd = u16::try_from(lcg.next_u64() % 65_536).unwrap();
                 let payload = lcg.bytes(48);
                 log.append(seq, ts, cmd, &payload).unwrap();
                 expected.push((seq, ts, cmd, payload));
-                // Consecutive sequence keeps both verify() and replay() happy.
-                seq += 1;
             }
 
             // iter round-trips every record with an identical payload.

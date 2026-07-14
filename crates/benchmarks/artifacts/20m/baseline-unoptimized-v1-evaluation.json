@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "target_effective_orders_per_second": 20000000,
+  "required_consecutive_runs": 3,
+  "passed": false,
+  "violations": [
+    "campaign requires exactly 3 consecutive runs, got 1",
+    "one or more consecutive runs failed the composed gate"
+  ],
+  "runs": [
+    {
+      "run_id": "baseline-unoptimized-61cc7e6-unavailable",
+      "effective_orders": 0,
+      "effective_orders_per_second": 0,
+      "new_orders_per_second": 0,
+      "passed": false,
+      "violations": [
+        "target was unreachable",
+        "complete raw samples with path and SHA-256 are required",
+        "raw one-second samples must cover the exact steady interval",
+        "every signed-RPC through Minimmit-finalization route stage needs evidence",
+        "offered count does not match the immutable workload rate/interval",
+        "receipt latency is not coordinated-omission safe",
+        "finality latency is not coordinated-omission safe",
+        "per-node throughput does not cover the manifest validator set exactly",
+        "per-shard throughput does not cover the configured unique shard count",
+        "effective finalized throughput 0/s is below 20000000/s"
+      ]
+    }
+  ]
+}

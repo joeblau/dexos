@@ -97,6 +97,25 @@ impl LeafWriter {
         Self { buf }
     }
 
+    /// Reuse caller-owned storage for another canonical leaf.
+    ///
+    /// The buffer is cleared but retains its capacity, then receives the same
+    /// version prefix as [`Self::new`]. This is the worker-scratch entry point
+    /// for allocation-free warmed state commits.
+    #[must_use]
+    pub fn from_buffer(mut buf: Vec<u8>) -> Self {
+        buf.clear();
+        buf.extend_from_slice(&LEAF_ENCODING_VERSION.to_le_bytes());
+        Self { buf }
+    }
+
+    /// Return the backing buffer without cloning so a caller can retain it as
+    /// reusable scratch after hashing or persistence.
+    #[must_use]
+    pub fn into_buffer(self) -> Vec<u8> {
+        self.buf
+    }
+
     /// Append a `u32` field (4 bytes, little-endian).
     pub fn field_u32(&mut self, v: u32) -> &mut Self {
         self.buf.extend_from_slice(&v.to_le_bytes());

@@ -20,14 +20,16 @@
 //! ```
 #![forbid(unsafe_code)]
 
+pub mod packed;
+
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use proto::{
-    command_hash, Account, AccountProof, Book, Checkpoint, Command, CommandAck, ControlMeta,
-    DepositStatus, ExecutionReceipt, MarketDetail, MarketStatus, MarketSummary, NetworkStatus,
-    NodeInfo, OracleStatus, Order, PageParams, PeerInfo, Position, RpcMethod, RpcOk, RpcRequest,
-    SubmitOrderParams, Trade, WithdrawalStatus,
+    command_hash, Account, AccountProof, Book, CancelOrderParams, Checkpoint, Command, CommandAck,
+    ControlMeta, DepositStatus, ExecutionReceipt, MarketDetail, MarketStatus, MarketSummary,
+    NetworkStatus, NodeInfo, OracleStatus, Order, PageParams, PeerInfo, Position,
+    ReplaceOrderParams, RpcMethod, RpcOk, RpcRequest, SubmitOrderParams, Trade, WithdrawalStatus,
 };
 use types::{AccountId, Hash, MarketId};
 
@@ -110,6 +112,49 @@ impl Client {
         }
         Ok(ack)
     }
+
+    /// Cancel a signed order through the one-shot control RPC.
+    pub async fn cancel_order(
+        &self,
+        signer: &Signer,
+        params: CancelOrderParams,
+    ) -> Result<CommandAck, ClientError> {
+        let command = params.to_command();
+        let meta = signer.sign(&command)?;
+        self.command_ack(command, RpcMethod::CancelOrder(meta, params))
+            .await
+    }
+
+    /// Replace a signed order through the one-shot control RPC.
+    pub async fn replace_order(
+        &self,
+        signer: &Signer,
+        params: ReplaceOrderParams,
+    ) -> Result<CommandAck, ClientError> {
+        let command = params.to_command();
+        let meta = signer.sign(&command)?;
+        self.command_ack(command, RpcMethod::ReplaceOrder(meta, params))
+            .await
+    }
+
+    async fn command_ack(
+        &self,
+        command: Command,
+        method: RpcMethod,
+    ) -> Result<CommandAck, ClientError> {
+        let ack = match self.call(method).await? {
+            RpcOk::CommandAck(ack) => ack,
+            _ => {
+                return Err(ClientError::UnexpectedResponse {
+                    expected: "CommandAck",
+                })
+            }
+        };
+        if ack.command_hash != command_hash(&command) {
+            return Err(ClientError::AckMismatch);
+        }
+        Ok(ack)
+    }
 }
 
 /// Generate the typed read-query helpers: each sends its `RpcMethod` and unwraps
@@ -151,10 +196,6 @@ read_queries! {
     fn get_market_status(market: MarketId) -> MarketStatus = RpcMethod::GetMarketStatus(market) => MarketStatus;
     /// Oracle status for a market.
     fn get_oracle_status(market: MarketId) -> OracleStatus = RpcMethod::GetOracleStatus(market) => OracleStatus;
-    /// A checkpoint by height.
-    fn get_checkpoint(height: u64) -> Checkpoint = RpcMethod::GetCheckpoint(height) => Checkpoint;
-    /// The latest checkpoint.
-    fn get_latest_checkpoint() -> Checkpoint = RpcMethod::GetLatestCheckpoint => Checkpoint;
     /// An account's state.
     fn get_account(account: AccountId) -> Account = RpcMethod::GetAccount(account) => Account;
     /// A Merkle proof for an account against the latest checkpoint.
@@ -171,6 +212,28 @@ read_queries! {
     fn get_withdrawal_status(request: Hash) -> WithdrawalStatus = RpcMethod::GetWithdrawalStatus(request) => WithdrawalStatus;
     /// Network / sync status.
     fn get_network_status() -> NetworkStatus = RpcMethod::GetNetworkStatus => NetworkStatus;
+}
+
+impl Client {
+    /// A checkpoint by height.
+    pub async fn get_checkpoint(&self, height: u64) -> Result<Checkpoint, ClientError> {
+        match self.call(RpcMethod::GetCheckpoint(height)).await? {
+            RpcOk::Checkpoint(checkpoint) => Ok(*checkpoint),
+            _ => Err(ClientError::UnexpectedResponse {
+                expected: "Checkpoint",
+            }),
+        }
+    }
+
+    /// The latest checkpoint.
+    pub async fn get_latest_checkpoint(&self) -> Result<Checkpoint, ClientError> {
+        match self.call(RpcMethod::GetLatestCheckpoint).await? {
+            RpcOk::Checkpoint(checkpoint) => Ok(*checkpoint),
+            _ => Err(ClientError::UnexpectedResponse {
+                expected: "Checkpoint",
+            }),
+        }
+    }
 }
 
 /// Signs control (write) commands. Holds the authorizing ed25519 keypair, the

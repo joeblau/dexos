@@ -1,6 +1,6 @@
 //! `dexos-desktop` — the native desktop frontend.
 //!
-//! Links the native [`client`] directly (no server-function hop) and renders the
+//! Links the native [`mod@client`] directly (no server-function hop) and renders the
 //! shared [`dexos_ui`] components against a live node. The node endpoint is read
 //! from `DEXOS_NODE_ADDR` (default `127.0.0.1:8080`); a fetch failure degrades to
 //! the table's empty state rather than crashing the shell.

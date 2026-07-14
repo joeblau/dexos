@@ -7,6 +7,15 @@
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
+mod packed_order;
+
+pub use packed_order::{
+    batch_auth_preimage_into, decode_batch_into, decode_batch_with_backend, encode_batch_into,
+    encode_batch_with_backend, negotiate_packed_order_version, PackedBatchBinding, PackedOrder,
+    PackedOrderError, PackedOrderView, PACKED_CANCEL_LEN, PACKED_ORDER_VERSION, PACKED_REPLACE_LEN,
+    PACKED_SUBMIT_LEN,
+};
+
 /// Crate identity, used by the node composition root for a startup manifest.
 pub const CRATE_NAME: &str = "codec";
 

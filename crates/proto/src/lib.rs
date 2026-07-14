@@ -17,6 +17,7 @@
 
 pub mod command;
 pub mod error;
+mod packed;
 pub mod request;
 pub mod response;
 pub mod stream;
@@ -30,6 +31,7 @@ pub use command::{
     SubmitOrderParams,
 };
 pub use error::RpcError;
+pub use packed::{command_from_packed_order, packed_order_from_method};
 pub use request::{RpcMethod, RpcRequest};
 pub use response::{RpcOk, RpcResponse, RpcResult};
 pub use stream::{

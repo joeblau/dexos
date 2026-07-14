@@ -10,11 +10,9 @@
 //! swapping the certificate backend is a crypto + committee change, never a
 //! consensus-logic change (§4.5, §13.2).
 
-use std::collections::BTreeMap;
-
 use crypto::{
     minimmit_thresholds, minimmit_unit_byzantine_bound, require_minimmit_sizing, CachedEd25519Key,
-    QuorumCertificate, QuorumError, Validator, ValidatorSet,
+    QuorumCertificate, QuorumError, QuorumSignatures, Validator, ValidatorSet,
 };
 use types::Hash;
 
@@ -40,6 +38,40 @@ pub enum ThresholdKind {
     /// The finalize threshold `L = W − B`: an L-notarization finalizes the
     /// block and its ancestors; the execution certificate also verifies here.
     Finalize,
+}
+
+/// Detailed, deterministic Minimmit certificate verification failure.
+///
+/// Unlike the compatibility [`QuorumError`] surface, signer-specific failures
+/// retain the exact committee index. This is the scalar conformance oracle for
+/// optimized batch kernels: a failed batch must attribute the same first bad
+/// signer in ascending bitmap order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum MinimmitCertificateError {
+    #[error("signature count does not match signer bitmap")]
+    MalformedCertificate,
+    #[error("unknown signer index {index}")]
+    UnknownSigner { index: u16 },
+    #[error("invalid signature at signer index {index}")]
+    InvalidSignature { index: u16 },
+    #[error("validator weight sum overflowed")]
+    WeightOverflow,
+    #[error("signed weight {signed} below threshold {threshold}")]
+    BelowThreshold { signed: u64, threshold: u64 },
+}
+
+impl From<MinimmitCertificateError> for QuorumError {
+    fn from(error: MinimmitCertificateError) -> Self {
+        match error {
+            MinimmitCertificateError::MalformedCertificate => Self::MalformedCertificate,
+            MinimmitCertificateError::UnknownSigner { .. } => Self::UnknownSigner,
+            MinimmitCertificateError::InvalidSignature { .. } => Self::InvalidSignature,
+            MinimmitCertificateError::WeightOverflow => Self::WeightOverflow,
+            MinimmitCertificateError::BelowThreshold { signed, threshold } => {
+                Self::BelowThreshold { signed, threshold }
+            }
+        }
+    }
 }
 
 /// The validators of one epoch exposing **both** Minimmit thresholds over a
@@ -70,6 +102,14 @@ pub struct MinimmitCommittee {
     finalize_set: ValidatorSet,
     /// Pre-parsed verifying keys aligned with the canonical membership order.
     cached_keys: Vec<CachedEd25519Key>,
+    /// Fixed lanes for the common `u32`-bounded weighted committee. `None`
+    /// retains the full-width scalar path for unusually large validator weights.
+    weight_lanes: Option<[u32; MAX_VALIDATORS]>,
+    /// Unit committees use one scalar popcount, which is faster than either a
+    /// branch loop or a vector gather at the bounded 16-member envelope.
+    unit_weights: bool,
+    /// Non-consensus runtime implementation choice for the pure weight sum.
+    quorum_backend: simd::Backend,
 }
 
 impl MinimmitCommittee {
@@ -123,11 +163,19 @@ impl MinimmitCommittee {
         let finalize_set = ValidatorSet::try_with_threshold(validators, finalize)
             .map_err(|_| VoteError::InvalidValidatorSet)?;
         let mut cached_keys = Vec::with_capacity(finalize_set.len());
-        for v in finalize_set.validators() {
+        let mut weight_lanes = [0u32; MAX_VALIDATORS];
+        let mut weights_fit_u32 = true;
+        let mut unit_weights = true;
+        for (index, v) in finalize_set.validators().iter().enumerate() {
             cached_keys.push(
                 CachedEd25519Key::parse(&v.public_key)
                     .map_err(|_| VoteError::InvalidValidatorSet)?,
             );
+            match u32::try_from(v.weight) {
+                Ok(weight) => weight_lanes[index] = weight,
+                Err(_) => weights_fit_u32 = false,
+            }
+            unit_weights &= v.weight == 1;
         }
         Ok(Self {
             epoch,
@@ -135,6 +183,9 @@ impl MinimmitCommittee {
             advance_set,
             finalize_set,
             cached_keys,
+            weight_lanes: weights_fit_u32.then_some(weight_lanes),
+            unit_weights,
+            quorum_backend: simd::detect(),
         })
     }
 
@@ -279,19 +330,25 @@ impl MinimmitCommittee {
         message: Hash,
         signers: &[(u16, [u8; 64])],
     ) -> Result<Certificate, VoteError> {
-        let mut by_index: BTreeMap<u16, [u8; 64]> = BTreeMap::new();
+        let mut by_index = [None; MAX_VALIDATORS];
         for &(index, signature) in signers {
             if usize::from(index) >= self.len() {
                 return Err(VoteError::ForeignSigner(u32::from(index)));
             }
-            by_index.entry(index).or_insert(signature);
+            let slot = &mut by_index[usize::from(index)];
+            if slot.is_none() {
+                *slot = Some(signature);
+            }
         }
         let mut signer_bitmap: u16 = 0;
-        let mut signatures: Vec<[u8; 64]> = Vec::with_capacity(by_index.len());
-        for (&index, signature) in &by_index {
-            // `index < len() <= MAX_VALIDATORS = 16`: the shift cannot overflow.
-            signer_bitmap |= 1u16 << index;
-            signatures.push(*signature);
+        let mut signatures = QuorumSignatures::new();
+        for (index, signature) in by_index.into_iter().take(self.len()).enumerate() {
+            if let Some(signature) = signature {
+                signer_bitmap |= 1u16 << u16::try_from(index).unwrap_or(0);
+                signatures
+                    .try_push(signature)
+                    .map_err(|_| VoteError::TooManyValidators)?;
+            }
         }
         Ok(Certificate {
             message,
@@ -316,11 +373,108 @@ impl MinimmitCommittee {
     /// Any [`QuorumError`] from [`ValidatorSet::verify`]: unknown signer,
     /// malformed certificate, invalid signature, or below-threshold weight.
     pub fn verify(&self, cert: &Certificate, kind: ThresholdKind) -> Result<(), QuorumError> {
-        match kind {
-            ThresholdKind::Advance => self.advance_set.verify(cert),
-            ThresholdKind::Finalize => self.finalize_set.verify(cert),
-        }
+        self.verify_detailed(cert, kind).map_err(Into::into)
     }
+
+    /// Verify with cached committee keys and preserve deterministic bad-signer
+    /// attribution. This hot path performs no heap allocation.
+    pub fn verify_detailed(
+        &self,
+        cert: &Certificate,
+        kind: ThresholdKind,
+    ) -> Result<(), MinimmitCertificateError> {
+        self.verify_detailed_with_backend(cert, kind, self.quorum_backend)
+    }
+
+    /// Qualification entry point using an explicit weight-reduction backend.
+    ///
+    /// Signature checks and deterministic bad-signer attribution are identical
+    /// to [`Self::verify_detailed`]. An unavailable architecture tag executes
+    /// the checked scalar weight oracle; production construction caches the
+    /// runnable backend returned by [`simd::detect`].
+    pub fn verify_detailed_with_backend(
+        &self,
+        cert: &Certificate,
+        kind: ThresholdKind,
+        backend: simd::Backend,
+    ) -> Result<(), MinimmitCertificateError> {
+        if cert.signer_count() != cert.signatures.len() {
+            return Err(MinimmitCertificateError::MalformedCertificate);
+        }
+        let threshold = match kind {
+            ThresholdKind::Advance => self.advance_threshold(),
+            ThresholdKind::Finalize => self.finalize_threshold(),
+        };
+        let mut signature_index = 0usize;
+        for index in 0..u16::BITS {
+            if cert.signer_bitmap & (1u16 << index) == 0 {
+                continue;
+            }
+            let validator_index = u16::try_from(index).unwrap_or(u16::MAX);
+            self.validators().get(usize::from(validator_index)).ok_or(
+                MinimmitCertificateError::UnknownSigner {
+                    index: validator_index,
+                },
+            )?;
+            let signature = cert
+                .signatures
+                .get(signature_index)
+                .ok_or(MinimmitCertificateError::MalformedCertificate)?;
+            signature_index += 1;
+            self.cached_keys[usize::from(validator_index)]
+                .verify(cert.message.as_bytes(), signature)
+                .map_err(|_| MinimmitCertificateError::InvalidSignature {
+                    index: validator_index,
+                })?;
+        }
+        // Weight accumulation is independent only after all ordered signature
+        // checks have succeeded. Keeping it here preserves the scalar oracle's
+        // exact malformed/unknown/invalid error precedence.
+        let signed_weight = self.selected_weight(cert.signer_bitmap, backend)?;
+        if signed_weight < threshold {
+            return Err(MinimmitCertificateError::BelowThreshold {
+                signed: signed_weight,
+                threshold,
+            });
+        }
+        Ok(())
+    }
+
+    fn selected_weight(
+        &self,
+        signer_bitmap: u16,
+        backend: simd::Backend,
+    ) -> Result<u64, MinimmitCertificateError> {
+        if self.unit_weights {
+            return Ok(u64::from(signer_bitmap.count_ones()));
+        }
+        if let Some(weights) = &self.weight_lanes {
+            return simd::selected_weight(backend, signer_bitmap, weights, self.len()).ok_or_else(
+                || MinimmitCertificateError::UnknownSigner {
+                    index: first_unknown_signer(signer_bitmap, self.len()),
+                },
+            );
+        }
+
+        let mut signed_weight = 0u64;
+        for (index, validator) in self.validators().iter().enumerate() {
+            if signer_bitmap & (1u16 << index) != 0 {
+                signed_weight = signed_weight
+                    .checked_add(validator.weight)
+                    .ok_or(MinimmitCertificateError::WeightOverflow)?;
+            }
+        }
+        Ok(signed_weight)
+    }
+}
+
+fn first_unknown_signer(signer_bitmap: u16, committee_len: usize) -> u16 {
+    let valid_mask = if committee_len >= MAX_VALIDATORS {
+        u16::MAX
+    } else {
+        (1u16 << committee_len) - 1
+    };
+    u16::try_from((signer_bitmap & !valid_mask).trailing_zeros()).unwrap_or(u16::MAX)
 }
 
 #[cfg(test)]
@@ -492,6 +646,105 @@ mod tests {
     }
 
     #[test]
+    fn detailed_verification_attributes_the_first_invalid_signer() {
+        let keys = keypairs(11);
+        let committee = MinimmitCommittee::new_unit(4, unit_validators(&keys)).unwrap();
+        let msg = Hash::from_bytes([0xC7; 32]);
+        let mut cert = committee
+            .assemble(msg, &sign_all(&keys, msg, &[0, 2, 4, 6, 8, 10]))
+            .unwrap();
+        cert.signatures[1][7] ^= 0x80;
+        cert.signatures[4][9] ^= 0x40;
+
+        assert_eq!(
+            committee.verify_detailed(&cert, ThresholdKind::Advance),
+            Err(MinimmitCertificateError::InvalidSignature { index: 2 })
+        );
+        assert_eq!(
+            committee.verify(&cert, ThresholdKind::Advance),
+            Err(QuorumError::InvalidSignature),
+            "the compatibility surface must retain its established error"
+        );
+    }
+
+    #[test]
+    fn scalar_and_simd_weight_paths_preserve_qc_results_and_error_precedence() {
+        let keys = keypairs(16);
+        let weights = [
+            1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610, 987, 1597,
+        ];
+        let committee = MinimmitCommittee::new(12, validators(&keys, &weights), 500).unwrap();
+        let msg = Hash::from_bytes([0xD4; 32]);
+        let cert = committee
+            .assemble(msg, &sign_all(&keys, msg, &[0, 2, 4, 6, 8, 10, 12, 14, 15]))
+            .unwrap();
+        for kind in [ThresholdKind::Advance, ThresholdKind::Finalize] {
+            let scalar = committee.verify_detailed_with_backend(&cert, kind, simd::Backend::Scalar);
+            for backend in [
+                simd::Backend::Avx2,
+                simd::Backend::Avx512,
+                simd::Backend::Neon,
+            ] {
+                assert_eq!(
+                    committee.verify_detailed_with_backend(&cert, kind, backend),
+                    scalar,
+                    "backend={backend:?} kind={kind:?}"
+                );
+            }
+        }
+
+        let short_keys = keypairs(6);
+        let short = MinimmitCommittee::new_unit(1, unit_validators(&short_keys)).unwrap();
+        let mut invalid_before_unknown = short
+            .assemble(msg, &sign_all(&short_keys, msg, &[0, 1, 2]))
+            .unwrap();
+        invalid_before_unknown.signatures[0][0] ^= 0x80;
+        invalid_before_unknown.signer_bitmap |= 1 << 8;
+        invalid_before_unknown
+            .signatures
+            .try_push(short_keys[0].sign(msg.as_bytes()))
+            .unwrap();
+        for backend in [
+            simd::Backend::Scalar,
+            simd::Backend::Avx2,
+            simd::Backend::Avx512,
+            simd::Backend::Neon,
+        ] {
+            assert_eq!(
+                short.verify_detailed_with_backend(
+                    &invalid_before_unknown,
+                    ThresholdKind::Advance,
+                    backend,
+                ),
+                Err(MinimmitCertificateError::InvalidSignature { index: 0 }),
+                "an earlier invalid signature must win over a later unknown signer"
+            );
+        }
+    }
+
+    #[test]
+    fn weights_wider_than_u32_keep_the_full_width_scalar_fallback() {
+        let keys = keypairs(6);
+        let weights = [u64::from(u32::MAX) + 1, 1, 1, 1, 1, 1];
+        let committee = MinimmitCommittee::new(2, validators(&keys, &weights), 1).unwrap();
+        let msg = Hash::from_bytes([0xE5; 32]);
+        let cert = committee
+            .assemble(msg, &sign_all(&keys, msg, &[0, 1, 2, 3, 4]))
+            .unwrap();
+        for backend in [
+            simd::Backend::Scalar,
+            simd::Backend::Avx2,
+            simd::Backend::Avx512,
+            simd::Backend::Neon,
+        ] {
+            assert_eq!(
+                committee.verify_detailed_with_backend(&cert, ThresholdKind::Finalize, backend,),
+                Ok(())
+            );
+        }
+    }
+
+    #[test]
     fn weighted_committee_computes_m_and_l_over_weights() {
         // W = 101, B = 20 (exactly 5B + 1): M = 2B+1 = 41, L = W−B = 81.
         let keys = keypairs(6);
@@ -600,7 +853,7 @@ mod tests {
             .assemble(msg, &[(3, sig3), (0, sig0), (3, sig3), (5, sig5)])
             .unwrap();
         assert_eq!(cert.signer_bitmap, 0b10_1001);
-        assert_eq!(cert.signatures, vec![sig0, sig3, sig5]);
+        assert_eq!(cert.signatures.as_slice(), [sig0, sig3, sig5]);
         // Ascending packing is proven end-to-end: misaligned signatures would
         // fail verification against the bitmap-named keys.
         assert_eq!(committee.verify(&cert, ThresholdKind::Advance), Ok(()));

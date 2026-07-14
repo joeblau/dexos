@@ -119,6 +119,10 @@ pub enum Input {
 /// consensus-final from execution-final, and the ladder between them is
 /// monotone per height.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// Certificates keep quorum signatures inline so forming and relaying consensus
+// effects never allocates. Boxing the broadcast variant would defeat that
+// hot-path guarantee.
+#[allow(clippy::large_enum_variant)]
 pub enum Effect {
     /// Send a consensus message to every peer.
     Broadcast(ConsensusMessage),
@@ -167,6 +171,9 @@ pub enum Effect {
 
 /// Monotone per-height finality state (§10).
 #[derive(Debug, Clone, PartialEq, Eq)]
+// The execution certificate intentionally remains inline for the same
+// allocation-free finality handoff guaranteed by `Effect` above.
+#[allow(clippy::large_enum_variant)]
 pub enum FinalityStage {
     /// An L-notarization fixed ordering, but the execution L-certificate has
     /// not yet arrived.
@@ -1693,7 +1700,7 @@ mod tests {
         Certificate {
             message,
             signer_bitmap: 0b0000_0000_0000_0111,
-            signatures: vec![[0x55; 64], [0x66; 64], [0x77; 64]],
+            signatures: [[0x55; 64], [0x66; 64], [0x77; 64]].into_iter().collect(),
         }
     }
 
@@ -1826,10 +1833,11 @@ mod tests {
     }
 
     #[test]
-    fn step_dispatches_every_input_variant_as_a_no_op_stub() {
-        // #521 acceptance: `step` dispatches on all Input variants; the rule
-        // bodies are later issues, so every arm is a deterministic no-op that
-        // neither emits effects nor mutates state.
+    fn invalid_inputs_cover_every_dispatch_variant_and_fail_closed() {
+        // Exercise every dispatch arm with invalid signatures, absent buffered
+        // state, or a signer-less local timeout. None may emit an effect or
+        // mutate the replica. Valid rule behavior is covered by the focused
+        // R1-R7 tests below.
         let (mut replica, _) = replica(3);
         let before = format!("{replica:?}");
         for input in all_inputs() {
@@ -1838,7 +1846,7 @@ mod tests {
         assert_eq!(
             format!("{replica:?}"),
             before,
-            "no stub may mutate replica state"
+            "rejected inputs must not mutate replica state"
         );
     }
 
@@ -1846,7 +1854,7 @@ mod tests {
     fn step_replay_is_deterministic() {
         // Two identically-constructed replicas fed the same ordered Input
         // sequence produce identical Effect sequences and identical state —
-        // the §7 determinism guarantee, checked at the skeleton stage.
+        // the §7 determinism guarantee across every dispatch variant.
         let (mut a, boot_a) = replica(0);
         let (mut b, boot_b) = replica(0);
         assert_eq!(boot_a, boot_b, "bootstrap effects must replay identically");

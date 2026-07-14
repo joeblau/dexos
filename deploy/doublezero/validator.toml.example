@@ -1,0 +1,44 @@
+[node]
+name = "NODE_NAME"
+region = "REGION"
+light = false
+roles = ["validator", "sequencer", "witness", "gateway"]
+
+[network]
+listen = "DZ_SOURCE_IP:9000"
+bootstrap_peers = [
+  "lon-validator-0.dz.dexos:9000",
+  "lon-validator-1.dz.dexos:9000",
+  "nyc-validator-0.dz.dexos:9000",
+  "nyc-validator-1.dz.dexos:9000",
+  "tyo-validator-0.dz.dexos:9000",
+  "tyo-validator-1.dz.dexos:9000",
+]
+enable_quic = true
+enable_datagrams = true
+
+[consensus]
+checkpoint_interval_ms = 100
+delta_ms = 100
+epoch_length = 100000
+validator_set_path = "VALIDATOR_SET_PATH"
+
+[storage]
+data_dir = "DATA_DIR"
+snapshot_interval_sequences = 1000000
+segment_size_mb = 1024
+
+[rpc]
+listen = "DZ_SOURCE_IP:8080"
+read_only = false
+
+[performance]
+pin_threads = true
+# ShardWorker supports busy polling, but the production node driver does not
+# wire it yet and config validation fails closed while this is true.
+busy_poll = false
+drain_timeout_ms = 30000
+
+[observability]
+log_format = "json"
+metrics_listen = "MGMT_IP:9100"

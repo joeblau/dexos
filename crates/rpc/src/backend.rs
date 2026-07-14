@@ -183,8 +183,12 @@ fn route(backend: &dyn RpcBackend, mode: RpcMode, method: RpcMethod) -> Result<R
         }
         RpcMethod::GetMarketStatus(m) => backend.get_market_status(m).map(RpcOk::MarketStatus),
         RpcMethod::GetOracleStatus(m) => backend.get_oracle_status(m).map(RpcOk::OracleStatus),
-        RpcMethod::GetCheckpoint(h) => backend.get_checkpoint(h).map(RpcOk::Checkpoint),
-        RpcMethod::GetLatestCheckpoint => backend.get_latest_checkpoint().map(RpcOk::Checkpoint),
+        RpcMethod::GetCheckpoint(h) => backend
+            .get_checkpoint(h)
+            .map(|checkpoint| RpcOk::Checkpoint(Box::new(checkpoint))),
+        RpcMethod::GetLatestCheckpoint => backend
+            .get_latest_checkpoint()
+            .map(|checkpoint| RpcOk::Checkpoint(Box::new(checkpoint))),
         RpcMethod::GetAccount(a) => backend.get_account(a).map(RpcOk::Account),
         RpcMethod::GetAccountProof(a) => backend.get_account_proof(a).map(RpcOk::AccountProof),
         RpcMethod::GetPosition(a, m) => backend.get_position(a, m).map(RpcOk::Position),

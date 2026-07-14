@@ -1,0 +1,6 @@
+typescript/node_modules/
+typescript/dist/
+python/**/__pycache__/
+python/.pytest_cache/
+python/.mypy_cache/
+python/*.egg-info/

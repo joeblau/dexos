@@ -16,7 +16,9 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crypto::{hash_domain, merkle_root, verify_ed25519, QuorumCertificate, ValidatorSet};
+use crypto::{
+    hash_domain, merkle_root, verify_ed25519, QuorumCertificate, QuorumSignatures, ValidatorSet,
+};
 use state_tree::checkpoint_root;
 use types::{Hash, ShardId, StateRoot};
 
@@ -638,12 +640,14 @@ impl WitnessCollector {
             .get(&digest)
             .ok_or(CheckpointError::BelowThreshold)?;
         let mut bitmap: u16 = 0;
-        let mut signatures: Vec<[u8; 64]> = Vec::with_capacity(per_digest.len());
+        let mut signatures = QuorumSignatures::new();
         let mut weight: u64 = 0;
         for (&index, signature) in per_digest {
             // index < MAX_VALIDATORS (16) is guaranteed at admission time.
             bitmap |= 1u16 << index;
-            signatures.push(*signature);
+            signatures
+                .try_push(*signature)
+                .map_err(|_| CheckpointError::Quorum)?;
             weight = weight.saturating_add(
                 committee
                     .weight(

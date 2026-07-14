@@ -1,0 +1,50 @@
+seed = 567
+target = "127.0.0.1:8080"
+market_count = 64
+orders_per_second = 1
+cancel_ratio = 200000
+# Replacement is sampled only after cancel=false: 0.8 * 0.125 = 0.1.
+replace_ratio = 125000
+clock_method = "PtpOffset"
+duration_secs = 1
+sample_capacity = 65536
+
+[order_mix]
+limit = 70
+market = 15
+post_only = 10
+reduce_only = 5
+
+[burst]
+kind = "Steady"
+peak_multiplier = 1
+burst_secs = 1
+idle_secs = 1
+
+[impairment]
+loss_ratio = 0
+dup_ratio = 0
+reorder_ratio = 0
+extra_latency_us = 0
+latency_jitter_us = 0
+
+[adversarial]
+enabled = false
+malformed_ratio = 0
+oversized_ratio = 0
+max_garbage_len = 64
+
+[oracle]
+updates_per_second = 0
+
+[market_data]
+subscribers = 0
+updates_per_second = 0
+
+[[regions]]
+name = "assignment-overrides-region"
+users = 1
+cross_region = false
+base_latency_us = 0
+jitter_us = 0
+clock_offset_us = 0

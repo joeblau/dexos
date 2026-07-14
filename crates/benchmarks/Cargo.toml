@@ -27,5 +27,12 @@ codec = { path = "../codec" }
 state-tree = { path = "../state-tree" }
 storage = { path = "../storage" }
 consensus = { path = "../consensus" }
+simd = { path = "../simd" }
+network = { path = "../network" }
+node = { path = "../node" }
+loadgen = { path = "../loadgen" }
 serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+toml.workspace = true
 thiserror.workspace = true

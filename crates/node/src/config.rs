@@ -364,9 +364,10 @@ impl RpcSection {
     /// `tls` is injected by the caller because building
     /// [`rpc::TlsMode::Required`] reads the PEM files named by
     /// `tls_cert_path` / `tls_key_path` / `tls_client_ca_path` from disk via
-    /// [`rpc::acceptor_from_pem`] — this method performs no I/O. TODO(#418):
-    /// when the RPC listener is wired into the node runtime, the composition
-    /// root must load those PEMs and pass `TlsMode::Required(acceptor)`
+    /// [`rpc::acceptor_from_pem`] — this method performs no I/O. Tracked by
+    /// composition issue #312: when the RPC listener is wired into the
+    /// runtime, the composition root must load those PEMs and pass
+    /// `TlsMode::Required(acceptor)`
     /// whenever [`Self::tls_configured`] is true.
     pub fn server_config(&self, tls: rpc::TlsMode) -> rpc::ServerConfig {
         rpc::ServerConfig {
