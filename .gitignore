@@ -2,6 +2,7 @@
 **/*.rs.bk
 Cargo.lock.bak
 results.json
+determinism-digest.txt
 *.profraw
 *.profdata
 perf.data*

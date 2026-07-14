@@ -120,9 +120,9 @@ guards, state-root agreement — add `--full` for the determinism suite):
 ```sh
 cargo build --release --bin marketd     # produces target/release/marketd
 
-./target/release/marketd run --config config/dev.toml            # full node
-./target/release/marketd run --light --config config/light.toml  # read-only light node
-./target/release/marketd run --role validator --role sequencer   # multiple roles
+./target/release/marketd run --config config/dev.toml            # process-smoke composition
+./target/release/marketd run --light --config config/light.toml  # light-role process smoke
+./target/release/marketd run --role validator --role sequencer   # select placeholder roles
 cargo run --release --bin marketd --features dev-tools -- benchmark --suite all --output results.json
 ./target/release/marketd replay --snapshot <path> --log <path>
 ./target/release/marketd verify  --snapshot <path>
@@ -136,12 +136,15 @@ cargo install --path bin/marketd
 marketd run --config config/dev.toml
 ```
 
-`marketd run` starts the node, prints its startup manifest (including the
-selected SIMD backend), binds optional `/metrics` + `/livez` + `/readyz` when
-`[observability].metrics_listen` is set, and idles until it receives SIGINT or
-SIGTERM. Shutdown runs flush hooks, drains bounded queues under
-`performance.drain_timeout_ms` (default 30s), and exits nonzero on drain
-timeout or critical-task failure.
+`marketd run` currently starts placeholder role handlers, prints its startup
+manifest (including the selected SIMD backend), and binds only the optional
+`/metrics` + `/livez` + `/readyz` observability listener. It does not yet bind
+configured RPC/peer listeners, open durable storage, or compose execution and
+consensus; this is tracked by [#312](https://github.com/joeblau/dexos/issues/312).
+SIGINT/SIGTERM drains the bounded in-memory queues under
+`performance.drain_timeout_ms` (default 30s), but the storage/network/RPC flush
+hooks remain placeholders. See the [bare-metal runbook](docs/runbooks/BARE_METAL.md)
+for the supported process-smoke boundary and production block.
 
 ### Operator commands (real vs planned)
 
@@ -226,15 +229,24 @@ dx serve --package dexos-mobile --platform ios      # or --platform android
 > `dexos-mobile` already link `client` and query `get_markets` from
 > `DEXOS_NODE_ADDR` (default `127.0.0.1:8080`), degrading to an empty table on
 > error. Note that `marketd run` does **not** yet bind the RPC listener
-> ([TODO #418](crates/node/src/config.rs)), so there is no live node↔UI data path
+> ([composition issue #312](https://github.com/joeblau/dexos/issues/312)), so
+> there is no live node↔UI data path
 > today — point the apps at a process that serves the RPC directly (a dev harness
 > or test server) until the node's listener lands.
+
+## Client SDKs
+
+Production packed-order clients are available for Rust (`client::packed`),
+TypeScript (`@dexos/sdk`), and Python (`dexos-sdk`). They share the same v1
+golden vectors and support signed 32–128 record batches over persistent TCP or
+TLS 1.3, including correlated execution and finality receipts. See the
+[SDK guide](sdk/README.md) for package locations and the lease contract.
 
 ## Demo scripts
 
 ```sh
-./scripts/demo-local.sh              # three full nodes + one light node (US/EU/Japan configs)
-./scripts/demo-failover.sh           # kill the leader, continue, verify
+./scripts/demo-local.sh              # four regional process-smoke runtimes
+./scripts/demo-failover.sh           # kill one smoke process; verify isolation
 ./scripts/benchmark-single-market.sh # single-market throughput/latency report
 ./scripts/verify-state-roots.sh      # cross-node deterministic state-root check
 ```
@@ -249,4 +261,5 @@ no benchmark claims without reproducible scripts.
 
 See [architecture](docs/ARCHITECTURE.md), [security status](docs/SECURITY.md),
 [build features](docs/FEATURES.md), [performance profiling](docs/PERFORMANCE.md),
-and the [`dexos` CLI reference](docs/CLI.md).
+[order and instrument wire formats](docs/ORDER_AND_INSTRUMENT_FORMATS.md), and
+the [`dexos` CLI reference](docs/CLI.md).
