@@ -1,0 +1,64 @@
+# Safe bare-metal smoke configuration.
+#
+# IMPORTANT: the current `marketd run` composition root starts placeholder role
+# handlers and the observability listener only. It does not bind [network] or
+# [rpc], open [storage], load a node identity key, or provide authoritative
+# snapshots/recovery. Keep this observer/read-only posture until those release
+# blockers are closed. See docs/runbooks/BARE_METAL.md.
+
+[node]
+name = "bare-metal-smoke-1"
+region = "local"
+light = true
+roles = ["observer"]
+
+[network]
+# Validated at startup, but not bound by the current composition root.
+listen = "127.0.0.1:9000"
+bootstrap_peers = []
+enable_quic = false
+enable_datagrams = false
+
+[consensus]
+checkpoint_interval_ms = 100
+delta_ms = 25
+epoch_length = 100000
+# Observer mode does not load this file. A validator/sequencer/witness/custody
+# deployment must replace it with a reviewed, unit-weight committee descriptor.
+validator_set_path = "/etc/dexos/validators.toml"
+
+[storage]
+# The systemd sandbox grants write access only below /var/lib/dexos.
+# Current `marketd run` does not open this path yet.
+data_dir = "/var/lib/dexos/data"
+snapshot_interval_sequences = 1000000
+segment_size_mb = 1024
+
+[rpc]
+# Validated at startup, but not bound by the current composition root.
+listen = "127.0.0.1:8080"
+read_only = true
+max_connections = 4096
+max_connections_per_ip = 64
+rate_per_ip_per_sec = 32
+rate_burst = 64
+idle_timeout_ms = 30000
+read_timeout_ms = 5000
+write_timeout_ms = 5000
+dispatch_timeout_ms = 5000
+max_in_flight_requests = 1024
+max_in_flight_bytes = 67108864
+max_in_flight_requests_per_conn = 16
+max_in_flight_bytes_per_conn = 1048576
+
+[performance]
+pin_threads = false
+busy_poll = false
+drain_timeout_ms = 30000
+
+[observability]
+log_format = "json"
+# This is the only listener `marketd run` currently binds. Keep it loopback-only
+# and publish it through an authenticated monitoring agent if remote scraping is
+# needed.
+metrics_listen = "127.0.0.1:9100"

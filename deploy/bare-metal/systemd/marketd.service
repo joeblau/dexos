@@ -1,0 +1,64 @@
+[Unit]
+Description=DexOS marketd node (pre-production composition skeleton)
+Documentation=file:/usr/share/doc/dexos/BARE_METAL.md
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=3
+ConditionFileIsExecutable=/opt/dexos/current/marketd
+
+[Service]
+Type=simple
+User=dexos
+Group=dexos
+UMask=0027
+WorkingDirectory=/var/lib/dexos
+Environment=RUST_BACKTRACE=0
+EnvironmentFile=/etc/dexos/marketd.env
+ExecStartPre=/usr/libexec/dexos/bare-metal-preflight --binary /opt/dexos/current/marketd --config /etc/dexos/marketd.toml --env-file /etc/dexos/marketd.env --data-dir /var/lib/dexos/data
+ExecStart=/opt/dexos/current/marketd run --config /etc/dexos/marketd.toml
+KillSignal=SIGTERM
+# NodeConfig permits a drain deadline up to 600 seconds.  Leave headroom for
+# post-drain hooks so systemd never SIGKILLs an otherwise valid configured drain.
+TimeoutStopSec=620s
+Restart=on-failure
+RestartSec=5s
+
+# Runtime/resource bounds. The process owns no privileged port or device.
+LimitNOFILE=65536
+TasksMax=8192
+RuntimeDirectory=dexos
+RuntimeDirectoryMode=0750
+StateDirectory=dexos
+StateDirectoryMode=0750
+
+# systemd sandbox. Configuration and immutable releases are read-only; only the
+# state directory is writable. AF_INET/AF_INET6 remain allowed for metrics and
+# the future composed peer/RPC listeners.
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ProtectProc=invisible
+ProcSubset=pid
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+ReadOnlyPaths=/etc/dexos /opt/dexos
+ReadWritePaths=/var/lib/dexos
+
+[Install]
+WantedBy=multi-user.target
