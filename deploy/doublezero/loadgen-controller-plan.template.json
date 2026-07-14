@@ -1,0 +1,22 @@
+{
+  "run_id": 5670001,
+  "start_unix_ns": 0,
+  "total_rate": 24000000,
+  "total_connections": 12000,
+  "client_id_base": 1000000,
+  "seed": 567,
+  "phases": {
+    "warmup_secs": 60,
+    "steady_secs": 600,
+    "drain_secs": 30,
+    "cooldown_secs": 10
+  },
+  "targets": [
+    "lon-validator-0.dz.dexos:8080",
+    "lon-validator-1.dz.dexos:8080",
+    "nyc-validator-0.dz.dexos:8080",
+    "nyc-validator-1.dz.dexos:8080",
+    "tyo-validator-0.dz.dexos:8080",
+    "tyo-validator-1.dz.dexos:8080"
+  ]
+}

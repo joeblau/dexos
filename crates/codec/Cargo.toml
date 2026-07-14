@@ -18,9 +18,11 @@ debug_codec = []
 
 [dependencies]
 types = { path = "../types" }
+simd = { path = "../simd" }
 serde.workspace = true
 postcard.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 crypto = { path = "../crypto" }
+sha2.workspace = true

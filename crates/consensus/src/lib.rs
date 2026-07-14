@@ -33,9 +33,10 @@ pub use checkpoint::{
 pub use minimmit::{
     notarize_digest, nullify_digest, propose_auth, BlockHeader, Certificate, ConsensusMessage,
     Effect, Effect as MinimmitEffect, EpochError, ExecAttest, FinalityStage, Input,
-    Input as MinimmitInput, MinimmitCommittee, MinimmitReplica, Notarization, Notarize,
-    Nullification, Nullify, ParentRef, Proof, Propose, Tally, TallyOutcome, ThresholdKind,
-    WireError, BOTTOM_VIEW, DOMAIN_BLOCK, DOMAIN_NOTARIZE, DOMAIN_NULLIFY, DOMAIN_PROPOSE,
+    Input as MinimmitInput, MinimmitCertificateError, MinimmitCommittee, MinimmitReplica,
+    Notarization, Notarize, Nullification, Nullify, ParentRef, Proof, Propose, Tally, TallyOutcome,
+    ThresholdKind, WireError, BOTTOM_VIEW, DOMAIN_BLOCK, DOMAIN_NOTARIZE, DOMAIN_NULLIFY,
+    DOMAIN_PROPOSE,
 };
 pub use sequencer::{detect_gap, CommandRecord, CommandStatus, Sequencer, SequencerError};
 pub use vote::{

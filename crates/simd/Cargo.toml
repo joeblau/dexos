@@ -12,3 +12,7 @@ workspace = true
 [dependencies]
 types = { path = "../types" }
 crypto = { path = "../crypto" }
+thiserror.workspace = true
+
+[dev-dependencies]
+lz4_flex.workspace = true

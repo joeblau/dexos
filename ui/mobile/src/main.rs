@@ -1,6 +1,6 @@
 //! `dexos-mobile` — the iOS/Android frontend.
 //!
-//! Shares the desktop model: it links the native [`client`] and renders the
+//! Shares the desktop model: it links the native [`mod@client`] and renders the
 //! shared [`dexos_ui`] components against a live node. The endpoint comes from
 //! `DEXOS_NODE_ADDR` (default `127.0.0.1:8080`); a fetch failure degrades to the
 //! table's empty state.

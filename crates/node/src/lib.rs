@@ -8,12 +8,20 @@
 //! Subsystem seams are bounded channels only — never unbounded queues — so a slow
 //! consumer applies backpressure instead of growing memory without limit.
 
+pub mod batch_receipts;
 pub mod config;
 pub mod consensus_driver;
+pub mod durable_packed;
 pub mod error;
 pub mod lowering;
 pub mod metrics;
+pub mod multi_packed_core;
+pub mod packed_core;
+pub mod packed_ingress;
+pub mod packed_server;
 pub mod readiness;
+pub mod receipt_finality;
+pub mod shard;
 pub mod shutdown;
 pub mod supervisor;
 pub mod threading;
@@ -26,15 +34,43 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::Instrument;
 
+pub use batch_receipts::{
+    admission_receipt, finalize_executed_receipt, BatchReceiptTracker, BatchReceiptTrackerError,
+};
 pub use config::{
     ConfigError, ConfigOverrides, ConsensusSection, LogFormat, NetworkSection, NodeConfig,
     NodeSection, ObservabilitySection, PerformanceSection, Role, RpcSection, StorageSection,
 };
 pub use consensus_driver::{ConsensusDriver, DriverError, DriverEvent};
+pub use durable_packed::{
+    DurablePackedBatchIngress, PackedBatchJournal, PackedBatchJournalError,
+    PACKED_BATCH_WAL_COMMAND_TYPE,
+};
 pub use error::NodeError;
 pub use lowering::{control_plane_produces, lower, LoweringError};
+pub use multi_packed_core::{
+    MultiSessionAdmissionReadiness, MultiSessionPackedValidatorCore,
+    MultiSessionPackedValidatorCoreError,
+};
 pub use observability::{MetricsRegistry, TraceGen, TraceId};
+pub use packed_core::{PackedValidatorCore, PackedValidatorCoreError};
+pub use packed_ingress::{
+    AuthenticatedPackedBatch, AuthenticatedPackedBatchIngress, AuthenticatedPackedIngressError,
+    PackedAuthority, PackedBatchAdmission, PackedBatchIngress, PackedIngressError, PackedSession,
+};
+pub use packed_server::{
+    deliver_minimmit_finality, serve_multi_packed_with_finality, serve_multi_packed_with_shutdown,
+    serve_packed_with_finality, serve_packed_with_shutdown, PackedFinalityDeliveryError,
+    PackedFinalityRouter, PackedFinalityRouterError, PackedServerConfig, PackedServerError,
+};
 pub use readiness::Readiness;
+pub use receipt_finality::{
+    MinimmitFinalityEvent, MinimmitReceiptBridge, MinimmitReceiptBridgeError,
+};
+pub use shard::{
+    shard_command_ring, shard_pipeline, spsc_ring, RingError, ShardCommand, ShardCounters,
+    ShardEffect, ShardEgress, ShardIngress, ShardStep, ShardWorker, SpscConsumer, SpscProducer,
+};
 pub use shutdown::{FlushHooks, DEFAULT_DRAIN_TIMEOUT};
 
 /// Capacity of each subsystem ingress queue. Bounded by construction.

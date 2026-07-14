@@ -17,12 +17,12 @@ pub use domain::{
     DOMAIN_VALIDATOR_SET_TRANSITION, DOMAIN_WITHDRAWAL_AUTH, DOMAIN_WITHDRAWAL_CERT,
     DOMAIN_WITHDRAWAL_ID,
 };
-pub use hash::{hash_domain, hash_leaf, hash_node, keccak256};
+pub use hash::{hash_domain, hash_domain_parts, hash_leaf, hash_node, keccak256};
 pub use merkle::{merkle_root, verify_proof, MerkleError, MerkleTree};
 pub use quorum::{
     minimmit_thresholds, minimmit_unit_byzantine_bound, require_minimmit_sizing, QuorumCertificate,
-    QuorumError, ThresholdSigners, Validator, ValidatorSet, MAX_VALIDATORS, QC_PACKED_HEADER_LEN,
-    QC_WIRE_VERSION, VALIDATOR_SET_VERSION,
+    QuorumError, QuorumSignatures, ThresholdSigners, Validator, ValidatorSet, MAX_VALIDATORS,
+    QC_PACKED_HEADER_LEN, QC_WIRE_VERSION, VALIDATOR_SET_VERSION,
 };
 #[allow(deprecated)]
 pub use signature::batch_verify_ed25519;

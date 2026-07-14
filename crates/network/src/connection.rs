@@ -38,6 +38,7 @@ use crate::peer::PeerId;
 use crate::reconnect::ReconnectPolicy;
 use crate::replay::{PeerDedup, ReplayWindow};
 use crate::scheduler::NUM_CLASSES;
+use crate::EncodedAuthenticatedOrderBatch;
 
 /// Reserved `msg_type` marking a frame as an unreliable datagram on transports
 /// that multiplex both streams over one wire (e.g. TCP). Application reliable
@@ -558,6 +559,41 @@ impl Connection {
         self.out_reliable.try_send(frame)?;
         *slot = Some(sequence);
         Ok(())
+    }
+
+    /// Enqueue one validated packed-order batch on the reliable NewOrder lane.
+    ///
+    /// TCP and QUIC both drain this same class-aware connection queue, so the
+    /// batch remains one authenticated transport frame and can never be mixed
+    /// with consensus, market-data, or another priority class. The only payload
+    /// copy here is the required batch-to-frame ownership transfer; individual
+    /// packed records are not copied or allocated separately.
+    pub fn send_order_batch(
+        &self,
+        batch: EncodedAuthenticatedOrderBatch<'_>,
+    ) -> Result<(), TransportError> {
+        self.send_typed(
+            TrafficClass::NewOrder,
+            crate::MSG_TYPE_ORDER_BATCH,
+            batch.bytes,
+        )
+    }
+
+    /// Enqueue one correlated packed-batch lifecycle receipt on the reliable
+    /// execution-receipt lane of this mutually authenticated connection.
+    pub fn send_order_batch_receipt(
+        &self,
+        receipt: &crate::OrderBatchReceipt,
+    ) -> Result<(), TransportError> {
+        let mut bytes = [0u8; crate::ORDER_BATCH_RECEIPT_LEN];
+        receipt
+            .encode_into(&mut bytes)
+            .map_err(|_| TransportError::InvalidOrderBatchReceipt)?;
+        self.send_typed(
+            TrafficClass::ExecutionReceipt,
+            crate::MSG_TYPE_ORDER_BATCH_RECEIPT,
+            &bytes,
+        )
     }
 
     /// Send a best-effort datagram (unreliable, unordered).

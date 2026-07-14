@@ -47,6 +47,7 @@
 //! bounded before allocation; and all queues are bounded with explicit
 //! backpressure.
 
+mod authenticated_order_batch;
 pub mod batch;
 mod budget;
 mod channel;
@@ -56,6 +57,8 @@ mod disconnect;
 mod error;
 mod framing;
 mod loopback;
+mod order_batch;
+mod order_batch_receipt;
 mod peer;
 mod reconnect;
 mod replay;
@@ -71,6 +74,11 @@ mod quic;
 /// Crate identity, used by the node composition root for a startup manifest.
 pub const CRATE_NAME: &str = "network";
 
+/// Application message tag for a versioned compressed packed-order envelope.
+pub const MSG_TYPE_ORDER_BATCH: u16 = 0x0101;
+/// Application message tag for a correlated packed-batch lifecycle receipt.
+pub const MSG_TYPE_ORDER_BATCH_RECEIPT: u16 = 0x0102;
+
 /// Whether this build includes a real QUIC transport (`quinn`).
 ///
 /// Used by the node config loader to fail closed when `enable_quic` /
@@ -84,7 +92,15 @@ pub const fn quic_supported() -> bool {
 // directly for the common path.
 pub use codec::{Frame, TrafficClass};
 
-pub use batch::{BatchDropMetrics, BatchSender, BatchSink, DropReason, DEFAULT_BATCH};
+pub use authenticated_order_batch::{
+    decode_authenticated_order_batch_frame_into, inspect_authenticated_order_batch,
+    AuthenticatedOrderBatchCodec, AuthenticatedOrderBatchError, AuthenticatedOrderBatchFrameError,
+    AuthenticatedOrderBatchHeader, EncodedAuthenticatedOrderBatch, OrderBatchBinding,
+    OrderBatchReplayGuard, VerifiedAuthenticatedOrderBatch, AUTHENTICATED_ORDER_BATCH_HEADER_LEN,
+    AUTHENTICATED_ORDER_BATCH_MAX_WIRE, AUTHENTICATED_ORDER_BATCH_SIGNATURE_LEN,
+    AUTHENTICATED_ORDER_BATCH_VERSION,
+};
+pub use batch::{BatchDropMetrics, BatchFrame, BatchSender, BatchSink, DropReason, DEFAULT_BATCH};
 pub use budget::ByteBudget;
 pub use class_auth::{authorize_class, ConsensusPermits, PeerRole};
 pub use connection::{
@@ -99,6 +115,16 @@ pub use connection::{
 pub use disconnect::{classify_disconnect, DisconnectMetrics, DisconnectReason};
 pub use error::TransportError;
 pub use loopback::{LoopbackFabric, LoopbackTransport};
+pub use order_batch::{
+    DecodedOrderBatch, DecodedPackedOrderBatch, EncodedOrderBatch, OrderBatchCodec,
+    OrderBatchError, OrderBatchStats, ORDER_BATCH_HEADER_LEN, ORDER_BATCH_MAX_UNCOMPRESSED,
+    ORDER_BATCH_MAX_WIRE, ORDER_BATCH_VERSION,
+};
+pub use order_batch_receipt::{
+    decode_order_batch_receipt_frame, encode_order_batch_receipt_frame, OrderBatchReceipt,
+    OrderBatchReceiptError, OrderBatchReceiptStage, MAX_PENDING_ORDER_BATCH_FINALITY,
+    ORDER_BATCH_RECEIPT_LEN, ORDER_BATCH_RECEIPT_VERSION,
+};
 pub use peer::{Peer, PeerId};
 pub use reconnect::{
     ReconnectBackoff, ReconnectPolicy, DEFAULT_INITIAL_MS, DEFAULT_MAX_MS, DEFAULT_MULTIPLIER_DEN,

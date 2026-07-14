@@ -1,14 +1,11 @@
 //! Runtime CPU-feature detection and backend selection.
 //!
-//! Backends other than scalar are experimental compatibility seams. They are
-//! not production controls and must not be interpreted as proof that a distinct
-//! vector instruction kernel executed.
-//!
 //! [`Backend`] names the family of kernel a call will run. [`detect`] probes the
-//! host once and returns the best backend actually available; callers may also
-//! *force* a backend (used by the differential test harness). Because the
-//! vectorized path is portable, forcing a wider backend than the host provides
-//! is always a clean, correct fallback rather than an error.
+//! host once and returns the best backend actually available. Operator-requested
+//! forcing goes through [`Backend::force`], which fails if the named backend is
+//! unknown or unavailable instead of silently running another implementation.
+
+use std::sync::OnceLock;
 
 /// The kernel family selected for a dispatched call.
 ///
@@ -40,24 +37,27 @@ impl Backend {
         }
     }
 
-    /// True only for production-supported, measured implementations.
+    /// True only for production-supported implementation families.
     #[must_use]
     pub const fn is_production(self) -> bool {
-        matches!(self, Backend::Scalar)
+        matches!(
+            self,
+            Backend::Scalar | Backend::Avx2 | Backend::Avx512 | Backend::Neon
+        )
     }
 
     /// True when this backend selects the vectorized kernel path.
     #[must_use]
     pub const fn is_vectorized(self) -> bool {
-        false
+        !matches!(self, Backend::Scalar)
     }
 
     /// Whether the *running host* actually provides this backend's features.
     ///
     /// [`Backend::Scalar`] is universally available. A vector backend is
     /// available only on a matching architecture with the required feature bits.
-    /// Forcing an unavailable backend still runs correctly (the portable vector
-    /// path), so this is advisory, not a gate.
+    /// Direct enum construction is intended for differential tests. Operator
+    /// configuration must use [`Backend::force`] so availability is a gate.
     #[must_use]
     pub fn is_available(self) -> bool {
         match self {
@@ -68,6 +68,37 @@ impl Backend {
             Backend::Neon => cfg!(target_arch = "aarch64"),
         }
     }
+
+    /// Strictly select an explicitly requested backend.
+    ///
+    /// # Errors
+    /// Returns [`BackendError::Unknown`] for an unknown name and
+    /// [`BackendError::Unavailable`] when the running host lacks its feature set.
+    pub fn force(name: &str) -> Result<Self, BackendError> {
+        let backend = match name {
+            "scalar" => Backend::Scalar,
+            "avx2" => Backend::Avx2,
+            "avx512" => Backend::Avx512,
+            "neon" => Backend::Neon,
+            _ => return Err(BackendError::Unknown(name.to_string())),
+        };
+        if backend.is_available() {
+            Ok(backend)
+        } else {
+            Err(BackendError::Unavailable(backend))
+        }
+    }
+}
+
+/// Runtime backend selection failure.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum BackendError {
+    /// The configured backend name is not recognized.
+    #[error("unknown SIMD backend '{0}'")]
+    Unknown(String),
+    /// The backend is known but cannot execute on this host.
+    #[error("SIMD backend '{}' is unavailable on this host", .0.name())]
+    Unavailable(Backend),
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -90,7 +121,7 @@ fn has_avx512() -> bool {
     false
 }
 
-/// Select the only production-qualified backend.
+/// Select and cache the best runnable backend for this process.
 ///
 /// Preference on x86-64 is AVX-512 → AVX2 → scalar; aarch64 always reports
 /// [`Backend::Neon`] (mandatory in the base ISA); every other architecture
@@ -98,7 +129,20 @@ fn has_avx512() -> bool {
 ///
 #[must_use]
 pub fn detect() -> Backend {
-    Backend::Scalar
+    static DETECTED: OnceLock<Backend> = OnceLock::new();
+    *DETECTED.get_or_init(detect_uncached)
+}
+
+fn detect_uncached() -> Backend {
+    if Backend::Avx512.is_available() {
+        Backend::Avx512
+    } else if Backend::Avx2.is_available() {
+        Backend::Avx2
+    } else if Backend::Neon.is_available() {
+        Backend::Neon
+    } else {
+        Backend::Scalar
+    }
 }
 
 #[cfg(test)]
@@ -117,14 +161,16 @@ mod tests {
     }
 
     #[test]
-    fn scalar_is_always_available_and_not_vectorized() {
+    fn scalar_is_always_available_and_vector_tags_are_distinct() {
         assert!(Backend::Scalar.is_available());
         assert!(!Backend::Scalar.is_vectorized());
-        assert!(!Backend::Avx2.is_vectorized());
-        assert!(!Backend::Avx512.is_vectorized());
-        assert!(!Backend::Neon.is_vectorized());
+        assert!(Backend::Avx2.is_vectorized());
+        assert!(Backend::Avx512.is_vectorized());
+        assert!(Backend::Neon.is_vectorized());
         assert!(Backend::Scalar.is_production());
-        assert!(!Backend::Avx2.is_production());
+        assert!(Backend::Avx2.is_production());
+        assert!(Backend::Avx512.is_production());
+        assert!(Backend::Neon.is_production());
     }
 
     #[test]
@@ -150,6 +196,23 @@ mod tests {
         if !cfg!(target_arch = "x86_64") {
             assert!(!Backend::Avx2.is_available());
             assert!(!Backend::Avx512.is_available());
+        }
+    }
+
+    #[test]
+    fn forced_backend_never_silently_falls_back() {
+        assert_eq!(Backend::force("scalar"), Ok(Backend::Scalar));
+        assert!(matches!(
+            Backend::force("not-a-backend"),
+            Err(BackendError::Unknown(_))
+        ));
+        for backend in [Backend::Avx2, Backend::Avx512, Backend::Neon] {
+            let forced = Backend::force(backend.name());
+            if backend.is_available() {
+                assert_eq!(forced, Ok(backend));
+            } else {
+                assert_eq!(forced, Err(BackendError::Unavailable(backend)));
+            }
         }
     }
 }

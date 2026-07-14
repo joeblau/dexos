@@ -300,10 +300,27 @@ impl SideBook {
         }
     }
 
-    /// Visit every price level in ascending price order.
-    pub(crate) fn for_each_level_price<F: FnMut(Price)>(&self, mut f: F) {
-        for price in self.levels.keys() {
-            f(*price);
+    /// Visit price levels in matching order (best first).
+    ///
+    /// Returning `false` stops the walk. Exposing the head alongside the price
+    /// lets dry-run matching scan the intrusive FIFO directly, without first
+    /// materializing and possibly reversing a temporary vector of prices.
+    pub(crate) fn for_each_level_best_first<F: FnMut(Price, u32) -> bool>(&self, mut f: F) {
+        match self.side {
+            Side::Ask => {
+                for (price, level) in &self.levels {
+                    if !f(*price, level.head) {
+                        break;
+                    }
+                }
+            }
+            Side::Bid => {
+                for (price, level) in self.levels.iter().rev() {
+                    if !f(*price, level.head) {
+                        break;
+                    }
+                }
+            }
         }
     }
 }

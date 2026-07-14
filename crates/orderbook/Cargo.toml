@@ -12,5 +12,6 @@ workspace = true
 [dependencies]
 types = { path = "../types" }
 crypto = { path = "../crypto" }
+simd = { path = "../simd" }
 serde.workspace = true
 thiserror.workspace = true

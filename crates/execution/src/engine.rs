@@ -6,6 +6,8 @@
 //! command streams produce identical state roots (deterministic replay).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
 
 use orderbook::{BookConfig, NewOrder, OrderBook, OrderOutcome};
 use risk::{RiskConfig, RiskEngine};
@@ -23,6 +25,41 @@ use crate::idempotency::{
 use crate::ledger::Ledger;
 use crate::session::SessionRegistry;
 
+/// Transaction snapshot page shared until its first mutation.
+///
+/// Cloning an [`Engine`] clones these `Arc`s only. A mutating subsystem call
+/// transparently materializes that one page through [`Arc::make_mut`], leaving
+/// the committed engine's page untouched until the transaction commits. This
+/// preserves the existing clone/apply/swap rollback proof while eliminating the
+/// unconditional deep copy of every subsystem before every command.
+struct CowState<T: Clone>(Arc<T>);
+
+impl<T: Clone> CowState<T> {
+    fn new(value: T) -> Self {
+        Self(Arc::new(value))
+    }
+}
+
+impl<T: Clone> Clone for CowState<T> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl<T: Clone> Deref for CowState<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T: Clone> DerefMut for CowState<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        Arc::make_mut(&mut self.0)
+    }
+}
+
 /// Engine construction parameters.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -38,6 +75,10 @@ pub struct EngineConfig {
     pub replay_window: usize,
     /// Risk parameters.
     pub risk: RiskConfig,
+    /// Backend for pure, bit-identical order-book match-planning arithmetic.
+    /// Stateful matching and every consensus-visible decision remain ordered
+    /// scalar operations.
+    pub matching_backend: orderbook::MatchingBackend,
 }
 
 impl Default for EngineConfig {
@@ -57,6 +98,7 @@ impl Default for EngineConfig {
                 max_accounts: risk::DEFAULT_MAX_ACCOUNTS,
                 max_markets: risk::DEFAULT_MAX_MARKETS,
             },
+            matching_backend: BookConfig::default().matching_backend,
         }
     }
 }
@@ -201,24 +243,26 @@ pub struct WalletBinding {
 
 /// The deterministic exchange engine.
 ///
-/// `Clone` is a deep copy of every subsystem (ledger, sessions, risk, state tree,
-/// books, and the in-memory maps). [`Engine::execute`] relies on it to apply each
-/// command to a throwaway working copy, giving every command an all-or-none
-/// transaction boundary across all subsystems.
-#[derive(Clone)]
+/// `Clone` is a shallow copy-on-write transaction snapshot. Each subsystem page
+/// is cloned only if a command mutates it; untouched pages remain shared.
+/// [`Engine::execute`] applies a command to that isolated snapshot and swaps it
+/// into place only on success, preserving the all-or-none boundary.
 pub struct Engine {
-    ledger: Ledger,
-    sessions: SessionRegistry,
-    risk: RiskEngine,
-    tree: StateTree,
+    ledger: CowState<Ledger>,
+    sessions: CowState<SessionRegistry>,
+    risk: CowState<RiskEngine>,
+    tree: CowState<StateTree>,
     /// Per-(market, instrument) order books.
-    books: HashMap<(u32, u16), OrderBook>,
-    markets: HashMap<u32, MarketMeta>,
+    books: CowState<HashMap<(u32, u16), CowState<OrderBook>>>,
+    /// Non-logical CPU kernel selection copied into every order book. Backend
+    /// differences are required to produce identical receipts and roots.
+    matching_backend: orderbook::MatchingBackend,
+    markets: CowState<HashMap<u32, MarketMeta>>,
     /// Resting-order notional reserved, keyed by book-order coordinates. Each
     /// record carries the resting quantity its reserve was computed from so
     /// fill-by-fill releases telescope to exactly the reserved amount (see
     /// [`OrderReserve`]).
-    order_reserves: HashMap<OrderKey, OrderReserve>,
+    order_reserves: CowState<HashMap<OrderKey, OrderReserve>>,
     /// Outcome claims: account -> market -> per-outcome balances. Live
     /// (spendable) claims only; claims backing resting asks are moved into
     /// `ask_claims_escrow` while the order rests. Keyed by account first so
@@ -226,51 +270,89 @@ pub struct Engine {
     /// every other account's entries (#404); the inner `BTreeMap` iterates
     /// markets in ascending key order — exactly the committed leaf's
     /// serialization order, so no per-leaf sort is needed.
-    claims: HashMap<u32, BTreeMap<u32, Vec<Amount>>>,
+    claims: CowState<HashMap<u32, BTreeMap<u32, Vec<Amount>>>>,
     /// Committed reserved-premium column for resting claim-market bids, keyed
     /// `(account, market)`. The cash itself sits in the ledger's `escrowed`
     /// partition; this column is the per-market breakdown folded into the
     /// account leaf (deterministic: BTreeMap iterates in key order).
-    bid_premium_escrow: BTreeMap<(u32, u32), Amount>,
+    bid_premium_escrow: CowState<BTreeMap<(u32, u32), Amount>>,
     /// Committed reserved-claims column for resting claim-market asks, keyed
     /// `(account, market, instrument)`; folded into the account leaf.
-    ask_claims_escrow: BTreeMap<(u32, u32, u16), Amount>,
+    ask_claims_escrow: CowState<BTreeMap<(u32, u32, u16), Amount>>,
     /// Per-resting-order escrow records for exact release on fill drawdown,
     /// cancel, cancel-all, replace, expiry, liquidation, and resolve.
-    claim_escrows: HashMap<OrderKey, ClaimOrderEscrow>,
+    claim_escrows: CowState<HashMap<OrderKey, ClaimOrderEscrow>>,
     /// Locked complete-set collateral still attributed to a minter: (account, market).
-    mint_locked: HashMap<(u32, u32), Amount>,
-    deposits_seen: HashSet<(u32, Vec<u8>, u32)>,
-    withdrawals: HashMap<u64, Withdrawal>,
+    mint_locked: CowState<HashMap<(u32, u32), Amount>>,
+    deposits_seen: CowState<HashSet<(u32, Vec<u8>, u32)>>,
+    withdrawals: CowState<HashMap<u64, Withdrawal>>,
     protocol_version: u16,
-    wallets: HashMap<u32, WalletBinding>,
+    wallets: CowState<HashMap<u32, WalletBinding>>,
     /// Durable, payload-bound command idempotency (exactly-once retries).
-    replay: ReplayGuard,
+    replay: CowState<ReplayGuard>,
     last_seq: Option<u64>,
+    /// Non-consensus worker-local leaf encoder storage. It is transferred to a
+    /// transaction snapshot, not cloned, and returned on rollback.
+    leaf_scratch: Vec<u8>,
+}
+
+impl Clone for Engine {
+    fn clone(&self) -> Self {
+        Self {
+            ledger: self.ledger.clone(),
+            sessions: self.sessions.clone(),
+            risk: self.risk.clone(),
+            tree: self.tree.clone(),
+            books: self.books.clone(),
+            matching_backend: self.matching_backend,
+            markets: self.markets.clone(),
+            order_reserves: self.order_reserves.clone(),
+            claims: self.claims.clone(),
+            bid_premium_escrow: self.bid_premium_escrow.clone(),
+            ask_claims_escrow: self.ask_claims_escrow.clone(),
+            claim_escrows: self.claim_escrows.clone(),
+            mint_locked: self.mint_locked.clone(),
+            deposits_seen: self.deposits_seen.clone(),
+            withdrawals: self.withdrawals.clone(),
+            protocol_version: self.protocol_version,
+            wallets: self.wallets.clone(),
+            replay: self.replay.clone(),
+            last_seq: self.last_seq,
+            // Scratch is non-logical and moves into the transaction in
+            // `execute`; ordinary clones start with an empty, allocation-free
+            // buffer and cannot observe or affect the source's capacity.
+            leaf_scratch: Vec::new(),
+        }
+    }
 }
 
 impl Engine {
     /// Build a new engine.
     pub fn new(config: EngineConfig) -> Self {
         Self {
-            ledger: Ledger::new(),
-            sessions: SessionRegistry::new(),
-            risk: RiskEngine::new(config.risk),
-            tree: StateTree::new(config.account_capacity, config.market_capacity),
-            books: HashMap::new(),
-            markets: HashMap::new(),
-            order_reserves: HashMap::new(),
-            claims: HashMap::new(),
-            bid_premium_escrow: BTreeMap::new(),
-            ask_claims_escrow: BTreeMap::new(),
-            claim_escrows: HashMap::new(),
-            mint_locked: HashMap::new(),
-            deposits_seen: HashSet::new(),
-            withdrawals: HashMap::new(),
+            ledger: CowState::new(Ledger::new()),
+            sessions: CowState::new(SessionRegistry::new()),
+            risk: CowState::new(RiskEngine::new(config.risk)),
+            tree: CowState::new(StateTree::new(
+                config.account_capacity,
+                config.market_capacity,
+            )),
+            books: CowState::new(HashMap::new()),
+            matching_backend: config.matching_backend,
+            markets: CowState::new(HashMap::new()),
+            order_reserves: CowState::new(HashMap::new()),
+            claims: CowState::new(HashMap::new()),
+            bid_premium_escrow: CowState::new(BTreeMap::new()),
+            ask_claims_escrow: CowState::new(BTreeMap::new()),
+            claim_escrows: CowState::new(HashMap::new()),
+            mint_locked: CowState::new(HashMap::new()),
+            deposits_seen: CowState::new(HashSet::new()),
+            withdrawals: CowState::new(HashMap::new()),
             protocol_version: 1,
-            wallets: HashMap::new(),
-            replay: ReplayGuard::with_window(config.replay_window),
+            wallets: CowState::new(HashMap::new()),
+            replay: CowState::new(ReplayGuard::with_window(config.replay_window)),
             last_seq: None,
+            leaf_scratch: Vec::with_capacity(64 * 1024),
         }
     }
 
@@ -301,7 +383,7 @@ impl Engine {
             return None;
         }
         let mut total = 0usize;
-        for ((m, _), book) in &self.books {
+        for ((m, _), book) in self.books.iter() {
             if *m == market.get() {
                 total = total.saturating_add(book.resting_len());
             }
@@ -342,6 +424,195 @@ impl Engine {
         self.risk
             .position(account, market)
             .unwrap_or(Quantity::ZERO)
+    }
+
+    /// Identify the common one-delta book path that can move into a transaction
+    /// without cloning its full resting set. A later error can undo this exact
+    /// delta by cancelling `order_id` before the book is restored.
+    fn resting_book_handoff(&self, command: &Command) -> Option<((u32, u16), types::OrderId)> {
+        let Command::PlaceOrder(c) = command else {
+            return None;
+        };
+        if c.reduce_only
+            || !matches!(c.order_type, OrderType::Limit)
+            || !matches!(c.tif, types::TimeInForce::Gtc)
+        {
+            return None;
+        }
+        let key = (c.market.get(), c.instrument);
+        let book = self.books.get(&key)?;
+        let order = NewOrder {
+            order_id: c.order_id,
+            account: c.account,
+            side: c.side,
+            order_type: c.order_type,
+            tif: c.tif,
+            price: c.price,
+            quantity: c.quantity,
+            client_id: c.client_id,
+            reduce_only: false,
+        };
+        book.can_rest_without_match(&order)
+            .ok()?
+            .then_some((key, c.order_id))
+    }
+
+    /// Execute the dominant accepted-order shape with a bounded in-place undo
+    /// journal. Every eligibility check is non-mutating; once admitted, the
+    /// single writer can only append one resting book node, one reservation,
+    /// one replay watermark/record, and two already-in-range Merkle leaves.
+    /// Other command shapes retain the general COW transaction below.
+    fn try_execute_resting_in_place(
+        &mut self,
+        seq: u64,
+        c: &crate::command::PlaceOrder,
+        binding: &crate::idempotency::KeyBinding,
+    ) -> Option<Result<ExecutionReceipt, ExecutionError>> {
+        if !matches!(c.auth, Authorization::Master)
+            || c.reduce_only
+            || !matches!(c.order_type, OrderType::Limit)
+            || !matches!(c.tif, types::TimeInForce::Gtc)
+        {
+            return None;
+        }
+        let meta = self.markets.get(&c.market.get())?;
+        if !matches!(meta.market_type, MarketType::Perpetual)
+            || !matches!(meta.lifecycle, MarketLifecycle::Open)
+            || !matches!(
+                meta.oracle_health,
+                OracleHealth::Normal | OracleHealth::Degraded
+            )
+            || c.instrument != 0
+        {
+            return None;
+        }
+        let order = NewOrder {
+            order_id: c.order_id,
+            account: c.account,
+            side: c.side,
+            order_type: c.order_type,
+            tif: c.tif,
+            price: c.price,
+            quantity: c.quantity,
+            client_id: c.client_id,
+            reduce_only: false,
+        };
+        let key = (c.market.get(), c.instrument);
+        let book = self.books.get(&key)?;
+        if !matches!(book.can_rest_without_match(&order), Ok(true)) {
+            return None;
+        }
+        let notional = match c.price.notional(c.quantity) {
+            Ok(value) => value,
+            Err(_) => return None,
+        };
+        if self
+            .risk
+            .check_order_in_market(c.account, c.market, notional, false)
+            .is_err()
+            || self
+                .risk
+                .check_reserve_resting(c.account, notional)
+                .is_err()
+        {
+            return None;
+        }
+        let account_index = usize::try_from(c.account.get()).ok()?;
+        let market_index = usize::try_from(c.market.get()).ok()?;
+        if account_index >= self.tree.account_capacity()
+            || market_index >= self.tree.market_capacity()
+        {
+            return None;
+        }
+        let reserve_key = (c.market.get(), c.instrument, c.order_id.get());
+        if self.order_reserves.contains_key(&reserve_key) {
+            return None;
+        }
+
+        // One bounded warmup allocation per fixed-capacity structure. Once the
+        // committed limits are reserved, successful inserts never grow them.
+        let reserve_capacity = BookConfig::default().capacity;
+        let additional = reserve_capacity.saturating_sub(self.order_reserves.len());
+        self.order_reserves.reserve(additional);
+        self.replay.prepare_window();
+
+        let result = self
+            .books
+            .get_mut(&key)
+            .and_then(|book| book.place(order).ok())?;
+        let rested = matches!(result.outcome, OrderOutcome::Resting { .. });
+        if !rested || result.filled_quantity().raw() != 0 {
+            // The preflight and mutation observe the same single-writer state,
+            // so this is unreachable; use the general path only when no delta
+            // was made. A crossing result is deliberately not guessed at here.
+            let _ = self
+                .books
+                .get_mut(&key)
+                .and_then(|book| book.cancel(c.order_id).ok());
+            return Some(Err(ExecutionError::EscrowInconsistency));
+        }
+        if let Err(error) = self.risk.reserve_resting(c.account, notional) {
+            let _ = self
+                .books
+                .get_mut(&key)
+                .and_then(|book| book.cancel(c.order_id).ok());
+            return Some(Err(error.into()));
+        }
+        self.order_reserves.insert(
+            reserve_key,
+            OrderReserve {
+                account: c.account,
+                reserved: notional,
+                qty_remaining: c.quantity,
+            },
+        );
+        let previous_watermark = self.replay.watermark(c.account.get(), KeyDomain::Order);
+        self.replay.reserve(binding);
+
+        if let Err(error) = self
+            .commit_account(c.account)
+            .and_then(|()| self.commit_market(c.market))
+        {
+            let rollback = self.rollback_resting_in_place(
+                c,
+                binding,
+                previous_watermark,
+                reserve_key,
+                notional,
+            );
+            return Some(Err(rollback.err().unwrap_or(error)));
+        }
+
+        let receipt = self.receipt(
+            seq,
+            ReceiptKind::OrderApplied {
+                filled: Quantity::ZERO,
+                rested: true,
+            },
+        );
+        self.replay.finalize(binding, receipt.clone());
+        self.last_seq = Some(seq);
+        Some(Ok(receipt))
+    }
+
+    fn rollback_resting_in_place(
+        &mut self,
+        c: &crate::command::PlaceOrder,
+        binding: &crate::idempotency::KeyBinding,
+        previous_watermark: Option<u64>,
+        reserve_key: OrderKey,
+        notional: Amount,
+    ) -> Result<(), ExecutionError> {
+        self.replay.restore_reservation(binding, previous_watermark);
+        self.order_reserves.remove(&reserve_key);
+        self.risk.release_resting(c.account, notional)?;
+        self.books
+            .get_mut(&(c.market.get(), c.instrument))
+            .ok_or(ExecutionError::UnknownMarket)?
+            .cancel(c.order_id)?;
+        self.commit_account(c.account)?;
+        self.commit_market(c.market)?;
+        Ok(())
     }
 
     /// Reject new risk when the market is not Open or the oracle freezes risk.
@@ -637,8 +908,20 @@ impl Engine {
     /// order.
     pub fn account_leaf(&self, account: AccountId) -> Result<Vec<u8>, ExecutionError> {
         let mut w = LeafWriter::new();
+        self.write_account_leaf(account, &mut w)?;
+        Ok(w.finish())
+    }
+
+    /// Stream one account's canonical fields into reusable writer storage.
+    /// Counts are computed in a first pass and fields emitted in a second, so
+    /// no temporary positions/claims/escrow vectors are materialized.
+    fn write_account_leaf(
+        &self,
+        account: AccountId,
+        w: &mut LeafWriter,
+    ) -> Result<(), ExecutionError> {
         // Settlement ledger: available / reserved / locked / auth epoch.
-        self.ledger.write_account_fields(account, &mut w)?;
+        self.ledger.write_account_fields(account, w)?;
         // Risk authority: collateral plus the derived equity/exposure/margin
         // columns, so trading state is committed alongside the ledger and the two
         // cannot silently diverge.
@@ -647,43 +930,49 @@ impl Engine {
             .field_i128(self.risk.exposure(account)?.raw())
             .field_i128(self.risk.initial_margin(account)?.raw())
             .field_i128(self.risk.maintenance_margin(account)?.raw());
-        // Open positions from risk (single source of truth); flats omitted.
-        let mut positions: Vec<(u32, i64)> = Vec::new();
+        // Open positions from risk (single source of truth); flats omitted. The
+        // risk vector is insertion-ordered, so emit its next-lowest market in
+        // repeated bounded scans. Typical accounts hold very few markets; this
+        // avoids a heap sort while retaining canonical ascending order.
         if let Ok(perps) = self.risk.perp_positions(account) {
-            for pos in perps {
-                if pos.net_qty.raw() != 0 {
-                    positions.push((pos.market.get(), pos.net_qty.raw()));
-                }
+            let count = perps.iter().filter(|p| p.net_qty.raw() != 0).count();
+            w.field_u32(u32::try_from(count).unwrap_or(u32::MAX));
+            let mut last_market = None;
+            for _ in 0..count {
+                let next = perps
+                    .iter()
+                    .filter(|p| {
+                        p.net_qty.raw() != 0 && last_market.is_none_or(|last| p.market.get() > last)
+                    })
+                    .min_by_key(|p| p.market.get())
+                    .expect("counted non-flat position has a next market");
+                w.field_u32(next.market.get()).field_i64(next.net_qty.raw());
+                last_market = Some(next.market.get());
             }
-        }
-        positions.sort_unstable_by_key(|&(m, _)| m);
-        w.field_u32(u32::try_from(positions.len()).unwrap_or(u32::MAX));
-        for (m, qty) in &positions {
-            w.field_u32(*m).field_i64(*qty);
+        } else {
+            w.field_u32(0);
         }
         // Outcome claims, ascending by market; fully-redeemed sets omitted.
-        // Claims are keyed by account first, so only this account's entries are
-        // walked (no global scan, #404); the inner `BTreeMap` iterates markets
-        // in ascending key order — byte-identical to the explicit
-        // sort-by-market this serialization previously performed.
-        let claims: Vec<(u32, &[Amount])> = self
-            .claims
-            .get(&account.get())
-            .map(|markets| {
-                markets
-                    .iter()
-                    .filter(|(_, amounts)| amounts.iter().any(|v| v.raw() != 0))
-                    .map(|(&m, amounts)| (m, amounts.as_slice()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        w.field_u32(u32::try_from(claims.len()).unwrap_or(u32::MAX));
-        for (m, amounts) in &claims {
-            w.field_u32(*m)
-                .field_u32(u32::try_from(amounts.len()).unwrap_or(u32::MAX));
-            for v in *amounts {
-                w.field_i128(v.raw());
+        // Claims are keyed by account first and the inner BTreeMap already
+        // supplies canonical market order.
+        if let Some(markets) = self.claims.get(&account.get()) {
+            let count = markets
+                .values()
+                .filter(|amounts| amounts.iter().any(|v| v.raw() != 0))
+                .count();
+            w.field_u32(u32::try_from(count).unwrap_or(u32::MAX));
+            for (&market, amounts) in markets {
+                if amounts.iter().all(|v| v.raw() == 0) {
+                    continue;
+                }
+                w.field_u32(market)
+                    .field_u32(u32::try_from(amounts.len()).unwrap_or(u32::MAX));
+                for value in amounts {
+                    w.field_i128(value.raw());
+                }
             }
+        } else {
+            w.field_u32(0);
         }
         // Reserved-premium column (resting claim-market bids), ascending by
         // market with zero entries omitted; then the reserved-claims column
@@ -692,40 +981,45 @@ impl Engine {
         // iteration), so identical command streams commit bit-identical leaves
         // on every architecture.
         let a = account.get();
-        let premium: Vec<(u32, i128)> = self
+        let premium_count = self
             .bid_premium_escrow
             .range((a, u32::MIN)..=(a, u32::MAX))
             .filter(|(_, v)| v.raw() != 0)
-            .map(|(&(_, m), v)| (m, v.raw()))
-            .collect();
-        w.field_u32(u32::try_from(premium.len()).unwrap_or(u32::MAX));
-        for (m, v) in &premium {
-            w.field_u32(*m).field_i128(*v);
+            .count();
+        w.field_u32(u32::try_from(premium_count).unwrap_or(u32::MAX));
+        for (&(_, market), value) in self
+            .bid_premium_escrow
+            .range((a, u32::MIN)..=(a, u32::MAX))
+            .filter(|(_, v)| v.raw() != 0)
+        {
+            w.field_u32(market).field_i128(value.raw());
         }
-        let reserved_claims: Vec<(u32, u16, i128)> = self
+        let reserved_count = self
             .ask_claims_escrow
             .range((a, u32::MIN, u16::MIN)..=(a, u32::MAX, u16::MAX))
             .filter(|(_, v)| v.raw() != 0)
-            .map(|(&(_, m, i), v)| (m, i, v.raw()))
-            .collect();
-        w.field_u32(u32::try_from(reserved_claims.len()).unwrap_or(u32::MAX));
-        for (m, inst, v) in &reserved_claims {
-            w.field_u32(*m).field_u32(u32::from(*inst)).field_i128(*v);
+            .count();
+        w.field_u32(u32::try_from(reserved_count).unwrap_or(u32::MAX));
+        for (&(_, market, instrument), value) in self
+            .ask_claims_escrow
+            .range((a, u32::MIN, u16::MIN)..=(a, u32::MAX, u16::MAX))
+            .filter(|(_, v)| v.raw() != 0)
+        {
+            w.field_u32(market)
+                .field_u32(u32::from(instrument))
+                .field_i128(value.raw());
         }
         // Idempotency watermarks: the highest order `client_id` and withdrawal
         // `nonce` this account has committed. Folding them into the leaf commits
         // the exactly-once replay boundary into the state root, so a snapshot /
         // WAL recovery reconstructs it and cannot silently regress it. Each is a
         // presence flag (0 = none processed) followed by the watermark value.
+        Self::write_watermark(w, self.replay.watermark(account.get(), KeyDomain::Order));
         Self::write_watermark(
-            &mut w,
-            self.replay.watermark(account.get(), KeyDomain::Order),
-        );
-        Self::write_watermark(
-            &mut w,
+            w,
             self.replay.watermark(account.get(), KeyDomain::Withdrawal),
         );
-        Ok(w.finish())
+        Ok(())
     }
 
     /// Append a `(present, value)` idempotency watermark to a committed leaf.
@@ -749,22 +1043,34 @@ impl Engine {
     }
 
     fn commit_account(&mut self, account: AccountId) -> Result<(), ExecutionError> {
-        let leaf = self.account_leaf(account)?;
-        self.tree.set_account(account, &leaf)?;
-        Ok(())
+        let mut writer = LeafWriter::from_buffer(std::mem::take(&mut self.leaf_scratch));
+        let result = self
+            .write_account_leaf(account, &mut writer)
+            .and_then(|()| Ok(self.tree.set_account(account, writer.as_bytes())?));
+        self.leaf_scratch = writer.into_buffer();
+        result
     }
 
-    /// Canonical committed leaf bytes for `market`: type tag, outcome count, mark
-    /// price, and the market's order-book root. Shared by [`Self::commit_market`]
-    /// and the invariant checks so both hash exactly the same pre-image.
-    fn market_leaf(&self, market: MarketId) -> Result<Vec<u8>, ExecutionError> {
+    /// The full canonical committed leaf for `market`, suitable for verifying
+    /// an inclusion proof against [`DeterministicEngine::state_root`].
+    pub fn market_leaf(&self, market: MarketId) -> Result<Vec<u8>, ExecutionError> {
+        let mut w = LeafWriter::new();
+        self.write_market_leaf(market, &mut w)?;
+        Ok(w.finish())
+    }
+
+    /// Stream canonical market fields into reusable commit scratch.
+    fn write_market_leaf(
+        &self,
+        market: MarketId,
+        w: &mut LeafWriter,
+    ) -> Result<(), ExecutionError> {
         let meta = self
             .markets
             .get(&market.get())
             .ok_or(ExecutionError::UnknownMarket)?;
         // Compose instrument book roots in ascending instrument order.
         let n = instrument_count(meta.market_type, meta.outcomes);
-        let mut w = LeafWriter::new();
         let type_tag: u32 = match meta.market_type {
             MarketType::Perpetual => 0,
             MarketType::BinaryPrediction => 1,
@@ -792,13 +1098,16 @@ impl Engine {
         } else {
             w.field_u32(0).field_u32(0);
         }
-        Ok(w.finish())
+        Ok(())
     }
 
     fn commit_market(&mut self, market: MarketId) -> Result<(), ExecutionError> {
-        let leaf = self.market_leaf(market)?;
-        self.tree.set_market(market, &leaf)?;
-        Ok(())
+        let mut writer = LeafWriter::from_buffer(std::mem::take(&mut self.leaf_scratch));
+        let result = self
+            .write_market_leaf(market, &mut writer)
+            .and_then(|()| Ok(self.tree.set_market(market, writer.as_bytes())?));
+        self.leaf_scratch = writer.into_buffer();
+        result
     }
 
     fn signed(side: Side, qty: Quantity) -> Result<Quantity, ExecutionError> {
@@ -1031,7 +1340,7 @@ impl Engine {
             // collar price * requested qty) so a sparse book cannot under-margin
             // a market order that later rests nothing (markets are IOC) but still
             // cannot be gamed by a 1-micro placeholder.
-            let plan = book.plan_match(order)?;
+            let plan = book.plan_match_summary(order)?;
             let collar_cap = order.price.notional_ceil(order.quantity)?;
             let from_depth = if plan.filled_quantity.raw() > 0 {
                 plan.notional_ceil
@@ -1261,10 +1570,14 @@ impl Engine {
                     },
                 );
                 let n = instrument_count(c.market_type, outcomes);
+                let book_config = BookConfig {
+                    matching_backend: self.matching_backend,
+                    ..BookConfig::default()
+                };
                 for inst in 0..n {
                     self.books.insert(
                         (c.market.get(), inst),
-                        OrderBook::new(BookConfig::default()),
+                        CowState::new(OrderBook::new(book_config)),
                     );
                 }
                 self.risk.set_mark_price(c.market, c.mark_price)?;
@@ -1366,12 +1679,16 @@ impl Engine {
                     )?;
                 }
                 // Reduce-only clamps against the risk engine position (perps).
-                let pos = self.position(c.account, c.market);
+                let reduce_position = (c.reduce_only
+                    || matches!(c.order_type, OrderType::ReduceOnly))
+                .then(|| self.position(c.account, c.market));
                 let book = self
                     .books
                     .get_mut(&(c.market.get(), c.instrument))
                     .ok_or(ExecutionError::UnknownMarket)?;
-                book.set_position(c.account, pos);
+                if let Some(pos) = reduce_position {
+                    book.set_position(c.account, pos);
+                }
                 // Idempotency is decided once, durably, at the command layer (see
                 // `execute`), so the book submits through its non-deduplicating
                 // path: a book-local dedup here could replay stale fills that this
@@ -1983,6 +2300,10 @@ impl Engine {
                     self.commit_account(*a)?;
                 }
                 // Cancel any remaining orders on every instrument book.
+                let book_config = BookConfig {
+                    matching_backend: self.matching_backend,
+                    ..BookConfig::default()
+                };
                 for inst in 0..n {
                     if let Some(book) = self.books.get_mut(&(c.market.get(), inst)) {
                         // cancel_all for every account that still has resting orders
@@ -1995,7 +2316,7 @@ impl Engine {
                         let _ = snapshot;
                         // Full drain: create a throwaway list of owners by probing
                         // order ids is hard; instead re-create empty books.
-                        *book = OrderBook::new(BookConfig::default());
+                        *book = CowState::new(OrderBook::new(book_config));
                     }
                 }
                 self.commit_market(c.market)?;
@@ -2137,16 +2458,38 @@ impl DeterministicEngine for Engine {
             }
         }
 
-        // Transaction boundary. Apply the command to a working copy of the whole
-        // engine. If any fallible step — fixed-point arithmetic, capacity, the
-        // ledger, the risk engine, an order book, or a state-tree write — returns
-        // `Err`, the working copy is dropped and `self` (with its committed state
-        // root) is left byte-identical, so no command is ever partially applied.
-        // On success the working copy is swapped in, committing the ledger, risk
-        // engine, books, in-memory maps, and state tree together, exactly once.
+        if let (Command::PlaceOrder(place), Some(binding)) = (&command, binding.as_ref()) {
+            if let Some(result) = self.try_execute_resting_in_place(seq, place, binding) {
+                return result;
+            }
+        }
+
+        // A preflight-proven plain GTC order that cannot cross has exactly one
+        // possible book delta: insertion of its resting order. Move that book
+        // into the working transaction before cloning the engine, rather than
+        // sharing it and forcing Arc::make_mut to clone every resting order.
+        // If a later subsystem rejects the command, cancelling that exact id
+        // restores the moved book before it is returned to `self`.
+        let handed_off = self
+            .resting_book_handoff(&command)
+            .and_then(|(key, order_id)| self.books.remove(&key).map(|book| (key, order_id, book)));
+
+        // Transaction boundary. The working copy initially shares immutable COW
+        // pages and materializes only the subsystems the command touches. If any
+        // fallible step returns `Err`, those private pages are dropped and `self`
+        // remains byte-identical. Non-consensus leaf scratch moves into the
+        // transaction and is explicitly returned on rollback, avoiding a clone
+        // or fresh buffer allocation.
         // `last_seq` advances only on that commit, so a failed command neither
         // consumes its sequence nor mutates any subsystem.
         let mut txn = self.clone();
+        let handoff_key = handed_off
+            .as_ref()
+            .map(|(key, order_id, _)| (*key, *order_id));
+        if let Some((key, _, book)) = handed_off {
+            txn.books.insert(key, book);
+        }
+        txn.leaf_scratch = std::mem::take(&mut self.leaf_scratch);
         txn.last_seq = Some(seq);
 
         if let Some(binding) = binding.as_ref() {
@@ -2155,7 +2498,24 @@ impl DeterministicEngine for Engine {
             txn.replay.reserve(binding);
         }
 
-        let receipt = txn.apply(seq, command)?;
+        let receipt = match txn.apply(seq, command) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                if let Some((key, order_id)) = handoff_key {
+                    let mut book = txn
+                        .books
+                        .remove(&key)
+                        .expect("handed-off book remains present until rollback");
+                    if book.contains(order_id) {
+                        book.cancel(order_id)
+                            .expect("preflight-proven resting insertion is cancellable");
+                    }
+                    self.books.insert(key, book);
+                }
+                self.leaf_scratch = std::mem::take(&mut txn.leaf_scratch);
+                return Err(error);
+            }
+        };
 
         if let Some(binding) = binding.as_ref() {
             // Cache the receipt for exact-retry replay. This is a local,
@@ -2196,6 +2556,7 @@ mod tests {
             market_capacity,
             replay_window: base.replay_window,
             risk: base.risk,
+            matching_backend: base.matching_backend,
         })
     }
 
@@ -2328,13 +2689,13 @@ mod tests {
         }
         // Claim-market escrow state: committed columns + per-order records.
         w.field_i128(i128::try_from(e.bid_premium_escrow.len()).unwrap());
-        for (&(a, m), v) in &e.bid_premium_escrow {
+        for (&(a, m), v) in e.bid_premium_escrow.iter() {
             w.field_u32(a);
             w.field_u32(m);
             w.field_i128(v.raw());
         }
         w.field_i128(i128::try_from(e.ask_claims_escrow.len()).unwrap());
-        for (&(a, m, inst), v) in &e.ask_claims_escrow {
+        for (&(a, m, inst), v) in e.ask_claims_escrow.iter() {
             w.field_u32(a);
             w.field_u32(m);
             w.field_u32(u32::from(inst));
@@ -2501,7 +2862,7 @@ mod tests {
         // per-order escrow records — so escrow can neither leak nor double-count
         // without failing here.
         let mut premium_by_account: HashMap<u32, i128> = HashMap::new();
-        for (&(a, _m), v) in &e.bid_premium_escrow {
+        for (&(a, _m), v) in e.bid_premium_escrow.iter() {
             *premium_by_account.entry(a).or_default() += v.raw();
         }
         for i in 0..n {
@@ -2514,7 +2875,7 @@ mod tests {
         }
         let mut premium_by_column: HashMap<(u32, u32), i128> = HashMap::new();
         let mut claims_by_column: HashMap<(u32, u32, u16), i128> = HashMap::new();
-        for (&(m, inst, _oid), rec) in &e.claim_escrows {
+        for (&(m, inst, _oid), rec) in e.claim_escrows.iter() {
             match rec.side {
                 Side::Bid => {
                     *premium_by_column.entry((rec.account.get(), m)).or_default() +=
@@ -3125,6 +3486,79 @@ mod tests {
         check_invariants(&e);
     }
 
+    #[test]
+    fn scalar_and_simd_pretrade_paths_emit_identical_receipts_errors_and_roots() {
+        fn market_bid(order_id: u64, quantity: i64) -> Command {
+            Command::PlaceOrder(PlaceOrder {
+                account: AccountId::new(1),
+                market: MarketId::new(0),
+                order_id: OrderId::new(order_id),
+                side: Side::Bid,
+                order_type: OrderType::Market,
+                tif: TimeInForce::Ioc,
+                price: Price::from_raw(1_100_000),
+                quantity: Quantity::from_raw(quantity),
+                client_id: order_id,
+                reduce_only: false,
+                instrument: 0,
+                auth: Authorization::Master,
+            })
+        }
+
+        let mut commands = vec![
+            create_account(1_000_000_000_000_000),
+            create_account(1_000_000_000_000_000),
+            create_perp(0, 1_000_000),
+        ];
+        // Nine makers cross both the 8-lane batch boundary and its tail. Raw
+        // prices/quantities force non-zero fixed-point remainders.
+        for lane in 0..9u64 {
+            commands.push(place(
+                0,
+                0,
+                lane + 1,
+                Side::Ask,
+                1_000_001 + i64::try_from(lane).unwrap(),
+                500_001 + i64::try_from(lane).unwrap(),
+            ));
+        }
+        commands.push(market_bid(10_000, 4_000_007));
+        // A no-depth tail command exercises the same error/receipt boundary
+        // after the preceding market order consumed most executable makers.
+        commands.push(market_bid(10_001, 10_000_000));
+        commands.push(market_bid(10_002, 0));
+
+        let run = |backend| {
+            let config = EngineConfig {
+                matching_backend: backend,
+                ..EngineConfig::default()
+            };
+            let mut engine = Engine::new(config);
+            let mut results = Vec::with_capacity(commands.len());
+            for (index, command) in commands.iter().cloned().enumerate() {
+                results.push(engine.execute(
+                    SequenceNumber::new(u64::try_from(index + 1).unwrap()),
+                    command,
+                ));
+            }
+            (
+                results,
+                engine.state_root(),
+                engine.risk.state_root(),
+                engine.market_resting_len(MarketId::new(0)),
+            )
+        };
+
+        let scalar = run(orderbook::MatchingBackend::Scalar);
+        for backend in [
+            orderbook::MatchingBackend::Avx2,
+            orderbook::MatchingBackend::Avx512,
+            orderbook::MatchingBackend::Neon,
+        ] {
+            assert_eq!(run(backend), scalar, "backend={backend:?}");
+        }
+    }
+
     // AC1: retrying a partially-filled resting order does not double the fills
     // nor re-rest the residual.
     #[test]
@@ -3320,6 +3754,7 @@ mod tests {
             market_capacity: 4,
             replay_window: 1,
             risk: EngineConfig::default().risk,
+            matching_backend: orderbook::MatchingBackend::Scalar,
         });
         e.execute(seq(1), create_account(1_000_000_000)).unwrap();
         e.execute(seq(2), create_account(1_000_000_000)).unwrap();

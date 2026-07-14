@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "run_id": 0,
+  "exact_command": "replace with the exact controller and three agent commands",
+  "target_reachable": false,
+  "provenance": {
+    "git_sha": "replace",
+    "git_dirty": true,
+    "cargo_lock_sha256": "replace-with-lowercase-sha256",
+    "rustc": "replace",
+    "llvm": "replace",
+    "profile": "release",
+    "features": "replace",
+    "rustflags": "replace",
+    "cpu": "replace",
+    "microcode": "replace",
+    "numa": "replace",
+    "kernel": "replace",
+    "governor": "performance",
+    "affinity": "replace",
+    "nic": "replace",
+    "nic_driver": "replace",
+    "nic_firmware": "replace",
+    "nic_offloads": "replace",
+    "mtu": 9000,
+    "topology": "dexos-lon-nyc-tyo-100g-v1"
+  },
+  "route": {
+    "signed_rpc": "replace-with-raw-evidence-reference",
+    "decode_admission": "replace-with-raw-evidence-reference",
+    "canonical_sequence": "replace-with-raw-evidence-reference",
+    "durable_journal": "replace-with-raw-evidence-reference",
+    "execution_orderbook_risk": "replace-with-raw-evidence-reference",
+    "state_root": "replace-with-raw-evidence-reference",
+    "receipt": "replace-with-raw-evidence-reference",
+    "minimmit_checkpoint": "replace-with-raw-evidence-reference"
+  },
+  "backlog": {
+    "pre_run": 0,
+    "end_of_steady": 0,
+    "after_two_checkpoint_intervals": 0,
+    "steady_slope_per_second": 0
+  },
+  "per_node": [
+    { "name": "lon-validator-0", "offered": 0, "accepted": 0, "executed": 0, "finalized": 0 },
+    { "name": "lon-validator-1", "offered": 0, "accepted": 0, "executed": 0, "finalized": 0 },
+    { "name": "nyc-validator-0", "offered": 0, "accepted": 0, "executed": 0, "finalized": 0 },
+    { "name": "nyc-validator-1", "offered": 0, "accepted": 0, "executed": 0, "finalized": 0 },
+    { "name": "tyo-validator-0", "offered": 0, "accepted": 0, "executed": 0, "finalized": 0 },
+    { "name": "tyo-validator-1", "offered": 0, "accepted": 0, "executed": 0, "finalized": 0 }
+  ],
+  "per_shard": [],
+  "retries_excluded": 0,
+  "duplicates_excluded": 0,
+  "sequence_gaps": 0,
+  "nic_drops": 0,
+  "unexplained_loss": 0
+}

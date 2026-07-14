@@ -14,5 +14,6 @@ types = { path = "../types" }
 crypto = { path = "../crypto" }
 codec = { path = "../codec" }
 state-tree = { path = "../state-tree" }
+simd = { path = "../simd" }
 serde.workspace = true
 thiserror.workspace = true

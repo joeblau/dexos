@@ -25,6 +25,7 @@ fn cfg() -> BookConfig {
         stp: StpPolicy::CancelMaker,
         dedup_capacity: 256,
         max_basket_legs: 16,
+        matching_backend: simd::Backend::Scalar,
     }
 }
 
@@ -553,8 +554,7 @@ fn duplicate_order_id_and_bad_input_are_typed_errors() {
 fn property_quantity_conservation_across_random_fills() {
     let mut r = Lcg(0xC0FFEE);
     let mut b = OrderBook::new(BookConfig { capacity: 32_768, dedup_capacity: 4096, ..cfg() });
-    let mut next_id = 1u64;
-    for _ in 0..20_000 {
+    for next_id in 1u64..=20_000 {
         let side = if r.below(2) == 0 { Side::Bid } else { Side::Ask };
         // Unique account per order so self-trade prevention never fires here;
         // that would cancel a resting maker and is covered by other tests.
@@ -573,8 +573,6 @@ fn property_quantity_conservation_across_random_fills() {
             _ => TimeInForce::Fok,
         };
         let ord = order(next_id, acct, side, ot, tif, price, qty, next_id);
-        next_id += 1;
-
         let before = b.total_resting_quantity().raw();
         let res = match b.submit(ord) {
             Ok(r) => r,
@@ -849,4 +847,245 @@ fn plan_match_follows_executable_depth_not_placeholder() {
     assert_eq!(cheap.notional.raw(), 0);
     // Book untouched by planning.
     assert_eq!(b.resting_len(), 3);
+}
+
+#[test]
+fn match_summary_is_exactly_equivalent_to_materialized_plan() {
+    for taker_side in [Side::Bid, Side::Ask] {
+        let maker_side = taker_side.opposite();
+        let mut b = OrderBook::new(cfg());
+        for (offset, (price, quantity)) in [(100, 7), (105, 11), (110, 13)].into_iter().enumerate()
+        {
+            b.submit(limit(
+                u64::try_from(offset + 1).unwrap(),
+                u32::try_from(offset + 1).unwrap(),
+                maker_side,
+                price,
+                quantity,
+            ))
+            .unwrap();
+        }
+        let collar = match taker_side {
+            Side::Bid => 110,
+            Side::Ask => 100,
+        };
+        let taker = order(
+            99,
+            99,
+            taker_side,
+            OrderType::Market,
+            TimeInForce::Ioc,
+            collar,
+            25,
+            99,
+        );
+        let plan = b.plan_match(&taker).unwrap();
+        let summary = b.plan_match_summary(&taker).unwrap();
+        assert_eq!(summary.filled_quantity, plan.filled_quantity);
+        assert_eq!(summary.worst_price, plan.worst_price);
+        assert_eq!(summary.notional, plan.notional);
+        assert_eq!(summary.notional_ceil, plan.notional_ceil);
+        assert_eq!(b.resting_len(), 3);
+    }
+}
+
+#[test]
+fn scalar_and_simd_match_summaries_cover_stp_rounding_and_tail_lanes() {
+    let backends = [
+        simd::Backend::Scalar,
+        simd::Backend::Avx2,
+        simd::Backend::Avx512,
+        simd::Backend::Neon,
+    ];
+    for policy in [
+        StpPolicy::CancelMaker,
+        StpPolicy::CancelTaker,
+        StpPolicy::CancelBoth,
+    ] {
+        for taker_side in [Side::Bid, Side::Ask] {
+            for maker_count in [0usize, 1, 3, 4, 7, 8, 9, 15, 16, 17] {
+                let mut config = cfg();
+                config.stp = policy;
+                let mut book = OrderBook::new(config);
+                for lane in 0..maker_count {
+                    let lane_i64 = i64::try_from(lane).unwrap();
+                    // Self-owned makers straddle vector blocks and exercise all
+                    // three STP stop/skip behaviors without changing traversal.
+                    let account = if lane == 2 || lane == 10 {
+                        99
+                    } else {
+                        u32::try_from(lane + 1).unwrap()
+                    };
+                    book.submit(limit(
+                        u64::try_from(lane + 1).unwrap(),
+                        account,
+                        taker_side.opposite(),
+                        1_000_001 + lane_i64,
+                        500_001 + lane_i64,
+                    ))
+                    .unwrap();
+                }
+                let collar = match taker_side {
+                    Side::Bid => 1_000_001 + i64::try_from(maker_count).unwrap(),
+                    Side::Ask => 1_000_001,
+                };
+                let taker = order(
+                    50_000,
+                    99,
+                    taker_side,
+                    OrderType::Market,
+                    TimeInForce::Ioc,
+                    collar,
+                    i64::try_from(maker_count).unwrap() * 600_000 + 1,
+                    50_000,
+                );
+                let scalar = book
+                    .plan_match_summary_with_backend(&taker, simd::Backend::Scalar)
+                    .unwrap();
+                let plan = book.plan_match(&taker).unwrap();
+                assert_eq!(scalar.filled_quantity, plan.filled_quantity);
+                assert_eq!(scalar.worst_price, plan.worst_price);
+                assert_eq!(scalar.notional, plan.notional);
+                assert_eq!(scalar.notional_ceil, plan.notional_ceil);
+                for backend in backends {
+                    assert_eq!(
+                        book.plan_match_summary_with_backend(&taker, backend),
+                        Ok(scalar),
+                        "policy={policy:?} side={taker_side:?} makers={maker_count} backend={backend:?}",
+                    );
+                }
+                assert_eq!(book.resting_len(), maker_count);
+            }
+        }
+    }
+}
+
+#[test]
+fn scalar_and_simd_match_summaries_are_identical_over_randomized_books() {
+    let mut random = Lcg(0x5725_7257_2572_5725);
+    for case in 0..512u64 {
+        let policy = match case % 3 {
+            0 => StpPolicy::CancelMaker,
+            1 => StpPolicy::CancelTaker,
+            _ => StpPolicy::CancelBoth,
+        };
+        let taker_side = if case.is_multiple_of(2) {
+            Side::Bid
+        } else {
+            Side::Ask
+        };
+        let mut config = cfg();
+        config.stp = policy;
+        let mut book = OrderBook::new(config);
+        let maker_count = usize::try_from(random.below(33)).unwrap();
+        for lane in 0..maker_count {
+            let account = if random.below(7) == 0 {
+                77
+            } else {
+                u32::try_from(lane + 1).unwrap()
+            };
+            let price = 900_000 + i64::try_from(random.below(200_001)).unwrap();
+            let quantity = 1 + i64::try_from(random.below(4_000_000_000)).unwrap();
+            book.submit(limit(
+                case * 100 + u64::try_from(lane).unwrap() + 1,
+                account,
+                taker_side.opposite(),
+                price,
+                quantity,
+            ))
+            .unwrap();
+        }
+        let taker = order(
+            9_000_000 + case,
+            77,
+            taker_side,
+            OrderType::Market,
+            TimeInForce::Ioc,
+            match taker_side {
+                Side::Bid => 1_100_000,
+                Side::Ask => 900_000,
+            },
+            1 + i64::try_from(random.below(8_000_000_000)).unwrap(),
+            9_000_000 + case,
+        );
+        let scalar = book.plan_match_summary_with_backend(&taker, simd::Backend::Scalar);
+        for backend in [
+            simd::Backend::Avx2,
+            simd::Backend::Avx512,
+            simd::Backend::Neon,
+        ] {
+            assert_eq!(
+                book.plan_match_summary_with_backend(&taker, backend),
+                scalar,
+                "case={case} backend={backend:?}",
+            );
+        }
+    }
+}
+
+#[test]
+fn scalar_and_simd_planning_preserve_fills_outcomes_errors_and_roots() {
+    let run = |backend: simd::Backend, policy: StpPolicy, taker_side: Side| {
+        let mut config = cfg();
+        config.stp = policy;
+        config.matching_backend = backend;
+        let mut book = OrderBook::new(config);
+        for lane in 0..17u64 {
+            book.submit(limit(
+                lane + 1,
+                if lane == 5 { 99 } else { u32::try_from(lane + 1).unwrap() },
+                taker_side.opposite(),
+                1_000_001 + i64::try_from(lane).unwrap(),
+                500_001 + i64::try_from(lane).unwrap(),
+            ))
+            .unwrap();
+        }
+        let taker = order(
+            90_000,
+            99,
+            taker_side,
+            OrderType::Market,
+            TimeInForce::Ioc,
+            match taker_side {
+                Side::Bid => 1_000_017,
+                Side::Ask => 1_000_001,
+            },
+            7_000_007,
+            90_000,
+        );
+        let summary = book.plan_match_summary(&taker);
+        let result = book.submit(taker);
+        let invalid = book.plan_match_summary(&order(
+            90_001,
+            100,
+            taker_side,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            0,
+            1,
+            90_001,
+        ));
+        (summary, result, invalid, book.state_root())
+    };
+
+    for policy in [
+        StpPolicy::CancelMaker,
+        StpPolicy::CancelTaker,
+        StpPolicy::CancelBoth,
+    ] {
+        for side in [Side::Bid, Side::Ask] {
+            let scalar = run(simd::Backend::Scalar, policy, side);
+            for backend in [
+                simd::Backend::Avx2,
+                simd::Backend::Avx512,
+                simd::Backend::Neon,
+            ] {
+                assert_eq!(
+                    run(backend, policy, side),
+                    scalar,
+                    "policy={policy:?} side={side:?} backend={backend:?}",
+                );
+            }
+        }
+    }
 }

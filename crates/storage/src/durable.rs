@@ -244,6 +244,8 @@ pub struct DurableLog {
     _lock: File,
     /// Whether this handle may mutate disk (append / seal / truncate).
     writable: bool,
+    /// Reused append frame; allocated once when the log opens.
+    framed: Vec<u8>,
 }
 
 /// Dedicated advisory-lock file inside the WAL directory.
@@ -278,6 +280,13 @@ fn acquire_dir_lock(dir: &Path, exclusive: bool) -> Result<File, DurableError> {
         }),
         Err(TryLockError::Error(e)) => Err(DurableError::Io(e)),
     }
+}
+
+fn index_capacity(cfg: &DurableConfig) -> usize {
+    cfg.segment_max_bytes
+        .div_ceil(FRAME_OVERHEAD)
+        .div_ceil(cfg.index_stride.max(1))
+        .saturating_add(1)
 }
 
 impl DurableLog {
@@ -344,6 +353,7 @@ impl DurableLog {
     /// gated on `writable` so the read-only path computes the valid prefix
     /// and metadata entirely in memory.
     fn open_locked(cfg: DurableConfig, lock: File, writable: bool) -> Result<Self, DurableError> {
+        let framed_capacity = cfg.max_record_bytes;
         let mut paths = list_segment_paths(&cfg.dir)?;
         paths.sort();
 
@@ -412,6 +422,7 @@ impl DurableLog {
             appends_since_sync: 0,
             _lock: lock,
             writable,
+            framed: Vec::with_capacity(framed_capacity),
         };
 
         if let Some(last) = log.segments.last() {
@@ -500,10 +511,10 @@ impl DurableLog {
             command_type,
             payload,
         };
-        let mut framed = Vec::with_capacity(framed_len);
-        record_ref.encode_into(&mut framed)?;
+        self.framed.clear();
+        record_ref.encode_into(&mut self.framed)?;
 
-        self.ensure_active_segment(sequence, framed.len())?;
+        self.ensure_active_segment(sequence, self.framed.len())?;
 
         let seg = self
             .segments
@@ -524,14 +535,14 @@ impl DurableLog {
         }
 
         let offset = seg.records_len;
-        file.write_all(&framed)?;
-        seg.records_len = offset + u64::try_from(framed.len()).unwrap_or(u64::MAX);
+        file.write_all(&self.framed)?;
+        seg.records_len = offset + u64::try_from(self.framed.len()).unwrap_or(u64::MAX);
         seg.record_count += 1;
         seg.last_sequence = Some(sequence);
         if seg.record_count == 1 {
             seg.base_sequence = sequence;
         }
-        self.active_chain = chain_mix(self.active_chain, &framed);
+        self.active_chain = chain_mix(self.active_chain, &self.framed);
         seg.chain_tip = self.active_chain;
 
         let stride = self.cfg.index_stride.max(1);
@@ -862,7 +873,7 @@ impl DurableLog {
             records_len: 0,
             sealed: false,
             chain_tip: chain_genesis(),
-            index_points: Vec::new(),
+            index_points: Vec::with_capacity(index_capacity(&self.cfg)),
         });
         self.active = Some(f);
         self.active_chain = chain_genesis();
@@ -1221,8 +1232,14 @@ fn scan_records(
     let mut count = 0usize;
     let mut last = None;
     let mut base = 0u64;
-    let mut points = Vec::new();
     let stride = index_stride.max(1);
+    let mut points = Vec::with_capacity(
+        records
+            .len()
+            .div_ceil(FRAME_OVERHEAD)
+            .div_ceil(stride)
+            .saturating_add(1),
+    );
     while off < records.len() {
         let (rref, consumed) = decode_ref_bounded(&records[off..], max_record_bytes)?;
         if count == 0 {
@@ -1251,9 +1268,14 @@ fn scan_valid_prefix(
     let mut count = 0usize;
     let mut last = None;
     let mut base = 0u64;
-    let mut points = Vec::new();
     let mut tip = chain_genesis();
     let stride = index_stride.max(1);
+    let mut points = Vec::with_capacity(
+        data.len()
+            .div_ceil(FRAME_OVERHEAD)
+            .div_ceil(stride)
+            .saturating_add(1),
+    );
 
     while off < data.len() {
         // Stop before a trailer that might look like garbage length.

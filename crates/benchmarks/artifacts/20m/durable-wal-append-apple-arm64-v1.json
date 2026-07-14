@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "artifact_type": "component-microbenchmark",
+  "qualification_status": "COMPONENT_ONLY_SYNC_DISABLED",
+  "generated_date": "2026-07-12",
+  "exact_command": "target/release/marketd benchmark --suite durable-wal-append --output /tmp/dexos-durable-wal-bench.json",
+  "provenance": {
+    "git_sha": "61cc7e6f392198e9e122807c5a87f53e7eff191f",
+    "git_dirty": true,
+    "cargo_lock_sha256": "35ec222cf1791bdf5c7c611adf6483e95950d2347d66177cf72849f5a7832728",
+    "rustc": "1.96.1 (31fca3adb 2026-06-26)",
+    "llvm": "22.1.8",
+    "profile": "release",
+    "features": "dev-tools",
+    "host_os": "macOS 27.0 build 26A5378j",
+    "kernel": "Darwin 27.0.0 RELEASE_ARM64_T6031",
+    "host_arch": "aarch64",
+    "cpu": "Apple M3 Max",
+    "allocation_counting": true,
+    "hardware_counters": "unavailable"
+  },
+  "boundary": {
+    "call_path": "storage::DurableLog::append using borrowed payload, reusable framed buffer, allocation-free chain hash, active file write, and sparse-index update",
+    "fixture": "one active segment; 64-byte payload; SyncPolicy::Never",
+    "excluded": [
+      "fdatasync",
+      "segment rotation",
+      "command encode",
+      "engine execution",
+      "checkpoint finality"
+    ]
+  },
+  "raw_stat": {
+    "name": "durable-wal-append",
+    "iterations": 2000,
+    "total_ns": 11927747,
+    "min_ns": 4125,
+    "p50_ns": 5500,
+    "p90_ns": 6750,
+    "p95_ns": 7375,
+    "p99_ns": 15750,
+    "p999_ns": 31667,
+    "max_ns": 75709,
+    "operations_per_second": 167676,
+    "allocations": 0,
+    "bytes_allocated": 0
+  }
+}

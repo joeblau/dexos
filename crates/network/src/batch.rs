@@ -76,7 +76,7 @@ pub trait BatchSink {
     /// Transmit the datagrams. Returns how many were accepted by the OS/NIC
     /// (a prefix of `frames`). The unaccepted suffix must be retained by the
     /// caller for retry.
-    fn flush_batch(&mut self, frames: &[Vec<u8>]) -> usize;
+    fn flush_batch(&mut self, frames: &[BatchFrame]) -> usize;
 }
 
 /// Optional kernel-bypass transmit path (AF_XDP / DPDK). Not enabled by default;
@@ -88,11 +88,25 @@ pub trait KernelBypassTx {
 
 /// One queued datagram with class and deadline metadata.
 #[derive(Debug, Clone)]
-struct Pending {
+pub struct BatchFrame {
     bytes: Vec<u8>,
     class: TrafficClass,
     enqueued_at: Instant,
     deadline: Duration,
+}
+
+impl BatchFrame {
+    /// Encoded bytes borrowed directly from the retained queue slot.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Priority class shared by every compatible frame in this flush.
+    #[must_use]
+    pub const fn class(&self) -> TrafficClass {
+        self.class
+    }
 }
 
 /// Accumulates encoded datagrams and flushes them in bounded, MTU-aware batches.
@@ -105,7 +119,7 @@ pub struct BatchSender {
     max_batch: usize,
     max_bytes: usize,
     default_deadline: Duration,
-    pending: Vec<Pending>,
+    pending: Vec<BatchFrame>,
     pending_bytes: usize,
     flushed: u64,
     batches: u64,
@@ -170,7 +184,7 @@ impl BatchSender {
             return true;
         }
         self.pending_bytes = self.pending_bytes.saturating_add(len);
-        self.pending.push(Pending {
+        self.pending.push(BatchFrame {
             bytes: datagram,
             class,
             enqueued_at: Instant::now(),
@@ -232,9 +246,9 @@ impl BatchSender {
         if self.pending.is_empty() {
             return 0;
         }
-        // Materialize a view of the byte buffers for the sink.
-        let frames: Vec<Vec<u8>> = self.pending.iter().map(|p| p.bytes.clone()).collect();
-        let sent = sink.flush_batch(&frames).min(frames.len());
+        // The sink borrows the retained queue slots directly: no clone, copy, or
+        // temporary vector allocation occurs in the flush path.
+        let sent = sink.flush_batch(&self.pending).min(self.pending.len());
         self.flushed += sent as u64;
         self.batches += 1;
         // Drop the accepted prefix; retain the unaccepted suffix in order.
@@ -263,7 +277,7 @@ mod tests {
         max_seen: usize,
     }
     impl BatchSink for CountingSink {
-        fn flush_batch(&mut self, frames: &[Vec<u8>]) -> usize {
+        fn flush_batch(&mut self, frames: &[BatchFrame]) -> usize {
             self.calls += 1;
             self.total += frames.len();
             self.max_seen = self.max_seen.max(frames.len());
@@ -278,7 +292,7 @@ mod tests {
         calls: usize,
     }
     impl BatchSink for PrefixSink {
-        fn flush_batch(&mut self, frames: &[Vec<u8>]) -> usize {
+        fn flush_batch(&mut self, frames: &[BatchFrame]) -> usize {
             self.calls += 1;
             let n = frames.len().min(self.accept);
             self.total += n;

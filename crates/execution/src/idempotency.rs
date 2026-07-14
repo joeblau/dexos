@@ -140,6 +140,29 @@ impl ReplayGuard {
             .or_insert(b.key);
     }
 
+    /// Restore the watermark captured immediately before [`Self::reserve`].
+    /// Used only by the execution engine's bounded in-place undo journal.
+    pub(crate) fn restore_reservation(&mut self, b: &KeyBinding, previous: Option<u64>) {
+        let key = (b.principal, b.domain.tag());
+        match previous {
+            Some(value) => {
+                self.watermark.insert(key, value);
+            }
+            None => {
+                self.watermark.remove(&key);
+            }
+        }
+    }
+
+    /// Reserve the bounded replay window in one warmup allocation rather than
+    /// growing its map/deque geometrically during steady-state execution.
+    pub(crate) fn prepare_window(&mut self) {
+        self.records
+            .reserve(self.window.saturating_sub(self.records.len()));
+        self.order
+            .reserve(self.window.saturating_sub(self.order.len()));
+    }
+
     /// Record the receipt for a freshly applied key in the bounded window so an
     /// exact retry can replay it. The window is a local, replay-rebuilt cache and
     /// is *not* part of the committed root; only [`Self::reserve`] mutates
@@ -216,20 +239,44 @@ pub(crate) fn derive_withdrawal_id(account: u32, nonce: u64) -> u64 {
 /// volatile timestamp for session keys, and session replays are already blocked
 /// by single-use session nonces.
 fn place_order_digest(c: &PlaceOrder) -> Hash {
-    let mut w = LeafWriter::new();
-    w.field_u32(u32::from(KeyDomain::Order.tag()))
-        .field_u32(c.account.get())
-        .field_u32(c.market.get())
-        .field_i64(i64::from_le_bytes(c.order_id.get().to_le_bytes()))
-        .field_u32(side_tag(c.side))
-        .field_u32(order_type_tag(c.order_type))
-        .field_u32(tif_tag(c.tif))
-        .field_i64(c.price.raw())
-        .field_i64(c.quantity.raw())
-        .field_i64(i64::from_le_bytes(c.client_id.to_le_bytes()))
-        .field_u32(u32::from(c.reduce_only))
-        .field_u32(u32::from(c.instrument));
-    crypto::hash_domain(crypto::DOMAIN_COMMAND, &w.finish())
+    // Exact LeafWriter v1 bytes, assembled on the stack. PlaceOrder has a
+    // fixed-width schema, so a heap-backed generic writer on every hot command
+    // is unnecessary. The golden test below pins equality to LeafWriter.
+    let mut bytes = [0u8; 66];
+    let mut at = 0usize;
+    put(
+        &mut bytes,
+        &mut at,
+        &state_tree::LEAF_ENCODING_VERSION.to_le_bytes(),
+    );
+    put(
+        &mut bytes,
+        &mut at,
+        &u32::from(KeyDomain::Order.tag()).to_le_bytes(),
+    );
+    put(&mut bytes, &mut at, &c.account.get().to_le_bytes());
+    put(&mut bytes, &mut at, &c.market.get().to_le_bytes());
+    put(&mut bytes, &mut at, &c.order_id.get().to_le_bytes());
+    put(&mut bytes, &mut at, &side_tag(c.side).to_le_bytes());
+    put(
+        &mut bytes,
+        &mut at,
+        &order_type_tag(c.order_type).to_le_bytes(),
+    );
+    put(&mut bytes, &mut at, &tif_tag(c.tif).to_le_bytes());
+    put(&mut bytes, &mut at, &c.price.raw().to_le_bytes());
+    put(&mut bytes, &mut at, &c.quantity.raw().to_le_bytes());
+    put(&mut bytes, &mut at, &c.client_id.to_le_bytes());
+    put(&mut bytes, &mut at, &u32::from(c.reduce_only).to_le_bytes());
+    put(&mut bytes, &mut at, &u32::from(c.instrument).to_le_bytes());
+    debug_assert_eq!(at, bytes.len());
+    crypto::hash_domain(crypto::DOMAIN_COMMAND, &bytes)
+}
+
+fn put<const N: usize>(out: &mut [u8; N], at: &mut usize, value: &[u8]) {
+    let end = *at + value.len();
+    out[*at..end].copy_from_slice(value);
+    *at = end;
 }
 
 /// Canonical digest over a [`RequestWithdrawal`]'s payload. Withdrawals are
@@ -401,6 +448,25 @@ mod tests {
             auth: crate::command::Authorization::Master,
         };
         let d = place_order_digest(&base);
+        let mut reference = LeafWriter::new();
+        reference
+            .field_u32(u32::from(KeyDomain::Order.tag()))
+            .field_u32(base.account.get())
+            .field_u32(base.market.get())
+            .field_i64(i64::from_le_bytes(base.order_id.get().to_le_bytes()))
+            .field_u32(side_tag(base.side))
+            .field_u32(order_type_tag(base.order_type))
+            .field_u32(tif_tag(base.tif))
+            .field_i64(base.price.raw())
+            .field_i64(base.quantity.raw())
+            .field_i64(i64::from_le_bytes(base.client_id.to_le_bytes()))
+            .field_u32(u32::from(base.reduce_only))
+            .field_u32(u32::from(base.instrument));
+        assert_eq!(
+            d,
+            crypto::hash_domain(crypto::DOMAIN_COMMAND, reference.as_bytes()),
+            "stack encoding must remain byte-identical to canonical LeafWriter v1",
+        );
         let mut changed = base.clone();
         changed.quantity = Quantity::from_raw(2_000_001);
         assert_ne!(d, place_order_digest(&changed));

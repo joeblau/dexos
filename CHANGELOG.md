@@ -16,6 +16,10 @@ versions may contain breaking changes and every such change must be called out.
   and an execution L-certificate remains mandatory after ordering finality.
   This wire/threshold change requires a coordinated restart; see
   [the migration runbook](docs/runbooks/MINIMMIT_HARD_FORK.md).
+- **Breaking Rust source API:** `QuorumCertificate::signatures` now uses the
+  fixed-capacity `QuorumSignatures` container instead of `Vec<[u8; 64]>`.
+  Existing serde and v2 packed bytes remain compatible; direct struct literals
+  must collect signatures into the bounded container.
 
 ### Security
 

@@ -9,7 +9,7 @@
 //! these components as props.
 //!
 //! # Layout
-//! - [`format`] — integer-only fixed-point formatting (no float ever, mirroring
+//! - [`mod@format`] — integer-only fixed-point formatting (no float ever, mirroring
 //!   the engine's no-float discipline for anything derived from wire scalars).
 //! - [`components`] — the shared Dioxus components (e.g. [`components::MarketsTable`]).
 #![forbid(unsafe_code)]

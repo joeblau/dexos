@@ -448,7 +448,7 @@ mod tests {
                 message: payload.digest(),
                 signer_bitmap: u16::try_from(r.next() & u64::from(u16::MAX))
                     .expect("masked to 16 bits"),
-                signatures: vec![sig],
+                signatures: [sig].into_iter().collect(),
             };
             let c = DecisionConfirmation { payload, quorum };
             let _ = c.verify(&set);

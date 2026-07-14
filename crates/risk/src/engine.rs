@@ -532,11 +532,37 @@ impl RiskEngine {
         account: AccountId,
         notional: Amount,
     ) -> Result<(), RiskError> {
+        let (i, next) = self.checked_resting_reservation(account, notional)?;
+        self.reserved_resting[i] = next;
+        Ok(())
+    }
+
+    /// Validate a resting-order reservation without mutating account state.
+    ///
+    /// The execution engine uses this immediately before its bounded in-place
+    /// resting-order transaction. A successful check proves that the subsequent
+    /// [`Self::reserve_resting`] call cannot fail while the single writer retains
+    /// ownership of the engine.
+    pub fn check_reserve_resting(
+        &self,
+        account: AccountId,
+        notional: Amount,
+    ) -> Result<(), RiskError> {
+        self.checked_resting_reservation(account, notional)
+            .map(|_| ())
+    }
+
+    fn checked_resting_reservation(
+        &self,
+        account: AccountId,
+        notional: Amount,
+    ) -> Result<(usize, Amount), RiskError> {
         if notional.is_negative() {
             return Err(RiskError::NegativeAmount);
         }
         if notional.raw() == 0 {
-            return Ok(());
+            let i = self.active_index(account)?;
+            return Ok((i, self.reserved_resting[i]));
         }
         let i = self.active_index(account)?;
         let next = self.reserved_resting[i].checked_add(notional)?;
@@ -561,8 +587,7 @@ impl RiskEngine {
         if projected.raw() > max_notional.raw() {
             return Err(RiskError::LeverageExceeded);
         }
-        self.reserved_resting[i] = next;
-        Ok(())
+        Ok((i, next))
     }
 
     /// Release previously reserved resting notional (cancel / fill of residual).

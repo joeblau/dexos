@@ -48,7 +48,9 @@ undocumented_unsafe_blocks = "warn"
 
 [workspace.dependencies]
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 toml = "1.1"
+lz4_flex = "0.13.1"
 sha2 = "0.10"
 sha3 = "0.10"
 postcard = { version = "1", features = ["use-std"] }
@@ -67,6 +69,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "json"] }
 thiserror = "2.0"
 anyhow = "1.0"
+arrayvec = "0.7.8"
 # Dioxus 0.7 multiplatform UI. Only the `ui/*` frontend crates depend on this;
 # the deterministic engine never does. Each app selects its renderer via the
 # per-crate `dioxus` features (web/desktop/mobile/server + fullstack).
@@ -87,7 +90,6 @@ rustls = { version = "0.23", default-features = false, features = ["std", "ring"
 rustls-native-certs = "0.8"
 axum = "0.7"
 tower-http = { version = "0.6", features = ["cors", "limit"] }
-serde_json = "1"
 
 # Thin release profile suitable for latency benchmarking later phases will tune.
 # Exchange kernels abort on panic so a single task panic cannot unwind across

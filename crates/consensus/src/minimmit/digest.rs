@@ -33,10 +33,10 @@ pub const DOMAIN_NULLIFY: &[u8] = b"dexos:consensus:minimmit:nullify:v1";
 /// validator-set boundary.
 #[must_use]
 pub fn notarize_digest(epoch: u64, view: u64, block_hash: Hash) -> Hash {
-    let mut buf = Vec::with_capacity(8 * 2 + 32);
-    buf.extend_from_slice(&epoch.to_le_bytes());
-    buf.extend_from_slice(&view.to_le_bytes());
-    buf.extend_from_slice(block_hash.as_bytes());
+    let mut buf = [0u8; 8 * 2 + 32];
+    buf[0..8].copy_from_slice(&epoch.to_le_bytes());
+    buf[8..16].copy_from_slice(&view.to_le_bytes());
+    buf[16..48].copy_from_slice(block_hash.as_bytes());
     hash_domain(DOMAIN_NOTARIZE, &buf)
 }
 
@@ -47,9 +47,9 @@ pub fn notarize_digest(epoch: u64, view: u64, block_hash: Hash) -> Hash {
 /// abandon the view.
 #[must_use]
 pub fn nullify_digest(epoch: u64, view: u64) -> Hash {
-    let mut buf = Vec::with_capacity(8 * 2);
-    buf.extend_from_slice(&epoch.to_le_bytes());
-    buf.extend_from_slice(&view.to_le_bytes());
+    let mut buf = [0u8; 8 * 2];
+    buf[0..8].copy_from_slice(&epoch.to_le_bytes());
+    buf[8..16].copy_from_slice(&view.to_le_bytes());
     hash_domain(DOMAIN_NULLIFY, &buf)
 }
 
@@ -70,12 +70,12 @@ pub fn propose_auth(
     parent_hash: Hash,
     parent_view: u64,
 ) -> Hash {
-    let mut buf = Vec::with_capacity(8 * 3 + 32 * 2);
-    buf.extend_from_slice(&epoch.to_le_bytes());
-    buf.extend_from_slice(&view.to_le_bytes());
-    buf.extend_from_slice(block_hash.as_bytes());
-    buf.extend_from_slice(parent_hash.as_bytes());
-    buf.extend_from_slice(&parent_view.to_le_bytes());
+    let mut buf = [0u8; 8 * 3 + 32 * 2];
+    buf[0..8].copy_from_slice(&epoch.to_le_bytes());
+    buf[8..16].copy_from_slice(&view.to_le_bytes());
+    buf[16..48].copy_from_slice(block_hash.as_bytes());
+    buf[48..80].copy_from_slice(parent_hash.as_bytes());
+    buf[80..88].copy_from_slice(&parent_view.to_le_bytes());
     hash_domain(DOMAIN_PROPOSE, &buf)
 }
 

@@ -23,7 +23,7 @@ pub mod replica;
 pub mod wire;
 
 pub use block::{BlockHeader, DOMAIN_BLOCK};
-pub use committee::{Certificate, MinimmitCommittee, ThresholdKind};
+pub use committee::{Certificate, MinimmitCertificateError, MinimmitCommittee, ThresholdKind};
 pub use digest::{
     notarize_digest, nullify_digest, propose_auth, DOMAIN_NOTARIZE, DOMAIN_NULLIFY, DOMAIN_PROPOSE,
 };

@@ -1,0 +1,34 @@
+{
+  "name": "@dexos/sdk",
+  "version": "0.0.1",
+  "description": "TypeScript client for the DexOS authenticated packed-order protocol",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist/finality-correlation.js",
+    "dist/finality-correlation.d.ts",
+    "dist/index.js",
+    "dist/index.d.ts",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test dist/index.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  },
+  "license": "Apache-2.0"
+}

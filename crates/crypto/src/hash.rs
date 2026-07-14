@@ -30,6 +30,27 @@ pub fn hash_domain(domain: &[u8], data: &[u8]) -> Hash {
     finalize(h)
 }
 
+/// Length-prefixed domain hash over logically concatenated borrowed parts.
+/// Produces bytes identical to [`hash_domain`] over their concatenation without
+/// allocating a temporary buffer.
+pub fn hash_domain_parts(domain: &[u8], parts: &[&[u8]]) -> Hash {
+    let total_len = parts.iter().fold(0u64, |total, part| {
+        total.saturating_add(u64::try_from(part.len()).unwrap_or(u64::MAX))
+    });
+    let mut h = Sha256::new();
+    h.update(
+        u64::try_from(domain.len())
+            .unwrap_or(u64::MAX)
+            .to_le_bytes(),
+    );
+    h.update(domain);
+    h.update(total_len.to_le_bytes());
+    for part in parts {
+        h.update(part);
+    }
+    finalize(h)
+}
+
 /// Hash a Merkle leaf payload.
 pub fn hash_leaf(data: &[u8]) -> Hash {
     hash_domain(DOMAIN_LEAF, data)
@@ -94,5 +115,16 @@ mod tests {
         assert_ne!(hash_node(left, right), hash_node(right, left));
         // Distinct from a raw leaf over the same bytes.
         assert_ne!(hash_node(left, right), hash_leaf(&data));
+    }
+
+    #[test]
+    fn borrowed_parts_are_identical_to_concatenation() {
+        let mut joined = Vec::new();
+        joined.extend_from_slice(b"alpha");
+        joined.extend_from_slice(b"beta");
+        assert_eq!(
+            hash_domain_parts(b"domain", &[b"alpha", b"beta"]),
+            hash_domain(b"domain", &joined)
+        );
     }
 }
