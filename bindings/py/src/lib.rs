@@ -17,11 +17,12 @@ use dexos_sdk_core::{convert, poc};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
+#[cfg(feature = "stub-gen")]
 use pyo3_stub_gen::{define_stub_info_gatherer, derive::gen_stub_pyfunction};
 
 /// Deterministic framed `GetMarket` request. Delegates entirely to the core's
 /// single source of truth; the python crate never re-implements framing.
-#[gen_stub_pyfunction]
+#[cfg_attr(feature = "stub-gen", gen_stub_pyfunction)]
 #[pyfunction]
 fn encode_get_market_request(
     py: Python<'_>,
@@ -33,7 +34,7 @@ fn encode_get_market_request(
 
 /// Deterministic ed25519 signature over `msg` for the keypair derived from the
 /// 32-byte `seed`. Raises `ValueError` if `seed` is not exactly 32 bytes.
-#[gen_stub_pyfunction]
+#[cfg_attr(feature = "stub-gen", gen_stub_pyfunction)]
 #[pyfunction]
 fn ed25519_sign<'py>(
     py: Python<'py>,
@@ -48,7 +49,7 @@ fn ed25519_sign<'py>(
 /// with the `preimage`, `signature`, `command_hash`, and full `framed_request`
 /// as `bytes`. These are exactly the values that must never drift between
 /// languages. Raises `ValueError` if `seed` is not 32 bytes.
-#[gen_stub_pyfunction]
+#[cfg_attr(feature = "stub-gen", gen_stub_pyfunction)]
 #[pyfunction]
 fn sign_submit_order(
     py: Python<'_>,
@@ -82,7 +83,7 @@ fn sign_submit_order(
 /// converter: parses `decimal` (max 6 fractional digits) into the `i128`
 /// [`Amount`](dexos_sdk_core::Amount) and re-formats it fixed-6dp, e.g.
 /// `"1.5"` -> `"1.500000"`. Raises `ValueError` on an invalid amount.
-#[gen_stub_pyfunction]
+#[cfg_attr(feature = "stub-gen", gen_stub_pyfunction)]
 #[pyfunction]
 fn amount_to_decimal(decimal: &str) -> PyResult<String> {
     let amount = convert::amount_from_decimal(decimal).map_err(PyValueError::new_err)?;
@@ -105,4 +106,5 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
 // write the committed, diff-gated `python/dexos/_core.pyi`. Per pyo3-stub-gen,
 // this MUST live in the library crate (same crate as the inventory submissions),
 // not in the generator binary.
+#[cfg(feature = "stub-gen")]
 define_stub_info_gatherer!(stub_info);
