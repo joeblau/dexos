@@ -49,6 +49,35 @@ impl Default for BookStateLimits {
     }
 }
 
+/// Host-local resource declarations from an allocation-free bounded v3 scan.
+///
+/// A successful inspection establishes exact framing, the supplied independent
+/// limits, and the scan-level canonical and semantic checks shared with the
+/// decoder. It does not authenticate the bytes or guarantee that allocating
+/// restoration and its global uniqueness checks will succeed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct BookStateResources {
+    /// Complete encoded image size.
+    pub encoded_bytes: usize,
+    /// Logical resting-order capacity eagerly reserved by a restored book.
+    pub capacity: usize,
+    /// Logical dedup capacity eagerly reserved by a restored book.
+    pub dedup_capacity: usize,
+    /// Logical basket-leg limit applied to future submissions.
+    pub max_basket_legs: usize,
+    /// Total bid plus ask price levels present in the image.
+    pub price_levels: usize,
+    /// Total resting orders present in the image.
+    pub resting_orders: usize,
+    /// Externally supplied position entries present in the image.
+    pub positions: usize,
+    /// Retained dedup records present in the image.
+    pub dedup_records: usize,
+    /// Fills across all retained cached match results.
+    pub total_cached_fills: usize,
+}
+
 /// Typed failure from canonical OrderBook v3 state encoding or decoding.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum BookStateError {

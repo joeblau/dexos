@@ -82,6 +82,26 @@ fn canonical_bytes(book: &OrderBook) -> Vec<u8> {
     book.encode_state_v3_bounded(usize::MAX).unwrap()
 }
 
+fn assert_inspection_error_matches_decode(
+    bytes: &[u8],
+    limits: &BookStateLimits,
+) -> BookStateError {
+    let inspection_error = match OrderBook::inspect_state_v3_bounded(bytes, limits) {
+        Err(error) => error,
+        Ok(resources) => panic!("resource inspection unexpectedly succeeded: {resources:?}"),
+    };
+    let decode_error = match OrderBook::decode_state_v3_bounded(
+        bytes,
+        limits,
+        simd::Backend::Scalar,
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("decode unexpectedly succeeded after resource inspection failed"),
+    };
+    assert_eq!(decode_error, inspection_error);
+    inspection_error
+}
+
 fn assert_logically_identical(left: &OrderBook, right: &OrderBook) {
     assert_eq!(canonical_bytes(left), canonical_bytes(right));
     assert_eq!(left.state_root(), right.state_root());
@@ -1246,6 +1266,42 @@ fn transition_root_v3_dedup_schema_golden_vector() {
 }
 
 #[test]
+fn state_v3_inspection_reports_exact_empty_and_fixture_resources() {
+    let empty_bytes = canonical_bytes(&OrderBook::new(codec_cfg()));
+    assert_eq!(
+        OrderBook::inspect_state_v3_bounded(&empty_bytes, &BookStateLimits::default()).unwrap(),
+        BookStateResources {
+            encoded_bytes: 59,
+            capacity: 12,
+            dedup_capacity: 8,
+            max_basket_legs: 4,
+            price_levels: 0,
+            resting_orders: 0,
+            positions: 0,
+            dedup_records: 0,
+            total_cached_fills: 0,
+        }
+    );
+
+    let fixture_bytes = canonical_bytes(&codec_fixture());
+    assert_eq!(fixture_bytes.len(), 358);
+    assert_eq!(
+        OrderBook::inspect_state_v3_bounded(&fixture_bytes, &BookStateLimits::default()).unwrap(),
+        BookStateResources {
+            encoded_bytes: 358,
+            capacity: 12,
+            dedup_capacity: 8,
+            max_basket_legs: 4,
+            price_levels: 2,
+            resting_orders: 2,
+            positions: 2,
+            dedup_records: 3,
+            total_cached_fills: 2,
+        }
+    );
+}
+
+#[test]
 fn state_v3_codec_round_trips_every_logical_field_and_keeps_backend_external() {
     let original = codec_fixture();
     let bytes = canonical_bytes(&original);
@@ -1277,31 +1333,25 @@ fn state_v3_codec_round_trips_every_logical_field_and_keeps_backend_external() {
 fn state_v3_codec_rejects_every_truncation_and_any_suffix() {
     let bytes = canonical_bytes(&codec_fixture());
     for cut in 0..bytes.len() {
-        assert!(
-            OrderBook::decode_state_v3_bounded(
-                &bytes[..cut],
-                &BookStateLimits::default(),
-                simd::Backend::Scalar,
-            )
-            .is_err(),
-            "truncation at byte {cut} was accepted"
+        let _ = assert_inspection_error_matches_decode(
+            &bytes[..cut],
+            &BookStateLimits::default(),
         );
     }
 
     let mut with_suffix = bytes;
     with_suffix.extend_from_slice(&[0xaa, 0xbb]);
-    match OrderBook::decode_state_v3_bounded(
-        &with_suffix,
-        &BookStateLimits::default(),
-        simd::Backend::Scalar,
-    ) {
-        Err(error) => assert_eq!(error, BookStateError::TrailingBytes { remaining: 2 }),
-        Ok(_) => panic!("trailing bytes were accepted"),
-    }
+    assert_eq!(
+        assert_inspection_error_matches_decode(
+            &with_suffix,
+            &BookStateLimits::default(),
+        ),
+        BookStateError::TrailingBytes { remaining: 2 }
+    );
 }
 
 #[test]
-fn state_v3_decoder_never_panics_on_arbitrary_bounded_bytes() {
+fn state_v3_inspection_and_decoder_never_panic_on_arbitrary_bounded_bytes() {
     let mut random = Lcg(0xC0DE_CAFE_F00D_BAAD);
     let limits = BookStateLimits {
         max_encoded_bytes: 512,
@@ -1323,17 +1373,42 @@ fn state_v3_decoder_never_panics_on_arbitrary_bounded_bytes() {
             let chunk_len = chunk.len();
             chunk.copy_from_slice(&word[..chunk_len]);
         }
-        let _ = OrderBook::decode_state_v3_bounded(&bytes, &limits, simd::Backend::Scalar);
+        let inspected = OrderBook::inspect_state_v3_bounded(&bytes, &limits);
+        let decoded = OrderBook::decode_state_v3_bounded(
+            &bytes,
+            &limits,
+            simd::Backend::Scalar,
+        );
+        if let Err(expected) = inspected {
+            match decoded {
+                Err(actual) => assert_eq!(actual, expected),
+                Ok(_) => panic!("decode succeeded after resource inspection failed"),
+            }
+        }
     }
 }
 
 #[test]
 fn state_v3_codec_enforces_every_resource_limit_independently() {
     let bytes = canonical_bytes(&codec_fixture());
+    let exact = BookStateLimits {
+        max_encoded_bytes: bytes.len(),
+        max_capacity: 12,
+        max_dedup_capacity: 8,
+        max_basket_legs: 4,
+        max_price_levels: 2,
+        max_resting_orders: 2,
+        max_positions: 2,
+        max_dedup_records: 3,
+        max_fills_per_result: 2,
+        max_total_fills: 2,
+    };
+    assert!(OrderBook::inspect_state_v3_bounded(&bytes, &exact).is_ok());
+
     let assert_resource = |limits: BookStateLimits, expected: &'static str| {
         assert!(matches!(
-            OrderBook::decode_state_v3_bounded(&bytes, &limits, simd::Backend::Scalar),
-            Err(BookStateError::ResourceLimit { resource, .. }) if resource == expected
+            assert_inspection_error_matches_decode(&bytes, &limits),
+            BookStateError::ResourceLimit { resource, .. } if resource == expected
         ));
     };
 
@@ -1341,16 +1416,13 @@ fn state_v3_codec_enforces_every_resource_limit_independently() {
         max_encoded_bytes: bytes.len() - 1,
         ..BookStateLimits::default()
     };
-    match OrderBook::decode_state_v3_bounded(&bytes, &limits, simd::Backend::Scalar) {
-        Err(error) => assert_eq!(
-            error,
-            BookStateError::EncodedBytesLimit {
-                actual: bytes.len(),
-                max: bytes.len() - 1,
-            }
-        ),
-        Ok(_) => panic!("oversized state was accepted"),
-    }
+    assert_eq!(
+        assert_inspection_error_matches_decode(&bytes, &limits),
+        BookStateError::EncodedBytesLimit {
+            actual: bytes.len(),
+            max: bytes.len() - 1,
+        }
+    );
 
     assert_resource(
         BookStateLimits {
@@ -1592,31 +1664,23 @@ fn state_v3_codec_rejects_unknown_header_tags() {
     let bytes = canonical_bytes(&OrderBook::new(codec_cfg()));
     let mut version = bytes.clone();
     version[0..2].copy_from_slice(&4u16.to_le_bytes());
-    assert!(matches!(
-        OrderBook::decode_state_v3_bounded(
-            &version,
-            &BookStateLimits::default(),
-            simd::Backend::Scalar,
-        ),
-        Err(BookStateError::UnsupportedVersion {
+    assert_eq!(
+        assert_inspection_error_matches_decode(&version, &BookStateLimits::default()),
+        BookStateError::UnsupportedVersion {
             found: 4,
             expected: BOOK_TRANSITION_ROOT_SCHEMA_VERSION,
-        })
-    ));
+        }
+    );
 
     let mut stp = bytes;
     stp[10] = 3;
-    assert!(matches!(
-        OrderBook::decode_state_v3_bounded(
-            &stp,
-            &BookStateLimits::default(),
-            simd::Backend::Scalar,
-        ),
-        Err(BookStateError::InvalidTag {
+    assert_eq!(
+        assert_inspection_error_matches_decode(&stp, &BookStateLimits::default()),
+        BookStateError::InvalidTag {
             field: "self-trade prevention policy",
             value: 3,
-        })
-    ));
+        }
+    );
 }
 
 #[test]

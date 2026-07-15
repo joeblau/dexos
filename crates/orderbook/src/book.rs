@@ -15,7 +15,7 @@ use crate::order::{
 };
 use crate::slab::{Slab, NIL};
 use crate::{
-    BookStateError, BookStateLimits, BOOK_ROOT_HOT_PATH_HASH_BUDGET_BYTES,
+    BookStateError, BookStateLimits, BookStateResources, BOOK_ROOT_HOT_PATH_HASH_BUDGET_BYTES,
     BOOK_ROOT_SCHEMA_VERSION, BOOK_TRANSITION_ROOT_SCHEMA_VERSION,
 };
 
@@ -729,6 +729,33 @@ impl OrderBook {
             });
         }
         Ok(writer.bytes)
+    }
+
+    /// Inspect canonical OrderBook v3 framing and resource declarations without
+    /// allocating or restoring a live book.
+    ///
+    /// This runs the same bounded first-pass scan as
+    /// [`Self::decode_state_v3_bounded`]. It validates exact fixed-width framing,
+    /// the supplied independent limits, canonical ordering visible without
+    /// workspace, and local scalar semantics. Success is resource admission, not
+    /// authentication or complete decode validation: restoration still performs
+    /// allocating global uniqueness checks and must rescan the input.
+    pub fn inspect_state_v3_bounded(
+        bytes: &[u8],
+        limits: &BookStateLimits,
+    ) -> Result<BookStateResources, BookStateError> {
+        let scanned = Self::scan_state_v3(bytes, limits)?;
+        Ok(BookStateResources {
+            encoded_bytes: bytes.len(),
+            capacity: scanned.header.capacity,
+            dedup_capacity: scanned.header.dedup_capacity,
+            max_basket_legs: scanned.header.max_basket_legs,
+            price_levels: scanned.shape.levels,
+            resting_orders: scanned.shape.orders,
+            positions: scanned.shape.positions,
+            dedup_records: scanned.shape.dedup_records,
+            total_cached_fills: scanned.shape.fills,
+        })
     }
 
     /// Decode and directly restore canonical OrderBook v3 state under
