@@ -25,7 +25,9 @@ pub use idempotency::REPLAY_TRANSITION_ROOT_SCHEMA_VERSION;
 pub use ledger::{
     Ledger, LedgerStateError, LedgerStateLimits, LEDGER_TRANSITION_ROOT_SCHEMA_VERSION,
 };
-pub use session::{SessionRegistry, SESSION_TRANSITION_ROOT_SCHEMA_VERSION};
+pub use session::{
+    SessionRegistry, SessionStateError, SessionStateLimits, SESSION_TRANSITION_ROOT_SCHEMA_VERSION,
+};
 
 /// Crate identity, used by the node composition root for a startup manifest.
 pub const CRATE_NAME: &str = "execution";
