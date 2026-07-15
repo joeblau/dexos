@@ -84,6 +84,12 @@ pub enum RiskError {
         /// Native-width value that could not be encoded.
         value: usize,
     },
+    /// Checked arithmetic could not represent the exact canonical state size.
+    #[error("risk state size overflow while processing {field}")]
+    StateSizeOverflow {
+        /// Stable state section or aggregate name.
+        field: &'static str,
+    },
     /// Stored risk state violates a relation required for deterministic future
     /// transitions, such as cache equality or reverse-index consistency.
     #[error("risk state invariant violated: {0}")]
