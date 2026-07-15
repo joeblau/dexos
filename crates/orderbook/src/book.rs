@@ -10,8 +10,8 @@ use crate::dedup::DedupCache;
 use crate::error::OrderError;
 use crate::level::{crosses, SideBook};
 use crate::order::{
-    BookConfig, Fill, MatchPlan, MatchResult, MatchSummary, NewOrder, Node, OrderOutcome,
-    PlannedFill, StpPolicy,
+    BookConfig, Fill, MatchPlan, MatchReport, MatchResult, MatchSummary, NewOrder, Node,
+    OrderOutcome, PlannedFill, StpCancellation, StpPolicy,
 };
 use crate::slab::{Slab, NIL};
 use crate::{
@@ -432,8 +432,9 @@ impl OrderBook {
     /// This book-local dedup is a convenience for callers that drive the book
     /// directly. Command-level callers that already enforce durable, payload-
     /// bound, exactly-once semantics (the execution engine) submit through
-    /// [`OrderBook::place`] instead, so idempotency is decided once at the
-    /// command layer rather than replayed a second time here.
+    /// [`OrderBook::place`] or [`OrderBook::place_with_report`] instead, so
+    /// idempotency is decided once at the command layer rather than replayed a
+    /// second time here.
     pub fn submit(&mut self, order: NewOrder) -> Result<MatchResult, OrderError> {
         if let Some(cached) = self.dedup.get(order.account, order.client_id) {
             return Ok(cached.clone());
@@ -449,10 +450,20 @@ impl OrderBook {
     /// Idempotency for engine-sequenced commands is enforced exactly once, and
     /// durably, at the command layer (see `execution::Engine`), which binds the
     /// idempotency key to the full command digest and commits a replay watermark
-    /// into the state root. The engine submits through this path so the book
-    /// never applies a second, weaker dedup that could replay stale fills.
+    /// into the state root. Engine integrations use this non-deduplicating path
+    /// (or [`OrderBook::place_with_report`]) so the book never applies a second,
+    /// weaker dedup that could replay stale fills.
     pub fn place(&mut self, order: NewOrder) -> Result<MatchResult, OrderError> {
-        self.execute(order)
+        Ok(self.place_with_report(order)?.result)
+    }
+
+    /// Submit a new order without book-local client deduplication and include
+    /// transient maker cancellations performed by self-trade prevention.
+    ///
+    /// The report is not retained in deduplication state and does not alter the
+    /// canonical v3 book schema or transition root.
+    pub fn place_with_report(&mut self, order: NewOrder) -> Result<MatchReport, OrderError> {
+        self.execute_with_report(order)
     }
 
     /// Cancel a resting order in O(1). Errors if the id is unknown.
@@ -493,6 +504,17 @@ impl OrderBook {
         price: Price,
         quantity: Quantity,
     ) -> Result<MatchResult, OrderError> {
+        Ok(self.replace_with_report(id, price, quantity)?.result)
+    }
+
+    /// Replace a resting order and include transient maker cancellations
+    /// performed by self-trade prevention while matching the replacement.
+    pub fn replace_with_report(
+        &mut self,
+        id: OrderId,
+        price: Price,
+        quantity: Quantity,
+    ) -> Result<MatchReport, OrderError> {
         if quantity.raw() <= 0 {
             return Err(OrderError::NonPositiveQuantity);
         }
@@ -519,7 +541,7 @@ impl OrderBook {
             client_id: node.client_id,
             reduce_only: false,
         };
-        self.execute(replacement)
+        self.execute_with_report(replacement)
     }
 
     /// Submit a basket as a single all-or-nothing unit.
@@ -1733,6 +1755,10 @@ impl OrderBook {
     }
 
     fn execute(&mut self, order: NewOrder) -> Result<MatchResult, OrderError> {
+        Ok(self.execute_with_report(order)?.result)
+    }
+
+    fn execute_with_report(&mut self, order: NewOrder) -> Result<MatchReport, OrderError> {
         if order.quantity.raw() <= 0 {
             return Err(OrderError::NonPositiveQuantity);
         }
@@ -1753,7 +1779,10 @@ impl OrderBook {
             match order.side {
                 Side::Ask => {
                     if pos <= 0 {
-                        return Ok(MatchResult::rejected());
+                        return Ok(MatchReport {
+                            result: MatchResult::rejected(),
+                            stp_cancelled: Vec::new(),
+                        });
                     }
                     if qty.raw() > pos {
                         qty = Quantity::from_raw(pos);
@@ -1761,7 +1790,10 @@ impl OrderBook {
                 }
                 Side::Bid => {
                     if pos >= 0 {
-                        return Ok(MatchResult::rejected());
+                        return Ok(MatchReport {
+                            result: MatchResult::rejected(),
+                            stp_cancelled: Vec::new(),
+                        });
                     }
                     let avail = pos.saturating_neg();
                     if qty.raw() > avail {
@@ -1774,12 +1806,18 @@ impl OrderBook {
         // Post-only never takes: reject if it would cross, else rest in full.
         if matches!(order.order_type, OrderType::PostOnly) {
             if self.would_cross(order.side, order.price) {
-                return Ok(MatchResult::rejected());
+                return Ok(MatchReport {
+                    result: MatchResult::rejected(),
+                    stp_cancelled: Vec::new(),
+                });
             }
             self.rest_order(&order, qty)?;
-            return Ok(MatchResult {
-                fills: Vec::new(),
-                outcome: OrderOutcome::Resting { remaining: qty },
+            return Ok(MatchReport {
+                result: MatchResult {
+                    fills: Vec::new(),
+                    outcome: OrderOutcome::Resting { remaining: qty },
+                },
+                stp_cancelled: Vec::new(),
             });
         }
 
@@ -1787,18 +1825,26 @@ impl OrderBook {
         if matches!(order.tif, TimeInForce::Fok) {
             let avail = self.crossable_qty(&order, is_market, qty.raw());
             if avail < qty.raw() {
-                return Ok(MatchResult::rejected());
+                return Ok(MatchReport {
+                    result: MatchResult::rejected(),
+                    stp_cancelled: Vec::new(),
+                });
             }
         }
 
         let mut fills = Vec::new();
-        let (remaining, stopped) = self.run_match(&order, is_market, qty, &mut fills);
+        let mut stp_cancelled = Vec::new();
+        let (remaining, stopped) =
+            self.run_match(&order, is_market, qty, &mut fills, &mut stp_cancelled);
         let filled = qty.saturating_sub(remaining);
 
         if remaining.raw() == 0 {
-            return Ok(MatchResult {
-                fills,
-                outcome: OrderOutcome::FullyFilled,
+            return Ok(MatchReport {
+                result: MatchResult {
+                    fills,
+                    outcome: OrderOutcome::FullyFilled,
+                },
+                stp_cancelled,
             });
         }
 
@@ -1814,22 +1860,35 @@ impl OrderBook {
                     } else {
                         OrderOutcome::Resting { remaining }
                     };
-                    Ok(MatchResult { fills, outcome })
+                    Ok(MatchReport {
+                        result: MatchResult { fills, outcome },
+                        stp_cancelled,
+                    })
                 }
-                // A fill is irreversible: matching already reduced or removed
-                // makers, so we must never surface an `Err` that would strand
-                // those fills (the caller applies fills only on `Ok`, so an
-                // `Err` here would diverge the book from risk/ledger). When a
-                // residual produced by real fills cannot rest, cancel it like an
-                // IOC remainder and return the fills. With no fills, `rest_order`
-                // never mutated the book (its `insert` fails first), so the book
-                // is bit-identical to its pre-command state and the capacity
-                // error is safe to propagate.
+                // A fill or an STP maker cancellation is irreversible: matching
+                // already reduced or removed makers, so we must never surface an
+                // `Err` that would suppress those deltas from the caller. When a
+                // residual cannot rest, cancel it like an IOC remainder and
+                // return every fill and cancellation. With neither fills nor STP
+                // cancellations, `rest_order` failed before mutation, so the book
+                // is bit-identical to its pre-command state and the error is safe
+                // to propagate.
                 Err(e) => {
                     if filled.raw() > 0 {
-                        Ok(MatchResult {
-                            fills,
-                            outcome: OrderOutcome::PartiallyFilledCancelled { filled },
+                        Ok(MatchReport {
+                            result: MatchResult {
+                                fills,
+                                outcome: OrderOutcome::PartiallyFilledCancelled { filled },
+                            },
+                            stp_cancelled,
+                        })
+                    } else if !stp_cancelled.is_empty() {
+                        Ok(MatchReport {
+                            result: MatchResult {
+                                fills,
+                                outcome: OrderOutcome::Rejected,
+                            },
+                            stp_cancelled,
                         })
                     } else {
                         Err(e)
@@ -1842,7 +1901,10 @@ impl OrderBook {
             } else {
                 OrderOutcome::Rejected
             };
-            Ok(MatchResult { fills, outcome })
+            Ok(MatchReport {
+                result: MatchResult { fills, outcome },
+                stp_cancelled,
+            })
         }
     }
 
@@ -1885,6 +1947,7 @@ impl OrderBook {
         is_market: bool,
         start_qty: Quantity,
         fills: &mut Vec<Fill>,
+        stp_cancelled: &mut Vec<StpCancellation>,
     ) -> (Quantity, bool) {
         let maker_side = taker.side.opposite();
         let mut remaining = start_qty;
@@ -1928,6 +1991,13 @@ impl OrderBook {
                 if maker.account == taker.account {
                     match self.config.stp {
                         StpPolicy::CancelMaker => {
+                            stp_cancelled.push(StpCancellation {
+                                order_id: maker.order_id,
+                                account: maker.account,
+                                side: maker.side,
+                                price: maker.price,
+                                remaining: maker.remaining,
+                            });
                             self.remove_resting(maker_side, head);
                             continue;
                         }
@@ -1936,6 +2006,13 @@ impl OrderBook {
                             break 'outer;
                         }
                         StpPolicy::CancelBoth => {
+                            stp_cancelled.push(StpCancellation {
+                                order_id: maker.order_id,
+                                account: maker.account,
+                                side: maker.side,
+                                price: maker.price,
+                                remaining: maker.remaining,
+                            });
                             self.remove_resting(maker_side, head);
                             stopped = true;
                             break 'outer;

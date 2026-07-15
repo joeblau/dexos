@@ -2127,3 +2127,146 @@ fn scalar_and_simd_planning_preserve_fills_outcomes_errors_and_roots() {
         }
     }
 }
+
+#[test]
+fn cancel_maker_report_preserves_encounter_order_and_current_remaining() {
+    let mut book = OrderBook::new(cfg());
+    book.place(limit(1, 7, Side::Ask, 100, 5)).unwrap();
+    // Leave the first self maker partially filled before the reported match.
+    book.place(limit(2, 8, Side::Bid, 100, 2)).unwrap();
+    book.place(limit(3, 9, Side::Ask, 100, 4)).unwrap();
+    book.place(limit(4, 7, Side::Ask, 100, 6)).unwrap();
+
+    let report = book
+        .place_with_report(limit(5, 7, Side::Bid, 100, 5))
+        .unwrap();
+
+    assert_eq!(report.result.fills.len(), 1);
+    assert_eq!(report.result.fills[0].maker_order, OrderId::new(3));
+    assert_eq!(report.result.fills[0].quantity, Quantity::from_raw(4));
+    assert_eq!(
+        report
+            .stp_cancelled
+            .iter()
+            .map(|cancel| (cancel.order_id.get(), cancel.remaining.raw()))
+            .collect::<Vec<_>>(),
+        vec![(1, 3), (4, 6)],
+    );
+    assert!(report.stp_cancelled.iter().all(|cancel| {
+        cancel.account == AccountId::new(7)
+            && cancel.side == Side::Ask
+            && cancel.price == Price::from_raw(100)
+    }));
+}
+
+#[test]
+fn cancel_both_reports_maker_then_stops_taker() {
+    let mut config = cfg();
+    config.stp = StpPolicy::CancelBoth;
+    let mut book = OrderBook::new(config);
+    book.place(limit(1, 7, Side::Ask, 100, 3)).unwrap();
+
+    let report = book
+        .place_with_report(limit(2, 7, Side::Bid, 100, 2))
+        .unwrap();
+
+    assert!(report.result.fills.is_empty());
+    assert!(matches!(report.result.outcome, OrderOutcome::Rejected));
+    assert_eq!(report.stp_cancelled.len(), 1);
+    assert_eq!(report.stp_cancelled[0].order_id, OrderId::new(1));
+    assert_eq!(report.stp_cancelled[0].remaining, Quantity::from_raw(3));
+    assert!(!book.contains(OrderId::new(1)));
+    assert!(!book.contains(OrderId::new(2)));
+}
+
+#[test]
+fn cancel_taker_emits_no_maker_cancellation() {
+    let mut config = cfg();
+    config.stp = StpPolicy::CancelTaker;
+    let mut book = OrderBook::new(config);
+    book.place(limit(1, 7, Side::Ask, 100, 3)).unwrap();
+
+    let report = book
+        .place_with_report(limit(2, 7, Side::Bid, 100, 2))
+        .unwrap();
+
+    assert!(report.result.fills.is_empty());
+    assert!(report.stp_cancelled.is_empty());
+    assert!(book.contains(OrderId::new(1)));
+}
+
+#[test]
+fn replace_report_includes_self_maker_crossed_by_replacement() {
+    let mut book = OrderBook::new(cfg());
+    book.place(limit(1, 7, Side::Ask, 100, 3)).unwrap();
+    book.place(limit(2, 7, Side::Bid, 90, 2)).unwrap();
+
+    let report = book
+        .replace_with_report(OrderId::new(2), Price::from_raw(100), Quantity::from_raw(2))
+        .unwrap();
+
+    assert_eq!(report.stp_cancelled.len(), 1);
+    assert_eq!(report.stp_cancelled[0].order_id, OrderId::new(1));
+    assert!(matches!(
+        report.result.outcome,
+        OrderOutcome::Resting { remaining } if remaining == Quantity::from_raw(2)
+    ));
+    assert!(book.contains(OrderId::new(2)));
+}
+
+#[test]
+fn report_variants_preserve_legacy_results_v3_bytes_and_roots() {
+    let mut legacy = OrderBook::new(cfg());
+    legacy.place(limit(1, 7, Side::Ask, 100, 3)).unwrap();
+    legacy.place(limit(2, 8, Side::Ask, 100, 2)).unwrap();
+    let mut reported = legacy.clone();
+
+    let incoming = limit(3, 7, Side::Bid, 100, 4);
+    let legacy_result = legacy.place(incoming).unwrap();
+    let report = reported.place_with_report(incoming).unwrap();
+    assert_eq!(report.result, legacy_result);
+    assert!(!report.stp_cancelled.is_empty());
+    assert_eq!(canonical_bytes(&reported), canonical_bytes(&legacy));
+    assert_eq!(reported.transition_root_v3(), legacy.transition_root_v3());
+
+    legacy.place(limit(4, 7, Side::Ask, 110, 2)).unwrap();
+    legacy.place(limit(5, 7, Side::Bid, 90, 2)).unwrap();
+    reported.place(limit(4, 7, Side::Ask, 110, 2)).unwrap();
+    reported.place(limit(5, 7, Side::Bid, 90, 2)).unwrap();
+    let legacy_result = legacy
+        .replace(OrderId::new(5), Price::from_raw(110), Quantity::from_raw(2))
+        .unwrap();
+    let report = reported
+        .replace_with_report(OrderId::new(5), Price::from_raw(110), Quantity::from_raw(2))
+        .unwrap();
+    assert_eq!(report.result, legacy_result);
+    assert!(!report.stp_cancelled.is_empty());
+    assert_eq!(canonical_bytes(&reported), canonical_bytes(&legacy));
+    assert_eq!(reported.transition_root_v3(), legacy.transition_root_v3());
+}
+
+#[test]
+fn failed_residual_rest_still_reports_applied_stp_cancellation() {
+    let mut book = OrderBook::new(cfg());
+    let self_ask = limit(1, 7, Side::Ask, 100, 1);
+    let full_bid = limit(2, 8, Side::Bid, 100, i64::MAX);
+    // Build the narrow internal edge directly: a crossed self maker plus a
+    // same-price bid level whose aggregate cannot accept another unit. Public
+    // matching never creates a crossed book, but execute_with_report must still
+    // preserve any cancellation it applies before a fallible residual rest.
+    book.rest_order(&self_ask, self_ask.quantity).unwrap();
+    book.rest_order(&full_bid, full_bid.quantity).unwrap();
+
+    let report = book
+        .place_with_report(limit(3, 7, Side::Bid, 100, 1))
+        .unwrap();
+
+    assert!(report.result.fills.is_empty());
+    assert!(matches!(report.result.outcome, OrderOutcome::Rejected));
+    assert_eq!(report.stp_cancelled.len(), 1);
+    assert_eq!(report.stp_cancelled[0].order_id, OrderId::new(1));
+    assert!(!book.contains(OrderId::new(1)));
+    assert!(!book.contains(OrderId::new(3)));
+    assert!(book.contains(OrderId::new(2)));
+    assert_eq!(book.total_resting_quantity(), Quantity::from_raw(i64::MAX));
+}
