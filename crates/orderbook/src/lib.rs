@@ -29,6 +29,7 @@ mod error;
 mod level;
 mod order;
 mod slab;
+mod state;
 
 pub use book::OrderBook;
 pub use conditional::{
@@ -43,6 +44,7 @@ pub use order::{
 };
 /// Runtime backend used only for pure, bit-identical match-planning kernels.
 pub use simd::Backend as MatchingBackend;
+pub use state::{BookStateError, BookStateLimits};
 
 /// Fast diagnostic book-root schema version (v2 = unordered XOR multiset of
 /// per-order leaves).

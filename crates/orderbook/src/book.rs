@@ -2,7 +2,7 @@
 //! cancellation, atomic cancel-replace, cancel-all, baskets, self-trade
 //! prevention, reduce-only clamping, and client idempotency.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use types::{AccountId, Amount, Hash, OrderId, OrderType, Price, Quantity, Side, TimeInForce};
 
@@ -15,8 +15,8 @@ use crate::order::{
 };
 use crate::slab::{Slab, NIL};
 use crate::{
-    BOOK_ROOT_HOT_PATH_HASH_BUDGET_BYTES, BOOK_ROOT_SCHEMA_VERSION,
-    BOOK_TRANSITION_ROOT_SCHEMA_VERSION,
+    BookStateError, BookStateLimits, BOOK_ROOT_HOT_PATH_HASH_BUDGET_BYTES,
+    BOOK_ROOT_SCHEMA_VERSION, BOOK_TRANSITION_ROOT_SCHEMA_VERSION,
 };
 
 /// Minimal fixed-width writer for the book's consensus-facing transition
@@ -28,6 +28,12 @@ struct TransitionWriter {
 }
 
 impl TransitionWriter {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(capacity),
+        }
+    }
+
     fn u8(&mut self, value: u8) {
         self.bytes.push(value);
     }
@@ -51,6 +57,115 @@ impl TransitionWriter {
     fn len(&mut self, value: usize) {
         self.u64(u64::try_from(value).expect("usize must fit u64 on supported targets"));
     }
+}
+
+/// Fixed-width, forward-only reader for canonical book state.
+#[derive(Clone, Copy)]
+struct StateReader<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> StateReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn take(&mut self, len: usize) -> Result<&'a [u8], BookStateError> {
+        let remaining = self.bytes.len().saturating_sub(self.offset);
+        if len > remaining {
+            return Err(BookStateError::Truncated {
+                offset: self.offset,
+                needed: len,
+                remaining,
+            });
+        }
+        let start = self.offset;
+        self.offset += len;
+        Ok(&self.bytes[start..self.offset])
+    }
+
+    fn u8(&mut self) -> Result<u8, BookStateError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u16(&mut self) -> Result<u16, BookStateError> {
+        let mut raw = [0u8; 2];
+        raw.copy_from_slice(self.take(2)?);
+        Ok(u16::from_le_bytes(raw))
+    }
+
+    fn u32(&mut self) -> Result<u32, BookStateError> {
+        let mut raw = [0u8; 4];
+        raw.copy_from_slice(self.take(4)?);
+        Ok(u32::from_le_bytes(raw))
+    }
+
+    fn u64(&mut self) -> Result<u64, BookStateError> {
+        let mut raw = [0u8; 8];
+        raw.copy_from_slice(self.take(8)?);
+        Ok(u64::from_le_bytes(raw))
+    }
+
+    fn i64(&mut self) -> Result<i64, BookStateError> {
+        let mut raw = [0u8; 8];
+        raw.copy_from_slice(self.take(8)?);
+        Ok(i64::from_le_bytes(raw))
+    }
+
+    fn finish(self) -> Result<(), BookStateError> {
+        let remaining = self.bytes.len().saturating_sub(self.offset);
+        if remaining == 0 {
+            Ok(())
+        } else {
+            Err(BookStateError::TrailingBytes { remaining })
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct StateShape {
+    levels: usize,
+    orders: usize,
+    positions: usize,
+    dedup_records: usize,
+    fills: usize,
+}
+
+impl StateShape {
+    /// Exact v3 size: fixed fields plus fixed-width repeated records.
+    fn encoded_len(self) -> Result<usize, BookStateError> {
+        let mut len = 59usize;
+        for (field, count, width) in [
+            ("price levels", self.levels, 16usize),
+            ("resting orders", self.orders, 37),
+            ("positions", self.positions, 12),
+            ("dedup records", self.dedup_records, 29),
+            ("cached fills", self.fills, 41),
+        ] {
+            let bytes = count
+                .checked_mul(width)
+                .ok_or(BookStateError::ArithmeticOverflow { field })?;
+            len = len
+                .checked_add(bytes)
+                .ok_or(BookStateError::ArithmeticOverflow { field })?;
+        }
+        Ok(len)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DecodedHeader {
+    capacity: usize,
+    stp: StpPolicy,
+    dedup_capacity: usize,
+    max_basket_legs: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScannedState {
+    header: DecodedHeader,
+    shape: StateShape,
 }
 
 /// Fixed-stack aggregation state for the independent arithmetic portion of an
@@ -502,10 +617,128 @@ impl OrderBook {
     /// leaves after future mutations.
     #[must_use]
     pub fn transition_root_v3(&self) -> Hash {
+        let bytes = self
+            .encode_state_v3_bounded(usize::MAX)
+            .expect("reachable OrderBook state must have an encodable v3 image");
+        crypto::hash_domain(crypto::DOMAIN_ORDERBOOK_STATE, &bytes)
+    }
+
+    /// Encode the canonical, versioned OrderBook state used verbatim as the
+    /// [`Self::transition_root_v3`] preimage.
+    ///
+    /// The exact encoded size is checked before allocating the output buffer.
+    /// Runtime-only [`crate::MatchingBackend`] selection and representation
+    /// details such as slab slots, free-list order, intrusive links, hash-table
+    /// layout, and derived indexes are intentionally absent.
+    pub fn encode_state_v3_bounded(&self, max_bytes: usize) -> Result<Vec<u8>, BookStateError> {
+        let shape = self.state_shape_v3()?;
+        let encoded_len = shape.encoded_len()?;
+        if encoded_len > max_bytes {
+            return Err(BookStateError::EncodedBytesLimit {
+                actual: encoded_len,
+                max: max_bytes,
+            });
+        }
+        let mut writer = TransitionWriter::with_capacity(encoded_len);
+        self.write_state_v3(&mut writer);
+        assert_eq!(
+            writer.bytes.len(),
+            encoded_len,
+            "v3 state size preflight must equal the emitted fixed-width image"
+        );
+        Ok(writer.bytes)
+    }
+
+    /// Decode and directly restore canonical OrderBook v3 state under
+    /// independent resource limits.
+    ///
+    /// The input is scanned once without allocating to validate every declared
+    /// count (including cumulative cached fills), exact fixed-width length, and
+    /// basic semantics. A second pass constructs live nodes directly and
+    /// rebuilds all derived indexes, links, and the v2 XOR cache; it never calls
+    /// [`Self::place`], [`Self::submit`], or the matching path. Finally the
+    /// rebuilt state must re-encode byte-identically and preserve the input's
+    /// authoritative v3 root.
+    ///
+    /// This codec establishes canonical representation and bounded semantic
+    /// validity only. Callers must obtain `bytes` and any expected root from an
+    /// authenticated, freshness-protected checkpoint or manifest.
+    pub fn decode_state_v3_bounded(
+        bytes: &[u8],
+        limits: &BookStateLimits,
+        matching_backend: crate::MatchingBackend,
+    ) -> Result<Self, BookStateError> {
+        let scanned = Self::scan_state_v3(bytes, limits)?;
+        let expected_len = scanned.shape.encoded_len()?;
+        if expected_len != bytes.len() {
+            return Err(if expected_len < bytes.len() {
+                BookStateError::TrailingBytes {
+                    remaining: bytes.len() - expected_len,
+                }
+            } else {
+                BookStateError::Truncated {
+                    offset: bytes.len(),
+                    needed: expected_len - bytes.len(),
+                    remaining: 0,
+                }
+            });
+        }
+        let rebuilt = Self::restore_state_v3(bytes, scanned, matching_backend)?;
+        let canonical = rebuilt.encode_state_v3_bounded(limits.max_encoded_bytes)?;
+        if canonical != bytes {
+            return Err(BookStateError::CanonicalEncodingMismatch);
+        }
+        let expected_root = crypto::hash_domain(crypto::DOMAIN_ORDERBOOK_STATE, bytes);
+        if rebuilt.transition_root_v3() != expected_root {
+            return Err(BookStateError::RootMismatch);
+        }
+        Ok(rebuilt)
+    }
+
+    fn state_shape_v3(&self) -> Result<StateShape, BookStateError> {
+        let capacity = Self::usize_as_u64("capacity", self.config.capacity)?;
+        if capacity > u64::from(u32::MAX) {
+            return Err(BookStateError::NativeWidth {
+                field: "slab capacity",
+                value: capacity,
+            });
+        }
         self.slab.validate_representation(self.config.capacity);
         self.dedup
             .validate_representation(self.config.dedup_capacity);
-        let mut writer = TransitionWriter::default();
+        Self::usize_as_u64("dedup capacity", self.config.dedup_capacity)?;
+        Self::usize_as_u64("basket legs", self.config.max_basket_legs)?;
+        let levels = self
+            .bids
+            .level_count()
+            .checked_add(self.asks.level_count())
+            .ok_or(BookStateError::ArithmeticOverflow {
+                field: "price levels",
+            })?;
+        let mut fills = 0usize;
+        let mut fills_overflowed = false;
+        self.dedup.for_each_in_eviction_order(|_, _, result| {
+            if let Some(next) = fills.checked_add(result.fills.len()) {
+                fills = next;
+            } else {
+                fills_overflowed = true;
+            }
+        });
+        if fills_overflowed {
+            return Err(BookStateError::ArithmeticOverflow {
+                field: "cached fills",
+            });
+        }
+        Ok(StateShape {
+            levels,
+            orders: self.slab.len(),
+            positions: self.positions.len(),
+            dedup_records: self.dedup.record_count(),
+            fills,
+        })
+    }
+
+    fn write_state_v3(&self, writer: &mut TransitionWriter) {
         writer.u16(BOOK_TRANSITION_ROOT_SCHEMA_VERSION);
         writer.len(self.config.capacity);
         writer.u8(Self::stp_tag(self.config.stp));
@@ -514,13 +747,13 @@ impl OrderBook {
 
         let mut recomputed_order_leaf_xor = [0u8; 32];
         let bid_orders = self.write_transition_side(
-            &mut writer,
+            writer,
             &self.bids,
             Side::Bid,
             &mut recomputed_order_leaf_xor,
         );
         let ask_orders = self.write_transition_side(
-            &mut writer,
+            writer,
             &self.asks,
             Side::Ask,
             &mut recomputed_order_leaf_xor,
@@ -564,10 +797,8 @@ impl OrderBook {
             .for_each_in_eviction_order(|account, client_id, result| {
                 writer.u32(account);
                 writer.u64(client_id);
-                Self::write_match_result(&mut writer, result);
+                Self::write_match_result(writer, result);
             });
-
-        crypto::hash_domain(crypto::DOMAIN_ORDERBOOK_STATE, &writer.bytes)
     }
 
     /// Deterministic dry-run of matching `order` against current depth.
@@ -783,6 +1014,555 @@ impl OrderBook {
     }
 
     // ----- internals -------------------------------------------------------
+
+    fn usize_as_u64(field: &'static str, value: usize) -> Result<u64, BookStateError> {
+        u64::try_from(value).map_err(|_| BookStateError::NativeWidth {
+            field,
+            value: u64::MAX,
+        })
+    }
+
+    fn u64_as_usize(field: &'static str, value: u64) -> Result<usize, BookStateError> {
+        usize::try_from(value).map_err(|_| BookStateError::NativeWidth { field, value })
+    }
+
+    fn limit_as_u64(limit: usize) -> u64 {
+        u64::try_from(limit).unwrap_or(u64::MAX)
+    }
+
+    fn check_limit(
+        resource: &'static str,
+        actual: u64,
+        limit: usize,
+    ) -> Result<(), BookStateError> {
+        let max = Self::limit_as_u64(limit);
+        if actual > max {
+            Err(BookStateError::ResourceLimit {
+                resource,
+                actual,
+                max,
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn add_count(
+        current: &mut usize,
+        amount: u64,
+        resource: &'static str,
+        limit: usize,
+    ) -> Result<usize, BookStateError> {
+        let amount = Self::u64_as_usize(resource, amount)?;
+        *current = current
+            .checked_add(amount)
+            .ok_or(BookStateError::ArithmeticOverflow { field: resource })?;
+        Self::check_limit(resource, Self::usize_as_u64(resource, *current)?, limit)?;
+        Ok(amount)
+    }
+
+    fn scan_state_v3(
+        bytes: &[u8],
+        limits: &BookStateLimits,
+    ) -> Result<ScannedState, BookStateError> {
+        if bytes.len() > limits.max_encoded_bytes {
+            return Err(BookStateError::EncodedBytesLimit {
+                actual: bytes.len(),
+                max: limits.max_encoded_bytes,
+            });
+        }
+        let mut reader = StateReader::new(bytes);
+        let version = reader.u16()?;
+        if version != BOOK_TRANSITION_ROOT_SCHEMA_VERSION {
+            return Err(BookStateError::UnsupportedVersion {
+                found: version,
+                expected: BOOK_TRANSITION_ROOT_SCHEMA_VERSION,
+            });
+        }
+
+        let capacity_raw = reader.u64()?;
+        Self::check_limit("capacity", capacity_raw, limits.max_capacity)?;
+        if capacity_raw > u64::from(u32::MAX) {
+            return Err(BookStateError::NativeWidth {
+                field: "slab capacity",
+                value: capacity_raw,
+            });
+        }
+        let capacity = Self::u64_as_usize("capacity", capacity_raw)?;
+        let stp = match reader.u8()? {
+            0 => StpPolicy::CancelMaker,
+            1 => StpPolicy::CancelTaker,
+            2 => StpPolicy::CancelBoth,
+            value => {
+                return Err(BookStateError::InvalidTag {
+                    field: "self-trade prevention policy",
+                    value,
+                })
+            }
+        };
+        let dedup_capacity_raw = reader.u64()?;
+        Self::check_limit(
+            "dedup capacity",
+            dedup_capacity_raw,
+            limits.max_dedup_capacity,
+        )?;
+        let dedup_capacity = Self::u64_as_usize("dedup capacity", dedup_capacity_raw)?;
+        let max_basket_legs_raw = reader.u64()?;
+        Self::check_limit("basket legs", max_basket_legs_raw, limits.max_basket_legs)?;
+        let max_basket_legs = Self::u64_as_usize("basket legs", max_basket_legs_raw)?;
+
+        let mut shape = StateShape::default();
+        let (_, best_bid) =
+            Self::scan_state_side(&mut reader, Side::Bid, capacity, limits, &mut shape)?;
+        let (best_ask, _) =
+            Self::scan_state_side(&mut reader, Side::Ask, capacity, limits, &mut shape)?;
+        if best_bid
+            .zip(best_ask)
+            .is_some_and(|(bid, ask)| bid.raw() >= ask.raw())
+        {
+            return Err(BookStateError::InvalidValue {
+                field: "resting bid and ask books must not be crossed or locked",
+            });
+        }
+
+        let position_count = reader.u64()?;
+        let mut positions = 0usize;
+        Self::add_count(
+            &mut positions,
+            position_count,
+            "positions",
+            limits.max_positions,
+        )?;
+        shape.positions = positions;
+        let mut previous_account = None;
+        for _ in 0..shape.positions {
+            let account = reader.u32()?;
+            if previous_account.is_some_and(|previous| account <= previous) {
+                return Err(BookStateError::NonCanonical {
+                    field: "positions must be strictly ordered by account",
+                });
+            }
+            previous_account = Some(account);
+            let _quantity = reader.i64()?;
+        }
+
+        let dedup_count = reader.u64()?;
+        let mut dedup_records = 0usize;
+        Self::add_count(
+            &mut dedup_records,
+            dedup_count,
+            "dedup records",
+            limits.max_dedup_records,
+        )?;
+        shape.dedup_records = dedup_records;
+        if shape.dedup_records > dedup_capacity {
+            return Err(BookStateError::InvalidValue {
+                field: "dedup record count exceeds logical dedup capacity",
+            });
+        }
+        for _ in 0..shape.dedup_records {
+            let account = reader.u32()?;
+            let _client_id = reader.u64()?;
+            Self::scan_match_result(&mut reader, account, limits, &mut shape.fills)?;
+        }
+        reader.finish()?;
+        if shape.encoded_len()? != bytes.len() {
+            return Err(BookStateError::NonCanonical {
+                field: "fixed-width v3 image length does not match its declared counts",
+            });
+        }
+
+        Ok(ScannedState {
+            header: DecodedHeader {
+                capacity,
+                stp,
+                dedup_capacity,
+                max_basket_legs,
+            },
+            shape,
+        })
+    }
+
+    fn scan_state_side(
+        reader: &mut StateReader<'_>,
+        expected_side: Side,
+        capacity: usize,
+        limits: &BookStateLimits,
+        shape: &mut StateShape,
+    ) -> Result<(Option<Price>, Option<Price>), BookStateError> {
+        let declared_levels = reader.u64()?;
+        let level_count = Self::add_count(
+            &mut shape.levels,
+            declared_levels,
+            "price levels",
+            limits.max_price_levels,
+        )?;
+        let mut first_price = None;
+        let mut previous_price = None;
+        for _ in 0..level_count {
+            let price = Price::from_raw(reader.i64()?);
+            if price.raw() <= 0 {
+                return Err(BookStateError::InvalidValue {
+                    field: "resting level price must be strictly positive",
+                });
+            }
+            if previous_price.is_some_and(|previous: Price| price.raw() <= previous.raw()) {
+                return Err(BookStateError::NonCanonical {
+                    field: "price levels must be strictly ascending",
+                });
+            }
+            first_price.get_or_insert(price);
+            previous_price = Some(price);
+
+            let declared_orders = reader.u64()?;
+            if declared_orders == 0 {
+                return Err(BookStateError::InvalidValue {
+                    field: "price levels must contain at least one resting order",
+                });
+            }
+            let order_count = Self::add_count(
+                &mut shape.orders,
+                declared_orders,
+                "resting orders",
+                limits.max_resting_orders,
+            )?;
+            if shape.orders > capacity {
+                return Err(BookStateError::InvalidValue {
+                    field: "resting order count exceeds logical capacity",
+                });
+            }
+            let mut level_quantity = 0i64;
+            for _ in 0..order_count {
+                let _order_id = reader.u64()?;
+                let _account = reader.u32()?;
+                let side_tag = reader.u8()?;
+                let side = Self::decode_side_tag(side_tag)?;
+                if side != expected_side {
+                    return Err(BookStateError::InvalidValue {
+                        field: "resting node side does not match its side book",
+                    });
+                }
+                let node_price = reader.i64()?;
+                if node_price != price.raw() {
+                    return Err(BookStateError::InvalidValue {
+                        field: "resting node price does not match its level",
+                    });
+                }
+                let remaining = reader.i64()?;
+                if remaining <= 0 {
+                    return Err(BookStateError::InvalidValue {
+                        field: "resting quantity must be strictly positive",
+                    });
+                }
+                level_quantity = level_quantity.checked_add(remaining).ok_or(
+                    BookStateError::ArithmeticOverflow {
+                        field: "price-level aggregate quantity",
+                    },
+                )?;
+                let _client_id = reader.u64()?;
+            }
+        }
+        Ok((first_price, previous_price))
+    }
+
+    fn scan_match_result(
+        reader: &mut StateReader<'_>,
+        dedup_account: u32,
+        limits: &BookStateLimits,
+        total_fills: &mut usize,
+    ) -> Result<(), BookStateError> {
+        let declared_fills = reader.u64()?;
+        Self::check_limit(
+            "fills per dedup result",
+            declared_fills,
+            limits.max_fills_per_result,
+        )?;
+        let fill_count = Self::add_count(
+            total_fills,
+            declared_fills,
+            "total cached fills",
+            limits.max_total_fills,
+        )?;
+        let mut taker_order = None;
+        let mut taker_account = None;
+        let mut taker_side = None;
+        let mut previous_price = None;
+        let mut filled_quantity = 0i64;
+        for _ in 0..fill_count {
+            let maker_order = reader.u64()?;
+            let current_taker_order = reader.u64()?;
+            let maker_account = reader.u32()?;
+            let current_taker_account = reader.u32()?;
+            let price = reader.i64()?;
+            let quantity = reader.i64()?;
+            let current_taker_side = Self::decode_side_tag(reader.u8()?)?;
+            if price <= 0 {
+                return Err(BookStateError::InvalidValue {
+                    field: "cached fill price must be strictly positive",
+                });
+            }
+            if quantity <= 0 {
+                return Err(BookStateError::InvalidValue {
+                    field: "cached fill quantity must be strictly positive",
+                });
+            }
+            if maker_order == current_taker_order {
+                return Err(BookStateError::InvalidValue {
+                    field: "cached fill maker and taker order ids must differ",
+                });
+            }
+            if maker_account == current_taker_account {
+                return Err(BookStateError::InvalidValue {
+                    field: "cached self-trade fill is not reachable",
+                });
+            }
+            if current_taker_account != dedup_account {
+                return Err(BookStateError::InvalidValue {
+                    field: "cached fill taker account must match its dedup key account",
+                });
+            }
+            if taker_order.is_some_and(|expected| expected != current_taker_order)
+                || taker_account.is_some_and(|expected| expected != current_taker_account)
+                || taker_side.is_some_and(|expected| expected != current_taker_side)
+            {
+                return Err(BookStateError::InvalidValue {
+                    field: "cached result fills must share one taker",
+                });
+            }
+            if let Some(previous) = previous_price {
+                let out_of_order = match current_taker_side {
+                    Side::Bid => price < previous,
+                    Side::Ask => price > previous,
+                };
+                if out_of_order {
+                    return Err(BookStateError::InvalidValue {
+                        field: "cached fills must retain canonical execution order",
+                    });
+                }
+            }
+            taker_order = Some(current_taker_order);
+            taker_account = Some(current_taker_account);
+            taker_side = Some(current_taker_side);
+            previous_price = Some(price);
+            filled_quantity = filled_quantity.checked_add(quantity).ok_or(
+                BookStateError::ArithmeticOverflow {
+                    field: "cached filled quantity",
+                },
+            )?;
+        }
+
+        let outcome_tag = reader.u8()?;
+        let outcome_quantity = reader.i64()?;
+        match outcome_tag {
+            0 if fill_count == 0 && outcome_quantity > 0 => {}
+            1 if fill_count > 0 && outcome_quantity == 0 => {}
+            2 if fill_count > 0 && outcome_quantity > 0 => {
+                filled_quantity.checked_add(outcome_quantity).ok_or(
+                    BookStateError::ArithmeticOverflow {
+                        field: "cached original quantity",
+                    },
+                )?;
+            }
+            3 if fill_count > 0
+                && outcome_quantity == filled_quantity
+                && filled_quantity < i64::MAX => {}
+            4 if fill_count == 0 && outcome_quantity == 0 => {}
+            0..=4 => {
+                return Err(BookStateError::InvalidValue {
+                    field: "cached result outcome is inconsistent with its fills or quantity",
+                })
+            }
+            value => {
+                return Err(BookStateError::InvalidTag {
+                    field: "order outcome",
+                    value,
+                })
+            }
+        }
+        Ok(())
+    }
+
+    fn restore_state_v3(
+        bytes: &[u8],
+        scanned: ScannedState,
+        matching_backend: crate::MatchingBackend,
+    ) -> Result<Self, BookStateError> {
+        let mut reader = StateReader::new(bytes);
+        let _version = reader.u16()?;
+        let _capacity = reader.u64()?;
+        let _stp = reader.u8()?;
+        let _dedup_capacity = reader.u64()?;
+        let _max_basket_legs = reader.u64()?;
+
+        let mut book = Self::new(BookConfig {
+            capacity: scanned.header.capacity,
+            stp: scanned.header.stp,
+            dedup_capacity: scanned.header.dedup_capacity,
+            max_basket_legs: scanned.header.max_basket_legs,
+            matching_backend,
+        });
+        let mut seen_order_ids = HashSet::with_capacity(scanned.shape.orders);
+        Self::restore_state_side(&mut reader, &mut book, Side::Bid, &mut seen_order_ids)?;
+        Self::restore_state_side(&mut reader, &mut book, Side::Ask, &mut seen_order_ids)?;
+        for orders in book.account_orders.values_mut() {
+            orders.sort_unstable();
+        }
+
+        let position_count = Self::u64_as_usize("positions", reader.u64()?)?;
+        for _ in 0..position_count {
+            let account = AccountId::new(reader.u32()?);
+            let quantity = Quantity::from_raw(reader.i64()?);
+            if book.positions.insert(account, quantity).is_some() {
+                return Err(BookStateError::NonCanonical {
+                    field: "duplicate position account",
+                });
+            }
+        }
+
+        let dedup_count = Self::u64_as_usize("dedup records", reader.u64()?)?;
+        let mut seen_dedup_keys = HashSet::with_capacity(dedup_count);
+        for _ in 0..dedup_count {
+            let account_raw = reader.u32()?;
+            let client_id = reader.u64()?;
+            if !seen_dedup_keys.insert((account_raw, client_id)) {
+                return Err(BookStateError::NonCanonical {
+                    field: "dedup FIFO contains a duplicate key",
+                });
+            }
+            let result = Self::decode_match_result(&mut reader)?;
+            book.dedup
+                .insert(AccountId::new(account_raw), client_id, result);
+        }
+        reader.finish()?;
+        Ok(book)
+    }
+
+    fn restore_state_side(
+        reader: &mut StateReader<'_>,
+        book: &mut Self,
+        expected_side: Side,
+        seen_order_ids: &mut HashSet<OrderId>,
+    ) -> Result<(), BookStateError> {
+        let level_count = Self::u64_as_usize("price levels", reader.u64()?)?;
+        for _ in 0..level_count {
+            let level_price = Price::from_raw(reader.i64()?);
+            let order_count = Self::u64_as_usize("resting orders", reader.u64()?)?;
+            for _ in 0..order_count {
+                let order_id = OrderId::new(reader.u64()?);
+                let account = AccountId::new(reader.u32()?);
+                let side = Self::decode_side_tag(reader.u8()?)?;
+                let price = Price::from_raw(reader.i64()?);
+                let remaining = Quantity::from_raw(reader.i64()?);
+                let client_id = reader.u64()?;
+                debug_assert_eq!(side, expected_side);
+                debug_assert_eq!(price, level_price);
+                if !seen_order_ids.insert(order_id) {
+                    return Err(BookStateError::NonCanonical {
+                        field: "resting order ids must be globally unique",
+                    });
+                }
+                let node = Node {
+                    order_id,
+                    account,
+                    side,
+                    price,
+                    remaining,
+                    client_id,
+                    prev: NIL,
+                    next: NIL,
+                };
+                let slot = book
+                    .slab
+                    .insert(node)
+                    .map_err(|_| BookStateError::InvalidValue {
+                        field: "resting order count exceeds slab capacity",
+                    })?;
+                match expected_side {
+                    Side::Bid => book.bids.push_back(&mut book.slab, slot),
+                    Side::Ask => book.asks.push_back(&mut book.slab, slot),
+                }
+                let stored = *book.slab.get(slot).ok_or(BookStateError::InvalidValue {
+                    field: "restored slab slot is not live",
+                })?;
+                book.auth_insert(&stored);
+                if book
+                    .id_index
+                    .insert(
+                        order_id,
+                        Locator {
+                            slot,
+                            side,
+                            account,
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err(BookStateError::NonCanonical {
+                        field: "resting order ids must be globally unique",
+                    });
+                }
+                book.account_orders
+                    .entry(account)
+                    .or_default()
+                    .push(order_id);
+            }
+        }
+        Ok(())
+    }
+
+    fn decode_match_result(reader: &mut StateReader<'_>) -> Result<MatchResult, BookStateError> {
+        let fill_count = Self::u64_as_usize("cached fills", reader.u64()?)?;
+        let mut fills = Vec::with_capacity(fill_count);
+        let mut makers = HashSet::with_capacity(fill_count);
+        for _ in 0..fill_count {
+            let fill = Fill {
+                maker_order: OrderId::new(reader.u64()?),
+                taker_order: OrderId::new(reader.u64()?),
+                maker_account: AccountId::new(reader.u32()?),
+                taker_account: AccountId::new(reader.u32()?),
+                price: Price::from_raw(reader.i64()?),
+                quantity: Quantity::from_raw(reader.i64()?),
+                taker_side: Self::decode_side_tag(reader.u8()?)?,
+            };
+            if !makers.insert(fill.maker_order) {
+                return Err(BookStateError::InvalidValue {
+                    field: "cached result cannot fill one maker order twice",
+                });
+            }
+            fills.push(fill);
+        }
+        let outcome_tag = reader.u8()?;
+        let quantity = Quantity::from_raw(reader.i64()?);
+        let outcome = match outcome_tag {
+            0 => OrderOutcome::Resting {
+                remaining: quantity,
+            },
+            1 => OrderOutcome::FullyFilled,
+            2 => OrderOutcome::PartiallyFilledResting {
+                remaining: quantity,
+            },
+            3 => OrderOutcome::PartiallyFilledCancelled { filled: quantity },
+            4 => OrderOutcome::Rejected,
+            value => {
+                return Err(BookStateError::InvalidTag {
+                    field: "order outcome",
+                    value,
+                })
+            }
+        };
+        Ok(MatchResult { fills, outcome })
+    }
+
+    fn decode_side_tag(value: u8) -> Result<Side, BookStateError> {
+        match value {
+            0 => Ok(Side::Bid),
+            1 => Ok(Side::Ask),
+            value => Err(BookStateError::InvalidTag {
+                field: "side",
+                value,
+            }),
+        }
+    }
 
     fn write_transition_side(
         &self,

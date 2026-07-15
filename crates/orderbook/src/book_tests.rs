@@ -57,6 +57,50 @@ fn limit(id: u64, acct: u32, side: Side, price: i64, qty: i64) -> NewOrder {
     order(id, acct, side, OrderType::Limit, TimeInForce::Gtc, price, qty, id)
 }
 
+fn codec_cfg() -> BookConfig {
+    BookConfig {
+        capacity: 12,
+        stp: StpPolicy::CancelMaker,
+        dedup_capacity: 8,
+        max_basket_legs: 4,
+        matching_backend: simd::Backend::Scalar,
+    }
+}
+
+fn codec_fixture() -> OrderBook {
+    let mut book = OrderBook::new(codec_cfg());
+    book.submit(limit(1, 1, Side::Ask, 110, 3)).unwrap();
+    book.submit(limit(2, 2, Side::Ask, 111, 4)).unwrap();
+    book.submit(limit(3, 3, Side::Bid, 111, 5)).unwrap();
+    book.place(limit(4, 4, Side::Bid, 100, 1)).unwrap();
+    book.set_position(AccountId::new(7), Quantity::from_raw(3));
+    book.set_position(AccountId::new(8), Quantity::from_raw(-2));
+    book
+}
+
+fn canonical_bytes(book: &OrderBook) -> Vec<u8> {
+    book.encode_state_v3_bounded(usize::MAX).unwrap()
+}
+
+fn assert_logically_identical(left: &OrderBook, right: &OrderBook) {
+    assert_eq!(canonical_bytes(left), canonical_bytes(right));
+    assert_eq!(left.state_root(), right.state_root());
+    assert_eq!(left.state_root_full_rebuild(), right.state_root_full_rebuild());
+    assert_eq!(left.transition_root_v3(), right.transition_root_v3());
+    assert_eq!(left.best_bid(), right.best_bid());
+    assert_eq!(left.best_ask(), right.best_ask());
+    assert_eq!(left.resting_len(), right.resting_len());
+    assert_eq!(left.total_resting_quantity(), right.total_resting_quantity());
+}
+
+fn overwrite_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+fn overwrite_i64(bytes: &mut [u8], offset: usize, value: i64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
 #[test]
 fn price_time_priority_matches_best_then_oldest() {
     let mut b = OrderBook::new(cfg());
@@ -939,13 +983,16 @@ fn transition_root_v3_golden_vector() {
     book.place(limit(1, 7, Side::Bid, 100, 5)).unwrap();
     book.place(limit(2, 8, Side::Ask, 110, 6)).unwrap();
     book.set_position(AccountId::new(7), Quantity::from_raw(3));
+    let encoded = canonical_bytes(&book);
+    assert_eq!(encoded.len(), 59 + 2 * 16 + 2 * 37 + 12);
     assert_eq!(
-        book.transition_root_v3(),
+        crypto::hash_domain(crypto::DOMAIN_ORDERBOOK_STATE, &encoded),
         Hash::from_bytes([
             50, 182, 109, 6, 209, 245, 235, 7, 86, 25, 40, 230, 200, 166, 188, 217, 49, 9,
             158, 191, 57, 93, 101, 0, 190, 80, 254, 226, 143, 95, 183, 114,
         ])
     );
+    assert_eq!(book.transition_root_v3(), crypto::hash_domain(crypto::DOMAIN_ORDERBOOK_STATE, &encoded));
 }
 
 #[test]
@@ -953,13 +1000,833 @@ fn transition_root_v3_dedup_schema_golden_vector() {
     let mut book = OrderBook::new(cfg());
     book.place(limit(1, 7, Side::Ask, 100, 5)).unwrap();
     book.submit(limit(2, 8, Side::Bid, 100, 5)).unwrap();
+    let encoded = canonical_bytes(&book);
+    assert_eq!(encoded.len(), 59 + 29 + 41);
     assert_eq!(
-        book.transition_root_v3(),
+        crypto::hash_domain(crypto::DOMAIN_ORDERBOOK_STATE, &encoded),
         Hash::from_bytes([
             185, 17, 219, 185, 165, 201, 13, 159, 104, 195, 106, 36, 58, 56, 128, 194, 227,
             130, 125, 1, 83, 22, 198, 252, 74, 108, 160, 76, 160, 100, 155, 76,
         ])
     );
+    assert_eq!(book.transition_root_v3(), crypto::hash_domain(crypto::DOMAIN_ORDERBOOK_STATE, &encoded));
+}
+
+#[test]
+fn state_v3_codec_round_trips_every_logical_field_and_keeps_backend_external() {
+    let original = codec_fixture();
+    let bytes = canonical_bytes(&original);
+    assert_eq!(
+        crypto::hash_domain(crypto::DOMAIN_ORDERBOOK_STATE, &bytes),
+        original.transition_root_v3()
+    );
+
+    let decoded = OrderBook::decode_state_v3_bounded(
+        &bytes,
+        &BookStateLimits::default(),
+        simd::Backend::Neon,
+    )
+    .unwrap();
+    assert_eq!(decoded.config.matching_backend, simd::Backend::Neon);
+    assert_logically_identical(&original, &decoded);
+
+    let too_small = bytes.len() - 1;
+    assert_eq!(
+        original.encode_state_v3_bounded(too_small),
+        Err(BookStateError::EncodedBytesLimit {
+            actual: bytes.len(),
+            max: too_small,
+        })
+    );
+}
+
+#[test]
+fn state_v3_codec_rejects_every_truncation_and_any_suffix() {
+    let bytes = canonical_bytes(&codec_fixture());
+    for cut in 0..bytes.len() {
+        assert!(
+            OrderBook::decode_state_v3_bounded(
+                &bytes[..cut],
+                &BookStateLimits::default(),
+                simd::Backend::Scalar,
+            )
+            .is_err(),
+            "truncation at byte {cut} was accepted"
+        );
+    }
+
+    let mut with_suffix = bytes;
+    with_suffix.extend_from_slice(&[0xaa, 0xbb]);
+    match OrderBook::decode_state_v3_bounded(
+        &with_suffix,
+        &BookStateLimits::default(),
+        simd::Backend::Scalar,
+    ) {
+        Err(error) => assert_eq!(error, BookStateError::TrailingBytes { remaining: 2 }),
+        Ok(_) => panic!("trailing bytes were accepted"),
+    }
+}
+
+#[test]
+fn state_v3_decoder_never_panics_on_arbitrary_bounded_bytes() {
+    let mut random = Lcg(0xC0DE_CAFE_F00D_BAAD);
+    let limits = BookStateLimits {
+        max_encoded_bytes: 512,
+        max_capacity: 64,
+        max_dedup_capacity: 32,
+        max_basket_legs: 16,
+        max_price_levels: 64,
+        max_resting_orders: 64,
+        max_positions: 64,
+        max_dedup_records: 32,
+        max_fills_per_result: 32,
+        max_total_fills: 64,
+    };
+    for _ in 0..10_000 {
+        let len = usize::try_from(random.below(513)).unwrap();
+        let mut bytes = vec![0u8; len];
+        for chunk in bytes.chunks_mut(8) {
+            let word = random.next_u64().to_le_bytes();
+            let chunk_len = chunk.len();
+            chunk.copy_from_slice(&word[..chunk_len]);
+        }
+        let _ = OrderBook::decode_state_v3_bounded(&bytes, &limits, simd::Backend::Scalar);
+    }
+}
+
+#[test]
+fn state_v3_codec_enforces_every_resource_limit_independently() {
+    let bytes = canonical_bytes(&codec_fixture());
+    let assert_resource = |limits: BookStateLimits, expected: &'static str| {
+        assert!(matches!(
+            OrderBook::decode_state_v3_bounded(&bytes, &limits, simd::Backend::Scalar),
+            Err(BookStateError::ResourceLimit { resource, .. }) if resource == expected
+        ));
+    };
+
+    let limits = BookStateLimits {
+        max_encoded_bytes: bytes.len() - 1,
+        ..BookStateLimits::default()
+    };
+    match OrderBook::decode_state_v3_bounded(&bytes, &limits, simd::Backend::Scalar) {
+        Err(error) => assert_eq!(
+            error,
+            BookStateError::EncodedBytesLimit {
+                actual: bytes.len(),
+                max: bytes.len() - 1,
+            }
+        ),
+        Ok(_) => panic!("oversized state was accepted"),
+    }
+
+    assert_resource(
+        BookStateLimits {
+            max_capacity: 11,
+            ..BookStateLimits::default()
+        },
+        "capacity",
+    );
+    assert_resource(
+        BookStateLimits {
+            max_dedup_capacity: 7,
+            ..BookStateLimits::default()
+        },
+        "dedup capacity",
+    );
+    assert_resource(
+        BookStateLimits {
+            max_basket_legs: 3,
+            ..BookStateLimits::default()
+        },
+        "basket legs",
+    );
+    assert_resource(
+        BookStateLimits {
+            max_price_levels: 1,
+            ..BookStateLimits::default()
+        },
+        "price levels",
+    );
+    assert_resource(
+        BookStateLimits {
+            max_resting_orders: 1,
+            ..BookStateLimits::default()
+        },
+        "resting orders",
+    );
+    assert_resource(
+        BookStateLimits {
+            max_positions: 1,
+            ..BookStateLimits::default()
+        },
+        "positions",
+    );
+    assert_resource(
+        BookStateLimits {
+            max_dedup_records: 2,
+            ..BookStateLimits::default()
+        },
+        "dedup records",
+    );
+    assert_resource(
+        BookStateLimits {
+            max_fills_per_result: 1,
+            ..BookStateLimits::default()
+        },
+        "fills per dedup result",
+    );
+    assert_resource(
+        BookStateLimits {
+            max_total_fills: 1,
+            ..BookStateLimits::default()
+        },
+        "total cached fills",
+    );
+}
+
+#[test]
+fn state_v3_codec_rejects_hostile_declared_bounds_before_payload_allocation() {
+    let empty = OrderBook::new(codec_cfg());
+    let mut huge_capacity = canonical_bytes(&empty);
+    overwrite_u64(&mut huge_capacity, 2, u64::MAX);
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &huge_capacity,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::ResourceLimit {
+            resource: "capacity",
+            actual: u64::MAX,
+            ..
+        })
+    ));
+
+    let mut huge_levels = canonical_bytes(&empty);
+    overwrite_u64(&mut huge_levels, 27, u64::MAX);
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &huge_levels,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::ResourceLimit {
+            resource: "price levels",
+            actual: u64::MAX,
+            ..
+        })
+    ));
+
+    // One declared bid level with an independently hostile order count. The
+    // record payload is intentionally absent: the count limit must win over
+    // truncation without attempting a resting-order allocation.
+    let mut huge_orders = canonical_bytes(&empty);
+    overwrite_u64(&mut huge_orders, 27, 1);
+    let mut level = Vec::new();
+    level.extend_from_slice(&100i64.to_le_bytes());
+    level.extend_from_slice(&u64::MAX.to_le_bytes());
+    huge_orders.splice(35..35, level);
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &huge_orders,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::ResourceLimit {
+            resource: "resting orders",
+            actual: u64::MAX,
+            ..
+        })
+    ));
+
+    let permissive = BookStateLimits {
+        max_capacity: usize::MAX,
+        ..BookStateLimits::default()
+    };
+    overwrite_u64(&mut huge_capacity, 2, u64::from(u32::MAX) + 1);
+    match OrderBook::decode_state_v3_bounded(
+        &huge_capacity,
+        &permissive,
+        simd::Backend::Scalar,
+    ) {
+        Err(error) => assert_eq!(
+            error,
+            BookStateError::NativeWidth {
+                field: "slab capacity",
+                value: u64::from(u32::MAX) + 1,
+            }
+        ),
+        Ok(_) => panic!("unrepresentable slab capacity was accepted"),
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    {
+        let mut unencodable = OrderBook::new(codec_cfg());
+        unencodable.config.capacity = usize::try_from(u64::from(u32::MAX) + 1).unwrap();
+        assert_eq!(
+            unencodable.encode_state_v3_bounded(usize::MAX),
+            Err(BookStateError::NativeWidth {
+                field: "slab capacity",
+                value: u64::from(u32::MAX) + 1,
+            })
+        );
+    }
+}
+
+#[test]
+fn state_v3_codec_rejects_noncanonical_or_corrupt_resting_state() {
+    let mut book = OrderBook::new(codec_cfg());
+    book.place(limit(1, 1, Side::Bid, 99, 2)).unwrap();
+    book.place(limit(2, 2, Side::Bid, 100, 3)).unwrap();
+    book.place(limit(3, 3, Side::Ask, 110, 4)).unwrap();
+    let bytes = canonical_bytes(&book);
+
+    // Header is 27 bytes. Bid count is 8 bytes. The first level is
+    // 16 + 37 bytes, so the second level price begins at byte 88.
+    let mut noncanonical_levels = bytes.clone();
+    overwrite_i64(&mut noncanonical_levels, 88, 99);
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &noncanonical_levels,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::NonCanonical { .. })
+    ));
+
+    let mut wrong_side = bytes.clone();
+    wrong_side[63] = 1;
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &wrong_side,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::InvalidValue { .. })
+    ));
+
+    let mut wrong_price = bytes.clone();
+    overwrite_i64(&mut wrong_price, 64, 98);
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &wrong_price,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::InvalidValue { .. })
+    ));
+
+    let mut zero_quantity = bytes.clone();
+    overwrite_i64(&mut zero_quantity, 72, 0);
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &zero_quantity,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::InvalidValue { .. })
+    ));
+
+    // The second bid's node starts at byte 104; duplicate the first order id.
+    let mut duplicate_order = bytes.clone();
+    overwrite_u64(&mut duplicate_order, 104, 1);
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &duplicate_order,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::NonCanonical { .. })
+    ));
+
+    // Ask count begins after both bid levels at byte 141; ask price/node price
+    // begin at 149/178. Lock the ask to the best bid.
+    let mut locked_book = bytes;
+    overwrite_i64(&mut locked_book, 149, 100);
+    overwrite_i64(&mut locked_book, 178, 100);
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &locked_book,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::InvalidValue { .. })
+    ));
+}
+
+#[test]
+fn state_v3_codec_rejects_unknown_header_tags() {
+    let bytes = canonical_bytes(&OrderBook::new(codec_cfg()));
+    let mut version = bytes.clone();
+    version[0..2].copy_from_slice(&4u16.to_le_bytes());
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &version,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::UnsupportedVersion {
+            found: 4,
+            expected: BOOK_TRANSITION_ROOT_SCHEMA_VERSION,
+        })
+    ));
+
+    let mut stp = bytes;
+    stp[10] = 3;
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &stp,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::InvalidTag {
+            field: "self-trade prevention policy",
+            value: 3,
+        })
+    ));
+}
+
+#[test]
+fn state_v3_codec_rejects_noncanonical_positions_and_malformed_cached_results() {
+    let mut positioned = OrderBook::new(codec_cfg());
+    positioned.set_position(AccountId::new(1), Quantity::from_raw(2));
+    positioned.set_position(AccountId::new(2), Quantity::from_raw(3));
+    let mut positions = canonical_bytes(&positioned);
+    positions[63..67].copy_from_slice(&1u32.to_le_bytes());
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &positions,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::NonCanonical { .. })
+    ));
+
+    let mut rejected_book = OrderBook::new(codec_cfg());
+    rejected_book
+        .submit(order(
+            1,
+            1,
+            Side::Bid,
+            OrderType::Market,
+            TimeInForce::Ioc,
+            100,
+            1,
+            10,
+        ))
+        .unwrap();
+    let rejected = canonical_bytes(&rejected_book);
+    // Empty state prefixes total 59 bytes, then account/client/fill-count. The
+    // outcome tag and quantity are bytes 79 and 80..88.
+    let mut unknown_outcome = rejected.clone();
+    unknown_outcome[79] = 9;
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &unknown_outcome,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::InvalidTag {
+            field: "order outcome",
+            value: 9,
+        })
+    ));
+    let mut impossible_outcome = rejected.clone();
+    impossible_outcome[79] = 1;
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &impossible_outcome,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::InvalidValue { .. })
+    ));
+    let mut nonzero_rejection = rejected;
+    overwrite_i64(&mut nonzero_rejection, 80, 1);
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &nonzero_rejection,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::InvalidValue { .. })
+    ));
+
+    let mut filled_book = OrderBook::new(codec_cfg());
+    filled_book.place(limit(20, 2, Side::Ask, 100, 2)).unwrap();
+    filled_book.submit(limit(21, 3, Side::Bid, 100, 2)).unwrap();
+    let filled = canonical_bytes(&filled_book);
+    // One fill starts at byte 79. Maker/taker accounts are at 95/99, price at
+    // 103, quantity at 111, side at 119, outcome at 120.
+    let mut self_trade = filled.clone();
+    self_trade[95..99].copy_from_slice(&3u32.to_le_bytes());
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &self_trade,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::InvalidValue { .. })
+    ));
+    let mut zero_fill = filled.clone();
+    overwrite_i64(&mut zero_fill, 111, 0);
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &zero_fill,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::InvalidValue { .. })
+    ));
+    let mut overflowing_partial = filled.clone();
+    overflowing_partial[120] = 2;
+    overwrite_i64(&mut overflowing_partial, 121, i64::MAX);
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &overflowing_partial,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::ArithmeticOverflow {
+            field: "cached original quantity",
+        })
+    ));
+    let mut wrong_dedup_owner = filled.clone();
+    wrong_dedup_owner[99..103].copy_from_slice(&4u32.to_le_bytes());
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &wrong_dedup_owner,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::InvalidValue { .. })
+    ));
+    let mut unknown_side = filled;
+    unknown_side[119] = 7;
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &unknown_side,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::InvalidTag {
+            field: "side",
+            value: 7,
+        })
+    ));
+
+    let mut duplicate_keys_book = OrderBook::new(codec_cfg());
+    for (id, account, client) in [(30, 5, 50), (31, 6, 51)] {
+        duplicate_keys_book
+            .submit(order(
+                id,
+                account,
+                Side::Bid,
+                OrderType::Market,
+                TimeInForce::Ioc,
+                100,
+                1,
+                client,
+            ))
+            .unwrap();
+    }
+    let mut duplicate_keys = canonical_bytes(&duplicate_keys_book);
+    // Two no-fill records are 29 bytes each and begin at 59 and 88.
+    duplicate_keys[88..92].copy_from_slice(&5u32.to_le_bytes());
+    overwrite_u64(&mut duplicate_keys, 92, 50);
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &duplicate_keys,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::NonCanonical { .. })
+    ));
+
+    let mut two_fill_book = OrderBook::new(codec_cfg());
+    two_fill_book.place(limit(40, 7, Side::Ask, 100, 1)).unwrap();
+    two_fill_book.place(limit(41, 8, Side::Ask, 101, 1)).unwrap();
+    two_fill_book.submit(limit(42, 9, Side::Bid, 101, 2)).unwrap();
+    let mut duplicate_maker = canonical_bytes(&two_fill_book);
+    // The sole record starts at 59. Its two 41-byte fills start at 79 and 120.
+    let first_maker = duplicate_maker[79..87].to_vec();
+    duplicate_maker[120..128].copy_from_slice(&first_maker);
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &duplicate_maker,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::InvalidValue { .. })
+    ));
+}
+
+#[test]
+fn state_v3_codec_round_trips_partial_outcomes_and_rejects_unreachable_boundaries() {
+    let mut partial_resting = OrderBook::new(codec_cfg());
+    partial_resting
+        .place(limit(50, 1, Side::Ask, 100, 1))
+        .unwrap();
+    let resting_result = partial_resting
+        .submit(limit(51, 2, Side::Bid, 100, 2))
+        .unwrap();
+    assert!(matches!(
+        resting_result.outcome,
+        OrderOutcome::PartiallyFilledResting { remaining }
+            if remaining == Quantity::from_raw(1)
+    ));
+    let resting_bytes = canonical_bytes(&partial_resting);
+    let restored = OrderBook::decode_state_v3_bounded(
+        &resting_bytes,
+        &BookStateLimits::default(),
+        simd::Backend::Scalar,
+    )
+    .unwrap();
+    assert_logically_identical(&partial_resting, &restored);
+
+    let mut partial_cancelled = OrderBook::new(codec_cfg());
+    partial_cancelled
+        .place(limit(60, 3, Side::Ask, 100, 1))
+        .unwrap();
+    let cancelled_result = partial_cancelled
+        .submit(order(
+            61,
+            4,
+            Side::Bid,
+            OrderType::Limit,
+            TimeInForce::Ioc,
+            100,
+            2,
+            61,
+        ))
+        .unwrap();
+    assert!(matches!(
+        cancelled_result.outcome,
+        OrderOutcome::PartiallyFilledCancelled { filled }
+            if filled == Quantity::from_raw(1)
+    ));
+    let cancelled_bytes = canonical_bytes(&partial_cancelled);
+    assert_eq!(cancelled_bytes.len(), 59 + 29 + 41);
+    assert_eq!(cancelled_bytes[120], 3);
+    let restored = OrderBook::decode_state_v3_bounded(
+        &cancelled_bytes,
+        &BookStateLimits::default(),
+        simd::Backend::Scalar,
+    )
+    .unwrap();
+    assert_logically_identical(&partial_cancelled, &restored);
+
+    let mut impossible_cancelled = cancelled_bytes;
+    overwrite_i64(&mut impossible_cancelled, 111, i64::MAX);
+    overwrite_i64(&mut impossible_cancelled, 121, i64::MAX);
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &impossible_cancelled,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::InvalidValue { .. })
+    ));
+}
+
+#[test]
+fn state_v3_dense_restore_matches_fragmented_slab_through_long_continuation() {
+    let config = BookConfig {
+        capacity: 12,
+        stp: StpPolicy::CancelMaker,
+        dedup_capacity: 16,
+        max_basket_legs: 4,
+        matching_backend: simd::Backend::Scalar,
+    };
+    let mut fragmented = OrderBook::new(config);
+    for resting in [
+        limit(10, 1, Side::Bid, 100, 8),
+        limit(11, 2, Side::Bid, 100, 7),
+        limit(14, 9, Side::Bid, 100, 6),
+        limit(12, 3, Side::Bid, 99, 6),
+        limit(20, 4, Side::Ask, 110, 5),
+        limit(21, 5, Side::Ask, 110, 9),
+        limit(22, 6, Side::Ask, 111, 4),
+    ] {
+        fragmented.submit(resting).unwrap();
+    }
+    fragmented.cancel(OrderId::new(12)).unwrap();
+    fragmented.cancel(OrderId::new(20)).unwrap();
+    fragmented.submit(limit(23, 7, Side::Ask, 112, 3)).unwrap();
+    fragmented.cancel(OrderId::new(10)).unwrap();
+    fragmented.submit(limit(13, 8, Side::Bid, 98, 2)).unwrap();
+    fragmented.cancel(OrderId::new(21)).unwrap();
+
+    let fragmented_layout = fragmented.slab.representation_for_test();
+    let bytes = canonical_bytes(&fragmented);
+    let mut dense = OrderBook::decode_state_v3_bounded(
+        &bytes,
+        &BookStateLimits::default(),
+        simd::Backend::Scalar,
+    )
+    .unwrap();
+    assert_ne!(fragmented_layout, dense.slab.representation_for_test());
+    assert_ne!(
+        fragmented.id_index[&OrderId::new(22)].slot,
+        dense.id_index[&OrderId::new(22)].slot
+    );
+    assert_logically_identical(&fragmented, &dense);
+
+    // A canceled order's retained cache entry must replay without resurrecting
+    // it or depending on its former slab slot.
+    let replay = limit(12, 3, Side::Bid, 99, 6);
+    assert_eq!(fragmented.submit(replay), dense.submit(replay));
+    assert!(!fragmented.contains(OrderId::new(12)));
+    assert!(!dense.contains(OrderId::new(12)));
+    assert_logically_identical(&fragmented, &dense);
+
+    // Fill id 11 completely, then partially reduce id 14 in-place.
+    let taker = limit(100, 50, Side::Ask, 100, 10);
+    assert_eq!(fragmented.plan_match(&taker), dense.plan_match(&taker));
+    assert_eq!(
+        fragmented.plan_match_summary_with_backend(&taker, simd::Backend::Scalar),
+        dense.plan_match_summary_with_backend(&taker, simd::Backend::Scalar)
+    );
+    assert_eq!(
+        fragmented.plan_match_summary_with_backend(&taker, simd::Backend::Avx2),
+        dense.plan_match_summary_with_backend(&taker, simd::Backend::Avx2)
+    );
+    assert_eq!(fragmented.place(taker), dense.place(taker));
+    assert_eq!(
+        fragmented.level_quantity(Side::Bid, Price::from_raw(100)),
+        Quantity::from_raw(3)
+    );
+    assert_logically_identical(&fragmented, &dense);
+
+    // Replace removes the partially-filled node, consumes both asks, and rests
+    // an identical residual even though each allocator chooses another slot.
+    assert_eq!(
+        fragmented.replace(OrderId::new(14), Price::from_raw(112), Quantity::from_raw(8)),
+        dense.replace(OrderId::new(14), Price::from_raw(112), Quantity::from_raw(8))
+    );
+    assert_logically_identical(&fragmented, &dense);
+    assert_eq!(
+        fragmented.cancel(OrderId::new(13)),
+        dense.cancel(OrderId::new(13))
+    );
+    assert_logically_identical(&fragmented, &dense);
+
+    fragmented.set_position(AccountId::new(60), Quantity::from_raw(5));
+    dense.set_position(AccountId::new(60), Quantity::from_raw(5));
+    let reduce_only = NewOrder {
+        reduce_only: true,
+        ..limit(200, 60, Side::Ask, 120, 8)
+    };
+    assert_eq!(fragmented.place(reduce_only), dense.place(reduce_only));
+    assert_logically_identical(&fragmented, &dense);
+
+    for resting in [
+        limit(201, 61, Side::Ask, 130, 1),
+        limit(202, 61, Side::Ask, 130, 1),
+    ] {
+        assert_eq!(fragmented.place(resting), dense.place(resting));
+    }
+    assert_eq!(fragmented.cancel_all(AccountId::new(61)), 2);
+    assert_eq!(dense.cancel_all(AccountId::new(61)), 2);
+    assert_logically_identical(&fragmented, &dense);
+
+    let dedup_order = order(
+        210,
+        70,
+        Side::Bid,
+        OrderType::Limit,
+        TimeInForce::Gtc,
+        80,
+        1,
+        777,
+    );
+    assert_eq!(fragmented.submit(dedup_order), dense.submit(dedup_order));
+    let before_replay = canonical_bytes(&fragmented);
+    assert_eq!(fragmented.submit(dedup_order), dense.submit(dedup_order));
+    assert_eq!(canonical_bytes(&fragmented), before_replay);
+    assert_logically_identical(&fragmented, &dense);
+
+    // The other-account bid fills first; CancelMaker then removes the taker's
+    // own bid before the residual ask rests.
+    let stp = limit(211, 70, Side::Ask, 80, 2);
+    assert_eq!(fragmented.place(stp), dense.place(stp));
+    assert_logically_identical(&fragmented, &dense);
+
+    for index in 0..9u64 {
+        let resting = limit(
+            300 + index,
+            80 + u32::try_from(index).unwrap(),
+            Side::Ask,
+            140 + i64::try_from(index).unwrap(),
+            1,
+        );
+        assert_eq!(fragmented.place(resting), dense.place(resting));
+        assert_logically_identical(&fragmented, &dense);
+    }
+    assert_eq!(fragmented.resting_len(), 11);
+
+    let basket = [
+        limit(400, 100, Side::Ask, 160, 1),
+        limit(401, 101, Side::Ask, 161, 1),
+    ];
+    let before_basket = canonical_bytes(&fragmented);
+    assert_eq!(
+        fragmented.submit_basket(&basket),
+        Err(OrderError::CapacityExhausted)
+    );
+    assert_eq!(
+        dense.submit_basket(&basket),
+        Err(OrderError::CapacityExhausted)
+    );
+    assert_eq!(canonical_bytes(&fragmented), before_basket);
+    assert_logically_identical(&fragmented, &dense);
+
+    let final_slot = limit(402, 102, Side::Ask, 162, 1);
+    assert_eq!(fragmented.place(final_slot), dense.place(final_slot));
+    let overflow = limit(403, 103, Side::Ask, 163, 1);
+    assert_eq!(
+        fragmented.place(overflow),
+        Err(OrderError::CapacityExhausted)
+    );
+    assert_eq!(dense.place(overflow), Err(OrderError::CapacityExhausted));
+    assert_logically_identical(&fragmented, &dense);
+    assert_eq!(
+        fragmented.cancel(OrderId::new(402)),
+        dense.cancel(OrderId::new(402))
+    );
+
+    assert_eq!(
+        fragmented.cancel(OrderId::new(9999)),
+        dense.cancel(OrderId::new(9999))
+    );
+    assert_eq!(
+        fragmented.replace(OrderId::new(9999), Price::from_raw(1), Quantity::from_raw(1)),
+        dense.replace(OrderId::new(9999), Price::from_raw(1), Quantity::from_raw(1))
+    );
+    let invalid_quantity = limit(500, 110, Side::Ask, 170, 0);
+    assert_eq!(
+        fragmented.place(invalid_quantity),
+        dense.place(invalid_quantity)
+    );
+    let invalid_price = limit(501, 110, Side::Ask, 0, 1);
+    assert_eq!(fragmented.place(invalid_price), dense.place(invalid_price));
+    assert_logically_identical(&fragmented, &dense);
+
+    let original_fragmented = canonical_bytes(&fragmented);
+    let original_dense = canonical_bytes(&dense);
+    let mut fragmented_clone = fragmented.clone();
+    let mut dense_clone = dense.clone();
+    assert_eq!(
+        fragmented_clone.cancel(OrderId::new(300)),
+        dense_clone.cancel(OrderId::new(300))
+    );
+    assert_eq!(
+        fragmented_clone.place(limit(600, 120, Side::Bid, 70, 1)),
+        dense_clone.place(limit(600, 120, Side::Bid, 70, 1))
+    );
+    assert_logically_identical(&fragmented_clone, &dense_clone);
+    assert_eq!(canonical_bytes(&fragmented), original_fragmented);
+    assert_eq!(canonical_bytes(&dense), original_dense);
 }
 
 #[test]

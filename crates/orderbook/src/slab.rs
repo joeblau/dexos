@@ -230,6 +230,13 @@ impl<T> Slab<T> {
     pub fn contains(&self, index: u32) -> bool {
         self.get(index).is_some()
     }
+
+    /// Test-only fingerprint proving two logically equivalent slabs may retain
+    /// different dense/free-list layouts across canonical restore.
+    #[cfg(test)]
+    pub(crate) fn representation_for_test(&self) -> (usize, u32) {
+        (self.entries.len(), self.free_head)
+    }
 }
 
 #[cfg(test)]
