@@ -1,0 +1,35 @@
+[
+  {
+    "id": "lon-load-0",
+    "region": "london",
+    "max_rate": 10000000,
+    "max_connections": 4000,
+    "allowed_targets": [
+      "lon-validator-0.dz.dexos:8080",
+      "lon-validator-1.dz.dexos:8080"
+    ],
+    "clock_uncertainty_ns": 500000
+  },
+  {
+    "id": "nyc-load-0",
+    "region": "new-york",
+    "max_rate": 10000000,
+    "max_connections": 4000,
+    "allowed_targets": [
+      "nyc-validator-0.dz.dexos:8080",
+      "nyc-validator-1.dz.dexos:8080"
+    ],
+    "clock_uncertainty_ns": 500000
+  },
+  {
+    "id": "tyo-load-0",
+    "region": "tokyo",
+    "max_rate": 10000000,
+    "max_connections": 4000,
+    "allowed_targets": [
+      "tyo-validator-0.dz.dexos:8080",
+      "tyo-validator-1.dz.dexos:8080"
+    ],
+    "clock_uncertainty_ns": 500000
+  }
+]

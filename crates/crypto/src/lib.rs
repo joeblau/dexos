@@ -13,16 +13,18 @@ pub mod signature;
 
 pub use domain::{
     ALL_DOMAINS, DOMAIN_ACCOUNT, DOMAIN_COMMAND, DOMAIN_DECISION, DOMAIN_DEPOSIT, DOMAIN_EXECUTION,
-    DOMAIN_LEAF, DOMAIN_MARKET, DOMAIN_NODE, DOMAIN_ORACLE, DOMAIN_VALIDATOR_SET,
-    DOMAIN_VALIDATOR_SET_TRANSITION, DOMAIN_WITHDRAWAL_AUTH, DOMAIN_WITHDRAWAL_CERT,
-    DOMAIN_WITHDRAWAL_ID,
+    DOMAIN_EXECUTION_LEDGER_STATE, DOMAIN_EXECUTION_REPLAY_STATE, DOMAIN_EXECUTION_SESSION_STATE,
+    DOMAIN_EXECUTION_STATE, DOMAIN_LEAF, DOMAIN_MARKET, DOMAIN_NODE, DOMAIN_ORACLE,
+    DOMAIN_ORDERBOOK_STATE, DOMAIN_RISK_STATE, DOMAIN_STORAGE_WAL_CHAIN, DOMAIN_STORAGE_WAL_PREFIX,
+    DOMAIN_VALIDATOR_SET, DOMAIN_VALIDATOR_SET_TRANSITION, DOMAIN_WITHDRAWAL_AUTH,
+    DOMAIN_WITHDRAWAL_CERT, DOMAIN_WITHDRAWAL_ID,
 };
-pub use hash::{hash_domain, hash_leaf, hash_node, keccak256};
+pub use hash::{hash_domain, hash_domain_parts, hash_leaf, hash_node, keccak256};
 pub use merkle::{merkle_root, verify_proof, MerkleError, MerkleTree};
 pub use quorum::{
     minimmit_thresholds, minimmit_unit_byzantine_bound, require_minimmit_sizing, QuorumCertificate,
-    QuorumError, ThresholdSigners, Validator, ValidatorSet, MAX_VALIDATORS, QC_PACKED_HEADER_LEN,
-    QC_WIRE_VERSION, VALIDATOR_SET_VERSION,
+    QuorumError, QuorumSignatures, ThresholdSigners, Validator, ValidatorSet, MAX_VALIDATORS,
+    QC_PACKED_HEADER_LEN, QC_WIRE_VERSION, VALIDATOR_SET_VERSION,
 };
 #[allow(deprecated)]
 pub use signature::batch_verify_ed25519;

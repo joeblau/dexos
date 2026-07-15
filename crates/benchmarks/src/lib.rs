@@ -30,6 +30,8 @@
 //! runs a single named suite for `--suite <name>`.
 
 pub mod alloc;
+pub mod composed;
+pub mod composed_builder;
 pub mod harness;
 pub mod json;
 pub mod report;
@@ -38,6 +40,13 @@ pub mod stats;
 pub mod suites;
 pub mod targets;
 
+pub use composed::{
+    evaluate_campaign, evaluate_run, load_manifest, CampaignEvaluation, ComposedRun, RunEvaluation,
+    WorkloadManifest, COMPOSED_SCHEMA_VERSION, TARGET_EFFECTIVE_ORDERS_PER_SECOND,
+};
+pub use composed_builder::{
+    build_composed_run, render_raw_campaign, ComposedRunEvidence, ScopeCounters,
+};
 pub use harness::{bench, measure_allocations, Config};
 pub use report::{Provenance, Report, SCHEMA_VERSION};
 pub use stats::{percentile_permille, BenchStat, HwCounters};

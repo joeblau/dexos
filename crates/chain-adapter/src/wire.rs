@@ -1,7 +1,7 @@
 //! [`Codec`] implementations for foreign `types`/`crypto` values used on the wire.
 
 use crate::codec::{Codec, CodecError, Reader, Writer};
-use crypto::QuorumCertificate;
+use crypto::{QuorumCertificate, QuorumSignatures};
 use types::{AccountId, Amount, Hash};
 
 /// A `u16` bitmap has at most 16 set bits, so a quorum never carries more.
@@ -50,9 +50,11 @@ impl Codec for QuorumCertificate {
         if count > MAX_QUORUM_SIGNATURES {
             return Err(CodecError::LengthOutOfRange);
         }
-        let mut signatures = Vec::with_capacity(count);
+        let mut signatures = QuorumSignatures::new();
         for _ in 0..count {
-            signatures.push(r.array64()?);
+            signatures
+                .try_push(r.array64()?)
+                .map_err(|_| CodecError::LengthOutOfRange)?;
         }
         Ok(QuorumCertificate {
             message,
@@ -80,7 +82,7 @@ mod tests {
         let qc = QuorumCertificate {
             message: h,
             signer_bitmap: 0b101,
-            signatures: vec![[1u8; 64], [2u8; 64]],
+            signatures: [[1u8; 64], [2u8; 64]].into_iter().collect(),
         };
         assert_eq!(QuorumCertificate::decode(&qc.encode()).unwrap(), qc);
     }

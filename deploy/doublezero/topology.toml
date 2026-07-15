@@ -1,0 +1,119 @@
+schema_version = 1
+topology_id = "dexos-lon-nyc-tyo-100g-v1"
+doublezero_environment = "mainnet-beta"
+doublezero_interface = "doublezero0"
+provisioned_link_gbps = 100
+mtu = 9000
+logical_shards = 256
+replication = "all validators execute all shards; shard ownership is local single-writer"
+
+[committee]
+protocol = "minimmit"
+n = 6
+f = 1
+m = 3
+l = 5
+checkpoint_interval_ms = 100
+delta_ms = 100
+
+[workload]
+manifest = "../../crates/benchmarks/workloads/global-20m-v1.toml"
+warmup_seconds = 60
+steady_seconds = 600
+drain_seconds = 2
+consecutive_runs = 3
+offered_orders_per_second = 24000000
+required_effective_orders_per_second = 20000000
+
+[host_profile]
+os = "Linux x86_64"
+kernel = "pin exact value in the signed campaign artifact"
+physical_cores = 128
+numa_nodes = 2
+governor = "performance"
+isolated_cpus = "8-127"
+irq_cpus = "0-7"
+shard_cpus_numa0 = "8-67"
+shard_cpus_numa1 = "68-127"
+file_descriptor_limit = 1048576
+clock = "PTP hardware clock disciplined; chrony fallback; record max error"
+
+[nic]
+queues = 64
+combined_channels = 64
+rss_hash = "toeplitz over IPv4/IPv6 TCP/UDP 4-tuples"
+rps = "disabled on hardware RSS queues"
+xps = "queue-local CPU mask"
+gro = true
+gso = true
+tso = true
+lro = false
+rx_usecs = 0
+tx_usecs = 0
+rx_ring = 8192
+tx_ring = 8192
+
+[kernel]
+net_core_rmem_max = 536870912
+net_core_wmem_max = 536870912
+net_core_netdev_max_backlog = 250000
+net_core_somaxconn = 65535
+net_ipv4_tcp_rmem = "4096 1048576 536870912"
+net_ipv4_tcp_wmem = "4096 1048576 536870912"
+net_ipv4_tcp_congestion_control = "bbr"
+net_ipv4_tcp_mtu_probing = 1
+vm_swappiness = 1
+
+[[regions]]
+name = "london"
+load_share_bps = 3334
+load_agent = "lon-load-0"
+validators = ["lon-validator-0", "lon-validator-1"]
+
+[[regions]]
+name = "new-york"
+load_share_bps = 3333
+load_agent = "nyc-load-0"
+validators = ["nyc-validator-0", "nyc-validator-1"]
+
+[[regions]]
+name = "tokyo"
+load_share_bps = 3333
+load_agent = "tyo-load-0"
+validators = ["tyo-validator-0", "tyo-validator-1"]
+
+[[validators]]
+name = "lon-validator-0"
+region = "london"
+rpc = "lon-validator-0.dz.dexos:8080"
+p2p = "lon-validator-0.dz.dexos:9000"
+
+[[validators]]
+name = "lon-validator-1"
+region = "london"
+rpc = "lon-validator-1.dz.dexos:8080"
+p2p = "lon-validator-1.dz.dexos:9000"
+
+[[validators]]
+name = "nyc-validator-0"
+region = "new-york"
+rpc = "nyc-validator-0.dz.dexos:8080"
+p2p = "nyc-validator-0.dz.dexos:9000"
+
+[[validators]]
+name = "nyc-validator-1"
+region = "new-york"
+rpc = "nyc-validator-1.dz.dexos:8080"
+p2p = "nyc-validator-1.dz.dexos:9000"
+
+[[validators]]
+name = "tyo-validator-0"
+region = "tokyo"
+rpc = "tyo-validator-0.dz.dexos:8080"
+p2p = "tyo-validator-0.dz.dexos:9000"
+
+[[validators]]
+name = "tyo-validator-1"
+region = "tokyo"
+rpc = "tyo-validator-1.dz.dexos:8080"
+p2p = "tyo-validator-1.dz.dexos:9000"

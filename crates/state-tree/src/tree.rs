@@ -27,6 +27,12 @@ pub enum StateError {
     /// The id maps to an index beyond the sub-tree's capacity.
     #[error("id is out of range for the tree capacity")]
     IdOutOfRange,
+    /// A stored incremental Merkle representation is malformed or stale.
+    #[error("state tree merkle representation: {0}")]
+    Merkle(#[from] crypto::MerkleError),
+    /// The optional combined-root cache disagrees with the two sub-tree roots.
+    #[error("state tree cached root disagrees with its sub-tree roots")]
+    CachedRootMismatch,
 }
 
 /// An incremental per-shard state commitment.
@@ -133,6 +139,25 @@ impl StateTree {
         let root = hash_node(self.accounts.root(), self.markets.root());
         self.cached_root.set(Some(root));
         root
+    }
+
+    /// Validate every stored value read by a future incremental update.
+    ///
+    /// Both Merkle node arrays must be exact bottom-up derivations of their
+    /// leaves, and a populated combined-root cache must agree with the sub-tree
+    /// roots. Cache absence remains non-logical and is accepted.
+    pub fn validate_transition_invariants(&self) -> Result<(), StateError> {
+        self.accounts.validate_invariants()?;
+        self.markets.validate_invariants()?;
+        let recomputed_root = hash_node(self.accounts.root(), self.markets.root());
+        if self
+            .cached_root
+            .get()
+            .is_some_and(|cached_root| cached_root != recomputed_root)
+        {
+            return Err(StateError::CachedRootMismatch);
+        }
+        Ok(())
     }
 
     /// An inclusion proof for account `id` against the shard [`Self::root`].
@@ -351,7 +376,27 @@ mod tests {
                 }
             }
             assert_eq!(tree.root(), fresh.root());
+            assert_eq!(tree.validate_transition_invariants(), Ok(()));
         }
+    }
+
+    #[test]
+    fn transition_validator_rejects_corrupt_combined_root_cache() {
+        let mut tree = StateTree::new(8, 8);
+        tree.set_account(AccountId::new(1), b"account").unwrap();
+        tree.set_market(MarketId::new(2), b"market").unwrap();
+        let correct_root = tree.root();
+        assert_eq!(tree.validate_transition_invariants(), Ok(()));
+
+        tree.cached_root.set(Some(Hash::from_bytes([0xCC; 32])));
+        assert_eq!(
+            tree.validate_transition_invariants(),
+            Err(StateError::CachedRootMismatch)
+        );
+
+        tree.cached_root.set(None);
+        assert_eq!(tree.validate_transition_invariants(), Ok(()));
+        assert_eq!(tree.root(), correct_root);
     }
 
     #[test]

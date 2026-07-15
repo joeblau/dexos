@@ -1,0 +1,105 @@
+{
+  "schema_version": 1,
+  "run_id": "baseline-unoptimized-61cc7e6-unavailable",
+  "workload_sha256": "269031ff79847f3e899099c38e08a6d2e8dadb1d03431f27e2f8d12a442cee1f",
+  "exact_command": "cargo run -p marketd --features dev-tools -- benchmark --suite all --output baseline-components.json",
+  "target_reachable": false,
+  "warmup_seconds": 60,
+  "steady_state_ns": 600000000000,
+  "raw_samples": {
+    "path": "",
+    "sha256": "",
+    "one_second_intervals": 0,
+    "complete": false
+  },
+  "provenance": {
+    "git_sha": "61cc7e6",
+    "git_dirty": false,
+    "cargo_lock_sha256": "36221d122fee694d2a1917f14105af43f77499272e0331d35b9650aa25a9fcb6",
+    "rustc": "1.92.0",
+    "llvm": "not-collected-baseline",
+    "profile": "release",
+    "features": "dev-tools",
+    "rustflags": "not-collected-baseline",
+    "cpu": "not-collected-baseline",
+    "microcode": "not-collected-baseline",
+    "numa": "not-collected-baseline",
+    "kernel": "not-collected-baseline",
+    "governor": "not-collected-baseline",
+    "affinity": "not-collected-baseline",
+    "nic": "not-collected-baseline",
+    "nic_driver": "not-collected-baseline",
+    "nic_firmware": "not-collected-baseline",
+    "nic_offloads": "not-collected-baseline",
+    "mtu": 1500,
+    "topology": "production route unavailable; no DoubleZero campaign ran"
+  },
+  "route": {
+    "signed_rpc": "",
+    "decode_admission": "",
+    "canonical_sequence": "",
+    "durable_journal": "",
+    "execution_orderbook_risk": "",
+    "state_root": "",
+    "receipt": "",
+    "minimmit_checkpoint": ""
+  },
+  "counts": {
+    "offered": 0,
+    "accepted": 0,
+    "rejected": 0,
+    "executed": 0,
+    "receipted": 0,
+    "finalized": 0,
+    "accepted_new_orders": 0,
+    "accepted_cancel_orders": 0,
+    "accepted_replace_orders": 0,
+    "retries_excluded": 0,
+    "duplicates_excluded": 0,
+    "sequence_gaps": 0,
+    "nic_drops": 0,
+    "unexplained_loss": 0
+  },
+  "backlog": {
+    "pre_run": 0,
+    "end_of_steady": 0,
+    "after_two_checkpoint_intervals": 0,
+    "steady_slope_per_second": 0
+  },
+  "receipt_latency_ns": {
+    "count": 0,
+    "p50": 0,
+    "p95": 0,
+    "p99": 0,
+    "p999": 0,
+    "max": 0,
+    "coordinated_omission_corrected": false
+  },
+  "finality_latency_ns": {
+    "count": 0,
+    "p50": 0,
+    "p95": 0,
+    "p99": 0,
+    "p999": 0,
+    "max": 0,
+    "coordinated_omission_corrected": false
+  },
+  "throughput": {
+    "aggregate": {
+      "name": "global",
+      "effective_orders": 0,
+      "interval_ns": 600000000000
+    },
+    "per_region": [
+      { "name": "london", "effective_orders": 0, "interval_ns": 600000000000 },
+      { "name": "new-york", "effective_orders": 0, "interval_ns": 600000000000 },
+      { "name": "tokyo", "effective_orders": 0, "interval_ns": 600000000000 }
+    ],
+    "per_node": [
+      { "name": "unavailable", "effective_orders": 0, "interval_ns": 600000000000 }
+    ],
+    "per_shard": [
+      { "name": "shard-0", "effective_orders": 0, "interval_ns": 600000000000 }
+    ]
+  }
+}

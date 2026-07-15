@@ -1,0 +1,48 @@
+schema_version = 1
+workload_id = "global-orders-20m-v1"
+offered_orders_per_second = 24000000
+shard_count = 256
+durability_mode = "fdatasync-group-commit"
+
+[action_mix_bps]
+new = 7000
+cancel = 2000
+replace = 1000
+
+[scale]
+markets = 64
+accounts = 1000000
+resting_orders_per_side = 4096
+fill_fanout_p99 = 8
+
+[auth]
+session_identity = "mutual-tls-plus-ed25519-session-binding"
+batch_authentication = "aead-envelope-bound-to-ordered-record-digest"
+replay_window = 1048576
+
+[consensus]
+n = 6
+f = 1
+m = 3
+l = 5
+checkpoint_interval_ms = 100
+
+[[regions]]
+name = "london"
+offered_load_bps = 3334
+validators = ["lon-validator-0", "lon-validator-1"]
+
+[[regions]]
+name = "new-york"
+offered_load_bps = 3333
+validators = ["nyc-validator-0", "nyc-validator-1"]
+
+[[regions]]
+name = "tokyo"
+offered_load_bps = 3333
+validators = ["tyo-validator-0", "tyo-validator-1"]
+
+[phases]
+warmup_seconds = 60
+steady_seconds = 600
+drain_seconds = 2

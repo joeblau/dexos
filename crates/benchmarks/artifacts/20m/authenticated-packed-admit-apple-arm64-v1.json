@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "artifact_type": "component-microbenchmark",
+  "qualification_status": "COMPONENT_ONLY_NOT_COMPOSED",
+  "generated_date": "2026-07-12",
+  "exact_command": "target/release/marketd benchmark --suite authenticated-packed-batch-admit-128 --output /tmp/dexos-auth-packed-bench.json",
+  "provenance": {
+    "git_sha": "61cc7e6f392198e9e122807c5a87f53e7eff191f",
+    "git_dirty": true,
+    "cargo_lock_sha256": "35ec222cf1791bdf5c7c611adf6483e95950d2347d66177cf72849f5a7832728",
+    "rustc": "1.96.1 (31fca3adb 2026-06-26)",
+    "llvm": "22.1.8",
+    "profile": "release",
+    "features": "dev-tools",
+    "host_os": "macOS 27.0 build 26A5378j",
+    "kernel": "Darwin 27.0.0 RELEASE_ARM64_T6031",
+    "host_arch": "aarch64",
+    "cpu": "Apple M3 Max",
+    "allocation_counting": true,
+    "hardware_counters": "unavailable"
+  },
+  "boundary": {
+    "call_path": "network::AuthenticatedOrderBatchCodec::verify -> replay check -> node::PackedBatchIngress::try_admit -> SPSC",
+    "fixture": "128 records; Ed25519 destination/session/account/sequence binding plus LZ4/CRC/typed decode/lower/atomic ring publication",
+    "excluded": [
+      "socket read",
+      "durable journal",
+      "engine execution",
+      "receipt",
+      "Minimmit finality"
+    ]
+  },
+  "raw_stat": {
+    "name": "authenticated-packed-batch-admit-128",
+    "iterations": 2000,
+    "total_ns": 83692660,
+    "min_ns": 39625,
+    "p50_ns": 41333,
+    "p90_ns": 42334,
+    "p95_ns": 45417,
+    "p99_ns": 53875,
+    "p999_ns": 64500,
+    "max_ns": 71459,
+    "batches_per_second": 23896,
+    "records_per_batch": 128,
+    "records_per_second": 3058688,
+    "allocations": 0,
+    "bytes_allocated": 0
+  }
+}

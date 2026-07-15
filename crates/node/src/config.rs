@@ -364,9 +364,10 @@ impl RpcSection {
     /// `tls` is injected by the caller because building
     /// [`rpc::TlsMode::Required`] reads the PEM files named by
     /// `tls_cert_path` / `tls_key_path` / `tls_client_ca_path` from disk via
-    /// [`rpc::acceptor_from_pem`] — this method performs no I/O. TODO(#418):
-    /// when the RPC listener is wired into the node runtime, the composition
-    /// root must load those PEMs and pass `TlsMode::Required(acceptor)`
+    /// [`rpc::acceptor_from_pem`] — this method performs no I/O. Tracked by
+    /// composition issue #312: when the RPC listener is wired into the
+    /// runtime, the composition root must load those PEMs and pass
+    /// `TlsMode::Required(acceptor)`
     /// whenever [`Self::tls_configured`] is true.
     pub fn server_config(&self, tls: rpc::TlsMode) -> rpc::ServerConfig {
         rpc::ServerConfig {
@@ -622,7 +623,12 @@ impl NodeConfig {
         }
     }
 
-    /// Apply CLI overrides on top of file values, then re-validate.
+    /// Apply CLI overrides on top of file values, then re-validate all startup
+    /// invariants, including filesystem-backed role requirements.
+    ///
+    /// Overrides may add a consensus-bearing role after [`Self::load`] checked
+    /// the original role set. Re-running only [`Self::validate`] here would let
+    /// that role bypass the required validator-set load.
     pub fn with_overrides(mut self, overrides: &ConfigOverrides) -> Result<Self, ConfigError> {
         if overrides.light {
             self.node.light = true;
@@ -631,6 +637,7 @@ impl NodeConfig {
             self.node.roles = overrides.roles.clone();
         }
         self.validate()?;
+        self.validate_paths()?;
         Ok(self)
     }
 
@@ -1383,10 +1390,37 @@ metrics_listen = "127.0.0.1:9100"
         let cfg = base
             .with_overrides(&ConfigOverrides {
                 light: false,
-                roles: vec![Role::Validator, Role::Sequencer],
+                roles: vec![Role::Gateway, Role::Observer],
             })
             .unwrap();
-        assert_eq!(cfg.node.roles, vec![Role::Validator, Role::Sequencer]);
+        assert_eq!(cfg.node.roles, vec![Role::Gateway, Role::Observer]);
+    }
+
+    #[test]
+    fn overrides_cannot_bypass_consensus_role_path_validation() {
+        let mut base = NodeConfig::from_toml_str("").unwrap();
+        base.consensus.validator_set_path = std::env::temp_dir()
+            .join(format!(
+                "dexos-missing-validators-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ))
+            .display()
+            .to_string();
+
+        let err = base
+            .with_overrides(&ConfigOverrides {
+                light: false,
+                roles: vec![Role::Validator],
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation(ref message) if message.contains("validator_set_path")),
+            "{err}"
+        );
     }
 
     #[test]

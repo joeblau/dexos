@@ -17,6 +17,17 @@ cd "$(dirname "$0")/.."
 # tests can pass on warnings that CI rejects.
 export RUSTFLAGS="-D warnings"
 
+# The UI frontends and language bindings have dedicated target/toolchain jobs;
+# keep the local engine gates identical to ci.yml.
+ENGINE_EXCLUDES=(
+    --exclude dexos-ui
+    --exclude dexos-web
+    --exclude dexos-desktop
+    --exclude dexos-mobile
+    --exclude dexos-sdk-wasm
+    --exclude dexos-sdk-py
+)
+
 FULL=0
 for arg in "$@"; do
     case "$arg" in
@@ -39,13 +50,13 @@ echo "==> rustfmt (ci job: lint)"
 cargo fmt --all --check
 
 echo "==> clippy (ci job: lint)"
-cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo clippy --workspace --all-targets --locked "${ENGINE_EXCLUDES[@]}" -- -D warnings
 
 echo "==> workspace tests (ci job: test)"
-cargo test --workspace --locked
+cargo test --workspace --locked "${ENGINE_EXCLUDES[@]}"
 
 echo "==> docs, fail on warnings (ci job: docs)"
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked "${ENGINE_EXCLUDES[@]}"
 
 echo "==> no floating point in deterministic core (ci job: gates)"
 ./scripts/check-no-float.sh

@@ -262,7 +262,7 @@ fn all_oks() -> Vec<RpcOk> {
             sources: 3,
             last_update: 1,
         }),
-        RpcOk::Checkpoint(sample_checkpoint()),
+        RpcOk::Checkpoint(Box::new(sample_checkpoint())),
         RpcOk::Account(fixture_account(1, Amount::ONE)),
         RpcOk::AccountProof(AccountProof {
             account_id: a(1),

@@ -13,16 +13,15 @@
 //! headline invariant, exercised by large deterministic LCG corpora in every
 //! module: `scalar == vectorized == dispatched`, bit for bit.
 //!
-//! # Design choice: portable, no `unsafe`
+//! # Design choice: isolate and audit architecture-specific `unsafe`
 //!
-//! This crate could carry `core::arch` intrinsics behind a documented
-//! crate-level `#![allow(unsafe_code)]`. It deliberately does **not**: the
-//! kernels are written so the compiler auto-vectorizes them, which keeps the
-//! crate compiling cleanly under the workspace `unsafe_code = "deny"` lint with
-//! zero `unsafe` blocks while still providing genuine vector code paths (see the
-//! lane-structured reductions in [`risk`] and the mask map in [`oracle`]). The
-//! [`Backend`] selector is the seam where future hand-written intrinsic kernels
-//! would slot in without changing any observable result.
+//! Most kernels remain safe Rust that the compiler can auto-vectorize. The
+//! fixed-width wire mover in [`wire`] uses narrowly scoped, documented
+//! architecture intrinsics/assembly so qualification can require actual vector
+//! instructions in emitted code. Each local `#[allow(unsafe_code)]` sits beside
+//! its bounds and CPU-feature invariant; the crate does not weaken the workspace
+//! lint globally. Scalar references and differential tests pin the observable
+//! bytes for every backend.
 //!
 //! # Kernels
 //!
@@ -31,22 +30,37 @@
 //! | [`digest`]  | batch signature pre-hashing / message digests      |
 //! | [`risk`]    | scenario-vector reduction (sum / min / max, i128) — **wrapping sum, not for solvency** |
 //! | [`oracle`]  | integer median / MAD + outlier mask                |
+//! | [`quorum`]  | selected Minimmit QC signer-weight reduction       |
 //! | [`merkle`]  | batched Merkle-update / from-scratch root helper    |
+//! | [`lz4`]     | runtime-qualified raw-block decompression copies    |
+//! | [`matching`]| batched exact match-plan fixed-point notionals       |
+//! | [`wire`]    | fixed-width packed-record load/store                |
 //!
 //! Each kernel exposes a `*_scalar` reference, a `(Backend, …)` selector, and a
 //! `*_dispatch` convenience that runs on the best backend [`detect`] finds.
 
 pub mod backend;
 pub mod digest;
+pub mod lz4;
+pub mod matching;
 pub mod merkle;
 pub mod oracle;
+pub mod quorum;
 pub mod risk;
+pub mod wire;
 
-pub use backend::{detect, Backend};
+pub use backend::{detect, Backend, BackendError};
 pub use digest::{
     batch_hash_domain, batch_hash_domain_dispatch, batch_hash_domain_scalar, batch_hash_leaves,
     batch_hash_leaves_dispatch, batch_hash_leaves_scalar, batch_keccak256,
     batch_keccak256_dispatch, batch_keccak256_scalar,
+};
+pub use lz4::{
+    decompress_lz4_block_into, decompress_lz4_block_into_exact, decompress_lz4_block_into_scalar,
+    Lz4CompressError, Lz4Compressor, Lz4DecompressError,
+};
+pub use matching::{
+    matching_notionals, matching_notionals_scalar, MatchNotional, MATCH_BATCH_LANES,
 };
 pub use merkle::{
     apply_updates, batch_merkle_root, batch_merkle_root_dispatch, batch_merkle_root_scalar,
@@ -55,10 +69,12 @@ pub use oracle::{
     filter_outliers, mad_i64, median_i64, outlier_mask, outlier_mask_dispatch, outlier_mask_scalar,
     outlier_mask_vectorized, OracleFilter,
 };
+pub use quorum::{selected_weight, selected_weight_scalar, QUORUM_WEIGHT_LANES};
 pub use risk::{
     scenario_stats, scenario_stats_amounts, scenario_stats_dispatch, scenario_stats_scalar,
     scenario_stats_vectorized, ScenarioStats,
 };
+pub use wire::{load_u64_le, store_u64_le};
 
 /// Crate identity, referenced by the node composition root for a startup manifest.
 pub const CRATE_NAME: &str = "simd";

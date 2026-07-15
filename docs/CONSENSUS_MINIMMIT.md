@@ -1,11 +1,10 @@
 # DexOS Minimmit Consensus — Protocol Design & Migration Spec
 
-**Status:** interim ground truth. This document pins the Minimmit protocol and the
-HotStuff→Minimmit migration contract for every issue in the migration epic (#509).
-Downstream issues cite section numbers here (`§N`) instead of restating the protocol.
-It remains authoritative until the formal quint model lands or its deferral is
-documented (#544). Protocol-correctness review by a second engineer is required
-before Phase 2 rule work (R1–R7) begins.
+**Status:** canonical implemented protocol and completed migration record. This
+document pins the Minimmit protocol and the HotStuff→Minimmit contract completed
+by migration epic #509. The R1–R7 implementation, simulation fault matrix, and
+interim conformance oracle are in-tree; the formal Quint model is explicitly
+deferred under the revisit triggers in `MINIMMIT_CONFORMANCE.md`.
 
 Minimmit reference: arXiv 2508.10862. Terminology below is **locked** for all DexOS
 artifacts; where upstream sources disagree, this document wins.
@@ -532,8 +531,11 @@ different things:
 - DexOS **execution certification proves state-agreement** — an L-threshold
   `Certificate` over `execution_commitment_digest(epoch, view, height,
   block_hash, execution_root)` assembled from `ExecAttest` votes (§4.3, #520,
-  #528). Light clients verify checkpoints (which bind `execution_root`) and never
-  re-execute; dropping the exec cert would break that trust chain.
+  #528). Here `execution_root` is the deterministic post-execution state root and
+  binds to `CheckpointHeader.new_state_root`; the checkpoint's own
+  `execution_root` field separately commits per-command execution-result hashes.
+  Light clients verify that binding and never re-execute; dropping the exec cert
+  would break that trust chain.
 
 **Two certificates at the same threshold L over different digests.** Both verify
 against `finalize_set` (§5.1).

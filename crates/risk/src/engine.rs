@@ -21,13 +21,14 @@
 //!
 //! # Determinism
 //!
-//! All arithmetic is integer fixed-point and total. [`RiskEngine::state_root`]
-//! is an order-independent-free FNV-1a fingerprint over the SoA columns; a
-//! replayed command stream reproduces a bit-identical root.
+//! All arithmetic is integer fixed-point and total. [`RiskEngine::transition_root_v1`]
+//! is the cryptographic, versioned commitment to complete stored transition
+//! state. The legacy [`RiskEngine::state_root`] remains only as a compact
+//! diagnostic fingerprint.
 
 use std::collections::BTreeSet;
 
-use types::{AccountId, Amount, MarketId, PayoutVector, Price, Quantity};
+use types::{AccountId, Amount, Hash, MarketId, PayoutVector, Price, Quantity};
 
 use crate::config::{
     MarginMode, OrderPriority, RiskConfig, MAX_ACCOUNT_CAPACITY, MAX_MARKET_CAPACITY,
@@ -37,6 +38,8 @@ use crate::liquidation::{AdlFill, InsuranceFund, LiquidationOutcome, Liquidation
 use crate::math::{abs_amount, neg_amount, neg_i64};
 use crate::position::PerpPosition;
 use crate::scenario::PayoutPosition;
+#[path = "state_codec.rs"]
+mod state_codec;
 
 /// Fixed-point risk & margin engine for scalar perp and payout-vector exposure.
 #[derive(Debug, Clone)]
@@ -300,8 +303,8 @@ impl RiskEngine {
     /// Atomic: if any fallible step (the position arithmetic, the realized-PnL
     /// settlement, or the recompute) overflows, the account's collateral and perp
     /// book are rolled back to their exact pre-fill state, so a rejected fill
-    /// leaves no partial mutation behind. The rollback data is entirely `Copy`
-    /// (`PerpPosition` and `Amount`), so the steady-state path stays allocation-free.
+    /// leaves no partial mutation behind. Reverse holder membership and any
+    /// market columns allocated during the attempt are restored as well.
     fn fill_index(
         &mut self,
         i: usize,
@@ -309,6 +312,17 @@ impl RiskEngine {
         signed_qty: Quantity,
         price: Price,
     ) -> Result<(), RiskError> {
+        let mi = market.index()?;
+        let market_lengths = (
+            self.marks.len(),
+            self.risk_group.len(),
+            self.market_limit.len(),
+            self.market_holders.len(),
+        );
+        let was_holder = self
+            .market_holders
+            .get(mi)
+            .is_some_and(|holders| holders.contains(&i));
         let len_before = self.perp[i].len();
         let pos_idx = self.position_slot(i, market);
         // `position_slot` appends a fresh flat slot for a market not yet held.
@@ -325,6 +339,22 @@ impl RiskEngine {
                 self.perp[i].push(saved_pos);
             } else {
                 self.perp[i][pos_idx] = saved_pos;
+            }
+
+            // `sync_market_holder` may have mutated the reverse index and grown
+            // every dense market column before a later recompute failed. Restore
+            // both the prior membership bit and exact allocation shape because
+            // the v1 transition root commits both.
+            self.marks.truncate(market_lengths.0);
+            self.risk_group.truncate(market_lengths.1);
+            self.market_limit.truncate(market_lengths.2);
+            self.market_holders.truncate(market_lengths.3);
+            if let Some(holders) = self.market_holders.get_mut(mi) {
+                if was_holder {
+                    holders.insert(i);
+                } else {
+                    holders.remove(&i);
+                }
             }
             return Err(e);
         }
@@ -367,20 +397,27 @@ impl RiskEngine {
         signed_qty: Quantity,
     ) -> Result<(), RiskError> {
         let i = self.active_index(account)?;
+        let len_before = self.payout[i].len();
         self.payout[i].push(PayoutPosition::new(payout, signed_qty));
-        self.recompute(i)?;
-        let required = self.cached_im[i];
-        let available = self.cached_equity[i];
+        let computed = match self.compute_columns(i) {
+            Ok(computed) => computed,
+            Err(error) => {
+                self.payout[i].truncate(len_before);
+                return Err(error);
+            }
+        };
+        let required = computed.im;
+        let available = computed.equity;
         if available.raw() < required.raw() {
-            // Roll the book back to its pre-trade state; the account cannot
-            // collateralize this position's worst-case liability.
-            self.payout[i].pop();
-            self.recompute(i)?;
+            // No cache has been written yet, so truncating the speculative book
+            // restores the exact pre-trade state without a fallible rollback.
+            self.payout[i].truncate(len_before);
             return Err(RiskError::InsufficientMargin {
                 required,
                 available,
             });
         }
+        self.write_columns(i, &computed);
         Ok(())
     }
 
@@ -532,11 +569,37 @@ impl RiskEngine {
         account: AccountId,
         notional: Amount,
     ) -> Result<(), RiskError> {
+        let (i, next) = self.checked_resting_reservation(account, notional)?;
+        self.reserved_resting[i] = next;
+        Ok(())
+    }
+
+    /// Validate a resting-order reservation without mutating account state.
+    ///
+    /// The execution engine uses this immediately before its bounded in-place
+    /// resting-order transaction. A successful check proves that the subsequent
+    /// [`Self::reserve_resting`] call cannot fail while the single writer retains
+    /// ownership of the engine.
+    pub fn check_reserve_resting(
+        &self,
+        account: AccountId,
+        notional: Amount,
+    ) -> Result<(), RiskError> {
+        self.checked_resting_reservation(account, notional)
+            .map(|_| ())
+    }
+
+    fn checked_resting_reservation(
+        &self,
+        account: AccountId,
+        notional: Amount,
+    ) -> Result<(usize, Amount), RiskError> {
         if notional.is_negative() {
             return Err(RiskError::NegativeAmount);
         }
         if notional.raw() == 0 {
-            return Ok(());
+            let i = self.active_index(account)?;
+            return Ok((i, self.reserved_resting[i]));
         }
         let i = self.active_index(account)?;
         let next = self.reserved_resting[i].checked_add(notional)?;
@@ -561,8 +624,7 @@ impl RiskEngine {
         if projected.raw() > max_notional.raw() {
             return Err(RiskError::LeverageExceeded);
         }
-        self.reserved_resting[i] = next;
-        Ok(())
+        Ok((i, next))
     }
 
     /// Release previously reserved resting notional (cancel / fill of residual).
@@ -745,6 +807,18 @@ impl RiskEngine {
     /// collateral suffices; for a solvent account the returned collateral is the
     /// only value leaving the risk system.
     pub fn liquidate(&mut self, account: AccountId) -> Result<LiquidationOutcome, RiskError> {
+        self.active_index(account)?;
+        // Liquidation can touch the victim, arbitrary ADL counterparties, every
+        // solvent account, insurance, indexes, queues, and global totals. Keep
+        // the public operation atomic by committing a complete working copy
+        // only after every fallible phase succeeds.
+        let mut working = self.clone();
+        let outcome = working.liquidate_inner(account)?;
+        *self = working;
+        Ok(outcome)
+    }
+
+    fn liquidate_inner(&mut self, account: AccountId) -> Result<LiquidationOutcome, RiskError> {
         let i = self.active_index(account)?;
 
         // Phase 1: auto-deleverage the account's perp book at the mark.
@@ -844,9 +918,10 @@ impl RiskEngine {
                     if j == i || !self.open[j] {
                         continue;
                     }
-                    // Re-verify the leg rather than trusting the index: a
-                    // rolled-back fill can leave a stale entry behind, and a
-                    // missing or flat leg is simply skipped.
+                    // Re-verify the leg rather than making the reverse index the
+                    // sole source of truth; malformed restored state is rejected
+                    // by the invariant gate, and a missing or flat leg is skipped
+                    // defensively here.
                     if let Some((cj, profit)) = self.market_leg(j, market, mark)? {
                         let opposite = (cj > 0) != (victim_signed > 0);
                         if opposite {
@@ -1042,8 +1117,234 @@ impl RiskEngine {
         self.used.iter().filter(|&&u| u).count()
     }
 
-    /// Deterministic order-sensitive fingerprint of all cached risk state.
-    /// Replaying an identical command stream yields an identical root.
+    /// Exact dense account-slot shape, including normalized unused gaps.
+    #[inline]
+    pub fn account_slot_count(&self) -> usize {
+        self.used.len()
+    }
+
+    /// Stored mark for `market`, if that market has been initialized in risk.
+    ///
+    /// This read-only view lets an enclosing state machine reconcile its
+    /// authoritative market registry without exposing dense implementation
+    /// details or allocating a mirror collection.
+    #[inline]
+    pub fn mark_price(&self, market: MarketId) -> Option<Price> {
+        self.mark_for(market)
+    }
+
+    /// Number of initialized risk-market marks.
+    #[inline]
+    pub fn marked_market_count(&self) -> usize {
+        self.marks.iter().filter(|mark| mark.is_some()).count()
+    }
+
+    /// Exact dense market-slot shape, including normalized unmarked gaps.
+    #[inline]
+    pub fn market_slot_count(&self) -> usize {
+        self.marks.len()
+    }
+
+    /// Validate every stored relation required to interpret the v1 transition
+    /// state without trusting caches, reverse indexes, or queue membership.
+    ///
+    /// This is intentionally read-only and deterministic so startup and future
+    /// snapshot restoration can fail closed before the engine becomes ready.
+    pub fn validate_transition_invariants(&self) -> Result<(), RiskError> {
+        self.validate_column_shapes()?;
+
+        if self.config.initial_margin.raw() <= 0
+            || self.config.maintenance_margin.raw() <= 0
+            || self.config.max_leverage.raw() <= 0
+            || self.config.maintenance_margin.raw() > self.config.initial_margin.raw()
+        {
+            return Err(RiskError::StateInvariant(
+                "risk ratios must be positive and maintenance must not exceed initial margin",
+            ));
+        }
+
+        if self.config.max_accounts == 0 || self.config.max_accounts > MAX_ACCOUNT_CAPACITY {
+            return Err(RiskError::StateInvariant(
+                "configured account capacity must be within the hard resource budget",
+            ));
+        }
+        if self.config.max_markets == 0 || self.config.max_markets > MAX_MARKET_CAPACITY {
+            return Err(RiskError::StateInvariant(
+                "configured market capacity must be within the hard resource budget",
+            ));
+        }
+        let expected_accounts = self.config.max_accounts;
+        let expected_markets = self.config.max_markets;
+        if self.max_accounts != expected_accounts || self.max_markets != expected_markets {
+            return Err(RiskError::StateInvariant(
+                "effective capacities do not match the configured resource clamps",
+            ));
+        }
+        if self.used.len() > self.max_accounts || self.marks.len() > self.max_markets {
+            return Err(RiskError::StateInvariant(
+                "dense state exceeds its effective capacity",
+            ));
+        }
+        if self
+            .market_limit
+            .iter()
+            .flatten()
+            .any(|limit| limit.is_negative())
+        {
+            return Err(RiskError::StateInvariant(
+                "market notional limits must be non-negative",
+            ));
+        }
+        if self.portfolio_limit.is_some_and(Amount::is_negative) {
+            return Err(RiskError::StateInvariant(
+                "portfolio notional limit must be non-negative",
+            ));
+        }
+        if self.insurance.balance().is_negative() {
+            return Err(RiskError::StateInvariant(
+                "insurance balance must be non-negative",
+            ));
+        }
+        if self.socialized_total.is_negative() {
+            return Err(RiskError::StateInvariant(
+                "socialized-loss total must be non-negative",
+            ));
+        }
+
+        for i in 0..self.used.len() {
+            if self.open[i] && !self.used[i] {
+                return Err(RiskError::StateInvariant(
+                    "an open account slot is not marked used",
+                ));
+            }
+
+            let cached = self.current_cached_columns(i);
+            if !self.used[i] {
+                if self.margin_mode[i] != MarginMode::Isolated
+                    || self.collateral[i] != Amount::ZERO
+                    || !self.perp[i].is_empty()
+                    || !self.payout[i].is_empty()
+                    || cached != CachedColumns::ZERO
+                    || self.reserved_resting[i] != Amount::ZERO
+                {
+                    return Err(RiskError::StateInvariant(
+                        "unused account slots must contain normalized defaults",
+                    ));
+                }
+                continue;
+            }
+            if !self.open[i] {
+                if self.collateral[i] != Amount::ZERO
+                    || !self.perp[i].is_empty()
+                    || !self.payout[i].is_empty()
+                    || cached != CachedColumns::ZERO
+                    || self.reserved_resting[i] != Amount::ZERO
+                {
+                    return Err(RiskError::StateInvariant(
+                        "closed account slots must contain normalized balances and positions",
+                    ));
+                }
+                continue;
+            }
+            if self.reserved_resting[i].is_negative() {
+                return Err(RiskError::StateInvariant(
+                    "resting notional reservation must be non-negative",
+                ));
+            }
+
+            let mut position_markets = BTreeSet::new();
+            for position in &self.perp[i] {
+                if !position_markets.insert(position.market.get()) {
+                    return Err(RiskError::StateInvariant(
+                        "an account contains duplicate perp markets",
+                    ));
+                }
+                let mi = position.market.index()?;
+                if mi >= self.max_markets {
+                    return Err(RiskError::StateInvariant(
+                        "a perp position exceeds the effective market capacity",
+                    ));
+                }
+                if position.net_qty.raw() != 0
+                    && !self
+                        .market_holders
+                        .get(mi)
+                        .is_some_and(|holders| holders.contains(&i))
+                {
+                    return Err(RiskError::StateInvariant(
+                        "a non-flat perp position is missing from the holder index",
+                    ));
+                }
+            }
+
+            if cached != self.compute_columns(i)? {
+                return Err(RiskError::StateInvariant(
+                    "cached account columns disagree with primary risk state",
+                ));
+            }
+        }
+
+        for (mi, holders) in self.market_holders.iter().enumerate() {
+            for &i in holders {
+                if i >= self.used.len() || !self.used[i] || !self.open[i] {
+                    return Err(RiskError::StateInvariant(
+                        "holder index references an unknown or closed account",
+                    ));
+                }
+                let has_non_flat_position = self.perp[i].iter().any(|position| {
+                    position.net_qty.raw() != 0 && position.market.index().ok() == Some(mi)
+                });
+                if !has_non_flat_position {
+                    return Err(RiskError::StateInvariant(
+                        "holder index has no matching non-flat perp position",
+                    ));
+                }
+            }
+        }
+
+        self.liq_queue.validate_representation()?;
+        for account in self.liq_queue.iter_fifo() {
+            let i = account.index()?;
+            if i >= self.used.len() || !self.used[i] || !self.open[i] {
+                return Err(RiskError::StateInvariant(
+                    "liquidation queue references an unknown or closed account",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Cryptographic commitment to every stored value that can influence a
+    /// future risk-engine transition.
+    ///
+    /// Schema v1 records primary state, transition-read caches, reverse indexes,
+    /// and both representations of the liquidation queue. Those apparently
+    /// derived values remain committed until a separate fail-closed validator
+    /// makes rebuilding them an enforced production invariant. Stored position
+    /// and queue order are preserved because checked arithmetic and FIFO
+    /// selection can depend on that order. Dense slot counts and unused gaps are
+    /// intentionally part of v1's exact-storage semantics: allocating an empty
+    /// slot changes the root even when semantic balances and positions do not.
+    ///
+    /// Returns a typed error if shape/relational validation, cache
+    /// recomputation, or fixed-width encoding prevents a complete commitment.
+    pub fn transition_root_v1(&self) -> Result<Hash, RiskError> {
+        let bytes = self.encode_state_v1_for_root()?;
+        Ok(crypto::hash_domain(crypto::DOMAIN_RISK_STATE, &bytes))
+    }
+
+    /// Encode exact stored state after the caller has established relational
+    /// invariants. Kept separate so private sensitivity tests can prove the v1
+    /// bytes bind a deliberately corrupted cache or index.
+    #[cfg(test)]
+    fn transition_root_v1_unchecked(&self) -> Result<Hash, RiskError> {
+        let bytes = self.encode_state_v1_unchecked_for_root()?;
+        Ok(crypto::hash_domain(crypto::DOMAIN_RISK_STATE, &bytes))
+    }
+
+    /// Legacy 64-bit diagnostic fingerprint over a subset of cached risk state.
+    /// This is not a cryptographic or complete state-machine commitment; use
+    /// [`Self::transition_root_v1`] for a versioned stored-state commitment.
     pub fn state_root(&self) -> u64 {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         for i in 0..self.used.len() {
@@ -1059,7 +1360,67 @@ impl RiskEngine {
         h
     }
 
+    const fn margin_mode_tag(mode: MarginMode) -> u8 {
+        match mode {
+            MarginMode::Isolated => 0,
+            MarginMode::Cross => 1,
+        }
+    }
+
     // --------------------------------------------------------------- internals
+
+    fn validate_column_shapes(&self) -> Result<(), RiskError> {
+        let account_slots = self.used.len();
+        for (name, len) in [
+            ("open", self.open.len()),
+            ("margin_mode", self.margin_mode.len()),
+            ("collateral", self.collateral.len()),
+            ("perp", self.perp.len()),
+            ("payout", self.payout.len()),
+            ("cached_equity", self.cached_equity.len()),
+            ("cached_exposure", self.cached_exposure.len()),
+            ("cached_scenario", self.cached_scenario.len()),
+            ("cached_im", self.cached_im.len()),
+            ("cached_mm", self.cached_mm.len()),
+            ("reserved_resting", self.reserved_resting.len()),
+        ] {
+            if len != account_slots {
+                return Err(RiskError::StateShape {
+                    section: "account",
+                    column: name,
+                    expected: account_slots,
+                    actual: len,
+                });
+            }
+        }
+
+        let market_slots = self.marks.len();
+        for (name, len) in [
+            ("risk_group", self.risk_group.len()),
+            ("market_limit", self.market_limit.len()),
+            ("market_holders", self.market_holders.len()),
+        ] {
+            if len != market_slots {
+                return Err(RiskError::StateShape {
+                    section: "market",
+                    column: name,
+                    expected: market_slots,
+                    actual: len,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn current_cached_columns(&self, i: usize) -> CachedColumns {
+        CachedColumns {
+            equity: self.cached_equity[i],
+            exposure: self.cached_exposure[i],
+            scenario: self.cached_scenario[i],
+            im: self.cached_im[i],
+            mm: self.cached_mm[i],
+        }
+    }
 
     fn recompute(&mut self, i: usize) -> Result<(), RiskError> {
         let cols = self.compute_columns(i)?;
@@ -1321,13 +1682,23 @@ impl RiskEngine {
 
 /// One account's cached risk columns, computed together so they can be committed
 /// atomically after the (fallible) computation succeeds.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CachedColumns {
     equity: Amount,
     exposure: Amount,
     scenario: Amount,
     im: Amount,
     mm: Amount,
+}
+
+impl CachedColumns {
+    const ZERO: Self = Self {
+        equity: Amount::ZERO,
+        exposure: Amount::ZERO,
+        scenario: Amount::ZERO,
+        im: Amount::ZERO,
+        mm: Amount::ZERO,
+    };
 }
 
 /// FNV-1a fold of one `i128` (little-endian) into a running hash.
@@ -1342,6 +1713,10 @@ fn fnv(hash: &mut u64, value: i128) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        RiskStateError, RiskStateLimits, DEFAULT_MAX_ACCOUNTS, DEFAULT_MAX_MARKETS,
+        RISK_TRANSITION_ROOT_SCHEMA_VERSION,
+    };
     use types::Ratio;
 
     const P: i64 = 1_000_000; // price 1.0
@@ -1381,6 +1756,18 @@ mod tests {
     /// A payout vector from raw `Amount` units (already at the 6-dp scale).
     fn pv(raw: &[i128]) -> PayoutVector {
         PayoutVector::new(raw.iter().map(|&x| Amount::from_raw(x)).collect()).unwrap()
+    }
+
+    #[test]
+    fn public_shape_readouts_include_normalized_unused_slots() {
+        let mut engine = engine();
+        engine.grow_accounts(3).unwrap();
+        engine.grow_market(5).unwrap();
+        assert_eq!(engine.account_count(), 0);
+        assert_eq!(engine.account_slot_count(), 4);
+        assert_eq!(engine.marked_market_count(), 0);
+        assert_eq!(engine.market_slot_count(), 6);
+        assert_eq!(engine.validate_transition_invariants(), Ok(()));
     }
 
     #[test]
@@ -1693,6 +2080,1341 @@ mod tests {
         let a = build_engine_from_seed(0x5151_5151);
         let b = build_engine_from_seed(0x5151_5151);
         assert_eq!(a.state_root(), b.state_root());
+        assert_eq!(
+            a.transition_root_v1().unwrap(),
+            b.transition_root_v1().unwrap()
+        );
+    }
+
+    fn commitment_fixture() -> RiskEngine {
+        let config = cfg().with_capacities(64, 32).unwrap();
+        let mut engine = RiskEngine::new(config);
+        engine.open_account(acct(1), amt(10_000)).unwrap();
+        engine.open_account(acct(2), amt(5_000)).unwrap();
+        engine.set_mark_price(mkt(1), price(100)).unwrap();
+        engine.set_mark_price(mkt(2), price(50)).unwrap();
+        engine.set_risk_group(mkt(1), 7).unwrap();
+        engine.set_risk_group(mkt(2), 7).unwrap();
+        engine.set_market_limit(mkt(1), amt(1_000_000)).unwrap();
+        engine.set_margin_mode(acct(1), MarginMode::Cross).unwrap();
+        engine
+            .apply_fill(acct(1), mkt(1), qty(2), price(90))
+            .unwrap();
+        engine
+            .apply_fill(acct(1), mkt(2), qty(-3), price(55))
+            .unwrap();
+        engine
+            .apply_fill(acct(2), mkt(1), qty(-1), price(110))
+            .unwrap();
+        engine
+            .open_payout_position(acct(1), pv(&[A, 0, A / 2]), qty(-1))
+            .unwrap();
+        engine
+            .open_payout_position(acct(1), pv(&[0, A]), qty(2))
+            .unwrap();
+        engine.reserve_resting(acct(1), amt(100)).unwrap();
+        engine.set_portfolio_limit(amt(2_000_000)).unwrap();
+        engine.fund_insurance(amt(123)).unwrap();
+        engine.liq_queue.enqueue(acct(2));
+        engine.liq_queue.enqueue(acct(1));
+        engine.socialized_total = Amount::from_raw(i128::from(i64::MAX) + 9);
+        engine
+    }
+
+    fn canonical_state(engine: &RiskEngine) -> Vec<u8> {
+        engine.encode_state_v1_bounded(usize::MAX).unwrap()
+    }
+
+    fn restore_default(bytes: &[u8]) -> RiskEngine {
+        RiskEngine::decode_state_v1_bounded(bytes, &RiskStateLimits::default()).unwrap()
+    }
+
+    fn unchecked_state(engine: &RiskEngine) -> Vec<u8> {
+        engine.encode_state_v1_unchecked_for_root().unwrap()
+    }
+
+    fn overwrite_u16(bytes: &mut [u8], offset: usize, value: u16) {
+        bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn overwrite_u32(bytes: &mut [u8], offset: usize, value: u32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn overwrite_u64(bytes: &mut [u8], offset: usize, value: u64) {
+        bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn assert_same_canonical_state(left: &RiskEngine, right: &RiskEngine) {
+        assert_eq!(canonical_state(left), canonical_state(right));
+        assert_eq!(
+            left.transition_root_v1().unwrap(),
+            right.transition_root_v1().unwrap()
+        );
+    }
+
+    fn assert_failed_continuation<T>(
+        mut source: RiskEngine,
+        operation: impl Fn(&mut RiskEngine) -> Result<T, RiskError>,
+    ) where
+        T: core::fmt::Debug + PartialEq,
+    {
+        let before = canonical_state(&source);
+        let mut restored = restore_default(&before);
+        let source_result = operation(&mut source);
+        let restored_result = operation(&mut restored);
+        assert!(source_result.is_err());
+        assert_eq!(source_result, restored_result);
+        assert_eq!(canonical_state(&source), before);
+        assert_eq!(canonical_state(&restored), before);
+    }
+
+    /// Apply a deliberately invariant-breaking mutation and prove the private
+    /// exact-state encoder binds it. Public-root rejection is covered by the
+    /// invariant tests below.
+    fn assert_commitment_changes(base: &RiskEngine, mutate: impl FnOnce(&mut RiskEngine)) {
+        let mut changed = base.clone();
+        mutate(&mut changed);
+        assert_ne!(
+            changed.transition_root_v1_unchecked().unwrap(),
+            base.transition_root_v1_unchecked().unwrap()
+        );
+    }
+
+    fn assert_checked_transition_root_changes(
+        base: &RiskEngine,
+        mutate: impl FnOnce(&mut RiskEngine),
+    ) {
+        let mut changed = base.clone();
+        mutate(&mut changed);
+        assert_ne!(
+            changed.transition_root_v1().unwrap(),
+            base.transition_root_v1().unwrap()
+        );
+    }
+
+    #[test]
+    fn transition_root_v1_golden_vectors() {
+        assert_eq!(
+            engine().transition_root_v1().unwrap(),
+            Hash::from_bytes([
+                206, 182, 185, 69, 246, 18, 13, 187, 14, 244, 34, 216, 7, 38, 243, 199, 77, 224,
+                16, 151, 14, 219, 145, 183, 124, 48, 127, 128, 129, 213, 125, 249,
+            ])
+        );
+        assert_eq!(
+            commitment_fixture().transition_root_v1().unwrap(),
+            Hash::from_bytes([
+                248, 195, 228, 43, 165, 224, 254, 112, 104, 211, 143, 98, 117, 193, 227, 125, 116,
+                62, 146, 165, 122, 207, 115, 149, 49, 39, 123, 88, 19, 107, 159, 248,
+            ])
+        );
+    }
+
+    #[test]
+    fn state_codec_v1_round_trips_exact_root_preimages() {
+        for (source, expected_len) in [(engine(), 123usize), (commitment_fixture(), 865)] {
+            let bytes = canonical_state(&source);
+            assert_eq!(bytes.len(), expected_len);
+            assert_eq!(
+                crypto::hash_domain(crypto::DOMAIN_RISK_STATE, &bytes),
+                source.transition_root_v1().unwrap()
+            );
+
+            let restored = restore_default(&bytes);
+            assert_same_canonical_state(&source, &restored);
+            assert_eq!(source.encode_state_v1_bounded(bytes.len()).unwrap(), bytes);
+            assert_eq!(
+                source.encode_state_v1_bounded(bytes.len() - 1),
+                Err(RiskStateError::EncodedBytesLimit {
+                    actual: bytes.len(),
+                    max: bytes.len() - 1,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn state_codec_v1_accepts_hard_capacity_edges_without_dense_allocation() {
+        let config = cfg()
+            .with_capacities(MAX_ACCOUNT_CAPACITY, MAX_MARKET_CAPACITY)
+            .unwrap();
+        let source = RiskEngine::new(config);
+        let bytes = canonical_state(&source);
+        assert_eq!(bytes.len(), 123);
+
+        let limits = RiskStateLimits {
+            max_account_capacity: MAX_ACCOUNT_CAPACITY,
+            max_market_capacity: MAX_MARKET_CAPACITY,
+            ..RiskStateLimits::default()
+        };
+        let restored = RiskEngine::decode_state_v1_bounded(&bytes, &limits).unwrap();
+        assert_same_canonical_state(&source, &restored);
+
+        for (max_accounts, max_markets) in [
+            (0, DEFAULT_MAX_MARKETS),
+            (MAX_ACCOUNT_CAPACITY + 1, DEFAULT_MAX_MARKETS),
+            (DEFAULT_MAX_ACCOUNTS, 0),
+            (DEFAULT_MAX_ACCOUNTS, MAX_MARKET_CAPACITY + 1),
+        ] {
+            let mut invalid = cfg();
+            invalid.max_accounts = max_accounts;
+            invalid.max_markets = max_markets;
+            assert!(matches!(
+                RiskEngine::new(invalid).encode_state_v1_bounded(usize::MAX),
+                Err(RiskStateError::RiskInvariant(RiskError::StateInvariant(_)))
+            ));
+        }
+    }
+
+    #[test]
+    fn state_codec_v1_rejects_every_truncation_and_suffix() {
+        let bytes = canonical_state(&commitment_fixture());
+        let limits = RiskStateLimits::default();
+        for end in 0..bytes.len() {
+            assert!(
+                RiskEngine::decode_state_v1_bounded(&bytes[..end], &limits).is_err(),
+                "accepted truncated prefix ending at byte {end}"
+            );
+        }
+
+        let mut suffixed = bytes;
+        suffixed.push(0);
+        assert_eq!(
+            RiskEngine::decode_state_v1_bounded(&suffixed, &limits)
+                .err()
+                .unwrap(),
+            RiskStateError::TrailingBytes { remaining: 1 }
+        );
+    }
+
+    #[test]
+    fn state_codec_v1_enforces_every_independent_limit_inclusively() {
+        let source = commitment_fixture();
+        let bytes = canonical_state(&source);
+        let exact = RiskStateLimits {
+            max_encoded_bytes: 865,
+            max_account_capacity: 64,
+            max_market_capacity: 32,
+            max_account_slots: 3,
+            max_market_slots: 3,
+            max_perp_positions_per_account: 2,
+            max_total_perp_positions: 3,
+            max_payout_positions_per_account: 2,
+            max_total_payout_positions: 2,
+            max_outcomes_per_payout: 3,
+            max_total_payout_values: 5,
+            max_holders_per_market: 2,
+            max_total_market_holders: 3,
+            max_liquidation_entries: 2,
+        };
+        let restored = RiskEngine::decode_state_v1_bounded(&bytes, &exact).unwrap();
+        assert_same_canonical_state(&source, &restored);
+
+        assert_eq!(
+            RiskEngine::decode_state_v1_bounded(
+                &bytes,
+                &RiskStateLimits {
+                    max_encoded_bytes: 864,
+                    ..exact
+                },
+            )
+            .err()
+            .unwrap(),
+            RiskStateError::EncodedBytesLimit {
+                actual: 865,
+                max: 864,
+            }
+        );
+
+        let below = [
+            (
+                "account capacity",
+                RiskStateLimits {
+                    max_account_capacity: 63,
+                    ..exact
+                },
+            ),
+            (
+                "market capacity",
+                RiskStateLimits {
+                    max_market_capacity: 31,
+                    ..exact
+                },
+            ),
+            (
+                "account slots",
+                RiskStateLimits {
+                    max_account_slots: 2,
+                    ..exact
+                },
+            ),
+            (
+                "market slots",
+                RiskStateLimits {
+                    max_market_slots: 2,
+                    ..exact
+                },
+            ),
+            (
+                "perp positions per account",
+                RiskStateLimits {
+                    max_perp_positions_per_account: 1,
+                    ..exact
+                },
+            ),
+            (
+                "total perp positions",
+                RiskStateLimits {
+                    max_total_perp_positions: 2,
+                    ..exact
+                },
+            ),
+            (
+                "payout positions per account",
+                RiskStateLimits {
+                    max_payout_positions_per_account: 1,
+                    ..exact
+                },
+            ),
+            (
+                "total payout positions",
+                RiskStateLimits {
+                    max_total_payout_positions: 1,
+                    ..exact
+                },
+            ),
+            (
+                "outcomes per payout",
+                RiskStateLimits {
+                    max_outcomes_per_payout: 2,
+                    ..exact
+                },
+            ),
+            (
+                "total payout values",
+                RiskStateLimits {
+                    max_total_payout_values: 4,
+                    ..exact
+                },
+            ),
+            (
+                "holders per market",
+                RiskStateLimits {
+                    max_holders_per_market: 1,
+                    ..exact
+                },
+            ),
+            (
+                "total market holders",
+                RiskStateLimits {
+                    max_total_market_holders: 2,
+                    ..exact
+                },
+            ),
+            (
+                "liquidation entries",
+                RiskStateLimits {
+                    max_liquidation_entries: 1,
+                    ..exact
+                },
+            ),
+        ];
+        for (expected_resource, limits) in below {
+            match RiskEngine::decode_state_v1_bounded(&bytes, &limits) {
+                Err(RiskStateError::ResourceLimit { resource, .. }) => {
+                    assert_eq!(resource, expected_resource);
+                }
+                other => panic!("expected {expected_resource} limit failure, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn state_codec_v1_rejects_hostile_headers_tags_counts_and_ordering() {
+        const CONFIGURED_ACCOUNTS: usize = 26;
+        const EFFECTIVE_ACCOUNTS: usize = 42;
+        const ACCOUNT_SLOTS: usize = 58;
+        const MARKET_SLOTS: usize = 66;
+        const EMPTY_PORTFOLIO_TAG: usize = 74;
+        let empty = canonical_state(&engine());
+        assert_eq!(empty.len(), 123);
+
+        let mut invalid = empty.clone();
+        overwrite_u16(&mut invalid, 0, RISK_TRANSITION_ROOT_SCHEMA_VERSION + 1);
+        assert!(matches!(
+            RiskEngine::decode_state_v1_bounded(&invalid, &RiskStateLimits::default()),
+            Err(RiskStateError::UnsupportedVersion { .. })
+        ));
+
+        invalid = empty.clone();
+        overwrite_u64(&mut invalid, CONFIGURED_ACCOUNTS, 0);
+        assert!(matches!(
+            RiskEngine::decode_state_v1_bounded(&invalid, &RiskStateLimits::default()),
+            Err(RiskStateError::InvalidValue { .. })
+        ));
+
+        invalid = empty.clone();
+        overwrite_u64(
+            &mut invalid,
+            CONFIGURED_ACCOUNTS,
+            u64::try_from(MAX_ACCOUNT_CAPACITY).unwrap() + 1,
+        );
+        assert!(matches!(
+            RiskEngine::decode_state_v1_bounded(&invalid, &RiskStateLimits::default()),
+            Err(RiskStateError::InvalidValue { .. })
+        ));
+
+        invalid = empty.clone();
+        overwrite_u64(&mut invalid, EFFECTIVE_ACCOUNTS, 1);
+        assert!(matches!(
+            RiskEngine::decode_state_v1_bounded(&invalid, &RiskStateLimits::default()),
+            Err(RiskStateError::InvalidValue { .. })
+        ));
+
+        for count_offset in [ACCOUNT_SLOTS, MARKET_SLOTS] {
+            invalid = empty.clone();
+            overwrite_u64(&mut invalid, count_offset, u64::MAX);
+            assert!(matches!(
+                RiskEngine::decode_state_v1_bounded(&invalid, &RiskStateLimits::default()),
+                Err(RiskStateError::ResourceLimit { .. })
+            ));
+        }
+
+        invalid = empty;
+        invalid[EMPTY_PORTFOLIO_TAG] = 2;
+        assert!(matches!(
+            RiskEngine::decode_state_v1_bounded(&invalid, &RiskStateLimits::default()),
+            Err(RiskStateError::InvalidTag {
+                field: "portfolio limit",
+                value: 2,
+            })
+        ));
+
+        const ACCOUNT_ONE_ROW: usize = 205;
+        const ACCOUNT_ZERO_USED_TAG: usize = 74;
+        const ACCOUNT_ZERO_MODE_TAG: usize = 76;
+        const FIRST_PAYOUT_VALUES: usize = 288;
+        const MARKET_ZERO_MARK_TAG: usize = 671;
+        const MARKET_ONE_FIRST_HOLDER: usize = 729;
+        const MARKET_ONE_SECOND_HOLDER: usize = 737;
+        const FIFO_SECOND_ACCOUNT: usize = 829;
+        const PRESENT_FIRST_ACCOUNT: usize = 841;
+        const PRESENT_SECOND_ACCOUNT: usize = 845;
+        let rich = canonical_state(&commitment_fixture());
+        assert_eq!(rich.len(), 865);
+
+        let mut excessive_perps = commitment_fixture();
+        excessive_perps.perp[1] = (0..=32)
+            .map(|market| PerpPosition {
+                market: mkt(market),
+                net_qty: Quantity::ZERO,
+                avg_entry: Price::ZERO,
+            })
+            .collect();
+        assert_eq!(
+            RiskEngine::decode_state_v1_bounded(
+                &unchecked_state(&excessive_perps),
+                &RiskStateLimits::default(),
+            )
+            .err()
+            .unwrap(),
+            RiskStateError::InvalidValue {
+                field: "perp position count exceeds effective market capacity",
+            }
+        );
+
+        let mut excessive_queue = commitment_fixture();
+        excessive_queue.liq_queue =
+            LiquidationQueue::from_fifo_checked(vec![acct(1), acct(2), acct(8), acct(9)]).unwrap();
+        assert_eq!(
+            RiskEngine::decode_state_v1_bounded(
+                &unchecked_state(&excessive_queue),
+                &RiskStateLimits::default(),
+            )
+            .err()
+            .unwrap(),
+            RiskStateError::InvalidValue {
+                field: "liquidation entry count exceeds account slots",
+            }
+        );
+
+        let mut unknown_queue_slot = commitment_fixture();
+        unknown_queue_slot.liq_queue =
+            LiquidationQueue::from_fifo_checked(vec![acct(1), acct(9)]).unwrap();
+        assert_eq!(
+            RiskEngine::decode_state_v1_bounded(
+                &unchecked_state(&unknown_queue_slot),
+                &RiskStateLimits::default(),
+            )
+            .err()
+            .unwrap(),
+            RiskStateError::InvalidValue {
+                field: "liquidation FIFO references an unknown account slot",
+            }
+        );
+
+        invalid = rich.clone();
+        overwrite_u64(&mut invalid, ACCOUNT_ONE_ROW, 0);
+        assert!(matches!(
+            RiskEngine::decode_state_v1_bounded(&invalid, &RiskStateLimits::default()),
+            Err(RiskStateError::NonCanonical { .. })
+        ));
+
+        for tag_offset in [
+            ACCOUNT_ZERO_USED_TAG,
+            ACCOUNT_ZERO_MODE_TAG,
+            MARKET_ZERO_MARK_TAG,
+        ] {
+            invalid = rich.clone();
+            invalid[tag_offset] = 2;
+            assert!(matches!(
+                RiskEngine::decode_state_v1_bounded(&invalid, &RiskStateLimits::default()),
+                Err(RiskStateError::InvalidTag { value: 2, .. })
+            ));
+        }
+
+        for outcomes in [0, u64::try_from(types::MAX_OUTCOMES).unwrap() + 1] {
+            invalid = rich.clone();
+            overwrite_u64(&mut invalid, FIRST_PAYOUT_VALUES, outcomes);
+            assert!(matches!(
+                RiskEngine::decode_state_v1_bounded(&invalid, &RiskStateLimits::default()),
+                Err(RiskStateError::InvalidValue { .. })
+            ));
+        }
+
+        invalid = rich.clone();
+        overwrite_u64(&mut invalid, MARKET_ONE_FIRST_HOLDER, 2);
+        overwrite_u64(&mut invalid, MARKET_ONE_SECOND_HOLDER, 1);
+        assert!(matches!(
+            RiskEngine::decode_state_v1_bounded(&invalid, &RiskStateLimits::default()),
+            Err(RiskStateError::NonCanonical { .. })
+        ));
+
+        invalid = rich.clone();
+        overwrite_u32(&mut invalid, FIFO_SECOND_ACCOUNT, 2);
+        assert!(matches!(
+            RiskEngine::decode_state_v1_bounded(&invalid, &RiskStateLimits::default()),
+            Err(RiskStateError::NonCanonical { .. })
+        ));
+
+        invalid = rich.clone();
+        overwrite_u32(&mut invalid, PRESENT_SECOND_ACCOUNT, 9);
+        assert_eq!(
+            RiskEngine::decode_state_v1_bounded(&invalid, &RiskStateLimits::default())
+                .err()
+                .unwrap(),
+            RiskStateError::InvalidValue {
+                field: "liquidation membership references an unknown account slot",
+            }
+        );
+
+        invalid = rich;
+        overwrite_u32(&mut invalid, PRESENT_FIRST_ACCOUNT, 2);
+        overwrite_u32(&mut invalid, PRESENT_SECOND_ACCOUNT, 1);
+        assert!(matches!(
+            RiskEngine::decode_state_v1_bounded(&invalid, &RiskStateLimits::default()),
+            Err(RiskStateError::NonCanonical { .. })
+        ));
+    }
+
+    #[test]
+    fn state_codec_v1_rejects_corrupt_derived_and_semantic_state() {
+        macro_rules! assert_unchecked_rejected {
+            ($engine:expr) => {{
+                let invalid = unchecked_state(&$engine);
+                assert!(
+                    RiskEngine::decode_state_v1_bounded(&invalid, &RiskStateLimits::default())
+                        .is_err()
+                );
+            }};
+        }
+
+        let base = commitment_fixture();
+        let mut corrupt = base.clone();
+        corrupt.cached_equity[1] = Amount::from_raw(corrupt.cached_equity[1].raw() + 1);
+        assert_unchecked_rejected!(corrupt);
+
+        corrupt = base.clone();
+        corrupt.cached_exposure[1] = Amount::from_raw(corrupt.cached_exposure[1].raw() + 1);
+        assert_unchecked_rejected!(corrupt);
+
+        corrupt = base.clone();
+        corrupt.cached_scenario[1] = Amount::from_raw(corrupt.cached_scenario[1].raw() + 1);
+        assert_unchecked_rejected!(corrupt);
+
+        corrupt = base.clone();
+        corrupt.cached_im[1] = Amount::from_raw(corrupt.cached_im[1].raw() + 1);
+        assert_unchecked_rejected!(corrupt);
+
+        corrupt = base.clone();
+        corrupt.cached_mm[1] = Amount::from_raw(corrupt.cached_mm[1].raw() + 1);
+        assert_unchecked_rejected!(corrupt);
+
+        corrupt = base.clone();
+        let duplicate = corrupt.perp[1][0];
+        corrupt.perp[1].push(duplicate);
+        assert_unchecked_rejected!(corrupt);
+
+        corrupt = base.clone();
+        assert!(corrupt.market_holders[1].remove(&1));
+        assert_unchecked_rejected!(corrupt);
+
+        corrupt = base.clone();
+        corrupt.market_holders[2].insert(2);
+        assert_unchecked_rejected!(corrupt);
+
+        corrupt = base.clone();
+        assert!(corrupt.liq_queue.remove_membership_for_test(acct(1)));
+        assert_unchecked_rejected!(corrupt);
+
+        corrupt = base.clone();
+        corrupt.reserved_resting[1] = Amount::from_raw(-1);
+        assert_unchecked_rejected!(corrupt);
+
+        corrupt = base.clone();
+        corrupt.insurance = InsuranceFund::new(Amount::from_raw(-1));
+        assert_unchecked_rejected!(corrupt);
+
+        corrupt = base.clone();
+        corrupt.collateral[1] = Amount::MAX;
+        assert!(matches!(
+            RiskEngine::decode_state_v1_bounded(
+                &unchecked_state(&corrupt),
+                &RiskStateLimits::default(),
+            ),
+            Err(RiskStateError::RiskInvariant(RiskError::Arith(
+                types::ArithError::Overflow
+            )))
+        ));
+
+        corrupt = base;
+        corrupt.margin_mode[0] = MarginMode::Cross;
+        assert_unchecked_rejected!(corrupt);
+    }
+
+    #[test]
+    fn state_codec_v1_never_panics_on_bounded_arbitrary_bytes() {
+        let limits = RiskStateLimits {
+            max_encoded_bytes: 512,
+            max_account_capacity: 8,
+            max_market_capacity: 8,
+            max_account_slots: 8,
+            max_market_slots: 8,
+            max_perp_positions_per_account: 8,
+            max_total_perp_positions: 16,
+            max_payout_positions_per_account: 8,
+            max_total_payout_positions: 16,
+            max_outcomes_per_payout: 8,
+            max_total_payout_values: 32,
+            max_holders_per_market: 8,
+            max_total_market_holders: 16,
+            max_liquidation_entries: 8,
+        };
+        let mut random = Lcg(0xC0DE_CAFE_5151_9090);
+        for _ in 0..2_048 {
+            let len = usize::try_from(random.next() % 513).unwrap();
+            let mut bytes = vec![0u8; len];
+            for byte in &mut bytes {
+                *byte = random.next().to_le_bytes()[0];
+            }
+            let _ = RiskEngine::decode_state_v1_bounded(&bytes, &limits);
+        }
+    }
+
+    #[test]
+    fn state_codec_v1_restores_exact_transition_continuation() {
+        let mut source = commitment_fixture();
+        source
+            .apply_fill(acct(1), mkt(1), qty(-2), price(90))
+            .unwrap();
+        assert_eq!(source.perp[1][0].net_qty, Quantity::ZERO);
+        assert_eq!(source.perp[1].len(), 2);
+        source
+            .open_payout_position(acct(1), pv(&[A / 4, A]), Quantity::ZERO)
+            .unwrap();
+        source.set_mark_price(mkt(2), Price::from_raw(-1)).unwrap();
+        source.apply_fee(acct(2), amt(5_011)).unwrap();
+        assert!(source.collateral(acct(2)).unwrap().is_negative());
+        source.open_account(acct(3), Amount::ZERO).unwrap();
+        source.set_margin_mode(acct(3), MarginMode::Cross).unwrap();
+        source.liquidate(acct(3)).unwrap();
+        assert!(!source.open[3]);
+        assert_eq!(source.margin_mode[3], MarginMode::Cross);
+
+        let bytes = canonical_state(&source);
+        let mut restored = restore_default(&bytes);
+        assert_same_canonical_state(&source, &restored);
+        assert_eq!(source.perp, restored.perp);
+        assert_eq!(source.payout, restored.payout);
+        assert_eq!(source.margin_mode, restored.margin_mode);
+        assert_eq!(source.market_holders, restored.market_holders);
+
+        assert_eq!(source.next_liquidation(), restored.next_liquidation());
+        assert_eq!(source.next_liquidation(), restored.next_liquidation());
+        source.set_mark_price(mkt(2), price(52)).unwrap();
+        restored.set_mark_price(mkt(2), price(52)).unwrap();
+        source
+            .apply_fill(acct(1), mkt(2), qty(1), price(52))
+            .unwrap();
+        restored
+            .apply_fill(acct(1), mkt(2), qty(1), price(52))
+            .unwrap();
+        source.apply_funding(acct(1), amt(3)).unwrap();
+        restored.apply_funding(acct(1), amt(3)).unwrap();
+        source.apply_fee(acct(2), amt(1)).unwrap();
+        restored.apply_fee(acct(2), amt(1)).unwrap();
+        source.release_resting(acct(1), amt(40)).unwrap();
+        restored.release_resting(acct(1), amt(40)).unwrap();
+        source.reserve_resting(acct(1), amt(25)).unwrap();
+        restored.reserve_resting(acct(1), amt(25)).unwrap();
+        assert_eq!(
+            source.check_order_in_market(acct(1), mkt(1), amt(17), false),
+            restored.check_order_in_market(acct(1), mkt(1), amt(17), false)
+        );
+        source
+            .open_payout_position(acct(1), pv(&[A, 0]), Quantity::ZERO)
+            .unwrap();
+        restored
+            .open_payout_position(acct(1), pv(&[A, 0]), Quantity::ZERO)
+            .unwrap();
+        assert_same_canonical_state(&source, &restored);
+
+        let before_failure = canonical_state(&source);
+        assert_eq!(
+            source.reserve_resting(acct(1), amt(-1)),
+            restored.reserve_resting(acct(1), amt(-1))
+        );
+        assert_eq!(canonical_state(&source), before_failure);
+        assert_same_canonical_state(&source, &restored);
+    }
+
+    #[test]
+    fn state_codec_v1_restores_successful_liquidation_continuation() {
+        let mut source = engine();
+        source.open_account(acct(1), amt(50)).unwrap();
+        source.open_account(acct(2), amt(10_000)).unwrap();
+        source.open_account(acct(3), amt(10_000)).unwrap();
+        source.open_account(acct(4), amt(10_000)).unwrap();
+        source.set_mark_price(mkt(1), price(100)).unwrap();
+        source
+            .apply_fill(acct(1), mkt(1), qty(10), price(100))
+            .unwrap();
+        source
+            .apply_fill(acct(2), mkt(1), qty(-4), price(110))
+            .unwrap();
+        source
+            .apply_fill(acct(3), mkt(1), qty(-4), price(100))
+            .unwrap();
+        source
+            .apply_fill(acct(4), mkt(1), qty(-2), price(95))
+            .unwrap();
+        source.fund_insurance(amt(20)).unwrap();
+        source.set_mark_price(mkt(1), price(90)).unwrap();
+        assert!(source.is_liquidatable(acct(1)).unwrap());
+        source.liq_queue.enqueue(acct(1));
+
+        let bytes = canonical_state(&source);
+        let mut restored = restore_default(&bytes);
+        assert_same_canonical_state(&source, &restored);
+        assert_eq!(source.market_holders, restored.market_holders);
+
+        let source_outcome = source.liquidate(acct(1)).unwrap();
+        let restored_outcome = restored.liquidate(acct(1)).unwrap();
+        assert_eq!(source_outcome, restored_outcome);
+        assert_eq!(source_outcome.insurance_drawn, amt(20));
+        assert_eq!(source_outcome.socialized_loss, amt(30));
+        assert_eq!(source_outcome.socialized_charged, amt(30));
+        assert_eq!(source_outcome.adl_fills.len(), 3);
+        assert!(!source_outcome.haircuts.is_empty());
+        assert_eq!(source.liquidation_queue_len(), 0);
+        assert_eq!(restored.liquidation_queue_len(), 0);
+        assert_same_canonical_state(&source, &restored);
+    }
+
+    #[test]
+    fn state_codec_v1_preserves_accepted_non_normalized_primary_values() {
+        let mut source = commitment_fixture();
+        source.perp[1][0] = PerpPosition {
+            market: mkt(31),
+            net_qty: Quantity::ZERO,
+            avg_entry: Price::from_raw(-777),
+        };
+        assert!(source.market_holders[1].remove(&1));
+        source
+            .open_payout_position(acct(1), pv(&[-A, 3 * A]), Quantity::ZERO)
+            .unwrap();
+        source.recompute(1).unwrap();
+        assert_eq!(source.marks.len(), 3);
+        assert_eq!(source.validate_transition_invariants(), Ok(()));
+
+        let restored = restore_default(&canonical_state(&source));
+        assert_same_canonical_state(&source, &restored);
+        assert_eq!(restored.perp[1][0], source.perp[1][0]);
+        assert_eq!(
+            restored.payout[1].last().unwrap().payout.values(),
+            &[Amount::from_raw(-A), Amount::from_raw(3 * A)]
+        );
+    }
+
+    #[test]
+    fn state_codec_v1_failed_transitions_match_and_preserve_bytes() {
+        let mut fill = engine();
+        fill.open_account(acct(1), Amount::from_raw(i128::MAX - 1_000))
+            .unwrap();
+        fill.set_mark_price(mkt(1), price(1)).unwrap();
+        fill.apply_fill(acct(1), mkt(1), qty(2), price(1)).unwrap();
+        assert_failed_continuation(fill, |engine| {
+            engine.apply_fill(
+                acct(1),
+                mkt(1),
+                Quantity::from_raw(-Q),
+                Price::from_raw(i64::MAX),
+            )
+        });
+
+        let mut mark = engine();
+        mark.open_account(acct(1), Amount::from_raw(i128::MAX - 1_000))
+            .unwrap();
+        mark.set_mark_price(mkt(1), price(1)).unwrap();
+        mark.apply_fill(acct(1), mkt(1), qty(1), price(1)).unwrap();
+        assert_failed_continuation(mark, |engine| {
+            engine.set_mark_price(mkt(1), Price::from_raw(i64::MAX))
+        });
+
+        let mut payout = engine();
+        payout.open_account(acct(0), Amount::ZERO).unwrap();
+        let overflowing_payout = PayoutVector::new(vec![Amount::MAX]).unwrap();
+        assert_failed_continuation(payout, |engine| {
+            engine.open_payout_position(
+                acct(0),
+                overflowing_payout.clone(),
+                Quantity::from_raw(2_000_000),
+            )
+        });
+
+        let config = RiskConfig::new(Ratio::ONE, Ratio::ONE, Ratio::ONE).unwrap();
+        let mut liquidation = RiskEngine::new(config);
+        let half = Amount::from_raw(i128::MAX / 2);
+        liquidation.open_account(acct(0), Amount::ZERO).unwrap();
+        liquidation.open_account(acct(1), half).unwrap();
+        liquidation.apply_fee(acct(0), half).unwrap();
+        assert_failed_continuation(liquidation, |engine| engine.liquidate(acct(0)));
+    }
+
+    #[test]
+    fn transition_root_v1_binds_config_accounts_positions_and_caches() {
+        let base = commitment_fixture();
+        assert_commitment_changes(&base, |engine| {
+            engine.config.initial_margin = Ratio::from_raw(100_001);
+        });
+        assert_commitment_changes(&base, |engine| {
+            engine.config.maintenance_margin = Ratio::from_raw(50_001);
+        });
+        assert_checked_transition_root_changes(&base, |engine| {
+            engine.config.max_leverage = Ratio::from_raw(20_000_001);
+        });
+        assert_commitment_changes(&base, |engine| engine.config.max_accounts += 1);
+        assert_commitment_changes(&base, |engine| engine.config.max_markets += 1);
+        assert_commitment_changes(&base, |engine| engine.max_accounts += 1);
+        assert_commitment_changes(&base, |engine| engine.max_markets += 1);
+
+        assert_commitment_changes(&base, |engine| engine.used[1] = false);
+        assert_commitment_changes(&base, |engine| engine.open[1] = false);
+        assert_commitment_changes(&base, |engine| {
+            engine.margin_mode[1] = MarginMode::Isolated;
+        });
+        assert_commitment_changes(&base, |engine| {
+            engine.collateral[1] = engine.collateral[1]
+                .checked_add(Amount::from_raw(1))
+                .unwrap();
+        });
+        assert_commitment_changes(&base, |engine| {
+            engine.perp[1][0].market = mkt(3);
+        });
+        assert_commitment_changes(&base, |engine| {
+            engine.perp[1][0].net_qty = Quantity::from_raw(engine.perp[1][0].net_qty.raw() + 1);
+        });
+        assert_commitment_changes(&base, |engine| {
+            engine.perp[1][0].avg_entry = Price::from_raw(engine.perp[1][0].avg_entry.raw() + 1);
+        });
+        assert_commitment_changes(&base, |engine| {
+            engine.payout[1][0] = PayoutPosition::new(pv(&[A - 1, 1, A / 2]), qty(-1));
+        });
+        assert_commitment_changes(&base, |engine| {
+            engine.payout[1][0].signed_qty = qty(-2);
+        });
+        assert_commitment_changes(&base, |engine| {
+            engine.cached_equity[1] = Amount::from_raw(engine.cached_equity[1].raw() + 1);
+        });
+        assert_commitment_changes(&base, |engine| {
+            engine.cached_exposure[1] = Amount::from_raw(engine.cached_exposure[1].raw() + 1);
+        });
+        assert_commitment_changes(&base, |engine| {
+            engine.cached_scenario[1] = Amount::from_raw(engine.cached_scenario[1].raw() + 1);
+        });
+        assert_commitment_changes(&base, |engine| {
+            engine.cached_im[1] = Amount::from_raw(engine.cached_im[1].raw() + 1);
+        });
+        assert_commitment_changes(&base, |engine| {
+            engine.cached_mm[1] = Amount::from_raw(engine.cached_mm[1].raw() + 1);
+        });
+        assert_checked_transition_root_changes(&base, |engine| {
+            engine.reserved_resting[1] = Amount::from_raw(engine.reserved_resting[1].raw() + 1);
+        });
+    }
+
+    #[test]
+    fn transition_root_v1_binds_markets_indexes_and_globals() {
+        let base = commitment_fixture();
+        assert_commitment_changes(&base, |engine| {
+            engine.marks[1] = Some(Price::from_raw(engine.marks[1].unwrap().raw() + 1));
+        });
+        assert_commitment_changes(&base, |engine| engine.risk_group[1] = Some(8));
+        assert_checked_transition_root_changes(&base, |engine| {
+            engine.market_limit[1] = Some(amt(999_999));
+        });
+        assert_commitment_changes(&base, |engine| {
+            engine.market_holders[1].remove(&1);
+        });
+        assert_checked_transition_root_changes(&base, |engine| {
+            engine.portfolio_limit = Some(amt(1_999_999));
+        });
+        assert_checked_transition_root_changes(&base, |engine| {
+            engine.fund_insurance(Amount::from_raw(1)).unwrap();
+        });
+        assert_checked_transition_root_changes(&base, |engine| {
+            let first = engine.next_liquidation().unwrap();
+            let second = engine.next_liquidation().unwrap();
+            engine.liq_queue.enqueue(second);
+            engine.liq_queue.enqueue(first);
+        });
+        assert_commitment_changes(&base, |engine| {
+            assert!(engine.liq_queue.remove_membership_for_test(acct(1)));
+        });
+        assert_checked_transition_root_changes(&base, |engine| {
+            engine.socialized_total = Amount::from_raw(engine.socialized_total.raw() + 1);
+        });
+    }
+
+    #[test]
+    fn transition_root_v1_preserves_behavioral_order_and_canonicalizes_sets() {
+        let base = commitment_fixture();
+        assert_commitment_changes(&base, |engine| engine.perp[1].reverse());
+        assert_commitment_changes(&base, |engine| engine.payout[1].reverse());
+
+        let mut rebuilt_sets = base.clone();
+        for holders in &mut rebuilt_sets.market_holders {
+            let descending: Vec<usize> = holders.iter().rev().copied().collect();
+            holders.clear();
+            for holder in descending {
+                holders.insert(holder);
+            }
+        }
+        assert_eq!(
+            rebuilt_sets.transition_root_v1().unwrap(),
+            base.transition_root_v1().unwrap()
+        );
+
+        let independently_built = commitment_fixture();
+        assert_eq!(
+            independently_built.transition_root_v1().unwrap(),
+            base.transition_root_v1().unwrap()
+        );
+    }
+
+    #[test]
+    fn transition_root_v1_matches_recompute_and_clone() {
+        let mut engine = commitment_fixture();
+        let before = engine.transition_root_v1().unwrap();
+        assert_eq!(engine.clone().transition_root_v1().unwrap(), before);
+        engine.recompute_all().unwrap();
+        assert_eq!(engine.transition_root_v1().unwrap(), before);
+    }
+
+    #[test]
+    fn transition_root_v1_rejects_misaligned_account_columns() {
+        macro_rules! assert_shape_error {
+            ($field:ident) => {{
+                let mut engine = commitment_fixture();
+                let expected = engine.used.len();
+                engine.$field.pop();
+                assert_eq!(
+                    engine.transition_root_v1(),
+                    Err(RiskError::StateShape {
+                        section: "account",
+                        column: stringify!($field),
+                        expected,
+                        actual: expected - 1,
+                    })
+                );
+            }};
+        }
+
+        assert_shape_error!(open);
+        assert_shape_error!(margin_mode);
+        assert_shape_error!(collateral);
+        assert_shape_error!(perp);
+        assert_shape_error!(payout);
+        assert_shape_error!(cached_equity);
+        assert_shape_error!(cached_exposure);
+        assert_shape_error!(cached_scenario);
+        assert_shape_error!(cached_im);
+        assert_shape_error!(cached_mm);
+        assert_shape_error!(reserved_resting);
+    }
+
+    #[test]
+    fn transition_root_v1_rejects_misaligned_market_columns() {
+        macro_rules! assert_shape_error {
+            ($field:ident) => {{
+                let mut engine = commitment_fixture();
+                let expected = engine.marks.len();
+                engine.$field.pop();
+                assert_eq!(
+                    engine.transition_root_v1(),
+                    Err(RiskError::StateShape {
+                        section: "market",
+                        column: stringify!($field),
+                        expected,
+                        actual: expected - 1,
+                    })
+                );
+            }};
+        }
+
+        assert_shape_error!(risk_group);
+        assert_shape_error!(market_limit);
+        assert_shape_error!(market_holders);
+    }
+
+    #[test]
+    fn transition_root_v1_commits_dense_empty_market_slots() {
+        let mut engine = engine();
+        engine.open_account(acct(1), amt(100)).unwrap();
+        let before = engine.transition_root_v1().unwrap();
+
+        engine
+            .apply_fill(acct(1), mkt(7), Quantity::ZERO, price(1))
+            .unwrap();
+
+        assert!(engine.perp[1].is_empty());
+        assert_eq!(engine.marks.len(), 8);
+        assert_ne!(engine.transition_root_v1().unwrap(), before);
+    }
+
+    #[test]
+    fn transition_invariants_accept_fixture_and_reject_cache_corruption() {
+        let base = commitment_fixture();
+        assert_eq!(base.validate_transition_invariants(), Ok(()));
+
+        let mut corrupt = base.clone();
+        corrupt.cached_equity[1] = Amount::from_raw(corrupt.cached_equity[1].raw() + 1);
+        assert_eq!(
+            corrupt.validate_transition_invariants(),
+            Err(RiskError::StateInvariant(
+                "cached account columns disagree with primary risk state"
+            ))
+        );
+        assert_eq!(
+            corrupt.transition_root_v1(),
+            Err(RiskError::StateInvariant(
+                "cached account columns disagree with primary risk state"
+            ))
+        );
+    }
+
+    #[test]
+    fn transition_invariants_reject_holder_index_divergence() {
+        let base = commitment_fixture();
+
+        let mut missing = base.clone();
+        assert!(missing.market_holders[1].remove(&1));
+        assert_eq!(
+            missing.validate_transition_invariants(),
+            Err(RiskError::StateInvariant(
+                "a non-flat perp position is missing from the holder index"
+            ))
+        );
+
+        let mut extra = base.clone();
+        extra.market_holders[2].insert(2);
+        assert_eq!(
+            extra.validate_transition_invariants(),
+            Err(RiskError::StateInvariant(
+                "holder index has no matching non-flat perp position"
+            ))
+        );
+
+        let mut out_of_range = base;
+        let invalid_holder = out_of_range.used.len();
+        out_of_range.market_holders[1].insert(invalid_holder);
+        assert_eq!(
+            out_of_range.validate_transition_invariants(),
+            Err(RiskError::StateInvariant(
+                "holder index references an unknown or closed account"
+            ))
+        );
+    }
+
+    #[test]
+    fn transition_invariants_reject_duplicate_positions_queue_drift_and_bad_capacity() {
+        let base = commitment_fixture();
+
+        let mut duplicate_position = base.clone();
+        let duplicate = duplicate_position.perp[1][0];
+        duplicate_position.perp[1].push(duplicate);
+        assert_eq!(
+            duplicate_position.validate_transition_invariants(),
+            Err(RiskError::StateInvariant(
+                "an account contains duplicate perp markets"
+            ))
+        );
+
+        let mut position_over_capacity = base.clone();
+        position_over_capacity.perp[1][0].market = mkt(32);
+        assert_eq!(
+            position_over_capacity.validate_transition_invariants(),
+            Err(RiskError::StateInvariant(
+                "a perp position exceeds the effective market capacity"
+            ))
+        );
+
+        let mut open_but_unused = base.clone();
+        open_but_unused.used[1] = false;
+        assert_eq!(
+            open_but_unused.validate_transition_invariants(),
+            Err(RiskError::StateInvariant(
+                "an open account slot is not marked used"
+            ))
+        );
+
+        let mut queue_drift = base.clone();
+        assert!(queue_drift.liq_queue.remove_membership_for_test(acct(1)));
+        assert_eq!(
+            queue_drift.validate_transition_invariants(),
+            Err(RiskError::StateInvariant(
+                "liquidation FIFO and membership index disagree"
+            ))
+        );
+
+        let mut unknown_queue_account = base.clone();
+        unknown_queue_account.liq_queue.enqueue(acct(9));
+        assert_eq!(
+            unknown_queue_account.validate_transition_invariants(),
+            Err(RiskError::StateInvariant(
+                "liquidation queue references an unknown or closed account"
+            ))
+        );
+
+        let mut bad_capacity = base;
+        bad_capacity.max_accounts += 1;
+        assert_eq!(
+            bad_capacity.validate_transition_invariants(),
+            Err(RiskError::StateInvariant(
+                "effective capacities do not match the configured resource clamps"
+            ))
+        );
+
+        let mut dense_over_capacity = commitment_fixture();
+        dense_over_capacity.config.max_accounts = 1;
+        dense_over_capacity.max_accounts = 1;
+        assert_eq!(
+            dense_over_capacity.validate_transition_invariants(),
+            Err(RiskError::StateInvariant(
+                "dense state exceeds its effective capacity"
+            ))
+        );
+
+        let mut invalid_ratios = commitment_fixture();
+        invalid_ratios.config.maintenance_margin =
+            Ratio::from_raw(invalid_ratios.config.initial_margin.raw() + 1);
+        assert_eq!(
+            invalid_ratios.validate_transition_invariants(),
+            Err(RiskError::StateInvariant(
+                "risk ratios must be positive and maintenance must not exceed initial margin"
+            ))
+        );
+    }
+
+    #[test]
+    fn transition_invariants_reject_negative_globals_and_stale_dormant_slots() {
+        let base = commitment_fixture();
+
+        let mut negative_reservation = base.clone();
+        negative_reservation.reserved_resting[1] = Amount::from_raw(-1);
+        assert_eq!(
+            negative_reservation.validate_transition_invariants(),
+            Err(RiskError::StateInvariant(
+                "resting notional reservation must be non-negative"
+            ))
+        );
+
+        let mut negative_market_limit = base.clone();
+        negative_market_limit.market_limit[1] = Some(Amount::from_raw(-1));
+        assert_eq!(
+            negative_market_limit.validate_transition_invariants(),
+            Err(RiskError::StateInvariant(
+                "market notional limits must be non-negative"
+            ))
+        );
+
+        let mut negative_portfolio_limit = base.clone();
+        negative_portfolio_limit.portfolio_limit = Some(Amount::from_raw(-1));
+        assert_eq!(
+            negative_portfolio_limit.validate_transition_invariants(),
+            Err(RiskError::StateInvariant(
+                "portfolio notional limit must be non-negative"
+            ))
+        );
+
+        let mut negative_insurance = base.clone();
+        negative_insurance.insurance = InsuranceFund::new(Amount::from_raw(-1));
+        assert_eq!(
+            negative_insurance.validate_transition_invariants(),
+            Err(RiskError::StateInvariant(
+                "insurance balance must be non-negative"
+            ))
+        );
+
+        let mut negative_socialized = base;
+        negative_socialized.socialized_total = Amount::from_raw(-1);
+        assert_eq!(
+            negative_socialized.validate_transition_invariants(),
+            Err(RiskError::StateInvariant(
+                "socialized-loss total must be non-negative"
+            ))
+        );
+
+        let mut unused = engine();
+        unused.grow_accounts(2).unwrap();
+        unused.reserved_resting[1] = Amount::from_raw(1);
+        assert_eq!(
+            unused.validate_transition_invariants(),
+            Err(RiskError::StateInvariant(
+                "unused account slots must contain normalized defaults"
+            ))
+        );
+
+        let mut closed = commitment_fixture();
+        closed.open[1] = false;
+        assert_eq!(
+            closed.validate_transition_invariants(),
+            Err(RiskError::StateInvariant(
+                "closed account slots must contain normalized balances and positions"
+            ))
+        );
+    }
+
+    #[test]
+    fn payout_overflow_restores_exact_transition_state() {
+        let mut engine = engine();
+        engine.open_account(acct(0), Amount::ZERO).unwrap();
+        let before = engine.transition_root_v1().unwrap();
+        let payout = PayoutVector::new(vec![Amount::MAX]).unwrap();
+
+        assert_eq!(
+            engine.open_payout_position(acct(0), payout, Quantity::from_raw(2_000_000)),
+            Err(RiskError::Arith(types::ArithError::Overflow))
+        );
+        assert!(engine.payout[0].is_empty());
+        assert_eq!(engine.transition_root_v1().unwrap(), before);
+        assert_eq!(engine.validate_transition_invariants(), Ok(()));
+    }
+
+    #[test]
+    fn fill_recompute_overflow_restores_holder_index_and_dense_market_shape() {
+        let config = RiskConfig::new(Ratio::MAX, Ratio::ONE, Ratio::ONE).unwrap();
+        let mut engine = RiskEngine::new(config);
+        engine.open_account(acct(0), Amount::ZERO).unwrap();
+        let before = engine.transition_root_v1().unwrap();
+
+        assert_eq!(
+            engine.apply_fill(acct(0), mkt(1), Quantity::MAX, Price::MAX),
+            Err(RiskError::Arith(types::ArithError::Overflow))
+        );
+        assert!(engine.perp[0].is_empty());
+        assert_eq!(engine.market_holder_count(mkt(1)), Ok(0));
+        assert!(engine.marks.is_empty());
+        assert!(engine.risk_group.is_empty());
+        assert!(engine.market_limit.is_empty());
+        assert!(engine.market_holders.is_empty());
+        assert_eq!(engine.transition_root_v1().unwrap(), before);
+        assert_eq!(engine.validate_transition_invariants(), Ok(()));
+    }
+
+    #[test]
+    fn fill_recompute_overflow_restores_existing_holder_membership() {
+        let mut engine = engine();
+        engine.open_account(acct(0), Amount::ZERO).unwrap();
+        engine.set_margin_mode(acct(0), MarginMode::Cross).unwrap();
+        engine.set_risk_group(mkt(1), 7).unwrap();
+        engine.set_risk_group(mkt(2), 7).unwrap();
+        let max_qty = Quantity::from_raw(i64::MAX);
+        let min_symmetric_qty = Quantity::from_raw(-i64::MAX);
+        engine
+            .apply_fill(acct(0), mkt(1), max_qty, Price::MAX)
+            .unwrap();
+        engine
+            .apply_fill(acct(0), mkt(2), min_symmetric_qty, Price::MAX)
+            .unwrap();
+
+        // The two same-group legs exactly hedge, so even this extreme margin
+        // ratio is valid before the attempted close. Closing either leg exposes
+        // the other and overflows after holder membership has been removed.
+        engine.config.initial_margin = Ratio::MAX;
+        engine.recompute_all().unwrap();
+        let before = engine.transition_root_v1().unwrap();
+        assert_eq!(engine.market_holder_count(mkt(1)), Ok(1));
+
+        assert_eq!(
+            engine.apply_fill(acct(0), mkt(1), Quantity::from_raw(-i64::MAX), Price::MAX,),
+            Err(RiskError::Arith(types::ArithError::Overflow))
+        );
+        assert_eq!(engine.market_holder_count(mkt(1)), Ok(1));
+        assert_eq!(engine.position(acct(0), mkt(1)), Ok(max_qty));
+        assert_eq!(engine.transition_root_v1().unwrap(), before);
+        assert_eq!(engine.validate_transition_invariants(), Ok(()));
+    }
+
+    #[test]
+    fn liquidation_socialization_overflow_is_atomic() {
+        let config = RiskConfig::new(Ratio::ONE, Ratio::ONE, Ratio::ONE).unwrap();
+        let mut engine = RiskEngine::new(config);
+        let half = Amount::from_raw(i128::MAX / 2);
+        engine.open_account(acct(0), Amount::ZERO).unwrap();
+        engine.open_account(acct(1), half).unwrap();
+        engine.apply_fee(acct(0), half).unwrap();
+        let before = engine.transition_root_v1().unwrap();
+
+        assert_eq!(
+            engine.liquidate(acct(0)),
+            Err(RiskError::Arith(types::ArithError::Overflow))
+        );
+        assert_eq!(engine.transition_root_v1().unwrap(), before);
+        assert_eq!(engine.validate_transition_invariants(), Ok(()));
+    }
+
+    #[test]
+    fn multi_leg_adl_failure_restores_earlier_leg() {
+        let mut engine = engine();
+        engine.open_account(acct(0), Amount::ZERO).unwrap();
+        engine
+            .apply_fill(acct(0), mkt(1), Quantity::ONE, Price::ZERO)
+            .unwrap();
+        engine
+            .apply_fill(acct(0), mkt(2), Quantity::MIN, Price::ZERO)
+            .unwrap();
+        let before = engine.transition_root_v1().unwrap();
+
+        assert_eq!(
+            engine.liquidate(acct(0)),
+            Err(RiskError::Arith(types::ArithError::Overflow))
+        );
+        assert_eq!(engine.position(acct(0), mkt(1)), Ok(Quantity::ONE));
+        assert_eq!(engine.position(acct(0), mkt(2)), Ok(Quantity::MIN));
+        assert_eq!(engine.transition_root_v1().unwrap(), before);
+        assert_eq!(engine.validate_transition_invariants(), Ok(()));
     }
 
     // Atomicity: a fill that mutates the position and then overflows while settling
@@ -1781,6 +3503,7 @@ mod tests {
     fn opening_short_payout_without_collateral_fails() {
         let mut e = engine();
         e.open_account(acct(1), amt(0)).unwrap();
+        let before = e.transition_root_v1().unwrap();
         // Short one binary claim paying [1.0, 0.0]: worst case is a 1.0
         // liability, but the account posts no collateral.
         let market = pv(&[A, 0]);
@@ -1792,6 +3515,7 @@ mod tests {
         assert_eq!(e.scenario_margin(acct(1)).unwrap(), Amount::ZERO);
         assert_eq!(e.initial_margin(acct(1)).unwrap(), Amount::ZERO);
         assert_eq!(e.worst_case_equity(acct(1)).unwrap(), amt(0));
+        assert_eq!(e.transition_root_v1().unwrap(), before);
         // Once collateral covers the worst case, the same order is admitted.
         e.credit_collateral(acct(1), amt(1)).unwrap();
         assert!(e.open_payout_position(acct(1), market, qty(-1)).is_ok());

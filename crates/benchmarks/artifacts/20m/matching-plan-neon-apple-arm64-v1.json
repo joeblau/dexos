@@ -1,0 +1,133 @@
+{
+  "schema_version": 1,
+  "artifact_type": "paired-component-microbenchmark",
+  "qualification_status": "ARM64_KERNEL_AND_X86_64_REPLAY_QUALIFIED_X86_SIMD_AND_HARDWARE_COUNTERS_PENDING",
+  "generated_date": "2026-07-13",
+  "exact_command": "cargo run --release -p benchmarks --bin matching-paired -- --iterations 20000 --warmup 2000 --bootstrap-resamples 5000 --output /tmp/dexos-matching-paired-neon.json",
+  "provenance": {
+    "git_sha": "61cc7e6f392198e9e122807c5a87f53e7eff191f",
+    "git_dirty": true,
+    "cargo_lock_sha256": "1375c554cfbf77c912a42b1edb6f4a1f41e40feef4ea178d6d553b17005d349b",
+    "rustc": "1.96.1 (31fca3adb 2026-06-26)",
+    "llvm": "22.1.8",
+    "profile": "release",
+    "host_os": "macOS 27.0 build 26A5378j",
+    "kernel": "Darwin 27.0.0 RELEASE_ARM64_T6031",
+    "host_arch": "aarch64",
+    "cpu": "Apple M3 Max",
+    "backend": "neon",
+    "allocation_counting": true,
+    "hardware_counters": "unavailable"
+  },
+  "boundary": {
+    "call_path": "execution::Engine::pretrade_notional -> orderbook::OrderBook::plan_match_summary -> simd::matching_notionals",
+    "fixture": "128 best-first maker fills with exact six-decimal rounding and an 8-lane fixed stack batch",
+    "excluded": [
+      "stateful maker mutation",
+      "socket and transport",
+      "durable journal",
+      "Minimmit finality",
+      "Linux perf hardware counters",
+      "x86_64 AVX2 and AVX-512 runtime results"
+    ]
+  },
+  "method": {
+    "paired_iterations_per_run": 20000,
+    "warmup_pairs_per_run": 2000,
+    "repeat_runs": 4,
+    "order": "interleaved and alternating scalar-first/SIMD-first",
+    "confidence_method": "deterministic paired bootstrap of mean scalar-minus-SIMD nanoseconds",
+    "bootstrap_resamples": 5000,
+    "confidence_permille": 950,
+    "raw_pairs": "emitted by matching-paired into each requested output artifact"
+  },
+  "repeat_results": [
+    {
+      "scalar_p50_ns": 833,
+      "scalar_p95_ns": 917,
+      "scalar_p99_ns": 1041,
+      "simd_p50_ns": 833,
+      "simd_p95_ns": 875,
+      "simd_p99_ns": 1041,
+      "speedup_basis_points": 115,
+      "mean_delta_ns": 9,
+      "bootstrap_mean_delta_low_ns": 8,
+      "bootstrap_mean_delta_high_ns": 10,
+      "scalar_allocations": 0,
+      "simd_allocations": 0,
+      "statistically_significant_simd_win": true
+    },
+    {
+      "scalar_p50_ns": 792,
+      "scalar_p95_ns": 958,
+      "scalar_p99_ns": 1083,
+      "simd_p50_ns": 791,
+      "simd_p95_ns": 958,
+      "simd_p99_ns": 1042,
+      "speedup_basis_points": 241,
+      "mean_delta_ns": 19,
+      "bootstrap_mean_delta_low_ns": 17,
+      "bootstrap_mean_delta_high_ns": 21,
+      "scalar_allocations": 0,
+      "simd_allocations": 0,
+      "statistically_significant_simd_win": true
+    },
+    {
+      "scalar_p50_ns": 792,
+      "scalar_p95_ns": 959,
+      "scalar_p99_ns": 1084,
+      "simd_p50_ns": 791,
+      "simd_p95_ns": 959,
+      "simd_p99_ns": 1042,
+      "speedup_basis_points": 201,
+      "mean_delta_ns": 16,
+      "bootstrap_mean_delta_low_ns": 14,
+      "bootstrap_mean_delta_high_ns": 18,
+      "scalar_allocations": 0,
+      "simd_allocations": 0,
+      "statistically_significant_simd_win": true
+    },
+    {
+      "scalar_p50_ns": 792,
+      "scalar_p95_ns": 1000,
+      "scalar_p99_ns": 1083,
+      "simd_p50_ns": 792,
+      "simd_p95_ns": 1000,
+      "simd_p99_ns": 1042,
+      "speedup_basis_points": 115,
+      "mean_delta_ns": 9,
+      "bootstrap_mean_delta_low_ns": 6,
+      "bootstrap_mean_delta_high_ns": 12,
+      "scalar_allocations": 0,
+      "simd_allocations": 0,
+      "statistically_significant_simd_win": true
+    }
+  ],
+  "vector_instruction_evidence": {
+    "binary": "target/release/matching-paired",
+    "symbol": "simd::matching::matching_notionals",
+    "command": "otool -tvV target/release/matching-paired",
+    "instructions": [
+      "umull.2d v0, v2, v0",
+      "umull.2d v1, v3, v1"
+    ],
+    "x86_cross_compile_command": "RUSTC=\"$(rustup which --toolchain 1.92.0 rustc)\" RUSTDOC=\"$(rustup which --toolchain 1.92.0 rustdoc)\" rustup run 1.92.0 cargo rustc --release --target x86_64-unknown-linux-gnu -p simd --lib -- --emit=asm",
+    "x86_cross_compiled_instructions": [
+      "vpmuludq %ymm0, %ymm1, %ymm0",
+      "vpmuludq %zmm0, %zmm1, %zmm0"
+    ],
+    "x86_runtime_qualification": {
+      "environment": "x86_64-apple-darwin under Rosetta on Apple M3 Max",
+      "command": "RUSTC=\"$(rustup which --toolchain 1.92.0 rustc)\" RUSTDOC=\"$(rustup which --toolchain 1.92.0 rustdoc)\" rustup run 1.92.0 cargo test --target x86_64-apple-darwin -p simd -p orderbook -p execution",
+      "results": {
+        "execution": "74 passed",
+        "orderbook": "64 passed",
+        "simd": "49 passed",
+        "doc_tests": "passed"
+      },
+      "coverage": "receipts, typed errors, fills, outcomes, roots, rounding boundaries, STP policies, and tail lanes",
+      "vector_backend_available": false,
+      "limitation": "Rosetta reported no AVX2 or AVX-512 backend; this is x86_64 replay evidence, not x86 SIMD runtime or bare-metal performance qualification"
+    }
+  }
+}

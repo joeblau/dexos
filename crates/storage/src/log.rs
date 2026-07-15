@@ -320,15 +320,21 @@ impl SegmentedLog {
     /// # Errors
     /// Returns the first [`LogError`] encountered.
     pub fn verify(&self) -> Result<(), LogError> {
-        let mut expected: Option<u64> = None;
+        let mut last: Option<u64> = None;
         for item in self.iter() {
             let rec = item?;
-            if let Some(exp) = expected {
-                if rec.sequence != exp {
-                    return Err(gap_or_order(exp, rec.sequence));
+            if let Some(previous) = last {
+                let Some(expected) = previous.checked_add(1) else {
+                    return Err(LogError::OutOfOrder {
+                        last: previous,
+                        got: rec.sequence,
+                    });
+                };
+                if rec.sequence != expected {
+                    return Err(gap_or_order(expected, rec.sequence));
                 }
             }
-            expected = rec.sequence.checked_add(1);
+            last = Some(rec.sequence);
         }
         Ok(())
     }
@@ -634,6 +640,38 @@ mod tests {
             }) => {}
             other => panic!("expected gap, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn verify_rejects_any_record_after_u64_max() {
+        let mut log = SegmentedLog::default();
+        log.append(u64::MAX, 0, 1, b"terminal").unwrap();
+
+        // Append normally rejects the wrap, so inject a structurally valid
+        // frame to model corrupted/imported bytes that verification must never
+        // accept as a new sequence after the terminal u64 value.
+        let wrapped = Record {
+            protocol_version: crate::record::PROTOCOL_VERSION,
+            sequence: 0,
+            timestamp: 0,
+            command_type: 1,
+            payload: b"wrapped".to_vec(),
+        }
+        .encode()
+        .unwrap();
+        let segment = log.segments.last_mut().unwrap();
+        segment.bytes.extend_from_slice(&wrapped);
+        segment.count += 1;
+        segment.last_sequence = Some(0);
+        log.total_records += 1;
+
+        assert!(matches!(
+            log.verify(),
+            Err(LogError::OutOfOrder {
+                last: u64::MAX,
+                got: 0,
+            })
+        ));
     }
 
     #[test]

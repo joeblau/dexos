@@ -93,6 +93,11 @@ pub enum TransportError {
     #[error("message exceeds maximum frame payload")]
     MessageTooLarge,
 
+    /// A locally constructed packed-batch receipt violates its lifecycle or
+    /// counter-conservation contract and was refused before enqueue.
+    #[error("invalid packed batch receipt")]
+    InvalidOrderBatchReceipt,
+
     /// A duplicate or replayed message was suppressed.
     #[error("duplicate or replayed message suppressed")]
     Duplicate,

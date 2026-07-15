@@ -8,12 +8,20 @@
 //! Subsystem seams are bounded channels only — never unbounded queues — so a slow
 //! consumer applies backpressure instead of growing memory without limit.
 
+pub mod batch_receipts;
 pub mod config;
 pub mod consensus_driver;
+pub mod durable_packed;
 pub mod error;
 pub mod lowering;
 pub mod metrics;
+pub mod multi_packed_core;
+pub mod packed_core;
+pub mod packed_ingress;
+pub mod packed_server;
 pub mod readiness;
+pub mod receipt_finality;
+pub mod shard;
 pub mod shutdown;
 pub mod supervisor;
 pub mod threading;
@@ -26,15 +34,43 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::Instrument;
 
+pub use batch_receipts::{
+    admission_receipt, finalize_executed_receipt, BatchReceiptTracker, BatchReceiptTrackerError,
+};
 pub use config::{
     ConfigError, ConfigOverrides, ConsensusSection, LogFormat, NetworkSection, NodeConfig,
     NodeSection, ObservabilitySection, PerformanceSection, Role, RpcSection, StorageSection,
 };
 pub use consensus_driver::{ConsensusDriver, DriverError, DriverEvent};
+pub use durable_packed::{
+    DurablePackedBatchIngress, PackedBatchJournal, PackedBatchJournalError,
+    PACKED_BATCH_WAL_COMMAND_TYPE,
+};
 pub use error::NodeError;
 pub use lowering::{control_plane_produces, lower, LoweringError};
+pub use multi_packed_core::{
+    MultiSessionAdmissionReadiness, MultiSessionPackedValidatorCore,
+    MultiSessionPackedValidatorCoreError,
+};
 pub use observability::{MetricsRegistry, TraceGen, TraceId};
+pub use packed_core::{PackedValidatorCore, PackedValidatorCoreError};
+pub use packed_ingress::{
+    AuthenticatedPackedBatch, AuthenticatedPackedBatchIngress, AuthenticatedPackedIngressError,
+    PackedAuthority, PackedBatchAdmission, PackedBatchIngress, PackedIngressError, PackedSession,
+};
+pub use packed_server::{
+    deliver_minimmit_finality, serve_multi_packed_with_finality, serve_multi_packed_with_shutdown,
+    serve_packed_with_finality, serve_packed_with_shutdown, PackedFinalityDeliveryError,
+    PackedFinalityRouter, PackedFinalityRouterError, PackedServerConfig, PackedServerError,
+};
 pub use readiness::Readiness;
+pub use receipt_finality::{
+    MinimmitFinalityEvent, MinimmitReceiptBridge, MinimmitReceiptBridgeError,
+};
+pub use shard::{
+    shard_command_ring, shard_pipeline, spsc_ring, RingError, ShardCommand, ShardCounters,
+    ShardEffect, ShardEgress, ShardIngress, ShardStep, ShardWorker, SpscConsumer, SpscProducer,
+};
 pub use shutdown::{FlushHooks, DEFAULT_DRAIN_TIMEOUT};
 
 /// Capacity of each subsystem ingress queue. Bounded by construction.
@@ -127,6 +163,21 @@ impl Node {
     /// ingress queue exists per role.
     pub fn new(config: NodeConfig) -> Result<Self, NodeError> {
         config.validate()?;
+        if config
+            .node
+            .roles
+            .iter()
+            .any(|role| role.requires_validator_set())
+        {
+            return Err(ConfigError::Unsupported {
+                field: "node.roles",
+                detail: "validator, sequencer, witness, and custody roles are release-blocked until the production RPC, WAL, consensus-safety, execution, checkpoint, and recovery composition is complete",
+            }
+            .into());
+        }
+        // `Node` is also a public construction boundary. Do not rely solely on
+        // the CLI loader to have checked TLS and storage paths.
+        config.validate_paths()?;
         let roles = config.effective_roles();
         let (shutdown_tx, _initial_rx) = watch::channel(false);
         let mut ingress = Vec::with_capacity(roles.len());
@@ -779,6 +830,28 @@ mod tests {
         bad.node.light = true;
         bad.node.roles = vec![Role::Validator];
         assert!(matches!(Node::new(bad), Err(NodeError::Config(_))));
+    }
+
+    #[test]
+    fn authoritative_placeholder_roles_fail_closed() {
+        for role in [
+            Role::Validator,
+            Role::Sequencer,
+            Role::Witness,
+            Role::Custody,
+        ] {
+            let err = Node::new(cfg_with_roles(false, vec![role])).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    NodeError::Config(ConfigError::Unsupported {
+                        field: "node.roles",
+                        ..
+                    })
+                ),
+                "{role:?}: {err}"
+            );
+        }
     }
 
     #[test]

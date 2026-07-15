@@ -22,12 +22,12 @@ pub fn execution_commitment_digest(
     block_hash: Hash,
     execution_root: Hash,
 ) -> Hash {
-    let mut buf = Vec::with_capacity(8 * 3 + 32 + 32);
-    buf.extend_from_slice(&epoch.to_le_bytes());
-    buf.extend_from_slice(&view.to_le_bytes());
-    buf.extend_from_slice(&height.to_le_bytes());
-    buf.extend_from_slice(block_hash.as_bytes());
-    buf.extend_from_slice(execution_root.as_bytes());
+    let mut buf = [0u8; 8 * 3 + 32 + 32];
+    buf[0..8].copy_from_slice(&epoch.to_le_bytes());
+    buf[8..16].copy_from_slice(&view.to_le_bytes());
+    buf[16..24].copy_from_slice(&height.to_le_bytes());
+    buf[24..56].copy_from_slice(block_hash.as_bytes());
+    buf[56..88].copy_from_slice(execution_root.as_bytes());
     hash_domain(DOMAIN_EXEC_COMMIT, &buf)
 }
 

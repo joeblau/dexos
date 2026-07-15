@@ -83,6 +83,23 @@ pub struct MatchPlan {
     pub notional_ceil: types::Amount,
 }
 
+/// Allocation-free aggregate of a deterministic dry-run match.
+///
+/// This is the hot-path counterpart to [`MatchPlan`]. It contains exactly the
+/// values pre-trade risk needs, without retaining one heap-backed record per
+/// maker fill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MatchSummary {
+    /// Total quantity that would fill.
+    pub filled_quantity: Quantity,
+    /// Worst (least favorable for the taker) price among planned fills.
+    pub worst_price: Option<Price>,
+    /// Sum of `price.notional(qty)` over planned fills (toward zero).
+    pub notional: types::Amount,
+    /// Sum of `price.notional_ceil(qty)` — conservative margin base.
+    pub notional_ceil: types::Amount,
+}
+
 /// The disposition of a submitted order after matching.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OrderOutcome {
@@ -115,6 +132,57 @@ pub struct MatchResult {
     pub fills: Vec<Fill>,
     /// Final disposition of the incoming order.
     pub outcome: OrderOutcome,
+}
+
+/// Immutable fields of one currently resting order.
+///
+/// This transient view lets integrations reconcile external reserve or escrow
+/// sidecars against the live book without exposing slab links or other
+/// representation details. It is not part of the canonical book-state schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestingOrder {
+    /// Exchange-assigned order id.
+    pub order_id: OrderId,
+    /// Account that owns the resting order.
+    pub account: AccountId,
+    /// Resting side.
+    pub side: Side,
+    /// Resting limit price.
+    pub price: Price,
+    /// Quantity still resting.
+    pub remaining: Quantity,
+}
+
+/// A resting self order removed by self-trade prevention while matching an
+/// incoming order.
+///
+/// This is a transient execution report. It is deliberately excluded from the
+/// book's client-id deduplication records and canonical v3 state encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StpCancellation {
+    /// Resting order removed by the STP policy.
+    pub order_id: OrderId,
+    /// Account that owned the resting order.
+    pub account: AccountId,
+    /// Side of the removed resting order.
+    pub side: Side,
+    /// Resting limit price at removal.
+    pub price: Price,
+    /// Quantity still resting immediately before removal.
+    pub remaining: Quantity,
+}
+
+/// Match result plus transient maker cancellations caused by STP.
+///
+/// Cancellations are emitted in exact matching encounter order. They are an
+/// integration side channel for callers that keep collateral or escrow state
+/// alongside the book; they are never persisted in book state or dedup caches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchReport {
+    /// The legacy match result.
+    pub result: MatchResult,
+    /// Resting self orders removed during this match, in encounter order.
+    pub stp_cancelled: Vec<StpCancellation>,
 }
 
 impl MatchResult {
@@ -161,6 +229,9 @@ pub struct BookConfig {
     pub dedup_capacity: usize,
     /// Maximum legs in a single basket submission.
     pub max_basket_legs: usize,
+    /// Backend for pure match-planning arithmetic. Stateful FIFO/STP mutation
+    /// remains scalar, and every backend is required to be bit-identical.
+    pub matching_backend: crate::MatchingBackend,
 }
 
 impl Default for BookConfig {
@@ -170,6 +241,7 @@ impl Default for BookConfig {
             stp: StpPolicy::CancelMaker,
             dedup_capacity: 1 << 12,
             max_basket_legs: 64,
+            matching_backend: simd::detect(),
         }
     }
 }

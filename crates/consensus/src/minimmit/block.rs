@@ -68,10 +68,10 @@ impl BlockHeader {
     /// of [`crate::checkpoint::CheckpointHeader::hash`].
     #[must_use]
     pub fn hash(&self) -> Hash {
-        let mut buf = Vec::with_capacity(8 + 32 * 2);
-        buf.extend_from_slice(&self.height.to_le_bytes());
-        buf.extend_from_slice(self.parent_hash.as_bytes());
-        buf.extend_from_slice(self.payload_root.as_bytes());
+        let mut buf = [0u8; 8 + 32 * 2];
+        buf[0..8].copy_from_slice(&self.height.to_le_bytes());
+        buf[8..40].copy_from_slice(self.parent_hash.as_bytes());
+        buf[40..72].copy_from_slice(self.payload_root.as_bytes());
         hash_domain(DOMAIN_BLOCK, &buf)
     }
 }

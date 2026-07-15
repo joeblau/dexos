@@ -62,7 +62,7 @@ pub enum RpcOk {
     /// `get_oracle_status`.
     OracleStatus(OracleStatus),
     /// `get_checkpoint` / `get_latest_checkpoint`.
-    Checkpoint(Checkpoint),
+    Checkpoint(Box<Checkpoint>),
     /// `get_account`.
     Account(Account),
     /// `get_account_proof`.

@@ -16,3 +16,8 @@ workspace = true
 [dependencies]
 loadgen = { path = "../../crates/loadgen" }
 clap.workspace = true
+serde_json.workspace = true
+getrandom.workspace = true
+serde.workspace = true
+tokio.workspace = true
+types = { path = "../../crates/types" }

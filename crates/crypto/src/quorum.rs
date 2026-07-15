@@ -3,6 +3,7 @@
 
 use std::collections::BTreeSet;
 
+use arrayvec::ArrayVec;
 use serde::{Deserialize, Serialize};
 
 use crate::hash::{hash_domain, DOMAIN_VALIDATOR_SET};
@@ -425,6 +426,12 @@ pub const QC_WIRE_VERSION: u16 = 2;
 /// Fixed header size of a packed QC: 32-byte message + 2-byte little-endian bitmap.
 pub const QC_PACKED_HEADER_LEN: usize = 32 + 2;
 
+/// Fixed-capacity canonical signatures for a committee of at most 16 members.
+///
+/// Inline storage removes the owned-QC heap allocation while retaining slice
+/// indexing, iteration, and deterministic ascending signer order.
+pub type QuorumSignatures = ArrayVec<[u8; 64], MAX_VALIDATORS>;
+
 /// A quorum certificate: signatures over `message` from the validators named in
 /// `signer_bitmap` (bit `i` == validator `i`), in ascending index order.
 ///
@@ -449,7 +456,7 @@ pub struct QuorumCertificate {
     pub signer_bitmap: u16,
     /// Member signatures, aligned to the set bits in ascending order.
     #[serde(with = "sig_vec")]
-    pub signatures: Vec<[u8; 64]>,
+    pub signatures: QuorumSignatures,
 }
 
 impl QuorumCertificate {
@@ -489,12 +496,14 @@ impl QuorumCertificate {
         if bytes.len() != expected || k > MAX_VALIDATORS {
             return Err(QuorumError::MalformedCertificate);
         }
-        let mut signatures = Vec::with_capacity(k);
+        let mut signatures = QuorumSignatures::new();
         let mut off = QC_PACKED_HEADER_LEN;
         for _ in 0..k {
             let mut sig = [0u8; 64];
             sig.copy_from_slice(&bytes[off..off + 64]);
-            signatures.push(sig);
+            signatures
+                .try_push(sig)
+                .map_err(|_| QuorumError::MalformedCertificate)?;
             off += 64;
         }
         Ok(Self {
@@ -505,18 +514,19 @@ impl QuorumCertificate {
     }
 }
 
-/// serde adapter for `Vec<[u8; 64]>` (serde has no built-in impl past 32 bytes).
+/// Serde adapter for inline 64-byte signatures (serde has no built-in impl past 32 bytes).
 ///
 /// Encode writes each signature as a fixed 64-byte byte string without building
 /// an intermediate `Vec<&[u8]>`. Decode validates each element is exactly 64
 /// bytes and rejects oversized sequences before filling the output.
 mod sig_vec {
+    use super::QuorumSignatures;
     use serde::de::{SeqAccess, Visitor};
     use serde::ser::SerializeSeq;
     use serde::{Deserialize, Deserializer, Serializer};
     use std::fmt;
 
-    pub(super) fn serialize<S: Serializer>(v: &[[u8; 64]], s: S) -> Result<S::Ok, S::Error> {
+    pub(super) fn serialize<S: Serializer>(v: &QuorumSignatures, s: S) -> Result<S::Ok, S::Error> {
         let mut seq = s.serialize_seq(Some(v.len()))?;
         for sig in v {
             // Serialize as a byte slice so postcard / bincode pack densely.
@@ -525,22 +535,20 @@ mod sig_vec {
         seq.end()
     }
 
-    pub(super) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<[u8; 64]>, D::Error> {
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<QuorumSignatures, D::Error> {
         struct SigVisitor;
         impl<'de> Visitor<'de> for SigVisitor {
-            type Value = Vec<[u8; 64]>;
+            type Value = QuorumSignatures;
             fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
                 f.write_str("a sequence of 64-byte signatures")
             }
             fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-                // Bound by the 16-bit signer bitmap: never more than 16 sigs.
-                let hint = seq.size_hint().unwrap_or(0).min(16);
-                let mut out = Vec::with_capacity(hint);
+                let mut out = QuorumSignatures::new();
                 while let Some(v) = seq.next_element::<SigBytes>()? {
-                    if out.len() >= 16 {
-                        return Err(serde::de::Error::custom("too many signatures"));
-                    }
-                    out.push(v.0);
+                    out.try_push(v.0)
+                        .map_err(|_| serde::de::Error::custom("too many signatures"))?;
                 }
                 Ok(out)
             }
@@ -549,10 +557,31 @@ mod sig_vec {
         struct SigBytes([u8; 64]);
         impl<'de> Deserialize<'de> for SigBytes {
             fn deserialize<D2: Deserializer<'de>>(d: D2) -> Result<Self, D2::Error> {
-                let v = <Vec<u8>>::deserialize(d)?;
-                let arr = <[u8; 64]>::try_from(v.as_slice())
-                    .map_err(|_| serde::de::Error::custom("signature must be 64 bytes"))?;
-                Ok(SigBytes(arr))
+                struct BytesVisitor;
+                impl<'de> Visitor<'de> for BytesVisitor {
+                    type Value = SigBytes;
+
+                    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                        f.write_str("exactly 64 signature bytes")
+                    }
+
+                    fn visit_seq<A: SeqAccess<'de>>(
+                        self,
+                        mut seq: A,
+                    ) -> Result<Self::Value, A::Error> {
+                        let mut bytes = [0u8; 64];
+                        for byte in &mut bytes {
+                            *byte = seq.next_element()?.ok_or_else(|| {
+                                serde::de::Error::custom("signature must be 64 bytes")
+                            })?;
+                        }
+                        if seq.next_element::<u8>()?.is_some() {
+                            return Err(serde::de::Error::custom("signature must be 64 bytes"));
+                        }
+                        Ok(SigBytes(bytes))
+                    }
+                }
+                d.deserialize_seq(BytesVisitor)
             }
         }
         d.deserialize_seq(SigVisitor)
@@ -614,13 +643,13 @@ impl ThresholdSigners {
         indices.sort_unstable();
         indices.dedup();
         let mut bitmap = 0u16;
-        let mut signatures = Vec::new();
+        let mut signatures = QuorumSignatures::new();
         for &i in &indices {
             if i >= self.signers.len() || i >= MAX_VALIDATORS {
                 continue;
             }
             bitmap |= 1u16 << i;
-            signatures.push(self.signers[i].sign(message.as_bytes()));
+            let _ = signatures.try_push(self.signers[i].sign(message.as_bytes()));
         }
         QuorumCertificate {
             message,

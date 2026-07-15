@@ -7,12 +7,12 @@
 //! two identical command streams evict identically and therefore stay
 //! bit-identical across replays.
 
-use std::collections::HashMap;
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use types::AccountId;
 
 use crate::order::MatchResult;
+use crate::BookStateError;
 
 /// Composite idempotency key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -97,10 +97,106 @@ impl DedupCache {
         self.map.insert(key, result);
     }
 
+    /// Number of records retained in the authoritative FIFO window.
+    pub(crate) fn record_count(&self) -> usize {
+        self.order.len()
+    }
+
+    /// Typed validation for the result map, FIFO, and actual eviction capacity
+    /// read by future lookups/inserts.
+    pub(crate) fn validate_representation(
+        &self,
+        expected_capacity: usize,
+    ) -> Result<(), BookStateError> {
+        if self.capacity != expected_capacity {
+            return Err(BookStateError::InvalidValue {
+                field: "dedup capacity must match the logical book configuration",
+            });
+        }
+        if self.order.len() != self.map.len() {
+            return Err(BookStateError::InvalidValue {
+                field: "dedup FIFO and result map must contain the same keys",
+            });
+        }
+        if self.map.len() > self.capacity {
+            return Err(BookStateError::InvalidValue {
+                field: "dedup records must not exceed capacity",
+            });
+        }
+        let mut seen = HashSet::with_capacity(self.order.len());
+        for key in &self.order {
+            if !seen.insert(*key) {
+                return Err(BookStateError::NonCanonical {
+                    field: "dedup FIFO must not contain duplicate keys",
+                });
+            }
+            if !self.map.contains_key(key) {
+                return Err(BookStateError::InvalidValue {
+                    field: "dedup FIFO key must have a cached result",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Visit records in eviction order (oldest first), returning typed errors
+    /// for a corrupt queue/map mirror.
+    pub(crate) fn try_for_each_in_eviction_order<F>(&self, mut f: F) -> Result<(), BookStateError>
+    where
+        F: FnMut(u32, u64, &MatchResult) -> Result<(), BookStateError>,
+    {
+        if self.order.len() != self.map.len() {
+            return Err(BookStateError::InvalidValue {
+                field: "dedup FIFO and result map must contain the same keys",
+            });
+        }
+        if self.map.len() > self.capacity {
+            return Err(BookStateError::InvalidValue {
+                field: "dedup records must not exceed capacity",
+            });
+        }
+        let mut seen = HashSet::with_capacity(self.order.len());
+        for key in &self.order {
+            if !seen.insert(*key) {
+                return Err(BookStateError::NonCanonical {
+                    field: "dedup FIFO must not contain duplicate keys",
+                });
+            }
+            let result = self.map.get(key).ok_or(BookStateError::InvalidValue {
+                field: "dedup FIFO key must have a cached result",
+            })?;
+            f(key.account, key.client_id, result)?;
+        }
+        Ok(())
+    }
+
     /// Number of live cached keys.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.map.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn duplicate_oldest_fifo_key_for_test(&mut self) {
+        self.order[1] = self.order[0];
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remove_oldest_map_entry_for_test(&mut self) {
+        let key = self.order[0];
+        self.map.remove(&key);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn oldest_result_mut_for_test(&mut self) -> &mut MatchResult {
+        let key = self.order[0];
+        self.map.get_mut(&key).unwrap()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn newest_result_mut_for_test(&mut self) -> &mut MatchResult {
+        let key = *self.order.back().unwrap();
+        self.map.get_mut(&key).unwrap()
     }
 }
 
@@ -161,5 +257,47 @@ mod tests {
         let a = AccountId::new(1);
         c.insert(a, 1, result(1));
         assert!(c.get(a, 1).is_none());
+    }
+
+    #[test]
+    fn canonical_iteration_rejects_duplicate_fifo_keys() {
+        let mut c = DedupCache::with_capacity(2);
+        let a = AccountId::new(1);
+        c.insert(a, 1, result(1));
+        c.insert(a, 2, result(2));
+        c.order[1] = c.order[0];
+
+        assert_eq!(c.record_count(), 2);
+        assert!(matches!(
+            c.try_for_each_in_eviction_order(|_, _, _| Ok(())),
+            Err(BookStateError::NonCanonical {
+                field: "dedup FIFO must not contain duplicate keys"
+            })
+        ));
+    }
+
+    #[test]
+    fn representation_validator_binds_actual_capacity() {
+        let mut cache = DedupCache::with_capacity(2);
+        cache.insert(AccountId::new(1), 1, result(1));
+        cache.validate_representation(2).unwrap();
+
+        assert!(matches!(
+            cache.validate_representation(3),
+            Err(BookStateError::InvalidValue { .. })
+        ));
+    }
+
+    #[test]
+    fn representation_validator_rejects_records_over_capacity() {
+        let mut cache = DedupCache::with_capacity(1);
+        cache.insert(AccountId::new(1), 1, result(1));
+        cache.capacity = 0;
+        assert!(matches!(
+            cache.validate_representation(0),
+            Err(BookStateError::InvalidValue {
+                field: "dedup records must not exceed capacity"
+            })
+        ));
     }
 }

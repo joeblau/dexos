@@ -25,6 +25,7 @@ fn cfg() -> BookConfig {
         stp: StpPolicy::CancelMaker,
         dedup_capacity: 256,
         max_basket_legs: 16,
+        matching_backend: simd::Backend::Scalar,
     }
 }
 
@@ -54,6 +55,50 @@ fn order(
 
 fn limit(id: u64, acct: u32, side: Side, price: i64, qty: i64) -> NewOrder {
     order(id, acct, side, OrderType::Limit, TimeInForce::Gtc, price, qty, id)
+}
+
+fn codec_cfg() -> BookConfig {
+    BookConfig {
+        capacity: 12,
+        stp: StpPolicy::CancelMaker,
+        dedup_capacity: 8,
+        max_basket_legs: 4,
+        matching_backend: simd::Backend::Scalar,
+    }
+}
+
+fn codec_fixture() -> OrderBook {
+    let mut book = OrderBook::new(codec_cfg());
+    book.submit(limit(1, 1, Side::Ask, 110, 3)).unwrap();
+    book.submit(limit(2, 2, Side::Ask, 111, 4)).unwrap();
+    book.submit(limit(3, 3, Side::Bid, 111, 5)).unwrap();
+    book.place(limit(4, 4, Side::Bid, 100, 1)).unwrap();
+    book.set_position(AccountId::new(7), Quantity::from_raw(3));
+    book.set_position(AccountId::new(8), Quantity::from_raw(-2));
+    book
+}
+
+fn canonical_bytes(book: &OrderBook) -> Vec<u8> {
+    book.encode_state_v3_bounded(usize::MAX).unwrap()
+}
+
+fn assert_logically_identical(left: &OrderBook, right: &OrderBook) {
+    assert_eq!(canonical_bytes(left), canonical_bytes(right));
+    assert_eq!(left.state_root(), right.state_root());
+    assert_eq!(left.state_root_full_rebuild(), right.state_root_full_rebuild());
+    assert_eq!(left.transition_root_v3(), right.transition_root_v3());
+    assert_eq!(left.best_bid(), right.best_bid());
+    assert_eq!(left.best_ask(), right.best_ask());
+    assert_eq!(left.resting_len(), right.resting_len());
+    assert_eq!(left.total_resting_quantity(), right.total_resting_quantity());
+}
+
+fn overwrite_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+fn overwrite_i64(bytes: &mut [u8], offset: usize, value: i64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
 #[test]
@@ -91,6 +136,48 @@ fn o1_cancel_removes_only_target() {
     let res = b.submit(limit(9, 2, Side::Ask, 100, 6)).unwrap();
     assert_eq!(res.fills[0].maker_order, OrderId::new(1));
     assert_eq!(res.fills[1].maker_order, OrderId::new(3));
+}
+
+#[test]
+fn resting_order_views_are_complete_sorted_and_root_neutral() {
+    let mut b = OrderBook::new(cfg());
+    b.place(limit(9, 2, Side::Ask, 110, 7)).unwrap();
+    b.place(limit(3, 1, Side::Bid, 100, 5)).unwrap();
+    let bytes = canonical_bytes(&b);
+    let root = b.transition_root_v3();
+
+    assert_eq!(
+        b.resting_order(OrderId::new(9)),
+        Some(crate::RestingOrder {
+            order_id: OrderId::new(9),
+            account: AccountId::new(2),
+            side: Side::Ask,
+            price: Price::from_raw(110),
+            remaining: Quantity::from_raw(7),
+        })
+    );
+    assert_eq!(b.resting_order(OrderId::new(99)), None);
+    assert_eq!(
+        b.resting_orders(),
+        vec![
+            crate::RestingOrder {
+                order_id: OrderId::new(3),
+                account: AccountId::new(1),
+                side: Side::Bid,
+                price: Price::from_raw(100),
+                remaining: Quantity::from_raw(5),
+            },
+            crate::RestingOrder {
+                order_id: OrderId::new(9),
+                account: AccountId::new(2),
+                side: Side::Ask,
+                price: Price::from_raw(110),
+                remaining: Quantity::from_raw(7),
+            },
+        ]
+    );
+    assert_eq!(canonical_bytes(&b), bytes);
+    assert_eq!(b.transition_root_v3(), root);
 }
 
 #[test]
@@ -298,6 +385,197 @@ fn atomic_replace_failure_leaves_book_bit_identical() {
         Err(OrderError::UnknownOrder)
     );
     assert_eq!(b.state_root(), root_before);
+}
+
+fn replace_overflow_fixture() -> OrderBook {
+    let mut book = OrderBook::new(cfg());
+    book.place(limit(1, 1, Side::Bid, 100, i64::MAX - 5))
+        .unwrap();
+    book.place(limit(2, 2, Side::Bid, 90, 1)).unwrap();
+    book.place(limit(3, 3, Side::Bid, 90, 2)).unwrap();
+    book
+}
+
+fn assert_overflowing_replace_is_atomic(
+    mut book: OrderBook,
+    replace: impl FnOnce(&mut OrderBook) -> Result<(), OrderError>,
+) {
+    let target = OrderId::new(2);
+    let bytes_before = canonical_bytes(&book);
+    let state_root_before = book.state_root();
+    let transition_root_before = book.transition_root_v3();
+    let locator_before = book.id_index.get(&target).copied().unwrap();
+    let node_before = *book.slab.get(locator_before.slot).unwrap();
+    let id_index_capacity_before = book.id_index.capacity();
+    let account_ids_before = book
+        .account_orders
+        .get(&AccountId::new(2))
+        .unwrap()
+        .clone();
+    let account_ids_capacity_before = book
+        .account_orders
+        .get(&AccountId::new(2))
+        .unwrap()
+        .capacity();
+
+    assert_eq!(replace(&mut book), Err(OrderError::Overflow));
+
+    assert_eq!(canonical_bytes(&book), bytes_before);
+    assert_eq!(book.state_root(), state_root_before);
+    assert_eq!(book.state_root_full_rebuild(), state_root_before);
+    assert_eq!(book.transition_root_v3(), transition_root_before);
+    assert_eq!(book.id_index.capacity(), id_index_capacity_before);
+    assert_eq!(book.slab.capacity(), cfg().capacity);
+    assert_eq!(
+        book.account_orders.get(&AccountId::new(2)).unwrap(),
+        &account_ids_before
+    );
+    assert_eq!(
+        book.account_orders
+            .get(&AccountId::new(2))
+            .unwrap()
+            .capacity(),
+        account_ids_capacity_before
+    );
+
+    let locator_after = book.id_index.get(&target).copied().unwrap();
+    assert_eq!(locator_after.slot, locator_before.slot);
+    assert_eq!(locator_after.side, locator_before.side);
+    assert_eq!(locator_after.account, locator_before.account);
+    let node_after = *book.slab.get(locator_after.slot).unwrap();
+    assert_eq!(node_after.order_id, node_before.order_id);
+    assert_eq!(node_after.account, node_before.account);
+    assert_eq!(node_after.side, node_before.side);
+    assert_eq!(node_after.price, node_before.price);
+    assert_eq!(node_after.remaining, node_before.remaining);
+    assert_eq!(node_after.client_id, node_before.client_id);
+    assert_eq!(node_after.prev, node_before.prev);
+    assert_eq!(node_after.next, node_before.next);
+
+    // The target must retain its original time priority ahead of id 3.
+    book.cancel(OrderId::new(1)).unwrap();
+    let result = book.place(limit(4, 4, Side::Ask, 90, 2)).unwrap();
+    assert_eq!(result.fills.len(), 2);
+    assert_eq!(result.fills[0].maker_order, target);
+    assert_eq!(result.fills[1].maker_order, OrderId::new(3));
+}
+
+#[test]
+fn legacy_replace_overflow_leaves_storage_and_fifo_bit_identical() {
+    assert_overflowing_replace_is_atomic(replace_overflow_fixture(), |book| {
+        book.replace(
+            OrderId::new(2),
+            Price::from_raw(100),
+            Quantity::from_raw(10),
+        )
+        .map(|_| ())
+    });
+}
+
+#[test]
+fn reported_replace_overflow_leaves_storage_and_fifo_bit_identical() {
+    assert_overflowing_replace_is_atomic(replace_overflow_fixture(), |book| {
+        book.replace_with_report(
+            OrderId::new(2),
+            Price::from_raw(100),
+            Quantity::from_raw(10),
+        )
+        .map(|_| ())
+    });
+}
+
+#[test]
+fn crossing_replace_is_not_rejected_by_full_quantity_overflow() {
+    let mut book = replace_overflow_fixture();
+    // Build the narrow crossed-state edge directly. The six-unit fill leaves a
+    // four-unit residual, which fits at price 100 even though the full ten-unit
+    // replacement would overflow that level.
+    let maker = limit(4, 4, Side::Ask, 100, 6);
+    book.rest_order(&maker, maker.quantity).unwrap();
+
+    let result = book
+        .replace(
+            OrderId::new(2),
+            Price::from_raw(100),
+            Quantity::from_raw(10),
+        )
+        .unwrap();
+
+    assert_eq!(result.filled_quantity(), Quantity::from_raw(6));
+    assert!(matches!(
+        result.outcome,
+        OrderOutcome::PartiallyFilledResting { remaining }
+            if remaining == Quantity::from_raw(4)
+    ));
+    assert_eq!(
+        book.level_quantity(Side::Bid, Price::from_raw(100)),
+        Quantity::from_raw(i64::MAX - 1)
+    );
+}
+
+#[test]
+fn property_overflowing_replace_err_preserves_canonical_state() {
+    let mut random = Lcg(0xA70A_1C5E);
+    for case in 0..2_000 {
+        let side = if random.below(2) == 0 {
+            Side::Bid
+        } else {
+            Side::Ask
+        };
+        let target_starts_at_replacement_price = random.below(2) == 0;
+        let replacement_price = 100;
+        let original_price = if target_starts_at_replacement_price {
+            replacement_price
+        } else {
+            match side {
+                Side::Bid => 90,
+                Side::Ask => 110,
+            }
+        };
+        let headroom = 1 + i64::try_from(random.below(2_048)).unwrap();
+        let original_quantity = 1 + i64::try_from(random.below(64)).unwrap();
+        let level_quantity = if target_starts_at_replacement_price {
+            i64::MAX - headroom - original_quantity
+        } else {
+            i64::MAX - headroom
+        };
+        let replacement_quantity = if target_starts_at_replacement_price {
+            headroom + original_quantity + 1
+        } else {
+            headroom + 1
+        };
+
+        let mut book = OrderBook::new(BookConfig {
+            capacity: 4,
+            ..cfg()
+        });
+        book.place(limit(1, 1, side, replacement_price, level_quantity))
+            .unwrap();
+        book.place(limit(2, 2, side, original_price, original_quantity))
+            .unwrap();
+        let bytes_before = canonical_bytes(&book);
+        let root_before = book.transition_root_v3();
+
+        let result = if random.below(2) == 0 {
+            book.replace(
+                OrderId::new(2),
+                Price::from_raw(replacement_price),
+                Quantity::from_raw(replacement_quantity),
+            )
+            .map(|_| ())
+        } else {
+            book.replace_with_report(
+                OrderId::new(2),
+                Price::from_raw(replacement_price),
+                Quantity::from_raw(replacement_quantity),
+            )
+            .map(|_| ())
+        };
+
+        assert_eq!(result, Err(OrderError::Overflow), "case {case}");
+        assert_eq!(canonical_bytes(&book), bytes_before, "case {case}");
+        assert_eq!(book.transition_root_v3(), root_before, "case {case}");
+    }
 }
 
 #[test]
@@ -553,8 +831,7 @@ fn duplicate_order_id_and_bad_input_are_typed_errors() {
 fn property_quantity_conservation_across_random_fills() {
     let mut r = Lcg(0xC0FFEE);
     let mut b = OrderBook::new(BookConfig { capacity: 32_768, dedup_capacity: 4096, ..cfg() });
-    let mut next_id = 1u64;
-    for _ in 0..20_000 {
+    for next_id in 1u64..=20_000 {
         let side = if r.below(2) == 0 { Side::Bid } else { Side::Ask };
         // Unique account per order so self-trade prevention never fires here;
         // that would cancel a resting maker and is covered by other tests.
@@ -573,8 +850,6 @@ fn property_quantity_conservation_across_random_fills() {
             _ => TimeInForce::Fok,
         };
         let ord = order(next_id, acct, side, ot, tif, price, qty, next_id);
-        next_id += 1;
-
         let before = b.total_resting_quantity().raw();
         let res = match b.submit(ord) {
             Ok(r) => r,
@@ -782,7 +1057,8 @@ fn incremental_root_matches_full_rebuild_after_every_op() {
 
 #[test]
 fn book_root_schema_golden_vector() {
-    // Locks schema v2: empty book and a single resting bid.
+    // Locks the fast unordered diagnostic schema v2: empty book and a single
+    // resting bid. Authoritative callers use transition_root_v3 instead.
     let mut b = OrderBook::new(cfg());
     let empty = b.state_root();
     assert_eq!(empty, b.state_root_full_rebuild());
@@ -797,6 +1073,993 @@ fn book_root_schema_golden_vector() {
     b.cancel(OrderId::new(1)).unwrap();
     assert_eq!(b.state_root(), empty);
     assert_eq!(OrderBook::hot_path_hash_budget_bytes(), 48 + 33);
+}
+
+#[test]
+fn transition_root_v3_binds_fifo_and_next_fill() {
+    let first = limit(1, 1, Side::Ask, 100, 5);
+    let second = limit(2, 2, Side::Ask, 100, 5);
+    let mut a = OrderBook::new(cfg());
+    let mut b = OrderBook::new(cfg());
+    a.place(first).unwrap();
+    a.place(second).unwrap();
+    b.place(second).unwrap();
+    b.place(first).unwrap();
+
+    assert_eq!(
+        a.state_root(),
+        b.state_root(),
+        "v2 demonstrates the unordered-multiset defect"
+    );
+    assert_ne!(a.transition_root_v3(), b.transition_root_v3());
+
+    let taker = limit(3, 3, Side::Bid, 100, 1);
+    let a_fill = a.place(taker).unwrap();
+    let b_fill = b.place(taker).unwrap();
+    assert_eq!(a_fill.fills[0].maker_order, OrderId::new(1));
+    assert_eq!(b_fill.fills[0].maker_order, OrderId::new(2));
+}
+
+#[test]
+#[should_panic(expected = "price-level FIFO backward link mismatch")]
+fn transition_root_v3_rejects_corrupt_fifo_backward_link() {
+    let mut book = OrderBook::new(cfg());
+    book.place(limit(1, 1, Side::Ask, 100, 5)).unwrap();
+    book.place(limit(2, 2, Side::Ask, 100, 5)).unwrap();
+    let second_slot = book.id_index.get(&OrderId::new(2)).unwrap().slot;
+    book.slab.get_mut(second_slot).unwrap().prev = crate::slab::NIL;
+
+    let _ = book.transition_root_v3();
+}
+
+#[test]
+#[should_panic(expected = "incremental order-leaf XOR must match the canonical live-order scan")]
+fn transition_root_v3_rejects_corrupt_incremental_root_cache() {
+    let mut book = OrderBook::new(cfg());
+    book.place(limit(1, 1, Side::Ask, 100, 5)).unwrap();
+    book.order_leaf_xor[0] ^= 1;
+
+    let _ = book.transition_root_v3();
+}
+
+#[test]
+#[should_panic(expected = "stored side-book role must match its engine field")]
+fn transition_root_v3_rejects_corrupt_side_book_role() {
+    let mut book = OrderBook::new(cfg());
+    book.place(limit(1, 1, Side::Bid, 100, 5)).unwrap();
+    book.bids.set_side_for_test(Side::Ask);
+
+    let _ = book.transition_root_v3();
+}
+
+#[test]
+fn transition_root_v3_binds_logical_config_and_positions() {
+    let base = OrderBook::new(cfg());
+    let root = base.transition_root_v3();
+
+    for changed in [
+        BookConfig {
+            capacity: cfg().capacity + 1,
+            ..cfg()
+        },
+        BookConfig {
+            stp: StpPolicy::CancelTaker,
+            ..cfg()
+        },
+        BookConfig {
+            dedup_capacity: cfg().dedup_capacity + 1,
+            ..cfg()
+        },
+        BookConfig {
+            max_basket_legs: cfg().max_basket_legs + 1,
+            ..cfg()
+        },
+    ] {
+        assert_ne!(OrderBook::new(changed).transition_root_v3(), root);
+    }
+
+    let mut with_position = base.clone();
+    with_position.set_position(AccountId::new(7), Quantity::from_raw(-9));
+    assert_ne!(with_position.transition_root_v3(), root);
+}
+
+#[test]
+fn transition_root_v3_is_hashmap_order_independent_but_dedup_fifo_sensitive() {
+    let mut positions_ab = OrderBook::new(cfg());
+    positions_ab.set_position(AccountId::new(1), Quantity::from_raw(10));
+    positions_ab.set_position(AccountId::new(2), Quantity::from_raw(-20));
+    let mut positions_ba = OrderBook::new(cfg());
+    positions_ba.set_position(AccountId::new(2), Quantity::from_raw(-20));
+    positions_ba.set_position(AccountId::new(1), Quantity::from_raw(10));
+    assert_eq!(
+        positions_ab.transition_root_v3(),
+        positions_ba.transition_root_v3()
+    );
+
+    let rejected_a = order(
+        11,
+        1,
+        Side::Bid,
+        OrderType::Market,
+        TimeInForce::Ioc,
+        100,
+        1,
+        101,
+    );
+    let rejected_b = order(
+        12,
+        2,
+        Side::Bid,
+        OrderType::Market,
+        TimeInForce::Ioc,
+        100,
+        1,
+        102,
+    );
+    let mut dedup_ab = OrderBook::new(cfg());
+    dedup_ab.submit(rejected_a).unwrap();
+    dedup_ab.submit(rejected_b).unwrap();
+    let mut dedup_ba = OrderBook::new(cfg());
+    dedup_ba.submit(rejected_b).unwrap();
+    dedup_ba.submit(rejected_a).unwrap();
+    assert_eq!(dedup_ab.state_root(), dedup_ba.state_root());
+    assert_ne!(
+        dedup_ab.transition_root_v3(),
+        dedup_ba.transition_root_v3(),
+        "FIFO order controls which idempotency record is evicted next"
+    );
+}
+
+#[test]
+fn transition_root_v3_golden_vector() {
+    let mut book = OrderBook::new(cfg());
+    book.place(limit(1, 7, Side::Bid, 100, 5)).unwrap();
+    book.place(limit(2, 8, Side::Ask, 110, 6)).unwrap();
+    book.set_position(AccountId::new(7), Quantity::from_raw(3));
+    let encoded = canonical_bytes(&book);
+    assert_eq!(encoded.len(), 59 + 2 * 16 + 2 * 37 + 12);
+    assert_eq!(
+        crypto::hash_domain(crypto::DOMAIN_ORDERBOOK_STATE, &encoded),
+        Hash::from_bytes([
+            50, 182, 109, 6, 209, 245, 235, 7, 86, 25, 40, 230, 200, 166, 188, 217, 49, 9,
+            158, 191, 57, 93, 101, 0, 190, 80, 254, 226, 143, 95, 183, 114,
+        ])
+    );
+    assert_eq!(book.transition_root_v3(), crypto::hash_domain(crypto::DOMAIN_ORDERBOOK_STATE, &encoded));
+}
+
+#[test]
+fn transition_root_v3_dedup_schema_golden_vector() {
+    let mut book = OrderBook::new(cfg());
+    book.place(limit(1, 7, Side::Ask, 100, 5)).unwrap();
+    book.submit(limit(2, 8, Side::Bid, 100, 5)).unwrap();
+    let encoded = canonical_bytes(&book);
+    assert_eq!(encoded.len(), 59 + 29 + 41);
+    assert_eq!(
+        crypto::hash_domain(crypto::DOMAIN_ORDERBOOK_STATE, &encoded),
+        Hash::from_bytes([
+            185, 17, 219, 185, 165, 201, 13, 159, 104, 195, 106, 36, 58, 56, 128, 194, 227,
+            130, 125, 1, 83, 22, 198, 252, 74, 108, 160, 76, 160, 100, 155, 76,
+        ])
+    );
+    assert_eq!(book.transition_root_v3(), crypto::hash_domain(crypto::DOMAIN_ORDERBOOK_STATE, &encoded));
+}
+
+#[test]
+fn state_v3_codec_round_trips_every_logical_field_and_keeps_backend_external() {
+    let original = codec_fixture();
+    let bytes = canonical_bytes(&original);
+    assert_eq!(
+        crypto::hash_domain(crypto::DOMAIN_ORDERBOOK_STATE, &bytes),
+        original.transition_root_v3()
+    );
+
+    let decoded = OrderBook::decode_state_v3_bounded(
+        &bytes,
+        &BookStateLimits::default(),
+        simd::Backend::Neon,
+    )
+    .unwrap();
+    assert_eq!(decoded.config.matching_backend, simd::Backend::Neon);
+    assert_logically_identical(&original, &decoded);
+
+    let too_small = bytes.len() - 1;
+    assert_eq!(
+        original.encode_state_v3_bounded(too_small),
+        Err(BookStateError::EncodedBytesLimit {
+            actual: bytes.len(),
+            max: too_small,
+        })
+    );
+}
+
+#[test]
+fn state_v3_codec_rejects_every_truncation_and_any_suffix() {
+    let bytes = canonical_bytes(&codec_fixture());
+    for cut in 0..bytes.len() {
+        assert!(
+            OrderBook::decode_state_v3_bounded(
+                &bytes[..cut],
+                &BookStateLimits::default(),
+                simd::Backend::Scalar,
+            )
+            .is_err(),
+            "truncation at byte {cut} was accepted"
+        );
+    }
+
+    let mut with_suffix = bytes;
+    with_suffix.extend_from_slice(&[0xaa, 0xbb]);
+    match OrderBook::decode_state_v3_bounded(
+        &with_suffix,
+        &BookStateLimits::default(),
+        simd::Backend::Scalar,
+    ) {
+        Err(error) => assert_eq!(error, BookStateError::TrailingBytes { remaining: 2 }),
+        Ok(_) => panic!("trailing bytes were accepted"),
+    }
+}
+
+#[test]
+fn state_v3_decoder_never_panics_on_arbitrary_bounded_bytes() {
+    let mut random = Lcg(0xC0DE_CAFE_F00D_BAAD);
+    let limits = BookStateLimits {
+        max_encoded_bytes: 512,
+        max_capacity: 64,
+        max_dedup_capacity: 32,
+        max_basket_legs: 16,
+        max_price_levels: 64,
+        max_resting_orders: 64,
+        max_positions: 64,
+        max_dedup_records: 32,
+        max_fills_per_result: 32,
+        max_total_fills: 64,
+    };
+    for _ in 0..10_000 {
+        let len = usize::try_from(random.below(513)).unwrap();
+        let mut bytes = vec![0u8; len];
+        for chunk in bytes.chunks_mut(8) {
+            let word = random.next_u64().to_le_bytes();
+            let chunk_len = chunk.len();
+            chunk.copy_from_slice(&word[..chunk_len]);
+        }
+        let _ = OrderBook::decode_state_v3_bounded(&bytes, &limits, simd::Backend::Scalar);
+    }
+}
+
+#[test]
+fn state_v3_codec_enforces_every_resource_limit_independently() {
+    let bytes = canonical_bytes(&codec_fixture());
+    let assert_resource = |limits: BookStateLimits, expected: &'static str| {
+        assert!(matches!(
+            OrderBook::decode_state_v3_bounded(&bytes, &limits, simd::Backend::Scalar),
+            Err(BookStateError::ResourceLimit { resource, .. }) if resource == expected
+        ));
+    };
+
+    let limits = BookStateLimits {
+        max_encoded_bytes: bytes.len() - 1,
+        ..BookStateLimits::default()
+    };
+    match OrderBook::decode_state_v3_bounded(&bytes, &limits, simd::Backend::Scalar) {
+        Err(error) => assert_eq!(
+            error,
+            BookStateError::EncodedBytesLimit {
+                actual: bytes.len(),
+                max: bytes.len() - 1,
+            }
+        ),
+        Ok(_) => panic!("oversized state was accepted"),
+    }
+
+    assert_resource(
+        BookStateLimits {
+            max_capacity: 11,
+            ..BookStateLimits::default()
+        },
+        "capacity",
+    );
+    assert_resource(
+        BookStateLimits {
+            max_dedup_capacity: 7,
+            ..BookStateLimits::default()
+        },
+        "dedup capacity",
+    );
+    assert_resource(
+        BookStateLimits {
+            max_basket_legs: 3,
+            ..BookStateLimits::default()
+        },
+        "basket legs",
+    );
+    assert_resource(
+        BookStateLimits {
+            max_price_levels: 1,
+            ..BookStateLimits::default()
+        },
+        "price levels",
+    );
+    assert_resource(
+        BookStateLimits {
+            max_resting_orders: 1,
+            ..BookStateLimits::default()
+        },
+        "resting orders",
+    );
+    assert_resource(
+        BookStateLimits {
+            max_positions: 1,
+            ..BookStateLimits::default()
+        },
+        "positions",
+    );
+    assert_resource(
+        BookStateLimits {
+            max_dedup_records: 2,
+            ..BookStateLimits::default()
+        },
+        "dedup records",
+    );
+    assert_resource(
+        BookStateLimits {
+            max_fills_per_result: 1,
+            ..BookStateLimits::default()
+        },
+        "fills per dedup result",
+    );
+    assert_resource(
+        BookStateLimits {
+            max_total_fills: 1,
+            ..BookStateLimits::default()
+        },
+        "total cached fills",
+    );
+}
+
+#[test]
+fn state_v3_codec_rejects_hostile_declared_bounds_before_payload_allocation() {
+    let empty = OrderBook::new(codec_cfg());
+    let mut huge_capacity = canonical_bytes(&empty);
+    overwrite_u64(&mut huge_capacity, 2, u64::MAX);
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &huge_capacity,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::ResourceLimit {
+            resource: "capacity",
+            actual: u64::MAX,
+            ..
+        })
+    ));
+
+    let mut huge_levels = canonical_bytes(&empty);
+    overwrite_u64(&mut huge_levels, 27, u64::MAX);
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &huge_levels,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::ResourceLimit {
+            resource: "price levels",
+            actual: u64::MAX,
+            ..
+        })
+    ));
+
+    // One declared bid level with an independently hostile order count. The
+    // record payload is intentionally absent: the count limit must win over
+    // truncation without attempting a resting-order allocation.
+    let mut huge_orders = canonical_bytes(&empty);
+    overwrite_u64(&mut huge_orders, 27, 1);
+    let mut level = Vec::new();
+    level.extend_from_slice(&100i64.to_le_bytes());
+    level.extend_from_slice(&u64::MAX.to_le_bytes());
+    huge_orders.splice(35..35, level);
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &huge_orders,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::ResourceLimit {
+            resource: "resting orders",
+            actual: u64::MAX,
+            ..
+        })
+    ));
+
+    let permissive = BookStateLimits {
+        max_capacity: usize::MAX,
+        ..BookStateLimits::default()
+    };
+    overwrite_u64(&mut huge_capacity, 2, u64::from(u32::MAX) + 1);
+    match OrderBook::decode_state_v3_bounded(
+        &huge_capacity,
+        &permissive,
+        simd::Backend::Scalar,
+    ) {
+        Err(error) => assert_eq!(
+            error,
+            BookStateError::NativeWidth {
+                field: "slab capacity",
+                value: u64::from(u32::MAX) + 1,
+            }
+        ),
+        Ok(_) => panic!("unrepresentable slab capacity was accepted"),
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    {
+        let mut unencodable = OrderBook::new(codec_cfg());
+        unencodable.config.capacity = usize::try_from(u64::from(u32::MAX) + 1).unwrap();
+        assert_eq!(
+            unencodable.encode_state_v3_bounded(usize::MAX),
+            Err(BookStateError::NativeWidth {
+                field: "slab capacity",
+                value: u64::from(u32::MAX) + 1,
+            })
+        );
+    }
+}
+
+#[test]
+fn state_v3_codec_rejects_noncanonical_or_corrupt_resting_state() {
+    let mut book = OrderBook::new(codec_cfg());
+    book.place(limit(1, 1, Side::Bid, 99, 2)).unwrap();
+    book.place(limit(2, 2, Side::Bid, 100, 3)).unwrap();
+    book.place(limit(3, 3, Side::Ask, 110, 4)).unwrap();
+    let bytes = canonical_bytes(&book);
+
+    // Header is 27 bytes. Bid count is 8 bytes. The first level is
+    // 16 + 37 bytes, so the second level price begins at byte 88.
+    let mut noncanonical_levels = bytes.clone();
+    overwrite_i64(&mut noncanonical_levels, 88, 99);
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &noncanonical_levels,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::NonCanonical { .. })
+    ));
+
+    let mut wrong_side = bytes.clone();
+    wrong_side[63] = 1;
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &wrong_side,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::InvalidValue { .. })
+    ));
+
+    let mut wrong_price = bytes.clone();
+    overwrite_i64(&mut wrong_price, 64, 98);
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &wrong_price,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::InvalidValue { .. })
+    ));
+
+    let mut zero_quantity = bytes.clone();
+    overwrite_i64(&mut zero_quantity, 72, 0);
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &zero_quantity,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::InvalidValue { .. })
+    ));
+
+    // The second bid's node starts at byte 104; duplicate the first order id.
+    let mut duplicate_order = bytes.clone();
+    overwrite_u64(&mut duplicate_order, 104, 1);
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &duplicate_order,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::NonCanonical { .. })
+    ));
+
+    // Ask count begins after both bid levels at byte 141; ask price/node price
+    // begin at 149/178. Lock the ask to the best bid.
+    let mut locked_book = bytes;
+    overwrite_i64(&mut locked_book, 149, 100);
+    overwrite_i64(&mut locked_book, 178, 100);
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &locked_book,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::InvalidValue { .. })
+    ));
+}
+
+#[test]
+fn state_v3_codec_rejects_unknown_header_tags() {
+    let bytes = canonical_bytes(&OrderBook::new(codec_cfg()));
+    let mut version = bytes.clone();
+    version[0..2].copy_from_slice(&4u16.to_le_bytes());
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &version,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::UnsupportedVersion {
+            found: 4,
+            expected: BOOK_TRANSITION_ROOT_SCHEMA_VERSION,
+        })
+    ));
+
+    let mut stp = bytes;
+    stp[10] = 3;
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &stp,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::InvalidTag {
+            field: "self-trade prevention policy",
+            value: 3,
+        })
+    ));
+}
+
+#[test]
+fn state_v3_codec_rejects_noncanonical_positions_and_malformed_cached_results() {
+    let mut positioned = OrderBook::new(codec_cfg());
+    positioned.set_position(AccountId::new(1), Quantity::from_raw(2));
+    positioned.set_position(AccountId::new(2), Quantity::from_raw(3));
+    let mut positions = canonical_bytes(&positioned);
+    positions[63..67].copy_from_slice(&1u32.to_le_bytes());
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &positions,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::NonCanonical { .. })
+    ));
+
+    let mut rejected_book = OrderBook::new(codec_cfg());
+    rejected_book
+        .submit(order(
+            1,
+            1,
+            Side::Bid,
+            OrderType::Market,
+            TimeInForce::Ioc,
+            100,
+            1,
+            10,
+        ))
+        .unwrap();
+    let rejected = canonical_bytes(&rejected_book);
+    // Empty state prefixes total 59 bytes, then account/client/fill-count. The
+    // outcome tag and quantity are bytes 79 and 80..88.
+    let mut unknown_outcome = rejected.clone();
+    unknown_outcome[79] = 9;
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &unknown_outcome,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::InvalidTag {
+            field: "order outcome",
+            value: 9,
+        })
+    ));
+    let mut impossible_outcome = rejected.clone();
+    impossible_outcome[79] = 1;
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &impossible_outcome,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::InvalidValue { .. })
+    ));
+    let mut nonzero_rejection = rejected;
+    overwrite_i64(&mut nonzero_rejection, 80, 1);
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &nonzero_rejection,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::InvalidValue { .. })
+    ));
+
+    let mut filled_book = OrderBook::new(codec_cfg());
+    filled_book.place(limit(20, 2, Side::Ask, 100, 2)).unwrap();
+    filled_book.submit(limit(21, 3, Side::Bid, 100, 2)).unwrap();
+    let filled = canonical_bytes(&filled_book);
+    // One fill starts at byte 79. Maker/taker accounts are at 95/99, price at
+    // 103, quantity at 111, side at 119, outcome at 120.
+    let mut self_trade = filled.clone();
+    self_trade[95..99].copy_from_slice(&3u32.to_le_bytes());
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &self_trade,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::InvalidValue { .. })
+    ));
+    let mut zero_fill = filled.clone();
+    overwrite_i64(&mut zero_fill, 111, 0);
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &zero_fill,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::InvalidValue { .. })
+    ));
+    let mut overflowing_partial = filled.clone();
+    overflowing_partial[120] = 2;
+    overwrite_i64(&mut overflowing_partial, 121, i64::MAX);
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &overflowing_partial,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::ArithmeticOverflow {
+            field: "cached original quantity",
+        })
+    ));
+    let mut wrong_dedup_owner = filled.clone();
+    wrong_dedup_owner[99..103].copy_from_slice(&4u32.to_le_bytes());
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &wrong_dedup_owner,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::InvalidValue { .. })
+    ));
+    let mut unknown_side = filled;
+    unknown_side[119] = 7;
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &unknown_side,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::InvalidTag {
+            field: "side",
+            value: 7,
+        })
+    ));
+
+    let mut duplicate_keys_book = OrderBook::new(codec_cfg());
+    for (id, account, client) in [(30, 5, 50), (31, 6, 51)] {
+        duplicate_keys_book
+            .submit(order(
+                id,
+                account,
+                Side::Bid,
+                OrderType::Market,
+                TimeInForce::Ioc,
+                100,
+                1,
+                client,
+            ))
+            .unwrap();
+    }
+    let mut duplicate_keys = canonical_bytes(&duplicate_keys_book);
+    // Two no-fill records are 29 bytes each and begin at 59 and 88.
+    duplicate_keys[88..92].copy_from_slice(&5u32.to_le_bytes());
+    overwrite_u64(&mut duplicate_keys, 92, 50);
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &duplicate_keys,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::NonCanonical { .. })
+    ));
+
+    let mut two_fill_book = OrderBook::new(codec_cfg());
+    two_fill_book.place(limit(40, 7, Side::Ask, 100, 1)).unwrap();
+    two_fill_book.place(limit(41, 8, Side::Ask, 101, 1)).unwrap();
+    two_fill_book.submit(limit(42, 9, Side::Bid, 101, 2)).unwrap();
+    let mut duplicate_maker = canonical_bytes(&two_fill_book);
+    // The sole record starts at 59. Its two 41-byte fills start at 79 and 120.
+    let first_maker = duplicate_maker[79..87].to_vec();
+    duplicate_maker[120..128].copy_from_slice(&first_maker);
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &duplicate_maker,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::InvalidValue { .. })
+    ));
+}
+
+#[test]
+fn state_v3_codec_round_trips_partial_outcomes_and_rejects_unreachable_boundaries() {
+    let mut partial_resting = OrderBook::new(codec_cfg());
+    partial_resting
+        .place(limit(50, 1, Side::Ask, 100, 1))
+        .unwrap();
+    let resting_result = partial_resting
+        .submit(limit(51, 2, Side::Bid, 100, 2))
+        .unwrap();
+    assert!(matches!(
+        resting_result.outcome,
+        OrderOutcome::PartiallyFilledResting { remaining }
+            if remaining == Quantity::from_raw(1)
+    ));
+    let resting_bytes = canonical_bytes(&partial_resting);
+    let restored = OrderBook::decode_state_v3_bounded(
+        &resting_bytes,
+        &BookStateLimits::default(),
+        simd::Backend::Scalar,
+    )
+    .unwrap();
+    assert_logically_identical(&partial_resting, &restored);
+
+    let mut partial_cancelled = OrderBook::new(codec_cfg());
+    partial_cancelled
+        .place(limit(60, 3, Side::Ask, 100, 1))
+        .unwrap();
+    let cancelled_result = partial_cancelled
+        .submit(order(
+            61,
+            4,
+            Side::Bid,
+            OrderType::Limit,
+            TimeInForce::Ioc,
+            100,
+            2,
+            61,
+        ))
+        .unwrap();
+    assert!(matches!(
+        cancelled_result.outcome,
+        OrderOutcome::PartiallyFilledCancelled { filled }
+            if filled == Quantity::from_raw(1)
+    ));
+    let cancelled_bytes = canonical_bytes(&partial_cancelled);
+    assert_eq!(cancelled_bytes.len(), 59 + 29 + 41);
+    assert_eq!(cancelled_bytes[120], 3);
+    let restored = OrderBook::decode_state_v3_bounded(
+        &cancelled_bytes,
+        &BookStateLimits::default(),
+        simd::Backend::Scalar,
+    )
+    .unwrap();
+    assert_logically_identical(&partial_cancelled, &restored);
+
+    let mut impossible_cancelled = cancelled_bytes;
+    overwrite_i64(&mut impossible_cancelled, 111, i64::MAX);
+    overwrite_i64(&mut impossible_cancelled, 121, i64::MAX);
+    assert!(matches!(
+        OrderBook::decode_state_v3_bounded(
+            &impossible_cancelled,
+            &BookStateLimits::default(),
+            simd::Backend::Scalar,
+        ),
+        Err(BookStateError::InvalidValue { .. })
+    ));
+}
+
+#[test]
+fn state_v3_dense_restore_matches_fragmented_slab_through_long_continuation() {
+    let config = BookConfig {
+        capacity: 12,
+        stp: StpPolicy::CancelMaker,
+        dedup_capacity: 16,
+        max_basket_legs: 4,
+        matching_backend: simd::Backend::Scalar,
+    };
+    let mut fragmented = OrderBook::new(config);
+    for resting in [
+        limit(10, 1, Side::Bid, 100, 8),
+        limit(11, 2, Side::Bid, 100, 7),
+        limit(14, 9, Side::Bid, 100, 6),
+        limit(12, 3, Side::Bid, 99, 6),
+        limit(20, 4, Side::Ask, 110, 5),
+        limit(21, 5, Side::Ask, 110, 9),
+        limit(22, 6, Side::Ask, 111, 4),
+    ] {
+        fragmented.submit(resting).unwrap();
+    }
+    fragmented.cancel(OrderId::new(12)).unwrap();
+    fragmented.cancel(OrderId::new(20)).unwrap();
+    fragmented.submit(limit(23, 7, Side::Ask, 112, 3)).unwrap();
+    fragmented.cancel(OrderId::new(10)).unwrap();
+    fragmented.submit(limit(13, 8, Side::Bid, 98, 2)).unwrap();
+    fragmented.cancel(OrderId::new(21)).unwrap();
+
+    let fragmented_layout = fragmented.slab.representation_for_test();
+    let bytes = canonical_bytes(&fragmented);
+    let mut dense = OrderBook::decode_state_v3_bounded(
+        &bytes,
+        &BookStateLimits::default(),
+        simd::Backend::Scalar,
+    )
+    .unwrap();
+    assert_ne!(fragmented_layout, dense.slab.representation_for_test());
+    assert_ne!(
+        fragmented.id_index[&OrderId::new(22)].slot,
+        dense.id_index[&OrderId::new(22)].slot
+    );
+    assert_logically_identical(&fragmented, &dense);
+
+    // A canceled order's retained cache entry must replay without resurrecting
+    // it or depending on its former slab slot.
+    let replay = limit(12, 3, Side::Bid, 99, 6);
+    assert_eq!(fragmented.submit(replay), dense.submit(replay));
+    assert!(!fragmented.contains(OrderId::new(12)));
+    assert!(!dense.contains(OrderId::new(12)));
+    assert_logically_identical(&fragmented, &dense);
+
+    // Fill id 11 completely, then partially reduce id 14 in-place.
+    let taker = limit(100, 50, Side::Ask, 100, 10);
+    assert_eq!(fragmented.plan_match(&taker), dense.plan_match(&taker));
+    assert_eq!(
+        fragmented.plan_match_summary_with_backend(&taker, simd::Backend::Scalar),
+        dense.plan_match_summary_with_backend(&taker, simd::Backend::Scalar)
+    );
+    assert_eq!(
+        fragmented.plan_match_summary_with_backend(&taker, simd::Backend::Avx2),
+        dense.plan_match_summary_with_backend(&taker, simd::Backend::Avx2)
+    );
+    assert_eq!(fragmented.place(taker), dense.place(taker));
+    assert_eq!(
+        fragmented.level_quantity(Side::Bid, Price::from_raw(100)),
+        Quantity::from_raw(3)
+    );
+    assert_logically_identical(&fragmented, &dense);
+
+    // Replace removes the partially-filled node, consumes both asks, and rests
+    // an identical residual even though each allocator chooses another slot.
+    assert_eq!(
+        fragmented.replace(OrderId::new(14), Price::from_raw(112), Quantity::from_raw(8)),
+        dense.replace(OrderId::new(14), Price::from_raw(112), Quantity::from_raw(8))
+    );
+    assert_logically_identical(&fragmented, &dense);
+    assert_eq!(
+        fragmented.cancel(OrderId::new(13)),
+        dense.cancel(OrderId::new(13))
+    );
+    assert_logically_identical(&fragmented, &dense);
+
+    fragmented.set_position(AccountId::new(60), Quantity::from_raw(5));
+    dense.set_position(AccountId::new(60), Quantity::from_raw(5));
+    let reduce_only = NewOrder {
+        reduce_only: true,
+        ..limit(200, 60, Side::Ask, 120, 8)
+    };
+    assert_eq!(fragmented.place(reduce_only), dense.place(reduce_only));
+    assert_logically_identical(&fragmented, &dense);
+
+    for resting in [
+        limit(201, 61, Side::Ask, 130, 1),
+        limit(202, 61, Side::Ask, 130, 1),
+    ] {
+        assert_eq!(fragmented.place(resting), dense.place(resting));
+    }
+    assert_eq!(fragmented.cancel_all(AccountId::new(61)), 2);
+    assert_eq!(dense.cancel_all(AccountId::new(61)), 2);
+    assert_logically_identical(&fragmented, &dense);
+
+    let dedup_order = order(
+        210,
+        70,
+        Side::Bid,
+        OrderType::Limit,
+        TimeInForce::Gtc,
+        80,
+        1,
+        777,
+    );
+    assert_eq!(fragmented.submit(dedup_order), dense.submit(dedup_order));
+    let before_replay = canonical_bytes(&fragmented);
+    assert_eq!(fragmented.submit(dedup_order), dense.submit(dedup_order));
+    assert_eq!(canonical_bytes(&fragmented), before_replay);
+    assert_logically_identical(&fragmented, &dense);
+
+    // The other-account bid fills first; CancelMaker then removes the taker's
+    // own bid before the residual ask rests.
+    let stp = limit(211, 70, Side::Ask, 80, 2);
+    assert_eq!(fragmented.place(stp), dense.place(stp));
+    assert_logically_identical(&fragmented, &dense);
+
+    for index in 0..9u64 {
+        let resting = limit(
+            300 + index,
+            80 + u32::try_from(index).unwrap(),
+            Side::Ask,
+            140 + i64::try_from(index).unwrap(),
+            1,
+        );
+        assert_eq!(fragmented.place(resting), dense.place(resting));
+        assert_logically_identical(&fragmented, &dense);
+    }
+    assert_eq!(fragmented.resting_len(), 11);
+
+    let basket = [
+        limit(400, 100, Side::Ask, 160, 1),
+        limit(401, 101, Side::Ask, 161, 1),
+    ];
+    let before_basket = canonical_bytes(&fragmented);
+    assert_eq!(
+        fragmented.submit_basket(&basket),
+        Err(OrderError::CapacityExhausted)
+    );
+    assert_eq!(
+        dense.submit_basket(&basket),
+        Err(OrderError::CapacityExhausted)
+    );
+    assert_eq!(canonical_bytes(&fragmented), before_basket);
+    assert_logically_identical(&fragmented, &dense);
+
+    let final_slot = limit(402, 102, Side::Ask, 162, 1);
+    assert_eq!(fragmented.place(final_slot), dense.place(final_slot));
+    let overflow = limit(403, 103, Side::Ask, 163, 1);
+    assert_eq!(
+        fragmented.place(overflow),
+        Err(OrderError::CapacityExhausted)
+    );
+    assert_eq!(dense.place(overflow), Err(OrderError::CapacityExhausted));
+    assert_logically_identical(&fragmented, &dense);
+    assert_eq!(
+        fragmented.cancel(OrderId::new(402)),
+        dense.cancel(OrderId::new(402))
+    );
+
+    assert_eq!(
+        fragmented.cancel(OrderId::new(9999)),
+        dense.cancel(OrderId::new(9999))
+    );
+    assert_eq!(
+        fragmented.replace(OrderId::new(9999), Price::from_raw(1), Quantity::from_raw(1)),
+        dense.replace(OrderId::new(9999), Price::from_raw(1), Quantity::from_raw(1))
+    );
+    let invalid_quantity = limit(500, 110, Side::Ask, 170, 0);
+    assert_eq!(
+        fragmented.place(invalid_quantity),
+        dense.place(invalid_quantity)
+    );
+    let invalid_price = limit(501, 110, Side::Ask, 0, 1);
+    assert_eq!(fragmented.place(invalid_price), dense.place(invalid_price));
+    assert_logically_identical(&fragmented, &dense);
+
+    let original_fragmented = canonical_bytes(&fragmented);
+    let original_dense = canonical_bytes(&dense);
+    let mut fragmented_clone = fragmented.clone();
+    let mut dense_clone = dense.clone();
+    assert_eq!(
+        fragmented_clone.cancel(OrderId::new(300)),
+        dense_clone.cancel(OrderId::new(300))
+    );
+    assert_eq!(
+        fragmented_clone.place(limit(600, 120, Side::Bid, 70, 1)),
+        dense_clone.place(limit(600, 120, Side::Bid, 70, 1))
+    );
+    assert_logically_identical(&fragmented_clone, &dense_clone);
+    assert_eq!(canonical_bytes(&fragmented), original_fragmented);
+    assert_eq!(canonical_bytes(&dense), original_dense);
 }
 
 #[test]
@@ -849,4 +2112,840 @@ fn plan_match_follows_executable_depth_not_placeholder() {
     assert_eq!(cheap.notional.raw(), 0);
     // Book untouched by planning.
     assert_eq!(b.resting_len(), 3);
+}
+
+#[test]
+fn match_summary_is_exactly_equivalent_to_materialized_plan() {
+    for taker_side in [Side::Bid, Side::Ask] {
+        let maker_side = taker_side.opposite();
+        let mut b = OrderBook::new(cfg());
+        for (offset, (price, quantity)) in [(100, 7), (105, 11), (110, 13)].into_iter().enumerate()
+        {
+            b.submit(limit(
+                u64::try_from(offset + 1).unwrap(),
+                u32::try_from(offset + 1).unwrap(),
+                maker_side,
+                price,
+                quantity,
+            ))
+            .unwrap();
+        }
+        let collar = match taker_side {
+            Side::Bid => 110,
+            Side::Ask => 100,
+        };
+        let taker = order(
+            99,
+            99,
+            taker_side,
+            OrderType::Market,
+            TimeInForce::Ioc,
+            collar,
+            25,
+            99,
+        );
+        let plan = b.plan_match(&taker).unwrap();
+        let summary = b.plan_match_summary(&taker).unwrap();
+        assert_eq!(summary.filled_quantity, plan.filled_quantity);
+        assert_eq!(summary.worst_price, plan.worst_price);
+        assert_eq!(summary.notional, plan.notional);
+        assert_eq!(summary.notional_ceil, plan.notional_ceil);
+        assert_eq!(b.resting_len(), 3);
+    }
+}
+
+#[test]
+fn scalar_and_simd_match_summaries_cover_stp_rounding_and_tail_lanes() {
+    let backends = [
+        simd::Backend::Scalar,
+        simd::Backend::Avx2,
+        simd::Backend::Avx512,
+        simd::Backend::Neon,
+    ];
+    for policy in [
+        StpPolicy::CancelMaker,
+        StpPolicy::CancelTaker,
+        StpPolicy::CancelBoth,
+    ] {
+        for taker_side in [Side::Bid, Side::Ask] {
+            for maker_count in [0usize, 1, 3, 4, 7, 8, 9, 15, 16, 17] {
+                let mut config = cfg();
+                config.stp = policy;
+                let mut book = OrderBook::new(config);
+                for lane in 0..maker_count {
+                    let lane_i64 = i64::try_from(lane).unwrap();
+                    // Self-owned makers straddle vector blocks and exercise all
+                    // three STP stop/skip behaviors without changing traversal.
+                    let account = if lane == 2 || lane == 10 {
+                        99
+                    } else {
+                        u32::try_from(lane + 1).unwrap()
+                    };
+                    book.submit(limit(
+                        u64::try_from(lane + 1).unwrap(),
+                        account,
+                        taker_side.opposite(),
+                        1_000_001 + lane_i64,
+                        500_001 + lane_i64,
+                    ))
+                    .unwrap();
+                }
+                let collar = match taker_side {
+                    Side::Bid => 1_000_001 + i64::try_from(maker_count).unwrap(),
+                    Side::Ask => 1_000_001,
+                };
+                let taker = order(
+                    50_000,
+                    99,
+                    taker_side,
+                    OrderType::Market,
+                    TimeInForce::Ioc,
+                    collar,
+                    i64::try_from(maker_count).unwrap() * 600_000 + 1,
+                    50_000,
+                );
+                let scalar = book
+                    .plan_match_summary_with_backend(&taker, simd::Backend::Scalar)
+                    .unwrap();
+                let plan = book.plan_match(&taker).unwrap();
+                assert_eq!(scalar.filled_quantity, plan.filled_quantity);
+                assert_eq!(scalar.worst_price, plan.worst_price);
+                assert_eq!(scalar.notional, plan.notional);
+                assert_eq!(scalar.notional_ceil, plan.notional_ceil);
+                for backend in backends {
+                    assert_eq!(
+                        book.plan_match_summary_with_backend(&taker, backend),
+                        Ok(scalar),
+                        "policy={policy:?} side={taker_side:?} makers={maker_count} backend={backend:?}",
+                    );
+                }
+                assert_eq!(book.resting_len(), maker_count);
+            }
+        }
+    }
+}
+
+#[test]
+fn scalar_and_simd_match_summaries_are_identical_over_randomized_books() {
+    let mut random = Lcg(0x5725_7257_2572_5725);
+    for case in 0..512u64 {
+        let policy = match case % 3 {
+            0 => StpPolicy::CancelMaker,
+            1 => StpPolicy::CancelTaker,
+            _ => StpPolicy::CancelBoth,
+        };
+        let taker_side = if case.is_multiple_of(2) {
+            Side::Bid
+        } else {
+            Side::Ask
+        };
+        let mut config = cfg();
+        config.stp = policy;
+        let mut book = OrderBook::new(config);
+        let maker_count = usize::try_from(random.below(33)).unwrap();
+        for lane in 0..maker_count {
+            let account = if random.below(7) == 0 {
+                77
+            } else {
+                u32::try_from(lane + 1).unwrap()
+            };
+            let price = 900_000 + i64::try_from(random.below(200_001)).unwrap();
+            let quantity = 1 + i64::try_from(random.below(4_000_000_000)).unwrap();
+            book.submit(limit(
+                case * 100 + u64::try_from(lane).unwrap() + 1,
+                account,
+                taker_side.opposite(),
+                price,
+                quantity,
+            ))
+            .unwrap();
+        }
+        let taker = order(
+            9_000_000 + case,
+            77,
+            taker_side,
+            OrderType::Market,
+            TimeInForce::Ioc,
+            match taker_side {
+                Side::Bid => 1_100_000,
+                Side::Ask => 900_000,
+            },
+            1 + i64::try_from(random.below(8_000_000_000)).unwrap(),
+            9_000_000 + case,
+        );
+        let scalar = book.plan_match_summary_with_backend(&taker, simd::Backend::Scalar);
+        for backend in [
+            simd::Backend::Avx2,
+            simd::Backend::Avx512,
+            simd::Backend::Neon,
+        ] {
+            assert_eq!(
+                book.plan_match_summary_with_backend(&taker, backend),
+                scalar,
+                "case={case} backend={backend:?}",
+            );
+        }
+    }
+}
+
+#[test]
+fn scalar_and_simd_planning_preserve_fills_outcomes_errors_and_roots() {
+    let run = |backend: simd::Backend, policy: StpPolicy, taker_side: Side| {
+        let mut config = cfg();
+        config.stp = policy;
+        config.matching_backend = backend;
+        let mut book = OrderBook::new(config);
+        for lane in 0..17u64 {
+            book.submit(limit(
+                lane + 1,
+                if lane == 5 { 99 } else { u32::try_from(lane + 1).unwrap() },
+                taker_side.opposite(),
+                1_000_001 + i64::try_from(lane).unwrap(),
+                500_001 + i64::try_from(lane).unwrap(),
+            ))
+            .unwrap();
+        }
+        let taker = order(
+            90_000,
+            99,
+            taker_side,
+            OrderType::Market,
+            TimeInForce::Ioc,
+            match taker_side {
+                Side::Bid => 1_000_017,
+                Side::Ask => 1_000_001,
+            },
+            7_000_007,
+            90_000,
+        );
+        let summary = book.plan_match_summary(&taker);
+        let result = book.submit(taker);
+        let invalid = book.plan_match_summary(&order(
+            90_001,
+            100,
+            taker_side,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            0,
+            1,
+            90_001,
+        ));
+        (
+            summary,
+            result,
+            invalid,
+            book.state_root(),
+            book.transition_root_v3(),
+        )
+    };
+
+    for policy in [
+        StpPolicy::CancelMaker,
+        StpPolicy::CancelTaker,
+        StpPolicy::CancelBoth,
+    ] {
+        for side in [Side::Bid, Side::Ask] {
+            let scalar = run(simd::Backend::Scalar, policy, side);
+            for backend in [
+                simd::Backend::Avx2,
+                simd::Backend::Avx512,
+                simd::Backend::Neon,
+            ] {
+                assert_eq!(
+                    run(backend, policy, side),
+                    scalar,
+                    "policy={policy:?} side={side:?} backend={backend:?}",
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn cancel_maker_report_preserves_encounter_order_and_current_remaining() {
+    let mut book = OrderBook::new(cfg());
+    book.place(limit(1, 7, Side::Ask, 100, 5)).unwrap();
+    // Leave the first self maker partially filled before the reported match.
+    book.place(limit(2, 8, Side::Bid, 100, 2)).unwrap();
+    book.place(limit(3, 9, Side::Ask, 100, 4)).unwrap();
+    book.place(limit(4, 7, Side::Ask, 100, 6)).unwrap();
+
+    let report = book
+        .place_with_report(limit(5, 7, Side::Bid, 100, 5))
+        .unwrap();
+
+    assert_eq!(report.result.fills.len(), 1);
+    assert_eq!(report.result.fills[0].maker_order, OrderId::new(3));
+    assert_eq!(report.result.fills[0].quantity, Quantity::from_raw(4));
+    assert_eq!(
+        report
+            .stp_cancelled
+            .iter()
+            .map(|cancel| (cancel.order_id.get(), cancel.remaining.raw()))
+            .collect::<Vec<_>>(),
+        vec![(1, 3), (4, 6)],
+    );
+    assert!(report.stp_cancelled.iter().all(|cancel| {
+        cancel.account == AccountId::new(7)
+            && cancel.side == Side::Ask
+            && cancel.price == Price::from_raw(100)
+    }));
+}
+
+#[test]
+fn cancel_both_reports_maker_then_stops_taker() {
+    let mut config = cfg();
+    config.stp = StpPolicy::CancelBoth;
+    let mut book = OrderBook::new(config);
+    book.place(limit(1, 7, Side::Ask, 100, 3)).unwrap();
+
+    let report = book
+        .place_with_report(limit(2, 7, Side::Bid, 100, 2))
+        .unwrap();
+
+    assert!(report.result.fills.is_empty());
+    assert!(matches!(report.result.outcome, OrderOutcome::Rejected));
+    assert_eq!(report.stp_cancelled.len(), 1);
+    assert_eq!(report.stp_cancelled[0].order_id, OrderId::new(1));
+    assert_eq!(report.stp_cancelled[0].remaining, Quantity::from_raw(3));
+    assert!(!book.contains(OrderId::new(1)));
+    assert!(!book.contains(OrderId::new(2)));
+}
+
+#[test]
+fn cancel_taker_emits_no_maker_cancellation() {
+    let mut config = cfg();
+    config.stp = StpPolicy::CancelTaker;
+    let mut book = OrderBook::new(config);
+    book.place(limit(1, 7, Side::Ask, 100, 3)).unwrap();
+
+    let report = book
+        .place_with_report(limit(2, 7, Side::Bid, 100, 2))
+        .unwrap();
+
+    assert!(report.result.fills.is_empty());
+    assert!(report.stp_cancelled.is_empty());
+    assert!(book.contains(OrderId::new(1)));
+}
+
+#[test]
+fn replace_report_includes_self_maker_crossed_by_replacement() {
+    let mut book = OrderBook::new(cfg());
+    book.place(limit(1, 7, Side::Ask, 100, 3)).unwrap();
+    book.place(limit(2, 7, Side::Bid, 90, 2)).unwrap();
+
+    let report = book
+        .replace_with_report(OrderId::new(2), Price::from_raw(100), Quantity::from_raw(2))
+        .unwrap();
+
+    assert_eq!(report.stp_cancelled.len(), 1);
+    assert_eq!(report.stp_cancelled[0].order_id, OrderId::new(1));
+    assert!(matches!(
+        report.result.outcome,
+        OrderOutcome::Resting { remaining } if remaining == Quantity::from_raw(2)
+    ));
+    assert!(book.contains(OrderId::new(2)));
+}
+
+#[test]
+fn report_variants_preserve_legacy_results_v3_bytes_and_roots() {
+    let mut legacy = OrderBook::new(cfg());
+    legacy.place(limit(1, 7, Side::Ask, 100, 3)).unwrap();
+    legacy.place(limit(2, 8, Side::Ask, 100, 2)).unwrap();
+    let mut reported = legacy.clone();
+
+    let incoming = limit(3, 7, Side::Bid, 100, 4);
+    let legacy_result = legacy.place(incoming).unwrap();
+    let report = reported.place_with_report(incoming).unwrap();
+    assert_eq!(report.result, legacy_result);
+    assert!(!report.stp_cancelled.is_empty());
+    assert_eq!(canonical_bytes(&reported), canonical_bytes(&legacy));
+    assert_eq!(reported.transition_root_v3(), legacy.transition_root_v3());
+
+    legacy.place(limit(4, 7, Side::Ask, 110, 2)).unwrap();
+    legacy.place(limit(5, 7, Side::Bid, 90, 2)).unwrap();
+    reported.place(limit(4, 7, Side::Ask, 110, 2)).unwrap();
+    reported.place(limit(5, 7, Side::Bid, 90, 2)).unwrap();
+    let legacy_result = legacy
+        .replace(OrderId::new(5), Price::from_raw(110), Quantity::from_raw(2))
+        .unwrap();
+    let report = reported
+        .replace_with_report(OrderId::new(5), Price::from_raw(110), Quantity::from_raw(2))
+        .unwrap();
+    assert_eq!(report.result, legacy_result);
+    assert!(!report.stp_cancelled.is_empty());
+    assert_eq!(canonical_bytes(&reported), canonical_bytes(&legacy));
+    assert_eq!(reported.transition_root_v3(), legacy.transition_root_v3());
+}
+
+#[test]
+fn failed_residual_rest_still_reports_applied_stp_cancellation() {
+    let mut book = OrderBook::new(cfg());
+    let self_ask = limit(1, 7, Side::Ask, 100, 1);
+    let full_bid = limit(2, 8, Side::Bid, 100, i64::MAX);
+    // Build the narrow internal edge directly: a crossed self maker plus a
+    // same-price bid level whose aggregate cannot accept another unit. Public
+    // matching never creates a crossed book, but execute_with_report must still
+    // preserve any cancellation it applies before a fallible residual rest.
+    book.rest_order(&self_ask, self_ask.quantity).unwrap();
+    book.rest_order(&full_bid, full_bid.quantity).unwrap();
+
+    let report = book
+        .place_with_report(limit(3, 7, Side::Bid, 100, 1))
+        .unwrap();
+
+    assert!(report.result.fills.is_empty());
+    assert!(matches!(report.result.outcome, OrderOutcome::Rejected));
+    assert_eq!(report.stp_cancelled.len(), 1);
+    assert_eq!(report.stp_cancelled[0].order_id, OrderId::new(1));
+    assert!(!book.contains(OrderId::new(1)));
+    assert!(!book.contains(OrderId::new(3)));
+    assert!(book.contains(OrderId::new(2)));
+    assert_eq!(book.total_resting_quantity(), Quantity::from_raw(i64::MAX));
+}
+
+fn validator_fixture() -> OrderBook {
+    let mut config = codec_cfg();
+    config.capacity = 16;
+    let mut book = OrderBook::new(config);
+    book.place(limit(1, 1, Side::Bid, 90, 2)).unwrap();
+    book.place(limit(2, 1, Side::Bid, 90, 3)).unwrap();
+    book.place(limit(3, 3, Side::Ask, 110, 4)).unwrap();
+    book
+}
+
+fn error_field(error: &BookStateError) -> Option<&'static str> {
+    match error {
+        BookStateError::InvalidValue { field } | BookStateError::NonCanonical { field } => {
+            Some(*field)
+        }
+        _ => None,
+    }
+}
+
+fn assert_checked_rejection(book: &OrderBook, expected_field: &'static str) {
+    let validation = std::panic::catch_unwind(|| book.validate_transition_invariants());
+    let error = validation
+        .expect("recovery validation must not panic")
+        .expect_err("corrupt state must be rejected");
+    assert_eq!(error_field(&error), Some(expected_field));
+
+    let encoding = std::panic::catch_unwind(|| book.encode_state_v3_bounded(usize::MAX));
+    let error = encoding
+        .expect("bounded state encoding must not panic")
+        .expect_err("corrupt state must not encode");
+    assert_eq!(error_field(&error), Some(expected_field));
+}
+
+#[test]
+fn transition_validator_is_observationally_pure_and_preserves_v3_image() {
+    let book = codec_fixture();
+    let bytes = canonical_bytes(&book);
+    let root = book.transition_root_v3();
+    let diagnostic = book.state_root();
+    let resting = book.resting_orders();
+    let slab_representation = book.slab.representation_for_test();
+
+    book.validate_transition_invariants().unwrap();
+    book.validate_transition_invariants().unwrap();
+
+    assert_eq!(canonical_bytes(&book), bytes);
+    assert_eq!(book.transition_root_v3(), root);
+    assert_eq!(book.state_root(), diagnostic);
+    assert_eq!(book.resting_orders(), resting);
+    assert_eq!(book.slab.representation_for_test(), slab_representation);
+}
+
+#[test]
+fn transition_validator_rejects_bounded_fifo_link_corruption_without_panicking() {
+    let mut cycle = validator_fixture();
+    let first = cycle.id_index[&OrderId::new(1)].slot;
+    let second = cycle.id_index[&OrderId::new(2)].slot;
+    cycle.slab.get_mut(second).unwrap().next = first;
+    assert_checked_rejection(
+        &cycle,
+        "price-level FIFO backward link mismatch",
+    );
+
+    let mut dangling = validator_fixture();
+    dangling
+        .bids
+        .set_level_head_for_test(Price::from_raw(90), u32::MAX - 1);
+    assert_checked_rejection(
+        &dangling,
+        "price-level FIFO must reference a live slab node",
+    );
+}
+
+#[test]
+fn transition_validator_rejects_level_metadata_and_node_corruption_matrix() {
+    let mut wrong_role = validator_fixture();
+    wrong_role.bids.set_side_for_test(Side::Ask);
+    assert_checked_rejection(
+        &wrong_role,
+        "stored side-book role must match its engine field",
+    );
+
+    let mut empty_level = validator_fixture();
+    empty_level
+        .bids
+        .insert_empty_level_for_test(Price::from_raw(91));
+    assert_checked_rejection(
+        &empty_level,
+        "price levels must contain at least one resting order",
+    );
+
+    let mut wrong_count = validator_fixture();
+    wrong_count
+        .bids
+        .set_level_count_for_test(Price::from_raw(90), 3);
+    assert_checked_rejection(
+        &wrong_count,
+        "price-level count must equal its live FIFO length",
+    );
+
+    let mut wrong_tail = validator_fixture();
+    wrong_tail
+        .bids
+        .set_level_tail_for_test(Price::from_raw(90), NIL);
+    assert_checked_rejection(
+        &wrong_tail,
+        "price-level tail must be the final FIFO node",
+    );
+
+    let mut wrong_total = validator_fixture();
+    wrong_total.bids.set_level_total_for_test(
+        Price::from_raw(90),
+        Quantity::from_raw(6),
+    );
+    assert_checked_rejection(
+        &wrong_total,
+        "price-level aggregate must equal its live order quantities",
+    );
+
+    let mut zero_remaining = validator_fixture();
+    let slot = zero_remaining.id_index[&OrderId::new(1)].slot;
+    zero_remaining.slab.get_mut(slot).unwrap().remaining = Quantity::ZERO;
+    assert_checked_rejection(
+        &zero_remaining,
+        "resting quantity must be strictly positive",
+    );
+
+    let mut wrong_side = validator_fixture();
+    let slot = wrong_side.id_index[&OrderId::new(1)].slot;
+    wrong_side.slab.get_mut(slot).unwrap().side = Side::Ask;
+    assert_checked_rejection(
+        &wrong_side,
+        "resting node side does not match its side book",
+    );
+
+    let mut wrong_price = validator_fixture();
+    let slot = wrong_price.id_index[&OrderId::new(1)].slot;
+    wrong_price.slab.get_mut(slot).unwrap().price = Price::from_raw(91);
+    assert_checked_rejection(
+        &wrong_price,
+        "resting node price does not match its level",
+    );
+
+    let mut duplicate_id = validator_fixture();
+    let slot = duplicate_id.id_index[&OrderId::new(2)].slot;
+    duplicate_id.slab.get_mut(slot).unwrap().order_id = OrderId::new(1);
+    assert_checked_rejection(
+        &duplicate_id,
+        "resting order ids must be globally unique",
+    );
+
+    let mut unreachable = validator_fixture();
+    unreachable
+        .asks
+        .remove_level_for_test(Price::from_raw(110));
+    assert_checked_rejection(
+        &unreachable,
+        "every live slab node must be reachable from exactly one price level",
+    );
+}
+
+#[test]
+fn transition_validator_rejects_exact_derived_mirror_corruption_matrix() {
+    let mut missing_locator = validator_fixture();
+    missing_locator.id_index.remove(&OrderId::new(1));
+    assert_checked_rejection(
+        &missing_locator,
+        "live node must have an order-id locator",
+    );
+
+    let mut wrong_locator_slot = validator_fixture();
+    let other_slot = wrong_locator_slot.id_index[&OrderId::new(2)].slot;
+    wrong_locator_slot
+        .id_index
+        .get_mut(&OrderId::new(1))
+        .unwrap()
+        .slot = other_slot;
+    assert_checked_rejection(
+        &wrong_locator_slot,
+        "order-id locator points to wrong slot",
+    );
+
+    let mut wrong_locator_side = validator_fixture();
+    wrong_locator_side
+        .id_index
+        .get_mut(&OrderId::new(1))
+        .unwrap()
+        .side = Side::Ask;
+    assert_checked_rejection(&wrong_locator_side, "order-id locator side mismatch");
+
+    let mut wrong_locator_account = validator_fixture();
+    wrong_locator_account
+        .id_index
+        .get_mut(&OrderId::new(1))
+        .unwrap()
+        .account = AccountId::new(9);
+    assert_checked_rejection(
+        &wrong_locator_account,
+        "order-id locator account mismatch",
+    );
+
+    let mut extra_locator = validator_fixture();
+    let locator = extra_locator.id_index[&OrderId::new(1)];
+    extra_locator.id_index.insert(OrderId::new(999), locator);
+    assert_checked_rejection(
+        &extra_locator,
+        "order-id index must cover every live slab node exactly once",
+    );
+
+    let mut missing_account_order = validator_fixture();
+    missing_account_order
+        .account_orders
+        .get_mut(&AccountId::new(1))
+        .unwrap()
+        .clear();
+    assert_checked_rejection(
+        &missing_account_order,
+        "account-order index must exactly mirror live owned orders",
+    );
+
+    let mut extra_account_order = validator_fixture();
+    extra_account_order
+        .account_orders
+        .get_mut(&AccountId::new(1))
+        .unwrap()
+        .push(OrderId::new(999));
+    assert_checked_rejection(
+        &extra_account_order,
+        "account-order index must exactly mirror live owned orders",
+    );
+
+    let mut duplicate_account_order = validator_fixture();
+    duplicate_account_order
+        .account_orders
+        .get_mut(&AccountId::new(1))
+        .unwrap()
+        .push(OrderId::new(1));
+    assert_checked_rejection(
+        &duplicate_account_order,
+        "account-order ids must be strictly ascending and unique",
+    );
+
+    let mut unsorted_account_orders = validator_fixture();
+    unsorted_account_orders
+        .account_orders
+        .get_mut(&AccountId::new(1))
+        .unwrap()
+        .swap(0, 1);
+    assert_checked_rejection(
+        &unsorted_account_orders,
+        "account-order ids must be strictly ascending and unique",
+    );
+}
+
+#[test]
+fn transition_validator_rejects_allocator_dedup_and_xor_drift() {
+    let mut free_cycle = validator_fixture();
+    free_cycle.cancel(OrderId::new(3)).unwrap();
+    free_cycle.slab.make_free_list_cycle_for_test();
+    assert_checked_rejection(&free_cycle, "slab free list must not contain a cycle");
+
+    let mut duplicate_fifo = codec_fixture();
+    duplicate_fifo.dedup.duplicate_oldest_fifo_key_for_test();
+    assert_checked_rejection(
+        &duplicate_fifo,
+        "dedup FIFO must not contain duplicate keys",
+    );
+
+    let mut missing_result = codec_fixture();
+    missing_result.dedup.remove_oldest_map_entry_for_test();
+    assert_checked_rejection(
+        &missing_result,
+        "dedup FIFO and result map must contain the same keys",
+    );
+
+    let mut bad_xor = validator_fixture();
+    bad_xor.order_leaf_xor[0] ^= 0x80;
+    assert_checked_rejection(
+        &bad_xor,
+        "incremental order-leaf XOR must match the canonical live-order scan",
+    );
+}
+
+#[test]
+fn transition_validator_rejects_crossed_or_locked_books_and_unrepresentable_capacity() {
+    let mut locked = validator_fixture();
+    let ask_slot = locked.id_index[&OrderId::new(3)].slot;
+    locked.slab.get_mut(ask_slot).unwrap().price = Price::from_raw(90);
+    locked
+        .asks
+        .rekey_level_for_test(Price::from_raw(110), Price::from_raw(90));
+    assert_checked_rejection(
+        &locked,
+        "resting bid and ask books must not be crossed or locked",
+    );
+
+    let mut crossed = validator_fixture();
+    let ask_slot = crossed.id_index[&OrderId::new(3)].slot;
+    crossed.slab.get_mut(ask_slot).unwrap().price = Price::from_raw(89);
+    crossed
+        .asks
+        .rekey_level_for_test(Price::from_raw(110), Price::from_raw(89));
+    assert_checked_rejection(
+        &crossed,
+        "resting bid and ask books must not be crossed or locked",
+    );
+
+    let mut too_wide = validator_fixture();
+    let Ok(too_wide_capacity) = usize::try_from(u64::from(u32::MAX) + 1) else {
+        return;
+    };
+    too_wide.config.capacity = too_wide_capacity;
+    let error = too_wide.validate_transition_invariants().unwrap_err();
+    assert!(matches!(
+        error,
+        BookStateError::NativeWidth {
+            field: "slab capacity",
+            ..
+        }
+    ));
+    assert!(too_wide.encode_state_v3_bounded(usize::MAX).is_err());
+}
+
+fn cached_fill_fixture() -> OrderBook {
+    let mut book = OrderBook::new(codec_cfg());
+    book.submit(limit(10, 10, Side::Ask, 100, 2)).unwrap();
+    book.submit(limit(11, 11, Side::Bid, 100, 2)).unwrap();
+    book
+}
+
+#[test]
+fn transition_validator_rejects_malformed_cached_results() {
+    let mut bad_outcome = cached_fill_fixture();
+    bad_outcome.dedup.newest_result_mut_for_test().outcome = OrderOutcome::Rejected;
+    assert_checked_rejection(
+        &bad_outcome,
+        "cached result outcome is inconsistent with its fills or quantity",
+    );
+
+    let mut zero_fill = cached_fill_fixture();
+    zero_fill.dedup.newest_result_mut_for_test().fills[0].quantity = Quantity::ZERO;
+    assert_checked_rejection(
+        &zero_fill,
+        "cached fill quantity must be strictly positive",
+    );
+
+    let mut wrong_taker = cached_fill_fixture();
+    wrong_taker.dedup.newest_result_mut_for_test().fills[0].taker_account = AccountId::new(77);
+    assert_checked_rejection(
+        &wrong_taker,
+        "cached fill taker account must match its dedup key account",
+    );
+
+    let mut duplicate_maker = cached_fill_fixture();
+    let result = duplicate_maker.dedup.newest_result_mut_for_test();
+    result.fills.push(result.fills[0]);
+    result.outcome = OrderOutcome::PartiallyFilledCancelled {
+        filled: Quantity::from_raw(4),
+    };
+    assert_checked_rejection(
+        &duplicate_maker,
+        "cached result cannot fill one maker order twice",
+    );
+
+    let mut impossible_rest = codec_fixture();
+    impossible_rest.dedup.oldest_result_mut_for_test().outcome =
+        OrderOutcome::Resting { remaining: Quantity::ZERO };
+    assert_checked_rejection(
+        &impossible_rest,
+        "cached result outcome is inconsistent with its fills or quantity",
+    );
+}
+
+#[test]
+fn reachable_randomized_operations_always_validate_and_encode() {
+    let mut config = cfg();
+    config.capacity = 64;
+    config.dedup_capacity = 16;
+    let mut book = OrderBook::new(config);
+    let mut rng = Lcg(0xA11C_E5EED);
+    let mut next_id = 1u64;
+
+    for step in 0..1_000 {
+        match rng.below(7) {
+            0 | 1 => {
+                let side = if rng.below(2) == 0 { Side::Bid } else { Side::Ask };
+                let price = match side {
+                    Side::Bid => 80 + i64::try_from(rng.below(20)).unwrap(),
+                    Side::Ask => 101 + i64::try_from(rng.below(20)).unwrap(),
+                };
+                let incoming = limit(
+                    next_id,
+                    u32::try_from(1 + rng.below(8)).unwrap(),
+                    side,
+                    price,
+                    i64::try_from(1 + rng.below(8)).unwrap(),
+                );
+                if rng.below(2) == 0 {
+                    let _ = book.place(incoming);
+                } else {
+                    let _ = book.submit(incoming);
+                }
+                next_id += 1;
+            }
+            2 => {
+                let resting = book.resting_orders();
+                if !resting.is_empty() {
+                    let index = usize::try_from(rng.below(resting.len() as u64)).unwrap();
+                    book.cancel(resting[index].order_id).unwrap();
+                }
+            }
+            3 => {
+                let resting = book.resting_orders();
+                if !resting.is_empty() {
+                    let index = usize::try_from(rng.below(resting.len() as u64)).unwrap();
+                    let order = resting[index];
+                    let price = match order.side {
+                        Side::Bid => 80 + i64::try_from(rng.below(20)).unwrap(),
+                        Side::Ask => 101 + i64::try_from(rng.below(20)).unwrap(),
+                    };
+                    let quantity = Quantity::from_raw(i64::try_from(1 + rng.below(8)).unwrap());
+                    book.replace(order.order_id, Price::from_raw(price), quantity)
+                        .unwrap();
+                }
+            }
+            4 => {
+                let account = AccountId::new(u32::try_from(1 + rng.below(8)).unwrap());
+                let _ = book.cancel_all(account);
+            }
+            _ => book.set_position(
+                AccountId::new(u32::try_from(1 + rng.below(8)).unwrap()),
+                Quantity::from_raw(i64::try_from(rng.below(21)).unwrap() - 10),
+            ),
+        }
+        book.validate_transition_invariants()
+            .unwrap_or_else(|error| panic!("step {step}: {error}"));
+        if step % 25 == 0 {
+            let bytes = book.encode_state_v3_bounded(usize::MAX).unwrap();
+            assert_eq!(
+                book.transition_root_v3(),
+                crypto::hash_domain(crypto::DOMAIN_ORDERBOOK_STATE, &bytes)
+            );
+        }
+    }
 }

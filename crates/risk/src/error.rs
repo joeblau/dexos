@@ -64,6 +64,36 @@ pub enum RiskError {
         /// The hard resource-budget ceiling.
         budget: usize,
     },
+    /// Stored Structure-of-Arrays columns disagree about their slot count.
+    /// A transition root cannot safely represent such malformed state.
+    #[error("risk {section} column {column} has length {actual}, expected {expected}")]
+    StateShape {
+        /// Whether the malformed column is account- or market-indexed.
+        section: &'static str,
+        /// Name of the malformed column.
+        column: &'static str,
+        /// Slot count established by the section's primary column.
+        expected: usize,
+        /// Actual length of the malformed column.
+        actual: usize,
+    },
+    /// A native-width slot index or sequence length cannot be represented by
+    /// the v1 fixed-width commitment format.
+    #[error("state value {value} does not fit the transition-root u64 encoding")]
+    StateEncodingOverflow {
+        /// Native-width value that could not be encoded.
+        value: usize,
+    },
+    /// Checked arithmetic could not represent the exact canonical state size.
+    #[error("risk state size overflow while processing {field}")]
+    StateSizeOverflow {
+        /// Stable state section or aggregate name.
+        field: &'static str,
+    },
+    /// Stored risk state violates a relation required for deterministic future
+    /// transitions, such as cache equality or reverse-index consistency.
+    #[error("risk state invariant violated: {0}")]
+    StateInvariant(&'static str),
     /// A fixed-point arithmetic step overflowed or divided by zero.
     #[error("fixed-point arithmetic error: {0}")]
     Arith(#[from] ArithError),

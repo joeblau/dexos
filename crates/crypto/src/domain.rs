@@ -33,12 +33,32 @@ pub const DOMAIN_MARKET: &[u8] = b"dexos:market:v1";
 pub const DOMAIN_COMMAND: &[u8] = b"dexos:command:v1";
 /// Execution receipt.
 pub const DOMAIN_EXECUTION: &[u8] = b"dexos:execution:v1";
+/// Canonical execution-ledger transition state.
+pub const DOMAIN_EXECUTION_LEDGER_STATE: &[u8] = b"dexos:execution:ledger-state:v1";
+/// Canonical execution replay-window and exactly-once transition state.
+pub const DOMAIN_EXECUTION_REPLAY_STATE: &[u8] = b"dexos:execution:replay-state:v1";
+/// Canonical complete execution-engine transition state.
+pub const DOMAIN_EXECUTION_STATE: &[u8] = b"dexos:execution:state:v1";
+/// Canonical execution-layer session authorization and replay state.
+pub const DOMAIN_EXECUTION_SESSION_STATE: &[u8] = b"dexos:execution:session-state:v1";
+/// Canonical order-book transition state (price levels, FIFO priority, and
+/// future-behavior caches).
+pub const DOMAIN_ORDERBOOK_STATE: &[u8] = b"dexos:orderbook:state:v3";
+/// Canonical stored risk-engine transition state.
+pub const DOMAIN_RISK_STATE: &[u8] = b"dexos:risk:state:v1";
 /// Oracle observation / certificate body.
 pub const DOMAIN_ORACLE: &[u8] = b"dexos:oracle:v1";
 /// Canonical validator-set commitment.
 pub const DOMAIN_VALIDATOR_SET: &[u8] = b"dexos:validator-set:v1";
 /// Decision-market action/outcome confirmation.
 pub const DOMAIN_DECISION: &[u8] = b"dexos:decision:v1";
+
+// ---- storage ----
+
+/// Per-segment chain over exact framed write-ahead-log records.
+pub const DOMAIN_STORAGE_WAL_CHAIN: &[u8] = b"dexos:storage:wal-chain:v1";
+/// Segmentation-independent commitment to an exact logical WAL prefix.
+pub const DOMAIN_STORAGE_WAL_PREFIX: &[u8] = b"dexos:storage:wal-prefix:v1";
 
 // ---- custody / chain-adapter withdrawal family ----
 
@@ -74,9 +94,17 @@ pub const ALL_DOMAINS: &[&[u8]] = &[
     DOMAIN_MARKET,
     DOMAIN_COMMAND,
     DOMAIN_EXECUTION,
+    DOMAIN_EXECUTION_LEDGER_STATE,
+    DOMAIN_EXECUTION_REPLAY_STATE,
+    DOMAIN_EXECUTION_STATE,
+    DOMAIN_EXECUTION_SESSION_STATE,
+    DOMAIN_ORDERBOOK_STATE,
+    DOMAIN_RISK_STATE,
     DOMAIN_ORACLE,
     DOMAIN_VALIDATOR_SET,
     DOMAIN_DECISION,
+    DOMAIN_STORAGE_WAL_CHAIN,
+    DOMAIN_STORAGE_WAL_PREFIX,
     DOMAIN_WITHDRAWAL_ID,
     DOMAIN_WITHDRAWAL_AUTH,
     DOMAIN_WITHDRAWAL_CERT,

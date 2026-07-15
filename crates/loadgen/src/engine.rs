@@ -498,11 +498,8 @@ fn run_region(
             }
 
             // Client send time on the global timebase, spread across the second.
-            let within = if target == 0 {
-                0
-            } else {
-                i.saturating_mul(1_000_000_000) / target
-            };
+            // This loop is empty when `target == 0`, so division is always defined.
+            let within = i.saturating_mul(1_000_000_000) / target;
             let true_send = start_ns
                 .saturating_add(second.saturating_mul(1_000_000_000))
                 .saturating_add(within);

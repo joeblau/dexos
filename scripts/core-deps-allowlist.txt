@@ -1,3 +1,4 @@
+arrayvec
 base16ct
 block-buffer
 cfg-if
@@ -40,6 +41,7 @@ serde_derive
 sha2
 sha3
 signature
+simd
 spki
 state-tree
 subtle

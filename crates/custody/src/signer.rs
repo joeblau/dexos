@@ -39,7 +39,7 @@
 
 use std::sync::Arc;
 
-use crypto::{QuorumCertificate, Validator, ValidatorSet};
+use crypto::{QuorumCertificate, QuorumSignatures, Validator, ValidatorSet};
 use types::Hash;
 
 use crate::error::CustodyError;
@@ -304,10 +304,12 @@ impl<S: Signer> SignerSet<S> {
         idx.dedup();
 
         let mut signer_bitmap = 0u16;
-        let mut signatures = Vec::with_capacity(idx.len());
+        let mut signatures = QuorumSignatures::new();
         for &i in &idx {
             signer_bitmap |= 1u16 << i;
-            signatures.push(self.signers[i].sign(&message)?);
+            signatures
+                .try_push(self.signers[i].sign(&message)?)
+                .map_err(|_| CustodyError::InvalidThreshold)?;
         }
         Ok(QuorumCertificate {
             message,

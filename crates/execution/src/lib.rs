@@ -19,10 +19,18 @@ pub use command::{
     ReplaceOrder, RequestWithdrawal, ResolveMarket, RevokeSession, SetMarkPrice,
     SetMarketLifecycle, SetOracleHealth, SettleMarket, Timestamp,
 };
-pub use engine::{Engine, EngineConfig, WalletBinding};
+pub use engine::{
+    Engine, EngineConfig, EngineStateError, WalletBinding, ENGINE_STATE_SCHEMA_VERSION,
+    ENGINE_TRANSITION_ROOT_SCHEMA_VERSION,
+};
 pub use error::ExecutionError;
-pub use ledger::Ledger;
-pub use session::SessionRegistry;
+pub use idempotency::{ReplayStateError, REPLAY_TRANSITION_ROOT_SCHEMA_VERSION};
+pub use ledger::{
+    Ledger, LedgerStateError, LedgerStateLimits, LEDGER_TRANSITION_ROOT_SCHEMA_VERSION,
+};
+pub use session::{
+    SessionRegistry, SessionStateError, SessionStateLimits, SESSION_TRANSITION_ROOT_SCHEMA_VERSION,
+};
 
 /// Crate identity, used by the node composition root for a startup manifest.
 pub const CRATE_NAME: &str = "execution";
@@ -2132,8 +2140,6 @@ mod tests {
             types::MarketLifecycle::Draft,
             types::MarketLifecycle::Halted,
             types::MarketLifecycle::Closed,
-            types::MarketLifecycle::Resolved,
-            types::MarketLifecycle::Archived,
         ]
         .into_iter()
         .enumerate()

@@ -91,7 +91,7 @@ pub enum StreamPayload {
     /// An execution receipt.
     ExecutionReceipt(ExecutionReceipt),
     /// A checkpoint header.
-    Checkpoint(Checkpoint),
+    Checkpoint(Box<Checkpoint>),
     /// A market lifecycle transition.
     MarketLifecycle(MarketLifecycleEvent),
     /// A peer / network health snapshot.

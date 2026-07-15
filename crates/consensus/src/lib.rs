@@ -33,9 +33,10 @@ pub use checkpoint::{
 pub use minimmit::{
     notarize_digest, nullify_digest, propose_auth, BlockHeader, Certificate, ConsensusMessage,
     Effect, Effect as MinimmitEffect, EpochError, ExecAttest, FinalityStage, Input,
-    Input as MinimmitInput, MinimmitCommittee, MinimmitReplica, Notarization, Notarize,
-    Nullification, Nullify, ParentRef, Proof, Propose, Tally, TallyOutcome, ThresholdKind,
-    WireError, BOTTOM_VIEW, DOMAIN_BLOCK, DOMAIN_NOTARIZE, DOMAIN_NULLIFY, DOMAIN_PROPOSE,
+    Input as MinimmitInput, MinimmitCertificateError, MinimmitCommittee, MinimmitReplica,
+    Notarization, Notarize, Nullification, Nullify, ParentRef, Proof, Propose, Tally, TallyOutcome,
+    ThresholdKind, WireError, BOTTOM_VIEW, DOMAIN_BLOCK, DOMAIN_NOTARIZE, DOMAIN_NULLIFY,
+    DOMAIN_PROPOSE,
 };
 pub use sequencer::{detect_gap, CommandRecord, CommandStatus, Sequencer, SequencerError};
 pub use vote::{
@@ -111,5 +112,49 @@ mod tests {
             &key.sign(digest.as_bytes())
         )
         .is_ok());
+    }
+
+    #[test]
+    fn checkpoint_ancestry_never_wraps_sequence_space() {
+        let signers = ThresholdSigners::from_seeds(
+            &[[0; 32], [1; 32], [2; 32], [3; 32], [4; 32], [5; 32]],
+            5,
+        );
+        let shard = ShardId::new(0);
+        let parent_root = Hash::from_bytes([7; 32]);
+        let item = Hash::from_bytes([8; 32]);
+        let parent_header = build_checkpoint_header(
+            0,
+            shard,
+            u64::MAX,
+            u64::MAX,
+            Hash::ZERO,
+            parent_root,
+            &[item],
+            &[item],
+            Hash::ZERO,
+            0,
+        )
+        .unwrap();
+        let parent_qc = signers.sign(parent_header.hash(), vec![0, 1, 2, 3, 4]);
+        let parent = seal_checkpoint(parent_header, parent_qc);
+
+        let wrapped_header = build_checkpoint_header(
+            0,
+            shard,
+            0,
+            0,
+            parent_root,
+            Hash::from_bytes([9; 32]),
+            &[item],
+            &[item],
+            Hash::ZERO,
+            1,
+        )
+        .unwrap();
+        let wrapped_qc = signers.sign(wrapped_header.hash(), vec![0, 1, 2, 3, 4]);
+        let wrapped = seal_checkpoint(wrapped_header, wrapped_qc);
+
+        assert!(!links_to(&wrapped, &parent));
     }
 }

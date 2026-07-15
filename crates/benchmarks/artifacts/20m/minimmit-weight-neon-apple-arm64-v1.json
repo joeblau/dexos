@@ -1,0 +1,197 @@
+{
+  "schema_version": 1,
+  "artifact_type": "paired-component-microbenchmark",
+  "qualification_status": "ARM64_KERNEL_AND_COUNTERS_QUALIFIED_X86_SIMD_RUNTIME_AND_COUNTERS_PENDING",
+  "generated_date": "2026-07-13",
+  "exact_command": "cargo run --release -p benchmarks --bin minimmit-weight-paired -- --iterations 20000 --warmup 2000 --bootstrap-resamples 5000 --output /tmp/dexos-minimmit-weight-paired-neon.json",
+  "provenance": {
+    "git_sha": "61cc7e6f392198e9e122807c5a87f53e7eff191f",
+    "git_dirty": true,
+    "cargo_lock_sha256": "99a1bead665d856984251f9f55ef51bd2bf1df5adc8cdf9f5ba2cb1d0669bf3c",
+    "rustc": "1.96.1 (31fca3adb 2026-06-26)",
+    "llvm": "22.1.8",
+    "profile": "release",
+    "host_os": "macOS 27.0 build 26A5378j",
+    "kernel": "Darwin 27.0.0 RELEASE_ARM64_T6031",
+    "host_arch": "aarch64",
+    "cpu": "Apple M3 Max",
+    "backend": "neon",
+    "allocation_counting": true,
+    "hardware_counters": "Xcode 27 xctrace manual EL0 counters at 1 ms"
+  },
+  "boundary": {
+    "production_call_path": "consensus::MinimmitCommittee::verify_detailed -> simd::selected_weight",
+    "fixture": "256 independent dense n=16 weighted L-certificate signer bitmaps per timed sample",
+    "semantic_boundary": "only the commutative checked signer-weight sum is vectorized; signature verification and first-invalid-signer attribution remain scalar and ascending",
+    "excluded": [
+      "Ed25519 signature verification",
+      "digest construction",
+      "wire decode",
+      "reactor state transitions",
+      "network and Minimmit finality"
+    ]
+  },
+  "method": {
+    "paired_iterations_per_run": 20000,
+    "reductions_per_pair_side": 256,
+    "warmup_pairs_per_run": 2000,
+    "repeat_runs": 4,
+    "order": "interleaved and alternating scalar-first/SIMD-first",
+    "confidence_method": "deterministic paired bootstrap of mean scalar-minus-SIMD nanoseconds",
+    "bootstrap_resamples": 5000,
+    "confidence_permille": 950,
+    "raw_pairs": "emitted by minimmit-weight-paired into each requested output artifact"
+  },
+  "repeat_results": [
+    {
+      "scalar_p50_ns": 834,
+      "scalar_p95_ns": 1000,
+      "scalar_p99_ns": 1083,
+      "simd_p50_ns": 375,
+      "simd_p95_ns": 417,
+      "simd_p99_ns": 459,
+      "scalar_reductions_per_second": 298035214,
+      "simd_reductions_per_second": 684557688,
+      "speedup_basis_points": 5646,
+      "mean_delta_ns": 484,
+      "bootstrap_mean_delta_low_ns": 481,
+      "bootstrap_mean_delta_high_ns": 488,
+      "scalar_allocations": 0,
+      "simd_allocations": 0,
+      "statistically_significant_simd_win": true
+    },
+    {
+      "scalar_p50_ns": 750,
+      "scalar_p95_ns": 917,
+      "scalar_p99_ns": 1042,
+      "simd_p50_ns": 334,
+      "simd_p95_ns": 417,
+      "simd_p99_ns": 459,
+      "scalar_reductions_per_second": 319882762,
+      "simd_reductions_per_second": 717641750,
+      "speedup_basis_points": 5542,
+      "mean_delta_ns": 443,
+      "bootstrap_mean_delta_low_ns": 436,
+      "bootstrap_mean_delta_high_ns": 450,
+      "scalar_allocations": 0,
+      "simd_allocations": 0,
+      "statistically_significant_simd_win": true
+    },
+    {
+      "scalar_p50_ns": 792,
+      "scalar_p95_ns": 959,
+      "scalar_p99_ns": 1042,
+      "simd_p50_ns": 334,
+      "simd_p95_ns": 458,
+      "simd_p99_ns": 459,
+      "scalar_reductions_per_second": 315879509,
+      "simd_reductions_per_second": 716331977,
+      "speedup_basis_points": 5590,
+      "mean_delta_ns": 453,
+      "bootstrap_mean_delta_low_ns": 449,
+      "bootstrap_mean_delta_high_ns": 457,
+      "scalar_allocations": 0,
+      "simd_allocations": 0,
+      "statistically_significant_simd_win": true
+    },
+    {
+      "scalar_p50_ns": 750,
+      "scalar_p95_ns": 875,
+      "scalar_p99_ns": 1000,
+      "simd_p50_ns": 334,
+      "simd_p95_ns": 375,
+      "simd_p99_ns": 459,
+      "scalar_reductions_per_second": 325939223,
+      "simd_reductions_per_second": 724195103,
+      "speedup_basis_points": 5499,
+      "mean_delta_ns": 431,
+      "bootstrap_mean_delta_low_ns": 425,
+      "bootstrap_mean_delta_high_ns": 438,
+      "scalar_allocations": 0,
+      "simd_allocations": 0,
+      "statistically_significant_simd_win": true
+    }
+  ],
+  "correctness": {
+    "bitmap_corpus": "all 65536 bitmaps at committee lengths 0 through 16 across Scalar, AVX2, AVX-512, and NEON tags",
+    "qc_differential": "identical M/L decisions, below-threshold weights, malformed errors, invalid indices, and invalid-before-unknown precedence",
+    "wide_weight_fallback": "validator weights wider than u32 retain the full-width checked scalar path",
+    "x86_64_rosetta": "86 consensus and 51 SIMD tests passed; Rosetta exposed no AVX2/AVX-512 backend"
+  },
+  "hardware_counter_evidence": {
+    "tool": "xctrace version 16.0 (27A5209h), Xcode 27.0 build 27A5209h",
+    "recording_options": "crates/benchmarks/artifacts/20m/minimmit-weight-xctrace-m3-options.json",
+    "counter_set": [
+      "Cycles (FIXED_CYCLES)",
+      "Instructions (FIXED_INSTRUCTIONS)",
+      "INST_BRANCH",
+      "BRANCH_MISPRED_NONSPEC",
+      "L1D_CACHE_MISS_LD",
+      "L1D_CACHE_MISS_ST"
+    ],
+    "sampling": "EL0 time-triggered counters-profile samples at 1 ms, filtered to the minimmit-weight-counter running thread; totals are observed samples and are not extrapolated across unsampled intervals",
+    "iterations_per_path": 2000000000,
+    "checksum_per_path": 7835625000000,
+    "scalar_record_command": "xcrun xctrace record --template 'CPU Counters' --recording-options crates/benchmarks/artifacts/20m/minimmit-weight-xctrace-m3-options.json --output /tmp/dexos-minimmit-weight-scalar-manual.trace --no-prompt --target-stdout - --launch -- $PWD/target/release/minimmit-weight-counter --mode scalar --iterations 2000000000",
+    "simd_record_command": "xcrun xctrace record --template 'CPU Counters' --recording-options crates/benchmarks/artifacts/20m/minimmit-weight-xctrace-m3-options.json --output /tmp/dexos-minimmit-weight-simd-manual.trace --no-prompt --target-stdout - --launch -- $PWD/target/release/minimmit-weight-counter --mode simd --iterations 2000000000",
+    "scalar": {
+      "running_samples": 5262,
+      "sample_span_ns": 5427999667,
+      "cycles": 19717509772,
+      "instructions": 152358449083,
+      "branches": 17553345486,
+      "branch_mispredictions": 123349571,
+      "l1d_load_misses": 14650649,
+      "l1d_store_misses": 1362708,
+      "instructions_per_cycle": 7.72706345,
+      "mispredictions_per_million_branches": 7027.126031,
+      "l1d_load_misses_per_million_instructions": 96.159085,
+      "l1d_store_misses_per_million_instructions": 8.944092
+    },
+    "simd": {
+      "running_samples": 2564,
+      "sample_span_ns": 2565000125,
+      "cycles": 9237635773,
+      "instructions": 61421358642,
+      "branches": 1981535169,
+      "branch_mispredictions": 29613,
+      "l1d_load_misses": 53240,
+      "l1d_store_misses": 20421,
+      "instructions_per_cycle": 6.649034466,
+      "mispredictions_per_million_branches": 14.944474,
+      "l1d_load_misses_per_million_instructions": 0.866799,
+      "l1d_store_misses_per_million_instructions": 0.332474
+    },
+    "observed_total_reduction_percent": {
+      "cycles": 53.150089,
+      "instructions": 59.68628,
+      "branches": 88.711353,
+      "branch_mispredictions": 99.975993,
+      "l1d_load_misses": 99.636603,
+      "l1d_store_misses": 98.50144
+    },
+    "raw_trace_retention": "the .trace bundles and exported XML were diagnostic /tmp outputs; this compact artifact preserves commands, exact options, sample counts, raw totals, and normalized rates"
+  },
+  "vector_instruction_evidence": {
+    "arm64_assembly": "target/release/deps/simd-fab89b661d2ce193.s",
+    "arm64_instructions": [
+      "cmeq.4s",
+      "uaddlp.2d",
+      "uadalp.2d",
+      "addp.2d"
+    ],
+    "x86_cross_compile_command": "RUSTC=\"$(rustup which --toolchain 1.92.0 rustc)\" RUSTDOC=\"$(rustup which --toolchain 1.92.0 rustdoc)\" rustup run 1.92.0 cargo rustc --release --target x86_64-unknown-linux-gnu -p simd --lib -- --emit=asm",
+    "x86_assembly": "target/x86_64-unknown-linux-gnu/release/deps/simd-1e4c09632ffa04b4.s",
+    "avx2_instructions": [
+      "vpbroadcastd ymm",
+      "vpcmpeqd ymm",
+      "vpmovzxdq ymm",
+      "vpaddq ymm"
+    ],
+    "avx512_instructions": [
+      "vmovdqu32 zmm {k1} {z}",
+      "vpmovzxdq zmm",
+      "vpaddq zmm"
+    ]
+  }
+}

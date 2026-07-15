@@ -1,0 +1,15 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dexos-sdk"
+version = "0.0.1"
+description = "Python client for the DexOS authenticated packed-order protocol"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+dependencies = ["cryptography>=43"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dexos_sdk"]

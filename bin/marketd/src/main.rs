@@ -597,20 +597,14 @@ mod tests {
 
     #[test]
     fn repeated_role_flags_accumulate() {
-        let cli = Cli::try_parse_from([
-            "marketd",
-            "run",
-            "--role",
-            "validator",
-            "--role",
-            "sequencer",
-        ])
-        .unwrap();
+        let cli =
+            Cli::try_parse_from(["marketd", "run", "--role", "gateway", "--role", "observer"])
+                .unwrap();
         let Command::Run(args) = cli.command else {
             panic!("expected run");
         };
         let cfg = resolve_config(&args).unwrap();
-        assert_eq!(cfg.node.roles, vec![Role::Validator, Role::Sequencer]);
+        assert_eq!(cfg.node.roles, vec![Role::Gateway, Role::Observer]);
     }
 
     #[test]
@@ -863,7 +857,10 @@ mod tests {
         {
             use std::io::Write;
             let mut f = std::fs::OpenOptions::new().append(true).open(&seg).unwrap();
-            f.write_all(&[0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
+            // Only a 1–3-byte partial next-length field is unambiguously torn.
+            // Four bytes would be a complete, unauthenticated length and must
+            // fail closed rather than risk deleting corrupted acknowledged data.
+            f.write_all(&[0xDE, 0xAD, 0xBE]).unwrap();
             f.sync_data().unwrap();
         }
         let before = std::fs::read(&seg).unwrap();

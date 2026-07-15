@@ -1,8 +1,7 @@
-//! Crate-private filesystem durability helpers shared by the durable WAL.
+//! Crate-private filesystem durability helpers shared by durable storage.
 
+use std::io;
 use std::path::Path;
-
-use crate::durable::DurableError;
 
 /// Fsync a directory so metadata mutations inside it (file creates, unlinks,
 /// renames) are durable across power loss.
@@ -11,10 +10,10 @@ use crate::durable::DurableError;
 /// durable but not its *directory entry*: a segment created and appended to
 /// can vanish wholesale after a crash unless the parent directory is itself
 /// fsynced. This helper is strict and fail-closed — any failure propagates as
-/// [`DurableError::Io`] instead of acknowledging a write whose dirent could
-/// still disappear.
+/// an I/O error instead of acknowledging a write whose dirent could still
+/// disappear.
 #[cfg(unix)]
-pub(crate) fn sync_dir(dir: &Path) -> Result<(), DurableError> {
+pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
     std::fs::File::open(dir)?.sync_all()?;
     Ok(())
 }
@@ -23,7 +22,7 @@ pub(crate) fn sync_dir(dir: &Path) -> Result<(), DurableError> {
 /// Windows has no directory-fd fsync), and the platform provides metadata
 /// durability through different mechanisms. Documented no-op.
 #[cfg(not(unix))]
-pub(crate) fn sync_dir(_dir: &Path) -> Result<(), DurableError> {
+pub(crate) fn sync_dir(_dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
@@ -47,9 +46,6 @@ mod tests {
             .unwrap_or(0);
         let missing = std::env::temp_dir().join(format!("dexos-fsutil-missing-{nanos}"));
         let err = sync_dir(&missing);
-        assert!(
-            matches!(err, Err(DurableError::Io(_))),
-            "expected Io error for missing dir, got {err:?}"
-        );
+        assert!(err.is_err(), "expected I/O error for missing dir");
     }
 }

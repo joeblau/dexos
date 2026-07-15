@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "description": "32 canonical cancel records, raw v1 envelope, Ed25519 seed 0x08*32",
+  "input": {
+    "seed_hex": "0808080808080808080808080808080808080808080808080808080808080808",
+    "destination_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+    "session_ref": 7,
+    "account": 9,
+    "market": 2,
+    "first_nonce": 1,
+    "first_client_id": 100,
+    "first_order_id": 1000,
+    "record_count": 32,
+    "batch_sequence": 4,
+    "first_sequence": 100,
+    "transport_sequence": 0
+  },
+  "expected": {
+    "public_key_hex": "1398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca",
+    "first_record_hex": "0102280007000000010000000000000064000000000000000900000002000000e803000000000000",
+    "packed_records_sha256": "425ff7d22e7d12674d05976d010f91e0392a70fbdf28b561aa3b62451bdd0869",
+    "raw_order_batch_sha256": "05d54460e9a0de183a58b35469d3b4c025ce13ae6aaca09c7fc3d8beafa9e833",
+    "authenticated_batch_sha256": "39d069acb30d579bad636cd0a7f1af4a30373ff8f73fe901e84a0a38d8907049",
+    "order_batch_frame_sha256": "88459e3fa7e789288523a2a76e6687ef37614e8c779bfa180bdfbe590e3cd869",
+    "executed_receipt_frame_hex": "05de010004020100000000000000003000000044584252010220201f0001000000000004000000000000006400000000000000000000000000000015cd5b0700000000"
+  }
+}

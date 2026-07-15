@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Local three-region demo: starts three full nodes (US / EU / Japan) and one
-# light node on distinct ports, shows their startup manifests, then shuts them
-# down cleanly on SIGINT/SIGTERM. Preserves the production process model (separate
-# marketd processes with region configs).
+# Local regional process-smoke demo: starts four independent composition
+# skeletons on distinct metrics ports, shows their startup manifests, then
+# shuts them down on SIGINT/SIGTERM. This does not exercise peer networking,
+# execution, consensus, durable recovery, or failover.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -27,6 +27,7 @@ for name in us eu tokyo light; do
 done
 
 PIDS=()
+NAMES=(us eu tokyo light)
 start() { # name config extra...
     echo "==> starting $1"
     RUST_LOG=info $BIN run --config "$RUN/$2.toml" "${@:3}" >"$RUN/$1.log" 2>&1 &
@@ -38,6 +39,13 @@ start tokyo tokyo
 start light light
 
 sleep 2
+for idx in "${!PIDS[@]}"; do
+  if ! kill -0 "${PIDS[$idx]}" 2>/dev/null; then
+    echo "error: ${NAMES[$idx]:-process-$idx} exited during startup" >&2
+    sed -n '1,160p' "$RUN/${NAMES[$idx]:-process-$idx}.log" >&2 || true
+    exit 1
+  fi
+done
 echo
 echo "==> startup manifests:"
 grep -h "dexos node" "$RUN"/*.log || true
@@ -47,6 +55,7 @@ curl -sS "http://127.0.0.1:9100/livez" || true
 echo
 curl -sS "http://127.0.0.1:9100/readyz" || true
 echo
-echo "Three full nodes (US/EU/Japan) + one light node are running."
+echo "Four independent regional process-smoke runtimes are running."
+echo "They are not a connected cluster and do not prove execution or consensus."
 echo "Press Ctrl-C to stop them (SIGTERM drain under performance.drain_timeout_ms)."
 wait
