@@ -139,6 +139,48 @@ fn o1_cancel_removes_only_target() {
 }
 
 #[test]
+fn resting_order_views_are_complete_sorted_and_root_neutral() {
+    let mut b = OrderBook::new(cfg());
+    b.place(limit(9, 2, Side::Ask, 110, 7)).unwrap();
+    b.place(limit(3, 1, Side::Bid, 100, 5)).unwrap();
+    let bytes = canonical_bytes(&b);
+    let root = b.transition_root_v3();
+
+    assert_eq!(
+        b.resting_order(OrderId::new(9)),
+        Some(crate::RestingOrder {
+            order_id: OrderId::new(9),
+            account: AccountId::new(2),
+            side: Side::Ask,
+            price: Price::from_raw(110),
+            remaining: Quantity::from_raw(7),
+        })
+    );
+    assert_eq!(b.resting_order(OrderId::new(99)), None);
+    assert_eq!(
+        b.resting_orders(),
+        vec![
+            crate::RestingOrder {
+                order_id: OrderId::new(3),
+                account: AccountId::new(1),
+                side: Side::Bid,
+                price: Price::from_raw(100),
+                remaining: Quantity::from_raw(5),
+            },
+            crate::RestingOrder {
+                order_id: OrderId::new(9),
+                account: AccountId::new(2),
+                side: Side::Ask,
+                price: Price::from_raw(110),
+                remaining: Quantity::from_raw(7),
+            },
+        ]
+    );
+    assert_eq!(canonical_bytes(&b), bytes);
+    assert_eq!(b.transition_root_v3(), root);
+}
+
+#[test]
 fn best_bid_ask_track_the_book() {
     let mut b = OrderBook::new(cfg());
     assert_eq!(b.best_bid(), None);
