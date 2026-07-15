@@ -108,16 +108,17 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    env:
-      PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13"
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
       - name: regenerate + diff-gate the .pyi (built WITHOUT extension-module)
         # stub_gen links libpython on the host; the wheel enables extension-module.
         run: |
-          cargo run -p dexos-sdk-py --bin stub_gen --locked
+          cargo run -p dexos-sdk-py --bin stub_gen --features stub-gen --locked
           git diff --exit-code bindings/py/python/dexos/_core.pyi
       - name: build the wheel + run pytest against it
         run: |

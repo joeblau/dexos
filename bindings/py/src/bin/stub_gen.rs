@@ -3,7 +3,7 @@
 //! libpython on the host and can execute:
 //!
 //! ```sh
-//! cargo run -p dexos-sdk-py --bin stub_gen --locked
+//! cargo run -p dexos-sdk-py --bin stub_gen --features stub-gen --locked
 //! git diff --exit-code bindings/py/python/dexos/_core.pyi
 //! ```
 //!
