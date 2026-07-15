@@ -31,15 +31,16 @@ use types::{Hash, OrderType, Side, TimeInForce};
 use crate::command::{Command, ExecutionReceipt, PlaceOrder, ReceiptKind, RequestWithdrawal};
 use crate::error::ExecutionError;
 
-// The standalone decoder is staged for the outer Engine checkpoint codec. Until
-// that caller lands, its crate-private API is exercised only by this module's
-// tests; keep ordinary non-test library builds warning-clean without widening it.
+// The standalone decoder remains staged for the future outer Engine restore
+// path. The encoder is now composed by EngineState v1, while decode-only items
+// remain exercised by this module's tests.
 #[allow(dead_code)]
 mod state;
 #[allow(dead_code)]
 mod state_codec;
 
-pub(crate) use state::{ReplayStateError, ReplayStateLimits};
+pub use state::ReplayStateError;
+pub(crate) use state::ReplayStateLimits;
 
 /// Canonical complete replay-guard transition-root schema.
 pub const REPLAY_TRANSITION_ROOT_SCHEMA_VERSION: u16 = 1;

@@ -33,7 +33,7 @@ impl Default for ReplayStateLimits {
 
 /// Typed failure from canonical ReplayGuard v1 state encoding or decoding.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub(crate) enum ReplayStateError {
+pub enum ReplayStateError {
     /// The complete input or output exceeds its independent byte limit.
     #[error("replay state is {actual} bytes, exceeding the {max}-byte limit")]
     EncodedBytesLimit {
