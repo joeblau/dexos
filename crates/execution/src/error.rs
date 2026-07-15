@@ -88,6 +88,31 @@ pub enum ExecutionError {
     /// Referenced market does not exist.
     #[error("unknown market")]
     UnknownMarket,
+    /// A dense stored-state column does not match its canonical row count.
+    #[error(
+        "stored state shape mismatch in {section}.{column}: expected {expected}, got {actual}"
+    )]
+    StateShape {
+        /// Logical state section.
+        section: &'static str,
+        /// Misaligned column.
+        column: &'static str,
+        /// Canonical row count.
+        expected: usize,
+        /// Observed row count.
+        actual: usize,
+    },
+    /// Stored execution state violates a relation required for deterministic
+    /// future transitions.
+    #[error("execution state invariant violated: {0}")]
+    StateInvariant(&'static str),
+    /// A native-width length or index cannot be represented by the canonical
+    /// fixed-width transition-state encoding.
+    #[error("execution state value {value} does not fit the canonical u64 encoding")]
+    StateEncodingOverflow {
+        /// Native-width value that could not be encoded.
+        value: usize,
+    },
     /// Market already exists at that id.
     #[error("market already exists")]
     MarketExists,

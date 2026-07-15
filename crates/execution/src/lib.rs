@@ -21,7 +21,7 @@ pub use command::{
 };
 pub use engine::{Engine, EngineConfig, WalletBinding};
 pub use error::ExecutionError;
-pub use ledger::Ledger;
+pub use ledger::{Ledger, LEDGER_TRANSITION_ROOT_SCHEMA_VERSION};
 pub use session::{SessionRegistry, SESSION_TRANSITION_ROOT_SCHEMA_VERSION};
 
 /// Crate identity, used by the node composition root for a startup manifest.
