@@ -38,6 +38,8 @@ pub const DOMAIN_EXECUTION_SESSION_STATE: &[u8] = b"dexos:execution:session-stat
 /// Canonical order-book transition state (price levels, FIFO priority, and
 /// future-behavior caches).
 pub const DOMAIN_ORDERBOOK_STATE: &[u8] = b"dexos:orderbook:state:v3";
+/// Canonical stored risk-engine transition state.
+pub const DOMAIN_RISK_STATE: &[u8] = b"dexos:risk:state:v1";
 /// Oracle observation / certificate body.
 pub const DOMAIN_ORACLE: &[u8] = b"dexos:oracle:v1";
 /// Canonical validator-set commitment.
@@ -81,6 +83,7 @@ pub const ALL_DOMAINS: &[&[u8]] = &[
     DOMAIN_EXECUTION,
     DOMAIN_EXECUTION_SESSION_STATE,
     DOMAIN_ORDERBOOK_STATE,
+    DOMAIN_RISK_STATE,
     DOMAIN_ORACLE,
     DOMAIN_VALIDATOR_SET,
     DOMAIN_DECISION,

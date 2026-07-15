@@ -63,6 +63,9 @@ pub use scenario::{
 /// Crate identity, used by the node composition root for a startup manifest.
 pub const CRATE_NAME: &str = "risk";
 
+/// Canonical stored-risk transition-root schema.
+pub const RISK_TRANSITION_ROOT_SCHEMA_VERSION: u16 = 1;
+
 #[cfg(test)]
 mod tests {
     #[test]

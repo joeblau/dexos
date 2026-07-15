@@ -21,13 +21,14 @@
 //!
 //! # Determinism
 //!
-//! All arithmetic is integer fixed-point and total. [`RiskEngine::state_root`]
-//! is an order-independent-free FNV-1a fingerprint over the SoA columns; a
-//! replayed command stream reproduces a bit-identical root.
+//! All arithmetic is integer fixed-point and total. [`RiskEngine::transition_root_v1`]
+//! is the cryptographic, versioned commitment to complete stored transition
+//! state. The legacy [`RiskEngine::state_root`] remains only as a compact
+//! diagnostic fingerprint.
 
 use std::collections::BTreeSet;
 
-use types::{AccountId, Amount, MarketId, PayoutVector, Price, Quantity};
+use types::{AccountId, Amount, Hash, MarketId, PayoutVector, Price, Quantity};
 
 use crate::config::{
     MarginMode, OrderPriority, RiskConfig, MAX_ACCOUNT_CAPACITY, MAX_MARKET_CAPACITY,
@@ -37,6 +38,51 @@ use crate::liquidation::{AdlFill, InsuranceFund, LiquidationOutcome, Liquidation
 use crate::math::{abs_amount, neg_amount, neg_i64};
 use crate::position::PerpPosition;
 use crate::scenario::PayoutPosition;
+use crate::RISK_TRANSITION_ROOT_SCHEMA_VERSION;
+
+/// Fixed-width writer for the risk component's versioned stored-state
+/// commitment. Native-width integers and serde enum ordinals are deliberately
+/// excluded from the consensus-facing preimage.
+#[derive(Default)]
+struct CommitmentWriter {
+    bytes: Vec<u8>,
+}
+
+impl CommitmentWriter {
+    fn u8(&mut self, value: u8) {
+        self.bytes.push(value);
+    }
+
+    fn bool(&mut self, value: bool) {
+        self.u8(u8::from(value));
+    }
+
+    fn u16(&mut self, value: u16) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn u32(&mut self, value: u32) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn u64(&mut self, value: u64) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn i64(&mut self, value: i64) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn i128(&mut self, value: i128) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn usize(&mut self, value: usize) -> Result<(), RiskError> {
+        let value = u64::try_from(value).map_err(|_| RiskError::StateEncodingOverflow { value })?;
+        self.u64(value);
+        Ok(())
+    }
+}
 
 /// Fixed-point risk & margin engine for scalar perp and payout-vector exposure.
 #[derive(Debug, Clone)]
@@ -1067,8 +1113,156 @@ impl RiskEngine {
         self.used.iter().filter(|&&u| u).count()
     }
 
-    /// Deterministic order-sensitive fingerprint of all cached risk state.
-    /// Replaying an identical command stream yields an identical root.
+    /// Cryptographic commitment to every stored value that can influence a
+    /// future risk-engine transition.
+    ///
+    /// Schema v1 records primary state, transition-read caches, reverse indexes,
+    /// and both representations of the liquidation queue. Those apparently
+    /// derived values remain committed until a separate fail-closed validator
+    /// makes rebuilding them an enforced production invariant. Stored position
+    /// and queue order are preserved because checked arithmetic and FIFO
+    /// selection can depend on that order. Dense slot counts and unused gaps are
+    /// intentionally part of v1's exact-storage semantics: allocating an empty
+    /// slot changes the root even when semantic balances and positions do not.
+    ///
+    /// Returns a typed error if malformed in-memory column shapes or a value
+    /// outside the fixed-width encoding prevent a complete commitment.
+    pub fn transition_root_v1(&self) -> Result<Hash, RiskError> {
+        let mut writer = CommitmentWriter::default();
+        writer.u16(RISK_TRANSITION_ROOT_SCHEMA_VERSION);
+
+        writer.i64(self.config.initial_margin.raw());
+        writer.i64(self.config.maintenance_margin.raw());
+        writer.i64(self.config.max_leverage.raw());
+        writer.usize(self.config.max_accounts)?;
+        writer.usize(self.config.max_markets)?;
+        writer.usize(self.max_accounts)?;
+        writer.usize(self.max_markets)?;
+
+        let account_slots = self.used.len();
+        for (name, len) in [
+            ("open", self.open.len()),
+            ("margin_mode", self.margin_mode.len()),
+            ("collateral", self.collateral.len()),
+            ("perp", self.perp.len()),
+            ("payout", self.payout.len()),
+            ("cached_equity", self.cached_equity.len()),
+            ("cached_exposure", self.cached_exposure.len()),
+            ("cached_scenario", self.cached_scenario.len()),
+            ("cached_im", self.cached_im.len()),
+            ("cached_mm", self.cached_mm.len()),
+            ("reserved_resting", self.reserved_resting.len()),
+        ] {
+            if len != account_slots {
+                return Err(RiskError::StateShape {
+                    section: "account",
+                    column: name,
+                    expected: account_slots,
+                    actual: len,
+                });
+            }
+        }
+        writer.usize(account_slots)?;
+        for i in 0..account_slots {
+            writer.usize(i)?;
+            writer.bool(self.used[i]);
+            writer.bool(self.open[i]);
+            writer.u8(Self::margin_mode_tag(self.margin_mode[i]));
+            writer.i128(self.collateral[i].raw());
+
+            writer.usize(self.perp[i].len())?;
+            for position in &self.perp[i] {
+                writer.u32(position.market.get());
+                writer.i64(position.net_qty.raw());
+                writer.i64(position.avg_entry.raw());
+            }
+
+            writer.usize(self.payout[i].len())?;
+            for position in &self.payout[i] {
+                writer.usize(position.payout.values().len())?;
+                for value in position.payout.values() {
+                    writer.i128(value.raw());
+                }
+                writer.i64(position.signed_qty.raw());
+            }
+
+            writer.i128(self.cached_equity[i].raw());
+            writer.i128(self.cached_exposure[i].raw());
+            writer.i128(self.cached_scenario[i].raw());
+            writer.i128(self.cached_im[i].raw());
+            writer.i128(self.cached_mm[i].raw());
+            writer.i128(self.reserved_resting[i].raw());
+        }
+
+        let market_slots = self.marks.len();
+        for (name, len) in [
+            ("risk_group", self.risk_group.len()),
+            ("market_limit", self.market_limit.len()),
+            ("market_holders", self.market_holders.len()),
+        ] {
+            if len != market_slots {
+                return Err(RiskError::StateShape {
+                    section: "market",
+                    column: name,
+                    expected: market_slots,
+                    actual: len,
+                });
+            }
+        }
+        writer.usize(market_slots)?;
+        for i in 0..market_slots {
+            writer.usize(i)?;
+            if let Some(mark) = self.marks[i] {
+                writer.u8(1);
+                writer.i64(mark.raw());
+            } else {
+                writer.u8(0);
+            }
+            if let Some(group) = self.risk_group[i] {
+                writer.u8(1);
+                writer.u32(group);
+            } else {
+                writer.u8(0);
+            }
+            if let Some(limit) = self.market_limit[i] {
+                writer.u8(1);
+                writer.i128(limit.raw());
+            } else {
+                writer.u8(0);
+            }
+            writer.usize(self.market_holders[i].len())?;
+            for holder in &self.market_holders[i] {
+                writer.usize(*holder)?;
+            }
+        }
+
+        if let Some(limit) = self.portfolio_limit {
+            writer.u8(1);
+            writer.i128(limit.raw());
+        } else {
+            writer.u8(0);
+        }
+        writer.i128(self.insurance.balance().raw());
+
+        writer.usize(self.liq_queue.len())?;
+        self.liq_queue
+            .for_each_fifo(|account| writer.u32(account.get()));
+        let present = self.liq_queue.present_accounts_sorted();
+        writer.usize(present.len())?;
+        for account in present {
+            writer.u32(account.get());
+        }
+
+        writer.i128(self.socialized_total.raw());
+        Ok(crypto::hash_domain(
+            crypto::DOMAIN_RISK_STATE,
+            &writer.bytes,
+        ))
+    }
+
+    /// Legacy 64-bit diagnostic fingerprint over a subset of cached risk state.
+    /// This is not a cryptographic or complete state-machine commitment; use
+    /// [`Self::transition_root_v1`] for a versioned stored-state commitment.
     pub fn state_root(&self) -> u64 {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         for i in 0..self.used.len() {
@@ -1082,6 +1276,13 @@ impl RiskEngine {
         fnv(&mut h, self.insurance_fund().raw());
         fnv(&mut h, self.socialized_total.raw());
         h
+    }
+
+    const fn margin_mode_tag(mode: MarginMode) -> u8 {
+        match mode {
+            MarginMode::Isolated => 0,
+            MarginMode::Cross => 1,
+        }
     }
 
     // --------------------------------------------------------------- internals
@@ -1718,6 +1919,249 @@ mod tests {
         let a = build_engine_from_seed(0x5151_5151);
         let b = build_engine_from_seed(0x5151_5151);
         assert_eq!(a.state_root(), b.state_root());
+        assert_eq!(
+            a.transition_root_v1().unwrap(),
+            b.transition_root_v1().unwrap()
+        );
+    }
+
+    fn commitment_fixture() -> RiskEngine {
+        let config = cfg().with_capacities(64, 32).unwrap();
+        let mut engine = RiskEngine::new(config);
+        engine.open_account(acct(1), amt(10_000)).unwrap();
+        engine.open_account(acct(2), amt(5_000)).unwrap();
+        engine.set_mark_price(mkt(1), price(100)).unwrap();
+        engine.set_mark_price(mkt(2), price(50)).unwrap();
+        engine.set_risk_group(mkt(1), 7).unwrap();
+        engine.set_risk_group(mkt(2), 7).unwrap();
+        engine.set_market_limit(mkt(1), amt(1_000_000)).unwrap();
+        engine.set_margin_mode(acct(1), MarginMode::Cross).unwrap();
+        engine
+            .apply_fill(acct(1), mkt(1), qty(2), price(90))
+            .unwrap();
+        engine
+            .apply_fill(acct(1), mkt(2), qty(-3), price(55))
+            .unwrap();
+        engine
+            .apply_fill(acct(2), mkt(1), qty(-1), price(110))
+            .unwrap();
+        engine
+            .open_payout_position(acct(1), pv(&[A, 0, A / 2]), qty(-1))
+            .unwrap();
+        engine
+            .open_payout_position(acct(1), pv(&[0, A]), qty(2))
+            .unwrap();
+        engine.reserve_resting(acct(1), amt(100)).unwrap();
+        engine.set_portfolio_limit(amt(2_000_000)).unwrap();
+        engine.fund_insurance(amt(123)).unwrap();
+        engine.liq_queue.enqueue(acct(2));
+        engine.liq_queue.enqueue(acct(1));
+        engine.socialized_total = Amount::from_raw(i128::from(i64::MAX) + 9);
+        engine
+    }
+
+    fn assert_commitment_changes(base: &RiskEngine, mutate: impl FnOnce(&mut RiskEngine)) {
+        let mut changed = base.clone();
+        mutate(&mut changed);
+        assert_ne!(
+            changed.transition_root_v1().unwrap(),
+            base.transition_root_v1().unwrap()
+        );
+    }
+
+    #[test]
+    fn transition_root_v1_golden_vectors() {
+        assert_eq!(
+            engine().transition_root_v1().unwrap(),
+            Hash::from_bytes([
+                206, 182, 185, 69, 246, 18, 13, 187, 14, 244, 34, 216, 7, 38, 243, 199, 77, 224,
+                16, 151, 14, 219, 145, 183, 124, 48, 127, 128, 129, 213, 125, 249,
+            ])
+        );
+        assert_eq!(
+            commitment_fixture().transition_root_v1().unwrap(),
+            Hash::from_bytes([
+                248, 195, 228, 43, 165, 224, 254, 112, 104, 211, 143, 98, 117, 193, 227, 125, 116,
+                62, 146, 165, 122, 207, 115, 149, 49, 39, 123, 88, 19, 107, 159, 248,
+            ])
+        );
+    }
+
+    #[test]
+    fn transition_root_v1_binds_config_accounts_positions_and_caches() {
+        let base = commitment_fixture();
+        assert_commitment_changes(&base, |engine| {
+            engine.config.initial_margin = Ratio::from_raw(100_001);
+        });
+        assert_commitment_changes(&base, |engine| {
+            engine.config.maintenance_margin = Ratio::from_raw(50_001);
+        });
+        assert_commitment_changes(&base, |engine| {
+            engine.config.max_leverage = Ratio::from_raw(20_000_001);
+        });
+        assert_commitment_changes(&base, |engine| engine.config.max_accounts += 1);
+        assert_commitment_changes(&base, |engine| engine.config.max_markets += 1);
+        assert_commitment_changes(&base, |engine| engine.max_accounts += 1);
+        assert_commitment_changes(&base, |engine| engine.max_markets += 1);
+
+        assert_commitment_changes(&base, |engine| engine.used[1] = false);
+        assert_commitment_changes(&base, |engine| engine.open[1] = false);
+        assert_commitment_changes(&base, |engine| {
+            engine.margin_mode[1] = MarginMode::Isolated;
+        });
+        assert_commitment_changes(&base, |engine| {
+            engine.collateral[1] = engine.collateral[1]
+                .checked_add(Amount::from_raw(1))
+                .unwrap();
+        });
+        assert_commitment_changes(&base, |engine| {
+            engine.perp[1][0].market = mkt(3);
+        });
+        assert_commitment_changes(&base, |engine| {
+            engine.perp[1][0].net_qty = Quantity::from_raw(engine.perp[1][0].net_qty.raw() + 1);
+        });
+        assert_commitment_changes(&base, |engine| {
+            engine.perp[1][0].avg_entry = Price::from_raw(engine.perp[1][0].avg_entry.raw() + 1);
+        });
+        assert_commitment_changes(&base, |engine| {
+            engine.payout[1][0] = PayoutPosition::new(pv(&[A - 1, 1, A / 2]), qty(-1));
+        });
+        assert_commitment_changes(&base, |engine| {
+            engine.payout[1][0].signed_qty = qty(-2);
+        });
+        assert_commitment_changes(&base, |engine| {
+            engine.cached_equity[1] = Amount::from_raw(engine.cached_equity[1].raw() + 1);
+        });
+        assert_commitment_changes(&base, |engine| {
+            engine.cached_exposure[1] = Amount::from_raw(engine.cached_exposure[1].raw() + 1);
+        });
+        assert_commitment_changes(&base, |engine| {
+            engine.cached_scenario[1] = Amount::from_raw(engine.cached_scenario[1].raw() + 1);
+        });
+        assert_commitment_changes(&base, |engine| {
+            engine.cached_im[1] = Amount::from_raw(engine.cached_im[1].raw() + 1);
+        });
+        assert_commitment_changes(&base, |engine| {
+            engine.cached_mm[1] = Amount::from_raw(engine.cached_mm[1].raw() + 1);
+        });
+        assert_commitment_changes(&base, |engine| {
+            engine.reserved_resting[1] = Amount::from_raw(engine.reserved_resting[1].raw() + 1);
+        });
+    }
+
+    #[test]
+    fn transition_root_v1_binds_markets_indexes_and_globals() {
+        let base = commitment_fixture();
+        assert_commitment_changes(&base, |engine| {
+            engine.marks[1] = Some(Price::from_raw(engine.marks[1].unwrap().raw() + 1));
+        });
+        assert_commitment_changes(&base, |engine| engine.risk_group[1] = Some(8));
+        assert_commitment_changes(&base, |engine| {
+            engine.market_limit[1] = Some(amt(999_999));
+        });
+        assert_commitment_changes(&base, |engine| {
+            engine.market_holders[1].remove(&1);
+        });
+        assert_commitment_changes(&base, |engine| {
+            engine.portfolio_limit = Some(amt(1_999_999));
+        });
+        assert_commitment_changes(&base, |engine| {
+            engine.fund_insurance(Amount::from_raw(1)).unwrap();
+        });
+        assert_commitment_changes(&base, |engine| {
+            let first = engine.next_liquidation().unwrap();
+            let second = engine.next_liquidation().unwrap();
+            engine.liq_queue.enqueue(second);
+            engine.liq_queue.enqueue(first);
+        });
+        assert_commitment_changes(&base, |engine| {
+            assert!(engine.liq_queue.remove_membership_for_test(acct(1)));
+        });
+        assert_commitment_changes(&base, |engine| {
+            engine.socialized_total = Amount::from_raw(engine.socialized_total.raw() + 1);
+        });
+    }
+
+    #[test]
+    fn transition_root_v1_preserves_behavioral_order_and_canonicalizes_sets() {
+        let base = commitment_fixture();
+        assert_commitment_changes(&base, |engine| engine.perp[1].reverse());
+        assert_commitment_changes(&base, |engine| engine.payout[1].reverse());
+
+        let mut rebuilt_sets = base.clone();
+        for holders in &mut rebuilt_sets.market_holders {
+            let descending: Vec<usize> = holders.iter().rev().copied().collect();
+            holders.clear();
+            for holder in descending {
+                holders.insert(holder);
+            }
+        }
+        assert_eq!(
+            rebuilt_sets.transition_root_v1().unwrap(),
+            base.transition_root_v1().unwrap()
+        );
+
+        let independently_built = commitment_fixture();
+        assert_eq!(
+            independently_built.transition_root_v1().unwrap(),
+            base.transition_root_v1().unwrap()
+        );
+    }
+
+    #[test]
+    fn transition_root_v1_matches_recompute_and_clone() {
+        let mut engine = commitment_fixture();
+        let before = engine.transition_root_v1().unwrap();
+        assert_eq!(engine.clone().transition_root_v1().unwrap(), before);
+        engine.recompute_all().unwrap();
+        assert_eq!(engine.transition_root_v1().unwrap(), before);
+    }
+
+    #[test]
+    fn transition_root_v1_rejects_misaligned_account_columns() {
+        let mut engine = commitment_fixture();
+        let expected = engine.used.len();
+        engine.open.pop();
+        assert_eq!(
+            engine.transition_root_v1(),
+            Err(RiskError::StateShape {
+                section: "account",
+                column: "open",
+                expected,
+                actual: expected - 1,
+            })
+        );
+    }
+
+    #[test]
+    fn transition_root_v1_rejects_misaligned_market_columns() {
+        let mut engine = commitment_fixture();
+        let expected = engine.marks.len();
+        engine.risk_group.pop();
+        assert_eq!(
+            engine.transition_root_v1(),
+            Err(RiskError::StateShape {
+                section: "market",
+                column: "risk_group",
+                expected,
+                actual: expected - 1,
+            })
+        );
+    }
+
+    #[test]
+    fn transition_root_v1_commits_dense_empty_market_slots() {
+        let mut engine = engine();
+        engine.open_account(acct(1), amt(100)).unwrap();
+        let before = engine.transition_root_v1().unwrap();
+
+        engine
+            .apply_fill(acct(1), mkt(7), Quantity::ZERO, price(1))
+            .unwrap();
+
+        assert!(engine.perp[1].is_empty());
+        assert_eq!(engine.marks.len(), 8);
+        assert_ne!(engine.transition_root_v1().unwrap(), before);
     }
 
     // Atomicity: a fill that mutates the position and then overflows while settling
