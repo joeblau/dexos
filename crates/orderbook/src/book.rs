@@ -13,8 +13,45 @@ use crate::order::{
     BookConfig, Fill, MatchPlan, MatchResult, MatchSummary, NewOrder, Node, OrderOutcome,
     PlannedFill, StpPolicy,
 };
-use crate::slab::Slab;
-use crate::{BOOK_ROOT_HOT_PATH_HASH_BUDGET_BYTES, BOOK_ROOT_SCHEMA_VERSION};
+use crate::slab::{Slab, NIL};
+use crate::{
+    BOOK_ROOT_HOT_PATH_HASH_BUDGET_BYTES, BOOK_ROOT_SCHEMA_VERSION,
+    BOOK_TRANSITION_ROOT_SCHEMA_VERSION,
+};
+
+/// Minimal fixed-width writer for the book's consensus-facing transition
+/// commitment. It deliberately does not use serde enum ordinals or `usize`
+/// widths, so the preimage is stable across releases and architectures.
+#[derive(Default)]
+struct TransitionWriter {
+    bytes: Vec<u8>,
+}
+
+impl TransitionWriter {
+    fn u8(&mut self, value: u8) {
+        self.bytes.push(value);
+    }
+
+    fn u16(&mut self, value: u16) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn u32(&mut self, value: u32) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn u64(&mut self, value: u64) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn i64(&mut self, value: i64) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn len(&mut self, value: usize) {
+        self.u64(u64::try_from(value).expect("usize must fit u64 on supported targets"));
+    }
+}
 
 /// Fixed-stack aggregation state for the independent arithmetic portion of an
 /// ordered match scan. Traversal and STP decisions feed this in exact FIFO
@@ -121,8 +158,8 @@ struct Locator {
 ///
 /// Matching is strict price-time priority: the best price matches first and,
 /// within a price, the oldest resting order matches first (FIFO). Given an
-/// identical stream of commands the book reaches an identical state, verifiable
-/// via [`OrderBook::state_root`].
+/// identical stream of commands the book reaches an identical state, committed
+/// via [`OrderBook::transition_root_v3`].
 ///
 /// [`Clone`] yields a bit-identical, independent book. Baskets use it to
 /// snapshot before speculatively applying legs so a mid-basket failure can be
@@ -418,7 +455,7 @@ impl OrderBook {
         Ok(out)
     }
 
-    /// Incremental authenticated commitment over all resting orders.
+    /// Incremental unordered diagnostic over all resting orders.
     ///
     /// Schema v2: each resting order contributes a domain-separated leaf over
     /// `(order_id, account, side, price, remaining, client_id)`. The book
@@ -429,13 +466,17 @@ impl OrderBook {
     ///
     /// Bit-identical to [`Self::state_root_full_rebuild`] for every reachable
     /// state; the full rebuild is retained as a differential oracle in tests.
+    /// This v2 XOR aggregate deliberately stays available for the documented
+    /// hot-path budget, but it does not bind FIFO priority and is not an
+    /// authoritative state-machine commitment. Use [`Self::transition_root_v3`]
+    /// anywhere a root may be certified or persisted as state.
     #[must_use]
     pub fn state_root(&self) -> Hash {
         Self::finalize_root(&self.order_leaf_xor)
     }
 
-    /// Canonical full rebuild of the book root from every resting order.
-    /// Differential oracle for the incremental path — not used on the hot path.
+    /// Full rebuild of the unordered v2 diagnostic root from every resting
+    /// order. Differential oracle for the incremental path — not authoritative.
     #[must_use]
     pub fn state_root_full_rebuild(&self) -> Hash {
         let mut acc = [0u8; 32];
@@ -446,6 +487,67 @@ impl OrderBook {
             Self::xor_in(&mut acc, Self::order_leaf(n));
         });
         Self::finalize_root(&acc)
+    }
+
+    /// Canonical commitment to every stored value that can change a future
+    /// [`OrderBook`] result: logical configuration, price levels, exact FIFO
+    /// priority, externally supplied reduce-only positions, and the dedup
+    /// cache's eviction-ordered results.
+    ///
+    /// Schema v3 is correctness-first and performs a full ordered scan. It is
+    /// intentionally separate from the O(1) v2 diagnostic until an incremental
+    /// authenticated ordered structure can reproduce these bytes without
+    /// weakening the transition commitment.
+    #[must_use]
+    pub fn transition_root_v3(&self) -> Hash {
+        let mut writer = TransitionWriter::default();
+        writer.u16(BOOK_TRANSITION_ROOT_SCHEMA_VERSION);
+        writer.len(self.config.capacity);
+        writer.u8(Self::stp_tag(self.config.stp));
+        writer.len(self.config.dedup_capacity);
+        writer.len(self.config.max_basket_legs);
+
+        let bid_orders = self.write_transition_side(&mut writer, &self.bids, Side::Bid);
+        let ask_orders = self.write_transition_side(&mut writer, &self.asks, Side::Ask);
+        assert_eq!(
+            bid_orders
+                .checked_add(ask_orders)
+                .expect("live order count must not overflow"),
+            self.slab.len(),
+            "every live slab node must be reachable from exactly one price level"
+        );
+        assert_eq!(
+            self.id_index.len(),
+            self.slab.len(),
+            "order-id index must cover every live slab node"
+        );
+        assert_eq!(
+            self.account_orders.values().map(Vec::len).sum::<usize>(),
+            self.slab.len(),
+            "account-order index must cover every live slab node"
+        );
+
+        let mut positions: Vec<(u32, i64)> = self
+            .positions
+            .iter()
+            .map(|(account, quantity)| (account.get(), quantity.raw()))
+            .collect();
+        positions.sort_unstable();
+        writer.len(positions.len());
+        for (account, quantity) in positions {
+            writer.u32(account);
+            writer.i64(quantity);
+        }
+
+        writer.len(self.dedup.record_count());
+        self.dedup
+            .for_each_in_eviction_order(|account, client_id, result| {
+                writer.u32(account);
+                writer.u64(client_id);
+                Self::write_match_result(&mut writer, result);
+            });
+
+        crypto::hash_domain(crypto::DOMAIN_ORDERBOOK_STATE, &writer.bytes)
     }
 
     /// Deterministic dry-run of matching `order` against current depth.
@@ -661,6 +763,117 @@ impl OrderBook {
     }
 
     // ----- internals -------------------------------------------------------
+
+    fn write_transition_side(
+        &self,
+        writer: &mut TransitionWriter,
+        side: &SideBook,
+        expected_side: Side,
+    ) -> usize {
+        let mut visited = 0usize;
+        writer.len(side.level_count());
+        side.for_each_canonical_level(|price, head, tail, count, total_qty| {
+            writer.i64(price.raw());
+            writer.u64(u64::from(count));
+            let mut current = head;
+            let mut previous = NIL;
+            let mut last = NIL;
+            let mut computed_qty = Quantity::ZERO;
+            for _ in 0..count {
+                let node = self
+                    .slab
+                    .get(current)
+                    .expect("price-level FIFO must reference a live slab node");
+                assert_eq!(node.side, expected_side, "node stored on wrong side");
+                assert_eq!(node.price, price, "node stored at wrong price level");
+                assert_eq!(
+                    node.prev, previous,
+                    "price-level FIFO backward link mismatch"
+                );
+                let locator = self
+                    .id_index
+                    .get(&node.order_id)
+                    .expect("live node must have an order-id locator");
+                assert_eq!(
+                    locator.slot, current,
+                    "order-id locator points to wrong slot"
+                );
+                assert_eq!(locator.side, node.side, "order-id locator side mismatch");
+                assert_eq!(
+                    locator.account, node.account,
+                    "order-id locator account mismatch"
+                );
+                assert!(
+                    self.account_orders
+                        .get(&node.account)
+                        .is_some_and(|orders| orders.binary_search(&node.order_id).is_ok()),
+                    "live node must appear in its account-order index"
+                );
+                writer.u64(node.order_id.get());
+                writer.u32(node.account.get());
+                writer.u8(Self::side_tag(node.side));
+                writer.i64(node.price.raw());
+                writer.i64(node.remaining.raw());
+                writer.u64(node.client_id);
+                computed_qty = computed_qty
+                    .checked_add(node.remaining)
+                    .expect("price-level total quantity must not overflow");
+                previous = current;
+                last = current;
+                current = node.next;
+                visited = visited
+                    .checked_add(1)
+                    .expect("live order count must not overflow");
+            }
+            assert_eq!(
+                current, NIL,
+                "price-level count must equal its live FIFO length"
+            );
+            assert_eq!(last, tail, "price-level tail must be the final FIFO node");
+            assert_eq!(
+                computed_qty, total_qty,
+                "price-level aggregate must equal its live order quantities"
+            );
+        });
+        visited
+    }
+
+    fn write_match_result(writer: &mut TransitionWriter, result: &MatchResult) {
+        writer.len(result.fills.len());
+        for fill in &result.fills {
+            writer.u64(fill.maker_order.get());
+            writer.u64(fill.taker_order.get());
+            writer.u32(fill.maker_account.get());
+            writer.u32(fill.taker_account.get());
+            writer.i64(fill.price.raw());
+            writer.i64(fill.quantity.raw());
+            writer.u8(Self::side_tag(fill.taker_side));
+        }
+        let (tag, quantity) = match result.outcome {
+            OrderOutcome::Resting { remaining } => (0, remaining.raw()),
+            OrderOutcome::FullyFilled => (1, 0),
+            OrderOutcome::PartiallyFilledResting { remaining } => (2, remaining.raw()),
+            OrderOutcome::PartiallyFilledCancelled { filled } => (3, filled.raw()),
+            OrderOutcome::Rejected => (4, 0),
+        };
+        writer.u8(tag);
+        writer.i64(quantity);
+    }
+
+    const fn side_tag(side: Side) -> u8 {
+        match side {
+            Side::Bid => 0,
+            Side::Ask => 1,
+        }
+    }
+
+    const fn stp_tag(policy: StpPolicy) -> u8 {
+        match policy {
+            StpPolicy::CancelMaker => 0,
+            StpPolicy::CancelTaker => 1,
+            StpPolicy::CancelBoth => 2,
+        }
+    }
 
     fn order_leaf(n: &Node) -> Hash {
         let mut buf = [0u8; 48];
@@ -941,7 +1154,8 @@ impl OrderBook {
                 if new_rem.raw() == 0 {
                     self.remove_resting(maker_side, head);
                 } else {
-                    // Partial fill: update authenticated leaf for the new remaining.
+                    // Partial fill: update the cached v2 diagnostic leaf for the
+                    // new remaining. The v3 transition root scans stored state.
                     self.auth_update_remaining(head, new_rem);
                     let book = match maker_side {
                         Side::Bid => &mut self.bids,

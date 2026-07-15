@@ -7,8 +7,7 @@
 //! two identical command streams evict identically and therefore stay
 //! bit-identical across replays.
 
-use std::collections::HashMap;
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use types::AccountId;
 
@@ -97,6 +96,34 @@ impl DedupCache {
         self.map.insert(key, result);
     }
 
+    /// Number of records retained in the authoritative FIFO window.
+    pub(crate) fn record_count(&self) -> usize {
+        assert_eq!(
+            self.order.len(),
+            self.map.len(),
+            "dedup FIFO and result map must contain the same keys"
+        );
+        self.order.len()
+    }
+
+    /// Visit records in eviction order (oldest first). The queue and map are
+    /// updated atomically by [`Self::insert`], so a queued key always has a
+    /// corresponding result.
+    pub(crate) fn for_each_in_eviction_order<F: FnMut(u32, u64, &MatchResult)>(&self, mut f: F) {
+        let mut seen = HashSet::with_capacity(self.order.len());
+        for key in &self.order {
+            assert!(
+                seen.insert(*key),
+                "dedup FIFO must not contain duplicate keys"
+            );
+            let result = self
+                .map
+                .get(key)
+                .expect("dedup FIFO key must have a cached result");
+            f(key.account, key.client_id, result);
+        }
+    }
+
     /// Number of live cached keys.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
@@ -161,5 +188,18 @@ mod tests {
         let a = AccountId::new(1);
         c.insert(a, 1, result(1));
         assert!(c.get(a, 1).is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "dedup FIFO must not contain duplicate keys")]
+    fn canonical_iteration_rejects_duplicate_fifo_keys() {
+        let mut c = DedupCache::with_capacity(2);
+        let a = AccountId::new(1);
+        c.insert(a, 1, result(1));
+        c.insert(a, 2, result(2));
+        c.order[1] = c.order[0];
+
+        assert_eq!(c.record_count(), 2);
+        c.for_each_in_eviction_order(|_, _, _| {});
     }
 }

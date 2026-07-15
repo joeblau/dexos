@@ -780,7 +780,8 @@ fn incremental_root_matches_full_rebuild_after_every_op() {
 
 #[test]
 fn book_root_schema_golden_vector() {
-    // Locks schema v2: empty book and a single resting bid.
+    // Locks the fast unordered diagnostic schema v2: empty book and a single
+    // resting bid. Authoritative callers use transition_root_v3 instead.
     let mut b = OrderBook::new(cfg());
     let empty = b.state_root();
     assert_eq!(empty, b.state_root_full_rebuild());
@@ -795,6 +796,150 @@ fn book_root_schema_golden_vector() {
     b.cancel(OrderId::new(1)).unwrap();
     assert_eq!(b.state_root(), empty);
     assert_eq!(OrderBook::hot_path_hash_budget_bytes(), 48 + 33);
+}
+
+#[test]
+fn transition_root_v3_binds_fifo_and_next_fill() {
+    let first = limit(1, 1, Side::Ask, 100, 5);
+    let second = limit(2, 2, Side::Ask, 100, 5);
+    let mut a = OrderBook::new(cfg());
+    let mut b = OrderBook::new(cfg());
+    a.place(first).unwrap();
+    a.place(second).unwrap();
+    b.place(second).unwrap();
+    b.place(first).unwrap();
+
+    assert_eq!(
+        a.state_root(),
+        b.state_root(),
+        "v2 demonstrates the unordered-multiset defect"
+    );
+    assert_ne!(a.transition_root_v3(), b.transition_root_v3());
+
+    let taker = limit(3, 3, Side::Bid, 100, 1);
+    let a_fill = a.place(taker).unwrap();
+    let b_fill = b.place(taker).unwrap();
+    assert_eq!(a_fill.fills[0].maker_order, OrderId::new(1));
+    assert_eq!(b_fill.fills[0].maker_order, OrderId::new(2));
+}
+
+#[test]
+#[should_panic(expected = "price-level FIFO backward link mismatch")]
+fn transition_root_v3_rejects_corrupt_fifo_backward_link() {
+    let mut book = OrderBook::new(cfg());
+    book.place(limit(1, 1, Side::Ask, 100, 5)).unwrap();
+    book.place(limit(2, 2, Side::Ask, 100, 5)).unwrap();
+    let second_slot = book.id_index.get(&OrderId::new(2)).unwrap().slot;
+    book.slab.get_mut(second_slot).unwrap().prev = crate::slab::NIL;
+
+    let _ = book.transition_root_v3();
+}
+
+#[test]
+fn transition_root_v3_binds_logical_config_and_positions() {
+    let base = OrderBook::new(cfg());
+    let root = base.transition_root_v3();
+
+    for changed in [
+        BookConfig {
+            capacity: cfg().capacity + 1,
+            ..cfg()
+        },
+        BookConfig {
+            stp: StpPolicy::CancelTaker,
+            ..cfg()
+        },
+        BookConfig {
+            dedup_capacity: cfg().dedup_capacity + 1,
+            ..cfg()
+        },
+        BookConfig {
+            max_basket_legs: cfg().max_basket_legs + 1,
+            ..cfg()
+        },
+    ] {
+        assert_ne!(OrderBook::new(changed).transition_root_v3(), root);
+    }
+
+    let mut with_position = base.clone();
+    with_position.set_position(AccountId::new(7), Quantity::from_raw(-9));
+    assert_ne!(with_position.transition_root_v3(), root);
+}
+
+#[test]
+fn transition_root_v3_is_hashmap_order_independent_but_dedup_fifo_sensitive() {
+    let mut positions_ab = OrderBook::new(cfg());
+    positions_ab.set_position(AccountId::new(1), Quantity::from_raw(10));
+    positions_ab.set_position(AccountId::new(2), Quantity::from_raw(-20));
+    let mut positions_ba = OrderBook::new(cfg());
+    positions_ba.set_position(AccountId::new(2), Quantity::from_raw(-20));
+    positions_ba.set_position(AccountId::new(1), Quantity::from_raw(10));
+    assert_eq!(
+        positions_ab.transition_root_v3(),
+        positions_ba.transition_root_v3()
+    );
+
+    let rejected_a = order(
+        11,
+        1,
+        Side::Bid,
+        OrderType::Market,
+        TimeInForce::Ioc,
+        100,
+        1,
+        101,
+    );
+    let rejected_b = order(
+        12,
+        2,
+        Side::Bid,
+        OrderType::Market,
+        TimeInForce::Ioc,
+        100,
+        1,
+        102,
+    );
+    let mut dedup_ab = OrderBook::new(cfg());
+    dedup_ab.submit(rejected_a).unwrap();
+    dedup_ab.submit(rejected_b).unwrap();
+    let mut dedup_ba = OrderBook::new(cfg());
+    dedup_ba.submit(rejected_b).unwrap();
+    dedup_ba.submit(rejected_a).unwrap();
+    assert_eq!(dedup_ab.state_root(), dedup_ba.state_root());
+    assert_ne!(
+        dedup_ab.transition_root_v3(),
+        dedup_ba.transition_root_v3(),
+        "FIFO order controls which idempotency record is evicted next"
+    );
+}
+
+#[test]
+fn transition_root_v3_golden_vector() {
+    let mut book = OrderBook::new(cfg());
+    book.place(limit(1, 7, Side::Bid, 100, 5)).unwrap();
+    book.place(limit(2, 8, Side::Ask, 110, 6)).unwrap();
+    book.set_position(AccountId::new(7), Quantity::from_raw(3));
+    assert_eq!(
+        book.transition_root_v3(),
+        Hash::from_bytes([
+            50, 182, 109, 6, 209, 245, 235, 7, 86, 25, 40, 230, 200, 166, 188, 217, 49, 9,
+            158, 191, 57, 93, 101, 0, 190, 80, 254, 226, 143, 95, 183, 114,
+        ])
+    );
+}
+
+#[test]
+fn transition_root_v3_dedup_schema_golden_vector() {
+    let mut book = OrderBook::new(cfg());
+    book.place(limit(1, 7, Side::Ask, 100, 5)).unwrap();
+    book.submit(limit(2, 8, Side::Bid, 100, 5)).unwrap();
+    assert_eq!(
+        book.transition_root_v3(),
+        Hash::from_bytes([
+            185, 17, 219, 185, 165, 201, 13, 159, 104, 195, 106, 36, 58, 56, 128, 194, 227,
+            130, 125, 1, 83, 22, 198, 252, 74, 108, 160, 76, 160, 100, 155, 76,
+        ])
+    );
 }
 
 #[test]
@@ -1065,7 +1210,13 @@ fn scalar_and_simd_planning_preserve_fills_outcomes_errors_and_roots() {
             1,
             90_001,
         ));
-        (summary, result, invalid, book.state_root())
+        (
+            summary,
+            result,
+            invalid,
+            book.state_root(),
+            book.transition_root_v3(),
+        )
     };
 
     for policy in [

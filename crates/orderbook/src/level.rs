@@ -284,6 +284,23 @@ impl SideBook {
             .filter(|&h| h != NIL)
     }
 
+    /// Number of live price levels. Used by the canonical transition-state
+    /// encoder before it emits the levels themselves.
+    pub(crate) fn level_count(&self) -> usize {
+        self.levels.len()
+    }
+
+    /// Visit levels in canonical ascending-price order, exposing the FIFO head
+    /// and exact order count for bounded encoding.
+    pub(crate) fn for_each_canonical_level<F: FnMut(Price, u32, u32, u32, Quantity)>(
+        &self,
+        mut f: F,
+    ) {
+        for (price, level) in &self.levels {
+            f(*price, level.head, level.tail, level.count, level.total_qty);
+        }
+    }
+
     /// Iterate resting nodes in canonical order (price ascending, FIFO within a
     /// level), invoking `f` for each. Used for state hashing and cancel-all.
     pub(crate) fn for_each_canonical<F: FnMut(&Node)>(&self, slab: &Slab<Node>, mut f: F) {
