@@ -54,8 +54,13 @@ impl TransitionWriter {
         self.bytes.extend_from_slice(&value.to_le_bytes());
     }
 
-    fn len(&mut self, value: usize) {
-        self.u64(u64::try_from(value).expect("usize must fit u64 on supported targets"));
+    fn len(&mut self, field: &'static str, value: usize) -> Result<(), BookStateError> {
+        let value = u64::try_from(value).map_err(|_| BookStateError::NativeWidth {
+            field,
+            value: u64::MAX,
+        })?;
+        self.u64(value);
+        Ok(())
     }
 }
 
@@ -717,12 +722,12 @@ impl OrderBook {
             });
         }
         let mut writer = TransitionWriter::with_capacity(encoded_len);
-        self.write_state_v3(&mut writer);
-        assert_eq!(
-            writer.bytes.len(),
-            encoded_len,
-            "v3 state size preflight must equal the emitted fixed-width image"
-        );
+        self.write_state_v3(&mut writer)?;
+        if writer.bytes.len() != encoded_len {
+            return Err(BookStateError::InvalidValue {
+                field: "v3 state size preflight must equal the emitted fixed-width image",
+            });
+        }
         Ok(writer.bytes)
     }
 
@@ -766,10 +771,29 @@ impl OrderBook {
             return Err(BookStateError::CanonicalEncodingMismatch);
         }
         let expected_root = crypto::hash_domain(crypto::DOMAIN_ORDERBOOK_STATE, bytes);
-        if rebuilt.transition_root_v3() != expected_root {
+        let rebuilt_root = crypto::hash_domain(crypto::DOMAIN_ORDERBOOK_STATE, &canonical);
+        if rebuilt_root != expected_root {
             return Err(BookStateError::RootMismatch);
         }
         Ok(rebuilt)
+    }
+
+    /// Validate all transition-relevant and mutation-relevant OrderBook state.
+    ///
+    /// This cold-path check is total over corrupt in-memory representations:
+    /// intrusive and free-list walks are explicitly bounded and every failure
+    /// is returned as a typed [`BookStateError`]. It deliberately does not call
+    /// canonical iterators, transition-root helpers, or other fail-stop APIs.
+    pub fn validate_transition_invariants(&self) -> Result<(), BookStateError> {
+        let shape = self.state_shape_v3()?;
+        self.validate_book_graph(None)?;
+        let validated_fills = self.validate_dedup_results(None)?;
+        if validated_fills != shape.fills {
+            return Err(BookStateError::InvalidValue {
+                field: "validated cached-fill count must match the v3 shape preflight",
+            });
+        }
+        Ok(())
     }
 
     fn state_shape_v3(&self) -> Result<StateShape, BookStateError> {
@@ -780,9 +804,9 @@ impl OrderBook {
                 value: capacity,
             });
         }
-        self.slab.validate_representation(self.config.capacity);
+        self.slab.validate_representation(self.config.capacity)?;
         self.dedup
-            .validate_representation(self.config.dedup_capacity);
+            .validate_representation(self.config.dedup_capacity)?;
         Self::usize_as_u64("dedup capacity", self.config.dedup_capacity)?;
         Self::usize_as_u64("basket legs", self.config.max_basket_legs)?;
         let levels = self
@@ -793,69 +817,250 @@ impl OrderBook {
                 field: "price levels",
             })?;
         let mut fills = 0usize;
-        let mut fills_overflowed = false;
-        self.dedup.for_each_in_eviction_order(|_, _, result| {
-            if let Some(next) = fills.checked_add(result.fills.len()) {
-                fills = next;
-            } else {
-                fills_overflowed = true;
-            }
-        });
-        if fills_overflowed {
-            return Err(BookStateError::ArithmeticOverflow {
-                field: "cached fills",
-            });
+        self.dedup.try_for_each_in_eviction_order(|_, _, result| {
+            fills = fills.checked_add(result.fills.len()).ok_or(
+                BookStateError::ArithmeticOverflow {
+                    field: "cached fills",
+                },
+            )?;
+            Ok(())
+        })?;
+
+        for (field, value) in [
+            ("price levels", levels),
+            ("resting orders", self.slab.len()),
+            ("positions", self.positions.len()),
+            ("dedup records", self.dedup.record_count()),
+            ("cached fills", fills),
+        ] {
+            Self::usize_as_u64(field, value)?;
         }
-        Ok(StateShape {
+        let shape = StateShape {
             levels,
             orders: self.slab.len(),
             positions: self.positions.len(),
             dedup_records: self.dedup.record_count(),
             fills,
-        })
+        };
+        let _ = shape.encoded_len()?;
+        Ok(shape)
     }
 
-    fn write_state_v3(&self, writer: &mut TransitionWriter) {
-        writer.u16(BOOK_TRANSITION_ROOT_SCHEMA_VERSION);
-        writer.len(self.config.capacity);
-        writer.u8(Self::stp_tag(self.config.stp));
-        writer.len(self.config.dedup_capacity);
-        writer.len(self.config.max_basket_legs);
-
+    fn validate_book_graph(
+        &self,
+        writer: Option<&mut TransitionWriter>,
+    ) -> Result<(), BookStateError> {
+        let writer = std::cell::RefCell::new(writer);
+        let mut reachable_slots = HashSet::with_capacity(self.slab.len());
+        let mut reachable_ids = HashSet::with_capacity(self.slab.len());
+        let mut expected_accounts: HashMap<AccountId, Vec<OrderId>> = HashMap::new();
         let mut recomputed_order_leaf_xor = [0u8; 32];
-        let bid_orders = self.write_transition_side(
-            writer,
-            &self.bids,
+
+        let mut visit_level = |price: Price, count: u32| -> Result<(), BookStateError> {
+            if let Some(writer) = writer.borrow_mut().as_deref_mut() {
+                writer.i64(price.raw());
+                writer.u64(u64::from(count));
+            }
+            Ok(())
+        };
+        let mut visit_node = |slot: u32, node: &Node| -> Result<(), BookStateError> {
+            if !reachable_slots.insert(slot) {
+                return Err(BookStateError::InvalidValue {
+                    field: "live slab node must be reachable from exactly one price level",
+                });
+            }
+            if !reachable_ids.insert(node.order_id) {
+                return Err(BookStateError::NonCanonical {
+                    field: "resting order ids must be globally unique",
+                });
+            }
+            let locator =
+                self.id_index
+                    .get(&node.order_id)
+                    .ok_or(BookStateError::InvalidValue {
+                        field: "live node must have an order-id locator",
+                    })?;
+            if locator.slot != slot {
+                return Err(BookStateError::InvalidValue {
+                    field: "order-id locator points to wrong slot",
+                });
+            }
+            if locator.side != node.side {
+                return Err(BookStateError::InvalidValue {
+                    field: "order-id locator side mismatch",
+                });
+            }
+            if locator.account != node.account {
+                return Err(BookStateError::InvalidValue {
+                    field: "order-id locator account mismatch",
+                });
+            }
+            expected_accounts
+                .entry(node.account)
+                .or_default()
+                .push(node.order_id);
+            Self::xor_in(&mut recomputed_order_leaf_xor, Self::order_leaf(node));
+            if let Some(writer) = writer.borrow_mut().as_deref_mut() {
+                writer.u64(node.order_id.get());
+                writer.u32(node.account.get());
+                writer.u8(Self::side_tag(node.side));
+                writer.i64(node.price.raw());
+                writer.i64(node.remaining.raw());
+                writer.u64(node.client_id);
+            }
+            Ok(())
+        };
+
+        if let Some(writer) = writer.borrow_mut().as_deref_mut() {
+            writer.len("bid price levels", self.bids.level_count())?;
+        }
+        let bid_orders = self.bids.validate_reachable(
+            &self.slab,
             Side::Bid,
-            &mut recomputed_order_leaf_xor,
-        );
-        let ask_orders = self.write_transition_side(
-            writer,
-            &self.asks,
+            &mut visit_level,
+            &mut visit_node,
+        )?;
+        if let Some(writer) = writer.borrow_mut().as_deref_mut() {
+            writer.len("ask price levels", self.asks.level_count())?;
+        }
+        let ask_orders = self.asks.validate_reachable(
+            &self.slab,
             Side::Ask,
-            &mut recomputed_order_leaf_xor,
-        );
-        assert_eq!(
+            &mut visit_level,
+            &mut visit_node,
+        )?;
+        let reachable_count =
             bid_orders
                 .checked_add(ask_orders)
-                .expect("live order count must not overflow"),
-            self.slab.len(),
-            "every live slab node must be reachable from exactly one price level"
-        );
-        assert_eq!(
-            self.id_index.len(),
-            self.slab.len(),
-            "order-id index must cover every live slab node"
-        );
-        assert_eq!(
-            self.account_orders.values().map(Vec::len).sum::<usize>(),
-            self.slab.len(),
-            "account-order index must cover every live slab node"
-        );
-        assert_eq!(
-            recomputed_order_leaf_xor, self.order_leaf_xor,
-            "incremental order-leaf XOR must match the canonical live-order scan"
-        );
+                .ok_or(BookStateError::ArithmeticOverflow {
+                    field: "resting orders",
+                })?;
+        if reachable_count != self.slab.len() {
+            return Err(BookStateError::InvalidValue {
+                field: "every live slab node must be reachable from exactly one price level",
+            });
+        }
+        self.slab.try_for_each_occupied(|slot, _| {
+            if reachable_slots.contains(&slot) {
+                Ok(())
+            } else {
+                Err(BookStateError::InvalidValue {
+                    field: "occupied slab node is unreachable from the price-level graph",
+                })
+            }
+        })?;
+        if self
+            .bids
+            .best_price()
+            .zip(self.asks.best_price())
+            .is_some_and(|(bid, ask)| bid.raw() >= ask.raw())
+        {
+            return Err(BookStateError::InvalidValue {
+                field: "resting bid and ask books must not be crossed or locked",
+            });
+        }
+        if self.id_index.len() != self.slab.len() {
+            return Err(BookStateError::InvalidValue {
+                field: "order-id index must cover every live slab node exactly once",
+            });
+        }
+        for (order_id, locator) in &self.id_index {
+            let node = self
+                .slab
+                .get(locator.slot)
+                .ok_or(BookStateError::InvalidValue {
+                    field: "order-id locator must reference a live slab node",
+                })?;
+            if node.order_id != *order_id {
+                return Err(BookStateError::InvalidValue {
+                    field: "order-id locator key does not match its slab node",
+                });
+            }
+            if node.side != locator.side || node.account != locator.account {
+                return Err(BookStateError::InvalidValue {
+                    field: "order-id locator metadata does not match its slab node",
+                });
+            }
+        }
+        for orders in expected_accounts.values_mut() {
+            orders.sort_unstable();
+        }
+        let mut mirrored_orders = 0usize;
+        for (account, orders) in &self.account_orders {
+            if orders.windows(2).any(|pair| pair[0] >= pair[1]) {
+                return Err(BookStateError::NonCanonical {
+                    field: "account-order ids must be strictly ascending and unique",
+                });
+            }
+            let expected = expected_accounts
+                .get(account)
+                .map_or(&[][..], Vec::as_slice);
+            if orders.as_slice() != expected {
+                return Err(BookStateError::InvalidValue {
+                    field: "account-order index must exactly mirror live owned orders",
+                });
+            }
+            mirrored_orders = mirrored_orders.checked_add(orders.len()).ok_or(
+                BookStateError::ArithmeticOverflow {
+                    field: "account-order index",
+                },
+            )?;
+        }
+        for (account, expected) in &expected_accounts {
+            if self.account_orders.get(account).map(Vec::as_slice) != Some(expected.as_slice()) {
+                return Err(BookStateError::InvalidValue {
+                    field: "live node must appear in its account-order index",
+                });
+            }
+        }
+        if mirrored_orders != self.slab.len() {
+            return Err(BookStateError::InvalidValue {
+                field: "account-order index must cover every live slab node exactly once",
+            });
+        }
+        if recomputed_order_leaf_xor != self.order_leaf_xor {
+            return Err(BookStateError::InvalidValue {
+                field: "incremental order-leaf XOR must match the canonical live-order scan",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_dedup_results(
+        &self,
+        writer: Option<&mut TransitionWriter>,
+    ) -> Result<usize, BookStateError> {
+        let writer = std::cell::RefCell::new(writer);
+        if let Some(writer) = writer.borrow_mut().as_deref_mut() {
+            writer.len("dedup records", self.dedup.record_count())?;
+        }
+        let mut fills = 0usize;
+        self.dedup
+            .try_for_each_in_eviction_order(|account, client_id, result| {
+                Self::validate_cached_match_result(account, result)?;
+                fills = fills.checked_add(result.fills.len()).ok_or(
+                    BookStateError::ArithmeticOverflow {
+                        field: "cached fills",
+                    },
+                )?;
+                if let Some(writer) = writer.borrow_mut().as_deref_mut() {
+                    writer.u32(account);
+                    writer.u64(client_id);
+                    Self::write_match_result(writer, result)?;
+                }
+                Ok(())
+            })?;
+        Ok(fills)
+    }
+
+    fn write_state_v3(&self, writer: &mut TransitionWriter) -> Result<(), BookStateError> {
+        writer.u16(BOOK_TRANSITION_ROOT_SCHEMA_VERSION);
+        writer.len("capacity", self.config.capacity)?;
+        writer.u8(Self::stp_tag(self.config.stp));
+        writer.len("dedup capacity", self.config.dedup_capacity)?;
+        writer.len("basket legs", self.config.max_basket_legs)?;
+
+        self.validate_book_graph(Some(writer))?;
 
         let mut positions: Vec<(u32, i64)> = self
             .positions
@@ -863,19 +1068,14 @@ impl OrderBook {
             .map(|(account, quantity)| (account.get(), quantity.raw()))
             .collect();
         positions.sort_unstable();
-        writer.len(positions.len());
+        writer.len("positions", positions.len())?;
         for (account, quantity) in positions {
             writer.u32(account);
             writer.i64(quantity);
         }
 
-        writer.len(self.dedup.record_count());
-        self.dedup
-            .for_each_in_eviction_order(|account, client_id, result| {
-                writer.u32(account);
-                writer.u64(client_id);
-                Self::write_match_result(writer, result);
-            });
+        let _ = self.validate_dedup_results(Some(writer))?;
+        Ok(())
     }
 
     /// Deterministic dry-run of matching `order` against current depth.
@@ -1459,6 +1659,98 @@ impl OrderBook {
         Ok(())
     }
 
+    fn validate_cached_match_result(
+        dedup_account: u32,
+        result: &MatchResult,
+    ) -> Result<(), BookStateError> {
+        Self::usize_as_u64("cached fills", result.fills.len())?;
+        let mut makers = HashSet::with_capacity(result.fills.len());
+        let mut taker_order = None;
+        let mut taker_account = None;
+        let mut taker_side = None;
+        let mut previous_price = None;
+        let mut filled_quantity = 0i64;
+        for fill in &result.fills {
+            if fill.price.raw() <= 0 {
+                return Err(BookStateError::InvalidValue {
+                    field: "cached fill price must be strictly positive",
+                });
+            }
+            if fill.quantity.raw() <= 0 {
+                return Err(BookStateError::InvalidValue {
+                    field: "cached fill quantity must be strictly positive",
+                });
+            }
+            if fill.maker_order == fill.taker_order {
+                return Err(BookStateError::InvalidValue {
+                    field: "cached fill maker and taker order ids must differ",
+                });
+            }
+            if fill.maker_account == fill.taker_account {
+                return Err(BookStateError::InvalidValue {
+                    field: "cached self-trade fill is not reachable",
+                });
+            }
+            if fill.taker_account.get() != dedup_account {
+                return Err(BookStateError::InvalidValue {
+                    field: "cached fill taker account must match its dedup key account",
+                });
+            }
+            if taker_order.is_some_and(|expected| expected != fill.taker_order)
+                || taker_account.is_some_and(|expected| expected != fill.taker_account)
+                || taker_side.is_some_and(|expected| expected != fill.taker_side)
+            {
+                return Err(BookStateError::InvalidValue {
+                    field: "cached result fills must share one taker",
+                });
+            }
+            if previous_price.is_some_and(|previous: Price| match fill.taker_side {
+                Side::Bid => fill.price.raw() < previous.raw(),
+                Side::Ask => fill.price.raw() > previous.raw(),
+            }) {
+                return Err(BookStateError::InvalidValue {
+                    field: "cached fills must retain canonical execution order",
+                });
+            }
+            if !makers.insert(fill.maker_order) {
+                return Err(BookStateError::InvalidValue {
+                    field: "cached result cannot fill one maker order twice",
+                });
+            }
+            filled_quantity = filled_quantity.checked_add(fill.quantity.raw()).ok_or(
+                BookStateError::ArithmeticOverflow {
+                    field: "cached filled quantity",
+                },
+            )?;
+            taker_order = Some(fill.taker_order);
+            taker_account = Some(fill.taker_account);
+            taker_side = Some(fill.taker_side);
+            previous_price = Some(fill.price);
+        }
+
+        let valid_outcome = match result.outcome {
+            OrderOutcome::Resting { remaining } => result.fills.is_empty() && remaining.raw() > 0,
+            OrderOutcome::FullyFilled => !result.fills.is_empty(),
+            OrderOutcome::PartiallyFilledResting { remaining } => {
+                !result.fills.is_empty()
+                    && remaining.raw() > 0
+                    && filled_quantity.checked_add(remaining.raw()).is_some()
+            }
+            OrderOutcome::PartiallyFilledCancelled { filled } => {
+                !result.fills.is_empty()
+                    && filled.raw() == filled_quantity
+                    && filled_quantity < i64::MAX
+            }
+            OrderOutcome::Rejected => result.fills.is_empty(),
+        };
+        if !valid_outcome {
+            return Err(BookStateError::InvalidValue {
+                field: "cached result outcome is inconsistent with its fills or quantity",
+            });
+        }
+        Ok(())
+    }
+
     fn restore_state_v3(
         bytes: &[u8],
         scanned: ScannedState,
@@ -1531,8 +1823,21 @@ impl OrderBook {
                 let price = Price::from_raw(reader.i64()?);
                 let remaining = Quantity::from_raw(reader.i64()?);
                 let client_id = reader.u64()?;
-                debug_assert_eq!(side, expected_side);
-                debug_assert_eq!(price, level_price);
+                if side != expected_side {
+                    return Err(BookStateError::InvalidValue {
+                        field: "resting node side does not match its side book",
+                    });
+                }
+                if price != level_price {
+                    return Err(BookStateError::InvalidValue {
+                        field: "resting node price does not match its level",
+                    });
+                }
+                if remaining.raw() <= 0 {
+                    return Err(BookStateError::InvalidValue {
+                        field: "resting quantity must be strictly positive",
+                    });
+                }
                 if !seen_order_ids.insert(order_id) {
                     return Err(BookStateError::NonCanonical {
                         field: "resting order ids must be globally unique",
@@ -1641,89 +1946,11 @@ impl OrderBook {
         }
     }
 
-    fn write_transition_side(
-        &self,
+    fn write_match_result(
         writer: &mut TransitionWriter,
-        side: &SideBook,
-        expected_side: Side,
-        recomputed_order_leaf_xor: &mut [u8; 32],
-    ) -> usize {
-        assert_eq!(
-            side.side(),
-            expected_side,
-            "stored side-book role must match its engine field"
-        );
-        let mut visited = 0usize;
-        writer.len(side.level_count());
-        side.for_each_canonical_level(|price, head, tail, count, total_qty| {
-            writer.i64(price.raw());
-            writer.u64(u64::from(count));
-            let mut current = head;
-            let mut previous = NIL;
-            let mut last = NIL;
-            let mut computed_qty = Quantity::ZERO;
-            for _ in 0..count {
-                let node = self
-                    .slab
-                    .get(current)
-                    .expect("price-level FIFO must reference a live slab node");
-                assert_eq!(node.side, expected_side, "node stored on wrong side");
-                assert_eq!(node.price, price, "node stored at wrong price level");
-                assert_eq!(
-                    node.prev, previous,
-                    "price-level FIFO backward link mismatch"
-                );
-                let locator = self
-                    .id_index
-                    .get(&node.order_id)
-                    .expect("live node must have an order-id locator");
-                assert_eq!(
-                    locator.slot, current,
-                    "order-id locator points to wrong slot"
-                );
-                assert_eq!(locator.side, node.side, "order-id locator side mismatch");
-                assert_eq!(
-                    locator.account, node.account,
-                    "order-id locator account mismatch"
-                );
-                assert!(
-                    self.account_orders
-                        .get(&node.account)
-                        .is_some_and(|orders| orders.binary_search(&node.order_id).is_ok()),
-                    "live node must appear in its account-order index"
-                );
-                writer.u64(node.order_id.get());
-                writer.u32(node.account.get());
-                writer.u8(Self::side_tag(node.side));
-                writer.i64(node.price.raw());
-                writer.i64(node.remaining.raw());
-                writer.u64(node.client_id);
-                Self::xor_in(recomputed_order_leaf_xor, Self::order_leaf(node));
-                computed_qty = computed_qty
-                    .checked_add(node.remaining)
-                    .expect("price-level total quantity must not overflow");
-                previous = current;
-                last = current;
-                current = node.next;
-                visited = visited
-                    .checked_add(1)
-                    .expect("live order count must not overflow");
-            }
-            assert_eq!(
-                current, NIL,
-                "price-level count must equal its live FIFO length"
-            );
-            assert_eq!(last, tail, "price-level tail must be the final FIFO node");
-            assert_eq!(
-                computed_qty, total_qty,
-                "price-level aggregate must equal its live order quantities"
-            );
-        });
-        visited
-    }
-
-    fn write_match_result(writer: &mut TransitionWriter, result: &MatchResult) {
-        writer.len(result.fills.len());
+        result: &MatchResult,
+    ) -> Result<(), BookStateError> {
+        writer.len("cached fills", result.fills.len())?;
         for fill in &result.fills {
             writer.u64(fill.maker_order.get());
             writer.u64(fill.taker_order.get());
@@ -1742,6 +1969,7 @@ impl OrderBook {
         };
         writer.u8(tag);
         writer.i64(quantity);
+        Ok(())
     }
 
     const fn side_tag(side: Side) -> u8 {

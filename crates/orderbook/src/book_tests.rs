@@ -2503,3 +2503,449 @@ fn failed_residual_rest_still_reports_applied_stp_cancellation() {
     assert!(book.contains(OrderId::new(2)));
     assert_eq!(book.total_resting_quantity(), Quantity::from_raw(i64::MAX));
 }
+
+fn validator_fixture() -> OrderBook {
+    let mut config = codec_cfg();
+    config.capacity = 16;
+    let mut book = OrderBook::new(config);
+    book.place(limit(1, 1, Side::Bid, 90, 2)).unwrap();
+    book.place(limit(2, 1, Side::Bid, 90, 3)).unwrap();
+    book.place(limit(3, 3, Side::Ask, 110, 4)).unwrap();
+    book
+}
+
+fn error_field(error: &BookStateError) -> Option<&'static str> {
+    match error {
+        BookStateError::InvalidValue { field } | BookStateError::NonCanonical { field } => {
+            Some(*field)
+        }
+        _ => None,
+    }
+}
+
+fn assert_checked_rejection(book: &OrderBook, expected_field: &'static str) {
+    let validation = std::panic::catch_unwind(|| book.validate_transition_invariants());
+    let error = validation
+        .expect("recovery validation must not panic")
+        .expect_err("corrupt state must be rejected");
+    assert_eq!(error_field(&error), Some(expected_field));
+
+    let encoding = std::panic::catch_unwind(|| book.encode_state_v3_bounded(usize::MAX));
+    let error = encoding
+        .expect("bounded state encoding must not panic")
+        .expect_err("corrupt state must not encode");
+    assert_eq!(error_field(&error), Some(expected_field));
+}
+
+#[test]
+fn transition_validator_is_observationally_pure_and_preserves_v3_image() {
+    let book = codec_fixture();
+    let bytes = canonical_bytes(&book);
+    let root = book.transition_root_v3();
+    let diagnostic = book.state_root();
+    let resting = book.resting_orders();
+    let slab_representation = book.slab.representation_for_test();
+
+    book.validate_transition_invariants().unwrap();
+    book.validate_transition_invariants().unwrap();
+
+    assert_eq!(canonical_bytes(&book), bytes);
+    assert_eq!(book.transition_root_v3(), root);
+    assert_eq!(book.state_root(), diagnostic);
+    assert_eq!(book.resting_orders(), resting);
+    assert_eq!(book.slab.representation_for_test(), slab_representation);
+}
+
+#[test]
+fn transition_validator_rejects_bounded_fifo_link_corruption_without_panicking() {
+    let mut cycle = validator_fixture();
+    let first = cycle.id_index[&OrderId::new(1)].slot;
+    let second = cycle.id_index[&OrderId::new(2)].slot;
+    cycle.slab.get_mut(second).unwrap().next = first;
+    assert_checked_rejection(
+        &cycle,
+        "price-level FIFO backward link mismatch",
+    );
+
+    let mut dangling = validator_fixture();
+    dangling
+        .bids
+        .set_level_head_for_test(Price::from_raw(90), u32::MAX - 1);
+    assert_checked_rejection(
+        &dangling,
+        "price-level FIFO must reference a live slab node",
+    );
+}
+
+#[test]
+fn transition_validator_rejects_level_metadata_and_node_corruption_matrix() {
+    let mut wrong_role = validator_fixture();
+    wrong_role.bids.set_side_for_test(Side::Ask);
+    assert_checked_rejection(
+        &wrong_role,
+        "stored side-book role must match its engine field",
+    );
+
+    let mut empty_level = validator_fixture();
+    empty_level
+        .bids
+        .insert_empty_level_for_test(Price::from_raw(91));
+    assert_checked_rejection(
+        &empty_level,
+        "price levels must contain at least one resting order",
+    );
+
+    let mut wrong_count = validator_fixture();
+    wrong_count
+        .bids
+        .set_level_count_for_test(Price::from_raw(90), 3);
+    assert_checked_rejection(
+        &wrong_count,
+        "price-level count must equal its live FIFO length",
+    );
+
+    let mut wrong_tail = validator_fixture();
+    wrong_tail
+        .bids
+        .set_level_tail_for_test(Price::from_raw(90), NIL);
+    assert_checked_rejection(
+        &wrong_tail,
+        "price-level tail must be the final FIFO node",
+    );
+
+    let mut wrong_total = validator_fixture();
+    wrong_total.bids.set_level_total_for_test(
+        Price::from_raw(90),
+        Quantity::from_raw(6),
+    );
+    assert_checked_rejection(
+        &wrong_total,
+        "price-level aggregate must equal its live order quantities",
+    );
+
+    let mut zero_remaining = validator_fixture();
+    let slot = zero_remaining.id_index[&OrderId::new(1)].slot;
+    zero_remaining.slab.get_mut(slot).unwrap().remaining = Quantity::ZERO;
+    assert_checked_rejection(
+        &zero_remaining,
+        "resting quantity must be strictly positive",
+    );
+
+    let mut wrong_side = validator_fixture();
+    let slot = wrong_side.id_index[&OrderId::new(1)].slot;
+    wrong_side.slab.get_mut(slot).unwrap().side = Side::Ask;
+    assert_checked_rejection(
+        &wrong_side,
+        "resting node side does not match its side book",
+    );
+
+    let mut wrong_price = validator_fixture();
+    let slot = wrong_price.id_index[&OrderId::new(1)].slot;
+    wrong_price.slab.get_mut(slot).unwrap().price = Price::from_raw(91);
+    assert_checked_rejection(
+        &wrong_price,
+        "resting node price does not match its level",
+    );
+
+    let mut duplicate_id = validator_fixture();
+    let slot = duplicate_id.id_index[&OrderId::new(2)].slot;
+    duplicate_id.slab.get_mut(slot).unwrap().order_id = OrderId::new(1);
+    assert_checked_rejection(
+        &duplicate_id,
+        "resting order ids must be globally unique",
+    );
+
+    let mut unreachable = validator_fixture();
+    unreachable
+        .asks
+        .remove_level_for_test(Price::from_raw(110));
+    assert_checked_rejection(
+        &unreachable,
+        "every live slab node must be reachable from exactly one price level",
+    );
+}
+
+#[test]
+fn transition_validator_rejects_exact_derived_mirror_corruption_matrix() {
+    let mut missing_locator = validator_fixture();
+    missing_locator.id_index.remove(&OrderId::new(1));
+    assert_checked_rejection(
+        &missing_locator,
+        "live node must have an order-id locator",
+    );
+
+    let mut wrong_locator_slot = validator_fixture();
+    let other_slot = wrong_locator_slot.id_index[&OrderId::new(2)].slot;
+    wrong_locator_slot
+        .id_index
+        .get_mut(&OrderId::new(1))
+        .unwrap()
+        .slot = other_slot;
+    assert_checked_rejection(
+        &wrong_locator_slot,
+        "order-id locator points to wrong slot",
+    );
+
+    let mut wrong_locator_side = validator_fixture();
+    wrong_locator_side
+        .id_index
+        .get_mut(&OrderId::new(1))
+        .unwrap()
+        .side = Side::Ask;
+    assert_checked_rejection(&wrong_locator_side, "order-id locator side mismatch");
+
+    let mut wrong_locator_account = validator_fixture();
+    wrong_locator_account
+        .id_index
+        .get_mut(&OrderId::new(1))
+        .unwrap()
+        .account = AccountId::new(9);
+    assert_checked_rejection(
+        &wrong_locator_account,
+        "order-id locator account mismatch",
+    );
+
+    let mut extra_locator = validator_fixture();
+    let locator = extra_locator.id_index[&OrderId::new(1)];
+    extra_locator.id_index.insert(OrderId::new(999), locator);
+    assert_checked_rejection(
+        &extra_locator,
+        "order-id index must cover every live slab node exactly once",
+    );
+
+    let mut missing_account_order = validator_fixture();
+    missing_account_order
+        .account_orders
+        .get_mut(&AccountId::new(1))
+        .unwrap()
+        .clear();
+    assert_checked_rejection(
+        &missing_account_order,
+        "account-order index must exactly mirror live owned orders",
+    );
+
+    let mut extra_account_order = validator_fixture();
+    extra_account_order
+        .account_orders
+        .get_mut(&AccountId::new(1))
+        .unwrap()
+        .push(OrderId::new(999));
+    assert_checked_rejection(
+        &extra_account_order,
+        "account-order index must exactly mirror live owned orders",
+    );
+
+    let mut duplicate_account_order = validator_fixture();
+    duplicate_account_order
+        .account_orders
+        .get_mut(&AccountId::new(1))
+        .unwrap()
+        .push(OrderId::new(1));
+    assert_checked_rejection(
+        &duplicate_account_order,
+        "account-order ids must be strictly ascending and unique",
+    );
+
+    let mut unsorted_account_orders = validator_fixture();
+    unsorted_account_orders
+        .account_orders
+        .get_mut(&AccountId::new(1))
+        .unwrap()
+        .swap(0, 1);
+    assert_checked_rejection(
+        &unsorted_account_orders,
+        "account-order ids must be strictly ascending and unique",
+    );
+}
+
+#[test]
+fn transition_validator_rejects_allocator_dedup_and_xor_drift() {
+    let mut free_cycle = validator_fixture();
+    free_cycle.cancel(OrderId::new(3)).unwrap();
+    free_cycle.slab.make_free_list_cycle_for_test();
+    assert_checked_rejection(&free_cycle, "slab free list must not contain a cycle");
+
+    let mut duplicate_fifo = codec_fixture();
+    duplicate_fifo.dedup.duplicate_oldest_fifo_key_for_test();
+    assert_checked_rejection(
+        &duplicate_fifo,
+        "dedup FIFO must not contain duplicate keys",
+    );
+
+    let mut missing_result = codec_fixture();
+    missing_result.dedup.remove_oldest_map_entry_for_test();
+    assert_checked_rejection(
+        &missing_result,
+        "dedup FIFO and result map must contain the same keys",
+    );
+
+    let mut bad_xor = validator_fixture();
+    bad_xor.order_leaf_xor[0] ^= 0x80;
+    assert_checked_rejection(
+        &bad_xor,
+        "incremental order-leaf XOR must match the canonical live-order scan",
+    );
+}
+
+#[test]
+fn transition_validator_rejects_crossed_or_locked_books_and_unrepresentable_capacity() {
+    let mut locked = validator_fixture();
+    let ask_slot = locked.id_index[&OrderId::new(3)].slot;
+    locked.slab.get_mut(ask_slot).unwrap().price = Price::from_raw(90);
+    locked
+        .asks
+        .rekey_level_for_test(Price::from_raw(110), Price::from_raw(90));
+    assert_checked_rejection(
+        &locked,
+        "resting bid and ask books must not be crossed or locked",
+    );
+
+    let mut crossed = validator_fixture();
+    let ask_slot = crossed.id_index[&OrderId::new(3)].slot;
+    crossed.slab.get_mut(ask_slot).unwrap().price = Price::from_raw(89);
+    crossed
+        .asks
+        .rekey_level_for_test(Price::from_raw(110), Price::from_raw(89));
+    assert_checked_rejection(
+        &crossed,
+        "resting bid and ask books must not be crossed or locked",
+    );
+
+    let mut too_wide = validator_fixture();
+    let Ok(too_wide_capacity) = usize::try_from(u64::from(u32::MAX) + 1) else {
+        return;
+    };
+    too_wide.config.capacity = too_wide_capacity;
+    let error = too_wide.validate_transition_invariants().unwrap_err();
+    assert!(matches!(
+        error,
+        BookStateError::NativeWidth {
+            field: "slab capacity",
+            ..
+        }
+    ));
+    assert!(too_wide.encode_state_v3_bounded(usize::MAX).is_err());
+}
+
+fn cached_fill_fixture() -> OrderBook {
+    let mut book = OrderBook::new(codec_cfg());
+    book.submit(limit(10, 10, Side::Ask, 100, 2)).unwrap();
+    book.submit(limit(11, 11, Side::Bid, 100, 2)).unwrap();
+    book
+}
+
+#[test]
+fn transition_validator_rejects_malformed_cached_results() {
+    let mut bad_outcome = cached_fill_fixture();
+    bad_outcome.dedup.newest_result_mut_for_test().outcome = OrderOutcome::Rejected;
+    assert_checked_rejection(
+        &bad_outcome,
+        "cached result outcome is inconsistent with its fills or quantity",
+    );
+
+    let mut zero_fill = cached_fill_fixture();
+    zero_fill.dedup.newest_result_mut_for_test().fills[0].quantity = Quantity::ZERO;
+    assert_checked_rejection(
+        &zero_fill,
+        "cached fill quantity must be strictly positive",
+    );
+
+    let mut wrong_taker = cached_fill_fixture();
+    wrong_taker.dedup.newest_result_mut_for_test().fills[0].taker_account = AccountId::new(77);
+    assert_checked_rejection(
+        &wrong_taker,
+        "cached fill taker account must match its dedup key account",
+    );
+
+    let mut duplicate_maker = cached_fill_fixture();
+    let result = duplicate_maker.dedup.newest_result_mut_for_test();
+    result.fills.push(result.fills[0]);
+    result.outcome = OrderOutcome::PartiallyFilledCancelled {
+        filled: Quantity::from_raw(4),
+    };
+    assert_checked_rejection(
+        &duplicate_maker,
+        "cached result cannot fill one maker order twice",
+    );
+
+    let mut impossible_rest = codec_fixture();
+    impossible_rest.dedup.oldest_result_mut_for_test().outcome =
+        OrderOutcome::Resting { remaining: Quantity::ZERO };
+    assert_checked_rejection(
+        &impossible_rest,
+        "cached result outcome is inconsistent with its fills or quantity",
+    );
+}
+
+#[test]
+fn reachable_randomized_operations_always_validate_and_encode() {
+    let mut config = cfg();
+    config.capacity = 64;
+    config.dedup_capacity = 16;
+    let mut book = OrderBook::new(config);
+    let mut rng = Lcg(0xA11C_E5EED);
+    let mut next_id = 1u64;
+
+    for step in 0..1_000 {
+        match rng.below(7) {
+            0 | 1 => {
+                let side = if rng.below(2) == 0 { Side::Bid } else { Side::Ask };
+                let price = match side {
+                    Side::Bid => 80 + i64::try_from(rng.below(20)).unwrap(),
+                    Side::Ask => 101 + i64::try_from(rng.below(20)).unwrap(),
+                };
+                let incoming = limit(
+                    next_id,
+                    u32::try_from(1 + rng.below(8)).unwrap(),
+                    side,
+                    price,
+                    i64::try_from(1 + rng.below(8)).unwrap(),
+                );
+                if rng.below(2) == 0 {
+                    let _ = book.place(incoming);
+                } else {
+                    let _ = book.submit(incoming);
+                }
+                next_id += 1;
+            }
+            2 => {
+                let resting = book.resting_orders();
+                if !resting.is_empty() {
+                    let index = usize::try_from(rng.below(resting.len() as u64)).unwrap();
+                    book.cancel(resting[index].order_id).unwrap();
+                }
+            }
+            3 => {
+                let resting = book.resting_orders();
+                if !resting.is_empty() {
+                    let index = usize::try_from(rng.below(resting.len() as u64)).unwrap();
+                    let order = resting[index];
+                    let price = match order.side {
+                        Side::Bid => 80 + i64::try_from(rng.below(20)).unwrap(),
+                        Side::Ask => 101 + i64::try_from(rng.below(20)).unwrap(),
+                    };
+                    let quantity = Quantity::from_raw(i64::try_from(1 + rng.below(8)).unwrap());
+                    book.replace(order.order_id, Price::from_raw(price), quantity)
+                        .unwrap();
+                }
+            }
+            4 => {
+                let account = AccountId::new(u32::try_from(1 + rng.below(8)).unwrap());
+                let _ = book.cancel_all(account);
+            }
+            _ => book.set_position(
+                AccountId::new(u32::try_from(1 + rng.below(8)).unwrap()),
+                Quantity::from_raw(i64::try_from(rng.below(21)).unwrap() - 10),
+            ),
+        }
+        book.validate_transition_invariants()
+            .unwrap_or_else(|error| panic!("step {step}: {error}"));
+        if step % 25 == 0 {
+            let bytes = book.encode_state_v3_bounded(usize::MAX).unwrap();
+            assert_eq!(
+                book.transition_root_v3(),
+                crypto::hash_domain(crypto::DOMAIN_ORDERBOOK_STATE, &bytes)
+            );
+        }
+    }
+}
