@@ -1,0 +1,23 @@
+[package]
+name = "dexos-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+codec = { path = "../crates/codec" }
+libfuzzer-sys = "0.4"
+types = { path = "../crates/types" }
+
+[[bin]]
+name = "packed_order_decode"
+path = "fuzz_targets/packed_order_decode.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

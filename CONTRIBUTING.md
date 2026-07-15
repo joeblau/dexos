@@ -32,7 +32,7 @@ state-root agreement check, so preflight skips the standalone step):
 CI also enforces gates that need CI-specific tooling or multiple
 architectures and are not part of preflight: coverage (`cargo llvm-cov`), the
 multi-arch determinism digest compare, cross-arch snapshot transfer, the
-time-boxed fuzz stub, release builds
+fuzz/property job (including the checked-in packed-order libFuzzer target build), release builds
 (`cargo build --release --locked --bin marketd --no-default-features` and
 `--all-features`) plus release-artifact scaffolding, workflow pinning
 (`./scripts/check-workflows.sh`), and
