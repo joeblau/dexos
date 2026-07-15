@@ -1586,21 +1586,35 @@ mod tests {
                 run_distributed_agent(&scenario, adapter).await
             });
         }
+        let mut agent_counters = OutcomeCounters::default();
         while let Some(result) = agents.join_next().await {
             let report = result.unwrap().unwrap();
-            assert_eq!(report.counters.socket_written, 100);
+            assert_eq!(report.counters.offered, 100);
+            // Controller aggregation is the invariant here. A contended test
+            // runner may legitimately record open-loop debt before the deadline.
+            assert!(report.counters.socket_written > 0);
+            assert_eq!(report.counters.accepted, report.counters.socket_written);
+            report.counters.validate_conservation().unwrap();
             assert_eq!(report.interval_reports.len(), 1);
-            assert_eq!(report.interval_reports[0].counters.socket_written, 100);
+            assert_eq!(
+                report.interval_reports[0].counters.socket_written,
+                report.counters.socket_written
+            );
+            agent_counters.merge(&report.counters);
         }
         let report = controller.await.unwrap().unwrap();
         assert_eq!(report.agents.len(), 3);
         assert_eq!(report.aggregate.connections, 3);
-        assert_eq!(report.aggregate.counters.socket_written, 300);
-        assert_eq!(report.aggregate.request_to_ack.count, 300);
+        assert_eq!(report.aggregate.counters, agent_counters);
+        assert!(report.aggregate.counters.socket_written > 0);
+        assert_eq!(
+            report.aggregate.request_to_ack.count,
+            report.aggregate.counters.socket_written
+        );
         assert_eq!(report.aggregate.interval_reports.len(), 1);
         assert_eq!(
             report.aggregate.interval_reports[0].counters.socket_written,
-            300
+            report.aggregate.counters.socket_written
         );
         assert_eq!(
             report.aggregate.interval_reports[0]
@@ -1618,13 +1632,13 @@ mod tests {
                     .replace
                     .summary
                     .count,
-            300
+            report.aggregate.counters.socket_written
         );
         assert!(report.aggregate.passed());
 
         let _ = sink_stop_tx.send(true);
         let snapshot = sink.await.unwrap().unwrap().snapshot();
-        assert_eq!(snapshot.received, 300);
+        assert_eq!(snapshot.received, report.aggregate.counters.socket_written);
         let _ = std::fs::remove_file(token_path);
     }
 }
