@@ -12,37 +12,13 @@ use types::{AccountId, Amount, Hash};
 
 use crate::error::ExecutionError;
 
+mod state;
+mod state_codec;
+
+pub use state::{LedgerStateError, LedgerStateLimits};
+
 /// Canonical stored-ledger transition-root schema.
 pub const LEDGER_TRANSITION_ROOT_SCHEMA_VERSION: u16 = 1;
-
-/// Fixed-width canonical writer for the ledger's versioned stored-state
-/// commitment. Native-width integers and serde layouts are deliberately
-/// excluded from the preimage.
-#[derive(Default)]
-struct TransitionWriter {
-    bytes: Vec<u8>,
-}
-
-impl TransitionWriter {
-    fn u16(&mut self, value: u16) {
-        self.bytes.extend_from_slice(&value.to_le_bytes());
-    }
-
-    fn u64(&mut self, value: u64) {
-        self.bytes.extend_from_slice(&value.to_le_bytes());
-    }
-
-    fn i128(&mut self, value: i128) {
-        self.bytes.extend_from_slice(&value.to_le_bytes());
-    }
-
-    fn usize(&mut self, value: usize) -> Result<(), ExecutionError> {
-        let value =
-            u64::try_from(value).map_err(|_| ExecutionError::StateEncodingOverflow { value })?;
-        self.u64(value);
-        Ok(())
-    }
-}
 
 /// The SoA stablecoin ledger.
 #[derive(Debug, Clone, Default)]
@@ -194,22 +170,10 @@ impl Ledger {
     /// apparently authoritative root.
     pub fn transition_root_v1(&self) -> Result<Hash, ExecutionError> {
         self.validate_transition_invariants()?;
-
-        let mut writer = TransitionWriter::default();
-        writer.u16(LEDGER_TRANSITION_ROOT_SCHEMA_VERSION);
-        writer.usize(self.available.len())?;
-        for i in 0..self.available.len() {
-            writer.usize(i)?;
-            writer.i128(self.available[i].raw());
-            writer.i128(self.reserved[i].raw());
-            writer.i128(self.locked[i].raw());
-            writer.i128(self.escrowed[i].raw());
-            writer.u64(self.auth_epoch[i]);
-        }
-        writer.i128(self.total_supply.raw());
+        let bytes = self.encode_state_v1_for_transition_root()?;
         Ok(crypto::hash_domain(
             crypto::DOMAIN_EXECUTION_LEDGER_STATE,
-            &writer.bytes,
+            &bytes,
         ))
     }
 
