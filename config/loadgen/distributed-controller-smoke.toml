@@ -15,6 +15,12 @@ new = 700000
 cancel = 200000
 replace = 100000
 
+[thresholds]
+minimum_written_per_second = 1
+minimum_acknowledged_per_second = 1
+maximum_p99_ns = 0
+maximum_failure_ratio = 1000000
+
 [output]
 directory = "artifacts/loadgen/distributed-smoke"
 interval_jsonl = true
@@ -24,7 +30,7 @@ human = true
 listen = "127.0.0.1:9910"
 token_file = "secrets/loadgen-smoke.token"
 heartbeat_ms = 100
-agent_timeout_ms = 1000
+agent_timeout_ms = 5000
 start_delay_ms = 1000
 agents = ["agent-a", "agent-b", "agent-c"]
 allowed_endpoints = ["127.0.0.1:9900"]

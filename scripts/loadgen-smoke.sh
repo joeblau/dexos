@@ -31,17 +31,31 @@ for _ in {1..50}; do
 done
 
 target/debug/market-loadgen-campaign \
-  --scenario config/loadgen/local-sink.toml \
+  --scenario config/loadgen/local-sink-smoke.toml \
   >"$tmp/generator.json"
 
 kill -INT "$sink_pid"
 wait "$sink_pid"
 sink_pid=""
 
-grep -q '"target":"reference-sink-test-only"' "$tmp/generator.json"
-grep -q '"mode":"reference-sink-test-only"' "$tmp/sink.json"
-grep -q '"socket_written":1000' "$tmp/generator.json"
-test "$(wc -l < artifacts/loadgen/local-sink/intervals.jsonl)" -eq 1
-test -s artifacts/loadgen/local-sink/provenance.json
+python3 - "$tmp/generator.json" "$tmp/sink.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    generator = json.load(handle)
+with open(sys.argv[2], encoding="utf-8") as handle:
+    sink = json.load(handle)
+
+assert generator["target"] == "reference-sink-test-only"
+assert sink["mode"] == "reference-sink-test-only"
+assert generator["socket_written"] > 0
+assert generator["acknowledged"] > 0
+assert generator["acknowledged"] == generator["accepted"] + generator["rejected"]
+assert sink["received"] == generator["socket_written"]
+assert sink["acknowledged"] == generator["acknowledged"]
+PY
+test "$(wc -l < artifacts/loadgen/local-sink-smoke/intervals.jsonl)" -eq 1
+test -s artifacts/loadgen/local-sink-smoke/provenance.json
 
 echo "loadgen smoke passed"

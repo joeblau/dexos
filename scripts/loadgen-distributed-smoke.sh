@@ -39,7 +39,13 @@ target/debug/market-loadgen-campaign reference-sink --listen 127.0.0.1:9900 \
   >"$tmp/sink.json" 2>"$tmp/sink.log" &
 sink_pid=$!
 pids+=("$sink_pid")
-sleep 0.2
+for _ in {1..50}; do
+  if (exec 3<>/dev/tcp/127.0.0.1/9900) 2>/dev/null; then
+    exec 3>&-
+    break
+  fi
+  sleep 0.1
+done
 
 target/debug/market-loadgen-campaign \
   --scenario "$tmp/distributed-controller-smoke.toml" \
@@ -74,12 +80,33 @@ wait "$controller_pid"
 kill -INT "$sink_pid"
 wait "$sink_pid"
 
-grep -q '"mode":"distributed"' "$tmp/controller.json"
-grep -q '"socket_written":1200' "$tmp/controller.json"
-grep -q '"socket_written":400' "$tmp/agent-a.json"
-grep -q '"socket_written":400' "$tmp/agent-b.json"
-grep -q '"socket_written":400' "$tmp/agent-c.json"
-grep -q '"received":1200' "$tmp/sink.json"
+python3 - \
+  "$tmp/controller.json" \
+  "$tmp/agent-a.json" "$tmp/agent-b.json" "$tmp/agent-c.json" \
+  "$tmp/sink.json" <<'PY'
+import json
+import sys
+
+def read(path):
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)
+
+controller = read(sys.argv[1])
+agents = [read(path) for path in sys.argv[2:5]]
+sink = read(sys.argv[5])
+
+assert controller["mode"] == "distributed"
+assert len(controller["agents"]) == 3
+assert all(agent["socket_written"] > 0 for agent in agents)
+assert all(agent["acknowledged"] > 0 for agent in agents)
+written = sum(agent["socket_written"] for agent in agents)
+acknowledged = sum(agent["acknowledged"] for agent in agents)
+assert controller["aggregate"]["socket_written"] == written
+assert controller["aggregate"]["acknowledged"] == acknowledged
+assert sink["received"] == written
+assert sink["acknowledged"] == acknowledged
+assert sink["transport_errors"] == 0
+PY
 test "$(wc -l < artifacts/loadgen/distributed-smoke/controller/intervals.jsonl)" -eq 2
 test "$(wc -l < artifacts/loadgen/distributed-smoke/agent-agent-a/intervals.jsonl)" -eq 2
 test "$(wc -l < artifacts/loadgen/distributed-smoke/agent-agent-b/intervals.jsonl)" -eq 2

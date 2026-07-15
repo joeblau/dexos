@@ -48,12 +48,26 @@ run_signal() {
   sed \
     -e 's/duration_secs = 1/duration_secs = 30/' \
     -e "s#directory = .*#directory = \"$tmp/artifacts-$signal\"#" \
-    config/loadgen/local-sink.toml >"$scenario"
+    config/loadgen/local-sink-smoke.toml >"$scenario"
 
   target/debug/market-loadgen-campaign --scenario "$scenario" \
     >"$tmp/generator-$signal.json" 2>"$tmp/generator-$signal.log" &
   generator_pid=$!
-  sleep 0.5
+  ready=false
+  for _ in {1..100}; do
+    if grep -q 'loadgen second=' "$tmp/generator-$signal.log"; then
+      ready=true
+      break
+    fi
+    if ! kill -0 "$generator_pid" 2>/dev/null; then
+      break
+    fi
+    sleep 0.1
+  done
+  if [[ "$ready" != true ]]; then
+    echo "error: loadgen did not enter its steady run before $signal" >&2
+    exit 1
+  fi
   kill -"$signal" "$generator_pid"
   if wait "$generator_pid"; then
     echo "error: $signal-interrupted loadgen unexpectedly exited successfully" >&2
