@@ -10,6 +10,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+crypto = { path = "../crypto" }
 types = { path = "../types" }
 serde.workspace = true
 thiserror.workspace = true

@@ -177,6 +177,30 @@ impl LiquidationQueue {
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
     }
+
+    /// Visit the stored liquidation order from the next account to pop through
+    /// the newest queued account.
+    pub(crate) fn for_each_fifo<F: FnMut(AccountId)>(&self, mut f: F) {
+        for account in &self.queue {
+            f(*account);
+        }
+    }
+
+    /// Copy the actual membership index in canonical account order. The v1
+    /// commitment deliberately records both queue and index until a later
+    /// fail-closed validator makes the index safely derivable.
+    pub(crate) fn present_accounts_sorted(&self) -> Vec<AccountId> {
+        let mut accounts: Vec<AccountId> = self.present.iter().copied().collect();
+        accounts.sort_unstable();
+        accounts
+    }
+
+    /// Test-only corruption hook used to prove that the transition root binds
+    /// the membership index independently from FIFO contents.
+    #[cfg(test)]
+    pub(crate) fn remove_membership_for_test(&mut self, account: AccountId) -> bool {
+        self.present.remove(&account)
+    }
 }
 
 #[cfg(test)]

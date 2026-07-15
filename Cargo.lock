@@ -5593,6 +5593,7 @@ dependencies = [
 name = "risk"
 version = "0.0.1"
 dependencies = [
+ "crypto",
  "serde",
  "thiserror 2.0.18",
  "types",
