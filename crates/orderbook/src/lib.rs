@@ -44,14 +44,18 @@ pub use order::{
 /// Runtime backend used only for pure, bit-identical match-planning kernels.
 pub use simd::Backend as MatchingBackend;
 
-/// Authenticated book-root schema version (v2 = multiset of per-order leaves).
+/// Fast diagnostic book-root schema version (v2 = unordered XOR multiset of
+/// per-order leaves).
 ///
-/// Hot-path mutations update only the touched order leaf and re-finalize the
-/// cached aggregate; they never re-serialize the full resting set. See
-/// [`OrderBook::state_root`] and [`OrderBook::state_root_full_rebuild`].
+/// This root is retained only as a hot-path differential/performance signal. It
+/// does **not** commit FIFO priority and must never be certified as state. Use
+/// [`OrderBook::transition_root_v3`] for an authoritative transition root.
 pub const BOOK_ROOT_SCHEMA_VERSION: u8 = 2;
 
-/// Documented hot-path hashing budget for a no-fill insert or cancel of one
+/// Canonical, FIFO-sensitive transition-root schema.
+pub const BOOK_TRANSITION_ROOT_SCHEMA_VERSION: u16 = 3;
+
+/// Documented diagnostic hot-path hashing budget for a no-fill insert or cancel of one
 /// resting order: one order-leaf preimage (≤ 48 bytes of fields) under
 /// [`crypto::DOMAIN_EXECUTION`], XOR into the 32-byte aggregate, then one
 /// finalize hash over `1 + 32` bytes (schema version + aggregate). Independent
