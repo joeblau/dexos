@@ -106,6 +106,35 @@ impl DedupCache {
         self.order.len()
     }
 
+    /// Fail-stop validation for the result map, FIFO, and actual eviction
+    /// capacity read by future lookups/inserts.
+    pub(crate) fn validate_representation(&self, expected_capacity: usize) {
+        assert_eq!(
+            self.capacity, expected_capacity,
+            "dedup capacity must match the logical book configuration"
+        );
+        assert_eq!(
+            self.order.len(),
+            self.map.len(),
+            "dedup FIFO and result map must contain the same keys"
+        );
+        assert!(
+            self.map.len() <= self.capacity,
+            "dedup records must not exceed capacity"
+        );
+        let mut seen = HashSet::with_capacity(self.order.len());
+        for key in &self.order {
+            assert!(
+                seen.insert(*key),
+                "dedup FIFO must not contain duplicate keys"
+            );
+            assert!(
+                self.map.contains_key(key),
+                "dedup FIFO key must have a cached result"
+            );
+        }
+    }
+
     /// Visit records in eviction order (oldest first). The queue and map are
     /// updated atomically by [`Self::insert`], so a queued key always has a
     /// corresponding result.
@@ -201,5 +230,24 @@ mod tests {
 
         assert_eq!(c.record_count(), 2);
         c.for_each_in_eviction_order(|_, _, _| {});
+    }
+
+    #[test]
+    fn representation_validator_binds_actual_capacity() {
+        let mut cache = DedupCache::with_capacity(2);
+        cache.insert(AccountId::new(1), 1, result(1));
+        cache.validate_representation(2);
+
+        let mismatch = std::panic::catch_unwind(|| cache.validate_representation(3));
+        assert!(mismatch.is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "dedup records must not exceed capacity")]
+    fn representation_validator_rejects_records_over_capacity() {
+        let mut cache = DedupCache::with_capacity(1);
+        cache.insert(AccountId::new(1), 1, result(1));
+        cache.capacity = 0;
+        cache.validate_representation(0);
     }
 }

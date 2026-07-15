@@ -115,6 +115,15 @@ impl SideBook {
         }
     }
 
+    pub(crate) fn side(&self) -> Side {
+        self.side
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_side_for_test(&mut self, side: Side) {
+        self.side = side;
+    }
+
     /// Best price on this side: highest for bids, lowest for asks.
     pub(crate) fn best_price(&self) -> Option<Price> {
         match self.side {

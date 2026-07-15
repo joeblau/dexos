@@ -25,6 +25,67 @@ use crate::idempotency::{
 use crate::ledger::Ledger;
 use crate::session::SessionRegistry;
 
+/// Canonical complete execution-engine transition-root schema.
+pub const ENGINE_TRANSITION_ROOT_SCHEMA_VERSION: u16 = 1;
+
+/// Fixed-width canonical writer for the complete EngineState commitment.
+/// Native-width integers, map layout, and serde enum ordinals are excluded.
+#[derive(Default)]
+struct EngineTransitionWriter {
+    bytes: Vec<u8>,
+}
+
+impl EngineTransitionWriter {
+    fn u8(&mut self, value: u8) {
+        self.bytes.push(value);
+    }
+
+    fn bool(&mut self, value: bool) {
+        self.u8(u8::from(value));
+    }
+
+    fn u16(&mut self, value: u16) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn u32(&mut self, value: u32) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn u64(&mut self, value: u64) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn i32(&mut self, value: i32) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn i64(&mut self, value: i64) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn i128(&mut self, value: i128) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn usize(&mut self, value: usize) -> Result<(), ExecutionError> {
+        let value =
+            u64::try_from(value).map_err(|_| ExecutionError::StateEncodingOverflow { value })?;
+        self.u64(value);
+        Ok(())
+    }
+
+    fn length_prefixed_bytes(&mut self, value: &[u8]) -> Result<(), ExecutionError> {
+        self.usize(value.len())?;
+        self.bytes.extend_from_slice(value);
+        Ok(())
+    }
+
+    fn hash(&mut self, value: Hash) {
+        self.bytes.extend_from_slice(value.as_bytes());
+    }
+}
+
 /// Transaction snapshot page shared until its first mutation.
 ///
 /// Cloning an [`Engine`] clones these `Arc`s only. A mutating subsystem call
@@ -131,6 +192,51 @@ fn instrument_count(market_type: MarketType, outcomes: u16) -> u16 {
         outcomes.max(2)
     } else {
         1
+    }
+}
+
+const fn market_type_tag(market_type: MarketType) -> u8 {
+    match market_type {
+        MarketType::Perpetual => 0,
+        MarketType::BinaryPrediction => 1,
+        MarketType::MultiOutcomePrediction => 2,
+        MarketType::Decision => 3,
+        MarketType::Sports => 4,
+        MarketType::Scalar => 5,
+        MarketType::CustomPayoutVector => 6,
+    }
+}
+
+const fn market_lifecycle_tag(lifecycle: MarketLifecycle) -> u8 {
+    match lifecycle {
+        MarketLifecycle::Draft => 0,
+        MarketLifecycle::Staked => 1,
+        MarketLifecycle::Bootstrapping => 2,
+        MarketLifecycle::Open => 3,
+        MarketLifecycle::Halted => 4,
+        MarketLifecycle::Closed => 5,
+        MarketLifecycle::PendingResolution => 6,
+        MarketLifecycle::Disputed => 7,
+        MarketLifecycle::Resolved => 8,
+        MarketLifecycle::Invalid => 9,
+        MarketLifecycle::Settled => 10,
+        MarketLifecycle::Archived => 11,
+    }
+}
+
+const fn oracle_health_tag(health: OracleHealth) -> u8 {
+    match health {
+        OracleHealth::Normal => 0,
+        OracleHealth::Degraded => 1,
+        OracleHealth::Stale => 2,
+        OracleHealth::Halted => 3,
+    }
+}
+
+const fn side_tag(side: Side) -> u8 {
+    match side {
+        Side::Bid => 0,
+        Side::Ask => 1,
     }
 }
 
@@ -374,6 +480,222 @@ impl Engine {
     /// Read-only risk access.
     pub fn risk(&self) -> &RiskEngine {
         &self.risk
+    }
+
+    /// Cryptographic commitment to every stored value that can affect a future
+    /// execution-engine transition.
+    ///
+    /// EngineState v1 composes the checked ledger and risk roots, canonical
+    /// session and FIFO-sensitive book roots, the legacy proof tree and its
+    /// capacities, every engine-owned primary/sidecar map, the complete replay
+    /// guard (window, watermarks, retained receipts, and FIFO eviction order),
+    /// protocol version, and the last consumed sequence. Hash-map layout and
+    /// insertion order are excluded by sorting keys; all lengths and fields use
+    /// fixed-width little-endian encoding.
+    ///
+    /// This additive root is intentionally separate from
+    /// [`DeterministicEngine::state_root`]. Existing receipts and account/market
+    /// proofs continue to use the incremental state-tree root until activation,
+    /// proof migration, and exact-replay sequence semantics are versioned
+    /// together. Worker-local matching backend selection and encoding scratch
+    /// are deliberately excluded because neither can affect a transition.
+    /// Ledger, risk, replay, state-tree, and outer-encoding corruption is
+    /// returned as a typed error. The current session and book child
+    /// commitments fail-stop on corrupt private state; a restore path must
+    /// validate those children before invoking this root.
+    pub fn transition_root_v1(&self) -> Result<Hash, ExecutionError> {
+        let ledger_root = self.ledger.transition_root_v1()?;
+        let session_root = self.sessions.transition_root_v1();
+        let risk_root = self.risk.transition_root_v1()?;
+        self.tree.validate_transition_invariants()?;
+        self.replay
+            .validate_engine_context(self.ledger.account_count(), self.last_seq)?;
+        let replay_root = self.replay.transition_root_v1()?;
+
+        let mut writer = EngineTransitionWriter::default();
+        writer.u16(ENGINE_TRANSITION_ROOT_SCHEMA_VERSION);
+        writer.u16(self.protocol_version);
+        match self.last_seq {
+            Some(sequence) => {
+                writer.u8(1);
+                writer.u64(sequence);
+            }
+            None => {
+                writer.u8(0);
+                writer.u64(0);
+            }
+        }
+
+        writer.usize(self.tree.account_capacity())?;
+        writer.usize(self.tree.market_capacity())?;
+        writer.hash(self.tree.root());
+        writer.hash(ledger_root);
+        writer.hash(session_root);
+        writer.hash(risk_root);
+        writer.hash(replay_root);
+
+        let mut market_ids: Vec<u32> = self.markets.keys().copied().collect();
+        market_ids.sort_unstable();
+        writer.usize(market_ids.len())?;
+        for market_id in market_ids {
+            let market = self
+                .markets
+                .get(&market_id)
+                .expect("market key collected from the same immutable map");
+            writer.u32(market_id);
+            writer.u8(market_type_tag(market.market_type));
+            writer.u16(market.outcomes);
+            writer.i64(market.mark_price.raw());
+            writer.u8(market_lifecycle_tag(market.lifecycle));
+            writer.u8(oracle_health_tag(market.oracle_health));
+            writer.i32(market.maker_fee_bps);
+            writer.i32(market.taker_fee_bps);
+            writer.u64(market.last_funding_epoch);
+            match market.winning_outcome {
+                Some(winner) => {
+                    writer.u8(1);
+                    writer.u16(winner);
+                }
+                None => {
+                    writer.u8(0);
+                    writer.u16(0);
+                }
+            }
+        }
+
+        let mut book_keys: Vec<(u32, u16)> = self.books.keys().copied().collect();
+        book_keys.sort_unstable();
+        writer.usize(book_keys.len())?;
+        for (market, instrument) in book_keys {
+            let book = self
+                .books
+                .get(&(market, instrument))
+                .expect("book key collected from the same immutable map");
+            writer.u32(market);
+            writer.u16(instrument);
+            writer.hash(book.transition_root_v3());
+        }
+
+        let mut reserve_keys: Vec<OrderKey> = self.order_reserves.keys().copied().collect();
+        reserve_keys.sort_unstable();
+        writer.usize(reserve_keys.len())?;
+        for (market, instrument, order_id) in reserve_keys {
+            let reserve = self
+                .order_reserves
+                .get(&(market, instrument, order_id))
+                .expect("reserve key collected from the same immutable map");
+            writer.u32(market);
+            writer.u16(instrument);
+            writer.u64(order_id);
+            writer.u32(reserve.account.get());
+            writer.i128(reserve.reserved.raw());
+            writer.i64(reserve.qty_remaining.raw());
+        }
+
+        let mut claim_accounts: Vec<u32> = self.claims.keys().copied().collect();
+        claim_accounts.sort_unstable();
+        writer.usize(claim_accounts.len())?;
+        for account in claim_accounts {
+            writer.u32(account);
+            let markets = self
+                .claims
+                .get(&account)
+                .expect("claim account key collected from the same immutable map");
+            writer.usize(markets.len())?;
+            for (&market, balances) in markets {
+                writer.u32(market);
+                writer.usize(balances.len())?;
+                for balance in balances {
+                    writer.i128(balance.raw());
+                }
+            }
+        }
+
+        writer.usize(self.bid_premium_escrow.len())?;
+        for (&(account, market), amount) in self.bid_premium_escrow.iter() {
+            writer.u32(account);
+            writer.u32(market);
+            writer.i128(amount.raw());
+        }
+
+        writer.usize(self.ask_claims_escrow.len())?;
+        for (&(account, market, instrument), amount) in self.ask_claims_escrow.iter() {
+            writer.u32(account);
+            writer.u32(market);
+            writer.u16(instrument);
+            writer.i128(amount.raw());
+        }
+
+        let mut claim_escrow_keys: Vec<OrderKey> = self.claim_escrows.keys().copied().collect();
+        claim_escrow_keys.sort_unstable();
+        writer.usize(claim_escrow_keys.len())?;
+        for (market, instrument, order_id) in claim_escrow_keys {
+            let escrow = self
+                .claim_escrows
+                .get(&(market, instrument, order_id))
+                .expect("claim-escrow key collected from the same immutable map");
+            writer.u32(market);
+            writer.u16(instrument);
+            writer.u64(order_id);
+            writer.u32(escrow.account.get());
+            writer.u8(side_tag(escrow.side));
+            writer.i128(escrow.premium.raw());
+            writer.i128(escrow.claims.raw());
+        }
+
+        let mut mint_keys: Vec<(u32, u32)> = self.mint_locked.keys().copied().collect();
+        mint_keys.sort_unstable();
+        writer.usize(mint_keys.len())?;
+        for (account, market) in mint_keys {
+            let amount = self
+                .mint_locked
+                .get(&(account, market))
+                .expect("mint key collected from the same immutable map");
+            writer.u32(account);
+            writer.u32(market);
+            writer.i128(amount.raw());
+        }
+
+        let mut deposits: Vec<(u32, Vec<u8>, u32)> = self.deposits_seen.iter().cloned().collect();
+        deposits.sort_unstable();
+        writer.usize(deposits.len())?;
+        for (source_chain, source_tx, source_event_index) in deposits {
+            writer.u32(source_chain);
+            writer.length_prefixed_bytes(&source_tx)?;
+            writer.u32(source_event_index);
+        }
+
+        let mut withdrawal_ids: Vec<u64> = self.withdrawals.keys().copied().collect();
+        withdrawal_ids.sort_unstable();
+        writer.usize(withdrawal_ids.len())?;
+        for withdrawal_id in withdrawal_ids {
+            let withdrawal = self
+                .withdrawals
+                .get(&withdrawal_id)
+                .expect("withdrawal key collected from the same immutable map");
+            writer.u64(withdrawal_id);
+            writer.u32(withdrawal.account.get());
+            writer.i128(withdrawal.amount.raw());
+            writer.bool(withdrawal.finalized);
+        }
+
+        let mut wallet_accounts: Vec<u32> = self.wallets.keys().copied().collect();
+        wallet_accounts.sort_unstable();
+        writer.usize(wallet_accounts.len())?;
+        for account in wallet_accounts {
+            let wallet = self
+                .wallets
+                .get(&account)
+                .expect("wallet key collected from the same immutable map");
+            writer.u32(account);
+            writer.u32(wallet.chain_id);
+            writer.length_prefixed_bytes(&wallet.address)?;
+        }
+
+        Ok(crypto::hash_domain(
+            crypto::DOMAIN_EXECUTION_STATE,
+            &writer.bytes,
+        ))
     }
 
     /// Number of orders currently resting across all instruments of `market`,
@@ -1809,12 +2131,13 @@ impl Engine {
                     }
                 }
                 // Release every resting reservation for this account in the market.
-                let keys: Vec<OrderKey> = self
+                let mut keys: Vec<OrderKey> = self
                     .order_reserves
                     .iter()
                     .filter(|((m, _, _), rec)| *m == c.market.get() && rec.account == c.account)
                     .map(|(k, _)| *k)
                     .collect();
+                keys.sort_unstable();
                 for key in keys {
                     if let Some(rec) = self.order_reserves.remove(&key) {
                         self.risk.release_resting(rec.account, rec.reserved)?;
@@ -2080,12 +2403,13 @@ impl Engine {
                 affected.sort_by_key(|a| a.get());
                 affected.dedup();
                 // Drop any resting reservations for the liquidated account.
-                let drop_keys: Vec<OrderKey> = self
+                let mut drop_keys: Vec<OrderKey> = self
                     .order_reserves
                     .iter()
                     .filter(|(_, rec)| rec.account == c.account)
                     .map(|(k, _)| *k)
                     .collect();
+                drop_keys.sort_unstable();
                 for key in drop_keys {
                     if let Some(rec) = self.order_reserves.remove(&key) {
                         let _ = self.risk.release_resting(rec.account, rec.reserved);
@@ -2262,12 +2586,13 @@ impl Engine {
                         let _ = book; // cancelled via reserves keys below
                     }
                 }
-                let reserve_keys: Vec<OrderKey> = self
+                let mut reserve_keys: Vec<OrderKey> = self
                     .order_reserves
                     .keys()
                     .copied()
                     .filter(|(m, _, _)| *m == c.market.get())
                     .collect();
+                reserve_keys.sort_unstable();
                 for key in reserve_keys {
                     if let Some(rec) = self.order_reserves.remove(&key) {
                         let _ = self.risk.release_resting(rec.account, rec.reserved);
@@ -2345,12 +2670,13 @@ impl Engine {
                     .ok_or(ExecutionError::MarketNotResolved)?;
                 let win_idx = usize::from(winner);
                 // Drain mint locks into a settlement pool, then pay claim holders.
-                let minters: Vec<(u32, Amount)> = self
+                let mut minters: Vec<(u32, Amount)> = self
                     .mint_locked
                     .iter()
                     .filter(|((_, m), _)| *m == c.market.get())
                     .map(|((a, _), amt)| (*a, *amt))
                     .collect();
+                minters.sort_unstable_by_key(|(account, _)| *account);
                 let mut pool = Amount::ZERO;
                 for (acct, amt) in &minters {
                     let account = AccountId::new(*acct);
@@ -2358,13 +2684,14 @@ impl Engine {
                     pool = pool.checked_add(*amt)?;
                     self.mint_locked.remove(&(*acct, c.market.get()));
                 }
-                let holders: Vec<(u32, Vec<Amount>)> = self
+                let mut holders: Vec<(u32, Vec<Amount>)> = self
                     .claims
                     .iter()
                     .filter_map(|(&a, markets)| {
                         markets.get(&c.market.get()).map(|v| (a, v.clone()))
                     })
                     .collect();
+                holders.sort_unstable_by_key(|(account, _)| *account);
                 let mut paid = Amount::ZERO;
                 let mut touched: Vec<AccountId> = Vec::new();
                 for (acct, balances) in holders {
@@ -2447,8 +2774,10 @@ impl DeterministicEngine for Engine {
                     // Exactly-once: a byte-identical retry returns the original
                     // receipt without re-applying any delta. The only state that
                     // advances is the consumed sequence; ledger, positions, risk,
-                    // book, withdrawals, and the root are left byte-identical, so
-                    // advance `last_seq` in place rather than cloning the engine.
+                    // book, withdrawals, and the legacy proof-tree root are left
+                    // byte-identical. EngineState v1 does advance because it
+                    // commits `last_seq`, so update that field in place rather
+                    // than cloning the engine.
                     self.last_seq = Some(seq);
                     return Ok(receipt);
                 }
@@ -2518,9 +2847,10 @@ impl DeterministicEngine for Engine {
         };
 
         if let Some(binding) = binding.as_ref() {
-            // Cache the receipt for exact-retry replay. This is a local,
-            // replay-rebuilt cache and does not alter the committed root, so the
-            // receipt's state root (captured in `apply`) stays valid.
+            // Cache the receipt for exact-retry replay. The receipt's embedded
+            // root is the legacy incremental proof-tree root captured in
+            // `apply`; finalization changes only the additive EngineState v1
+            // commitment, which is not yet exposed in receipts.
             txn.replay.finalize(binding, receipt.clone());
         }
 
@@ -2541,13 +2871,14 @@ mod tests {
 
     use super::*;
     use crate::command::{
-        ApplyFundingEpoch, CancelAll, CancelOrder, CompleteSetOp, CreateAccount, CreateMarket,
-        DepositCredit, FinalizeWithdrawal, Liquidate, PlaceOrder, ReplaceOrder, RequestWithdrawal,
-        ResolveMarket, SetMarkPrice, SettleMarket,
+        ApplyFundingEpoch, AuthorizeSession, BindWallet, CancelAll, CancelOrder, CompleteSetOp,
+        CreateAccount, CreateMarket, DepositCredit, FinalizeWithdrawal, Liquidate, PlaceOrder,
+        ProtocolUpgrade, ReplaceOrder, RequestWithdrawal, ResolveMarket, SetMarkPrice,
+        SetMarketLifecycle, SetOracleHealth, SettleMarket,
     };
     use state_tree::{verify_account, verify_market};
     use std::collections::HashMap;
-    use types::{OrderId, OrderType, Price, TimeInForce};
+    use types::{OrderId, OrderType, Price, Ratio, TimeInForce};
 
     fn engine_with_caps(account_capacity: usize, market_capacity: usize) -> Engine {
         let base = EngineConfig::default();
@@ -2666,6 +2997,588 @@ mod tests {
             order_id: OrderId::new(order_id),
             auth: Authorization::Master,
         })
+    }
+
+    fn engine_transition_fixture() -> Engine {
+        let mut engine = engine_with_caps(32, 16);
+        let commands = vec![
+            create_account(100_000_000),
+            create_account(100_000_000),
+            Command::BindWallet(BindWallet {
+                account: AccountId::new(0),
+                chain_id: 8453,
+                address: vec![0x11; 20],
+            }),
+            Command::AuthorizeSession(AuthorizeSession {
+                account: AccountId::new(0),
+                session_key: [0x22; 32],
+                allowed_markets: vec![MarketId::new(0), MarketId::new(1)],
+                max_notional: Amount::from_raw(10_000_000),
+                expires_at: 99_999,
+                nonce_start: 7,
+                nonce_end: 11,
+            }),
+            deposit(1, vec![0x33; 32], 5_000_000),
+            create_perp(0, 1_000_000),
+            create_claim(1),
+            place(0, 0, 11, Side::Bid, 1_000_000, 1_000_000),
+            mint(0, 1, 3_000_000),
+            place_at(1, 1, 21, Side::Bid, 400_000, 1_000_000, 0, TimeInForce::Gtc),
+            place_at(0, 1, 22, Side::Ask, 600_000, 1_000_000, 1, TimeInForce::Gtc),
+            Command::RequestWithdrawal(RequestWithdrawal {
+                account: AccountId::new(1),
+                amount: Amount::from_raw(1_000_000),
+                nonce: 9,
+                destination_chain: 42161,
+                destination_address: vec![0x44; 20],
+                auth: Authorization::Master,
+            }),
+            Command::ApplyFundingEpoch(ApplyFundingEpoch {
+                market: MarketId::new(0),
+                epoch: 1,
+                rate: Ratio::from_raw(1_000),
+            }),
+            Command::SetOracleHealth(SetOracleHealth {
+                market: MarketId::new(0),
+                health: OracleHealth::Degraded,
+            }),
+            Command::SetMarketLifecycle(SetMarketLifecycle {
+                market: MarketId::new(0),
+                lifecycle: MarketLifecycle::Halted,
+            }),
+            Command::ProtocolUpgrade(ProtocolUpgrade { target_version: 2 }),
+        ];
+        for (index, command) in commands.into_iter().enumerate() {
+            engine
+                .execute(seq(u64::try_from(index).unwrap() + 1), command)
+                .unwrap();
+        }
+        let perp = engine.markets.get_mut(&0).unwrap();
+        perp.maker_fee_bps = -2;
+        perp.taker_fee_bps = 7;
+        engine
+    }
+
+    fn assert_engine_transition_changes(base: &Engine, mutate: impl FnOnce(&mut Engine)) {
+        let root = base.transition_root_v1().unwrap();
+        let mut changed = base.clone();
+        mutate(&mut changed);
+        assert_ne!(changed.transition_root_v1().unwrap(), root);
+    }
+
+    #[test]
+    fn engine_transition_root_v1_golden_vectors() {
+        assert_eq!(
+            Engine::new(EngineConfig::default())
+                .transition_root_v1()
+                .unwrap(),
+            Hash::from_bytes([
+                86, 51, 192, 177, 70, 237, 21, 63, 211, 11, 207, 94, 9, 13, 197, 109, 192, 225, 27,
+                208, 247, 95, 225, 208, 141, 218, 189, 155, 186, 64, 126, 56,
+            ])
+        );
+        assert_eq!(
+            engine_transition_fixture().transition_root_v1().unwrap(),
+            Hash::from_bytes([
+                224, 211, 240, 222, 168, 207, 17, 179, 33, 18, 171, 55, 14, 86, 220, 122, 82, 228,
+                188, 58, 77, 176, 72, 68, 138, 220, 18, 66, 240, 164, 193, 58,
+            ])
+        );
+    }
+
+    #[test]
+    fn engine_transition_root_v1_binds_components_protocol_tree_and_metadata() {
+        let base = engine_transition_fixture();
+
+        assert_engine_transition_changes(&base, |engine| engine.protocol_version += 1);
+        assert_engine_transition_changes(&base, |engine| {
+            engine.last_seq = Some(engine.last_seq.unwrap() + 1);
+        });
+        assert_engine_transition_changes(&base, |engine| {
+            engine
+                .tree
+                .set_account(AccountId::new(7), b"stale-leaf")
+                .unwrap();
+        });
+        assert_engine_transition_changes(&base, |engine| {
+            engine.tree = CowState::new(StateTree::new(64, 16));
+        });
+        assert_engine_transition_changes(&base, |engine| {
+            engine
+                .ledger
+                .credit(AccountId::new(0), Amount::from_raw(1))
+                .unwrap();
+        });
+        assert_engine_transition_changes(&base, |engine| {
+            engine
+                .sessions
+                .authorize(
+                    AccountId::new(1),
+                    [0x55; 32],
+                    vec![MarketId::new(1)],
+                    Amount::from_raw(1),
+                    100,
+                    1,
+                    2,
+                )
+                .unwrap();
+        });
+        assert_engine_transition_changes(&base, |engine| {
+            engine.risk.fund_insurance(Amount::from_raw(1)).unwrap();
+        });
+
+        assert_engine_transition_changes(&base, |engine| {
+            engine.markets.get_mut(&0).unwrap().market_type = MarketType::Sports;
+        });
+        assert_engine_transition_changes(&base, |engine| {
+            engine.markets.get_mut(&0).unwrap().outcomes += 1;
+        });
+        assert_engine_transition_changes(&base, |engine| {
+            engine.markets.get_mut(&0).unwrap().mark_price = Price::from_raw(1_000_001);
+        });
+        assert_engine_transition_changes(&base, |engine| {
+            engine.markets.get_mut(&0).unwrap().lifecycle = MarketLifecycle::Archived;
+        });
+        assert_engine_transition_changes(&base, |engine| {
+            engine.markets.get_mut(&0).unwrap().oracle_health = OracleHealth::Halted;
+        });
+        assert_engine_transition_changes(&base, |engine| {
+            engine.markets.get_mut(&0).unwrap().maker_fee_bps -= 1;
+        });
+        assert_engine_transition_changes(&base, |engine| {
+            engine.markets.get_mut(&0).unwrap().taker_fee_bps += 1;
+        });
+        assert_engine_transition_changes(&base, |engine| {
+            engine.markets.get_mut(&0).unwrap().last_funding_epoch += 1;
+        });
+        assert_engine_transition_changes(&base, |engine| {
+            engine.markets.get_mut(&1).unwrap().winning_outcome = Some(1);
+        });
+    }
+
+    #[test]
+    fn engine_transition_root_v1_binds_every_engine_sidecar() {
+        let base = engine_transition_fixture();
+
+        assert_engine_transition_changes(&base, |engine| {
+            engine
+                .books
+                .get_mut(&(0, 0))
+                .unwrap()
+                .set_position(AccountId::new(1), Quantity::from_raw(1));
+        });
+        assert_engine_transition_changes(&base, |engine| {
+            engine
+                .order_reserves
+                .values_mut()
+                .next()
+                .unwrap()
+                .qty_remaining = Quantity::from_raw(999_999);
+        });
+        assert_engine_transition_changes(&base, |engine| {
+            engine.claims.get_mut(&0).unwrap().get_mut(&1).unwrap()[0] =
+                Amount::from_raw(2_000_001);
+        });
+        assert_engine_transition_changes(&base, |engine| {
+            *engine.bid_premium_escrow.values_mut().next().unwrap() = Amount::from_raw(400_001);
+        });
+        assert_engine_transition_changes(&base, |engine| {
+            *engine.ask_claims_escrow.values_mut().next().unwrap() = Amount::from_raw(1_000_001);
+        });
+        assert_engine_transition_changes(&base, |engine| {
+            engine.claim_escrows.values_mut().next().unwrap().premium = Amount::from_raw(1);
+        });
+        assert_engine_transition_changes(&base, |engine| {
+            *engine.mint_locked.values_mut().next().unwrap() = Amount::from_raw(3_000_001);
+        });
+        assert_engine_transition_changes(&base, |engine| {
+            engine.deposits_seen.insert((9, vec![1, 2, 3], 4));
+        });
+        assert_engine_transition_changes(&base, |engine| {
+            engine.withdrawals.values_mut().next().unwrap().finalized = true;
+        });
+        assert_engine_transition_changes(&base, |engine| {
+            engine.wallets.get_mut(&0).unwrap().address.push(0x66);
+        });
+        assert_engine_transition_changes(&base, |engine| {
+            engine.replay.reserve(&crate::idempotency::KeyBinding {
+                principal: 1,
+                domain: KeyDomain::Order,
+                key: 99,
+                digest: Hash::ZERO,
+            });
+        });
+
+        let mut cache_rebuilt = base.clone();
+        cache_rebuilt.replay.discard_receipt_cache_for_test();
+        let replayed_order =
+            crate::idempotency::command_binding(&place(0, 0, 11, Side::Bid, 1_000_000, 1_000_000))
+                .unwrap();
+        assert!(matches!(
+            base.replay.classify(&replayed_order),
+            crate::idempotency::GuardDecision::Replay(_)
+        ));
+        assert!(matches!(
+            cache_rebuilt.replay.classify(&replayed_order),
+            crate::idempotency::GuardDecision::Expired
+        ));
+        assert_ne!(
+            cache_rebuilt.transition_root_v1().unwrap(),
+            base.transition_root_v1().unwrap()
+        );
+    }
+
+    #[test]
+    fn engine_transition_root_v1_binds_sidecar_keys_and_record_fields() {
+        let base = engine_transition_fixture();
+
+        assert_engine_transition_changes(&base, |engine| {
+            let (&old_key, _) = engine.books.iter().next().unwrap();
+            let book = engine.books.remove(&old_key).unwrap();
+            engine.books.insert((old_key.0 + 100, old_key.1), book);
+        });
+        assert_engine_transition_changes(&base, |engine| {
+            let (&old_key, _) = engine.markets.iter().next().unwrap();
+            let market = engine.markets.remove(&old_key).unwrap();
+            engine.markets.insert(old_key + 100, market);
+        });
+
+        assert_engine_transition_changes(&base, |engine| {
+            let reserve = engine.order_reserves.values_mut().next().unwrap();
+            reserve.account = AccountId::new(reserve.account.get() + 1);
+        });
+        assert_engine_transition_changes(&base, |engine| {
+            let reserve = engine.order_reserves.values_mut().next().unwrap();
+            reserve.reserved = Amount::from_raw(reserve.reserved.raw() + 1);
+        });
+        assert_engine_transition_changes(&base, |engine| {
+            let reserve = engine.order_reserves.values_mut().next().unwrap();
+            reserve.qty_remaining = Quantity::from_raw(reserve.qty_remaining.raw() + 1);
+        });
+        assert_engine_transition_changes(&base, |engine| {
+            let (&old_key, _) = engine.order_reserves.iter().next().unwrap();
+            let reserve = engine.order_reserves.remove(&old_key).unwrap();
+            engine
+                .order_reserves
+                .insert((old_key.0 + 100, old_key.1, old_key.2), reserve);
+        });
+
+        assert_engine_transition_changes(&base, |engine| {
+            let (&account, markets) = engine.claims.iter().next().unwrap();
+            let markets = markets.clone();
+            engine.claims.remove(&account);
+            engine.claims.insert(account + 100, markets);
+        });
+        assert_engine_transition_changes(&base, |engine| {
+            let markets = engine.claims.values_mut().next().unwrap();
+            let (&market, balances) = markets.iter().next().unwrap();
+            let balances = balances.clone();
+            markets.remove(&market);
+            markets.insert(market + 100, balances);
+        });
+        assert_engine_transition_changes(&base, |engine| {
+            engine
+                .claims
+                .values_mut()
+                .next()
+                .unwrap()
+                .values_mut()
+                .next()
+                .unwrap()
+                .push(Amount::ZERO);
+        });
+
+        assert_engine_transition_changes(&base, |engine| {
+            let (&old_key, &amount) = engine.bid_premium_escrow.iter().next().unwrap();
+            engine.bid_premium_escrow.remove(&old_key);
+            engine
+                .bid_premium_escrow
+                .insert((old_key.0 + 100, old_key.1), amount);
+        });
+        assert_engine_transition_changes(&base, |engine| {
+            let (&old_key, &amount) = engine.bid_premium_escrow.iter().next().unwrap();
+            engine.bid_premium_escrow.remove(&old_key);
+            engine
+                .bid_premium_escrow
+                .insert((old_key.0, old_key.1 + 100), amount);
+        });
+
+        assert_engine_transition_changes(&base, |engine| {
+            let (&old_key, &amount) = engine.ask_claims_escrow.iter().next().unwrap();
+            engine.ask_claims_escrow.remove(&old_key);
+            engine
+                .ask_claims_escrow
+                .insert((old_key.0 + 100, old_key.1, old_key.2), amount);
+        });
+        assert_engine_transition_changes(&base, |engine| {
+            let (&old_key, &amount) = engine.ask_claims_escrow.iter().next().unwrap();
+            engine.ask_claims_escrow.remove(&old_key);
+            engine
+                .ask_claims_escrow
+                .insert((old_key.0, old_key.1 + 100, old_key.2), amount);
+        });
+        assert_engine_transition_changes(&base, |engine| {
+            let (&old_key, &amount) = engine.ask_claims_escrow.iter().next().unwrap();
+            engine.ask_claims_escrow.remove(&old_key);
+            engine
+                .ask_claims_escrow
+                .insert((old_key.0, old_key.1, old_key.2 + 1), amount);
+        });
+
+        assert_engine_transition_changes(&base, |engine| {
+            let escrow = engine.claim_escrows.values_mut().next().unwrap();
+            escrow.account = AccountId::new(escrow.account.get() + 1);
+        });
+        assert_engine_transition_changes(&base, |engine| {
+            let escrow = engine.claim_escrows.values_mut().next().unwrap();
+            escrow.side = match escrow.side {
+                Side::Bid => Side::Ask,
+                Side::Ask => Side::Bid,
+            };
+        });
+        assert_engine_transition_changes(&base, |engine| {
+            let escrow = engine.claim_escrows.values_mut().next().unwrap();
+            escrow.premium = Amount::from_raw(escrow.premium.raw() + 1);
+        });
+        assert_engine_transition_changes(&base, |engine| {
+            let escrow = engine.claim_escrows.values_mut().next().unwrap();
+            escrow.claims = Amount::from_raw(escrow.claims.raw() + 1);
+        });
+        assert_engine_transition_changes(&base, |engine| {
+            let (&old_key, _) = engine.claim_escrows.iter().next().unwrap();
+            let escrow = engine.claim_escrows.remove(&old_key).unwrap();
+            engine
+                .claim_escrows
+                .insert((old_key.0 + 100, old_key.1, old_key.2), escrow);
+        });
+
+        assert_engine_transition_changes(&base, |engine| {
+            let (&old_key, &amount) = engine.mint_locked.iter().next().unwrap();
+            engine.mint_locked.remove(&old_key);
+            engine
+                .mint_locked
+                .insert((old_key.0 + 100, old_key.1), amount);
+        });
+        assert_engine_transition_changes(&base, |engine| {
+            let (&old_key, &amount) = engine.mint_locked.iter().next().unwrap();
+            engine.mint_locked.remove(&old_key);
+            engine
+                .mint_locked
+                .insert((old_key.0, old_key.1 + 100), amount);
+        });
+
+        for field in 0..3 {
+            assert_engine_transition_changes(&base, |engine| {
+                let mut deposit = engine.deposits_seen.iter().next().unwrap().clone();
+                engine.deposits_seen.remove(&deposit);
+                match field {
+                    0 => deposit.0 += 1,
+                    1 => deposit.1.push(0x77),
+                    2 => deposit.2 += 1,
+                    _ => unreachable!(),
+                }
+                engine.deposits_seen.insert(deposit);
+            });
+        }
+
+        assert_engine_transition_changes(&base, |engine| {
+            let (&withdrawal_id, _) = engine.withdrawals.iter().next().unwrap();
+            let withdrawal = engine.withdrawals.remove(&withdrawal_id).unwrap();
+            engine.withdrawals.insert(withdrawal_id + 1, withdrawal);
+        });
+        assert_engine_transition_changes(&base, |engine| {
+            let withdrawal = engine.withdrawals.values_mut().next().unwrap();
+            withdrawal.account = AccountId::new(withdrawal.account.get() + 1);
+        });
+        assert_engine_transition_changes(&base, |engine| {
+            let withdrawal = engine.withdrawals.values_mut().next().unwrap();
+            withdrawal.amount = Amount::from_raw(withdrawal.amount.raw() + 1);
+        });
+
+        assert_engine_transition_changes(&base, |engine| {
+            let (&account, _) = engine.wallets.iter().next().unwrap();
+            let wallet = engine.wallets.remove(&account).unwrap();
+            engine.wallets.insert(account + 100, wallet);
+        });
+        assert_engine_transition_changes(&base, |engine| {
+            engine.wallets.values_mut().next().unwrap().chain_id += 1;
+        });
+    }
+
+    #[test]
+    fn engine_transition_root_v1_excludes_only_worker_local_state() {
+        let base = engine_transition_fixture();
+        let root = base.transition_root_v1().unwrap();
+
+        let mut changed = base.clone();
+        changed.matching_backend = match changed.matching_backend {
+            orderbook::MatchingBackend::Scalar => orderbook::MatchingBackend::Avx2,
+            _ => orderbook::MatchingBackend::Scalar,
+        };
+        assert_eq!(changed.transition_root_v1().unwrap(), root);
+
+        let mut changed = base;
+        changed
+            .leaf_scratch
+            .extend_from_slice(b"worker-local scratch");
+        assert_eq!(changed.transition_root_v1().unwrap(), root);
+    }
+
+    #[test]
+    fn engine_transition_root_v1_propagates_child_validation_errors() {
+        let mut corrupt_ledger = engine_transition_fixture();
+        corrupt_ledger.ledger.corrupt_total_supply_for_test();
+        assert_eq!(
+            corrupt_ledger.transition_root_v1(),
+            Err(ExecutionError::StateInvariant(
+                "ledger partition sum does not equal total supply"
+            ))
+        );
+
+        let mut config = EngineConfig::default();
+        config.risk.maintenance_margin = Ratio::from_raw(2);
+        config.risk.initial_margin = Ratio::from_raw(1);
+        assert_eq!(
+            Engine::new(config).transition_root_v1(),
+            Err(ExecutionError::Risk(risk::RiskError::StateInvariant(
+                "risk ratios must be positive and maintenance must not exceed initial margin"
+            )))
+        );
+
+        let mut corrupt_replay_context = engine_transition_fixture();
+        corrupt_replay_context.last_seq = None;
+        assert_eq!(
+            corrupt_replay_context.transition_root_v1(),
+            Err(ExecutionError::StateInvariant(
+                "replay state exists without a consumed engine sequence"
+            ))
+        );
+
+        let mut corrupt_replay_context = engine_transition_fixture();
+        corrupt_replay_context
+            .replay
+            .reserve(&crate::idempotency::KeyBinding {
+                principal: 99,
+                domain: KeyDomain::Order,
+                key: 1,
+                digest: Hash::ZERO,
+            });
+        assert_eq!(
+            corrupt_replay_context.transition_root_v1(),
+            Err(ExecutionError::StateInvariant(
+                "replay principal does not reference an existing ledger account"
+            ))
+        );
+    }
+
+    fn rebuild_map_descending<K, V>(source: &HashMap<K, V>) -> HashMap<K, V>
+    where
+        K: Clone + Ord + Eq + std::hash::Hash,
+        V: Clone,
+    {
+        let mut entries: Vec<(K, V)> = source
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        entries.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        entries.into_iter().collect()
+    }
+
+    #[test]
+    fn engine_transition_root_v1_canonicalizes_hash_layout() {
+        let base = engine_transition_fixture();
+        let mut rebuilt = base.clone();
+        rebuilt.markets = CowState::new(rebuild_map_descending(&base.markets));
+        rebuilt.books = CowState::new(rebuild_map_descending(&base.books));
+        rebuilt.order_reserves = CowState::new(rebuild_map_descending(&base.order_reserves));
+        rebuilt.claims = CowState::new(rebuild_map_descending(&base.claims));
+        rebuilt.claim_escrows = CowState::new(rebuild_map_descending(&base.claim_escrows));
+        rebuilt.mint_locked = CowState::new(rebuild_map_descending(&base.mint_locked));
+        rebuilt.withdrawals = CowState::new(rebuild_map_descending(&base.withdrawals));
+        rebuilt.wallets = CowState::new(rebuild_map_descending(&base.wallets));
+        let mut deposits: Vec<_> = base.deposits_seen.iter().cloned().collect();
+        deposits.sort_unstable_by(|a, b| b.cmp(a));
+        rebuilt.deposits_seen = CowState::new(deposits.into_iter().collect());
+
+        assert_eq!(
+            rebuilt.transition_root_v1().unwrap(),
+            base.transition_root_v1().unwrap()
+        );
+
+        let mut canonical = base;
+        let mut permuted = rebuilt;
+        for command in [
+            mint(1, 1, 1_000_000),
+            place_at(1, 1, 23, Side::Bid, 600_000, 1_000_000, 1, TimeInForce::Gtc),
+            Command::ResolveMarket(ResolveMarket {
+                market: MarketId::new(1),
+                winning_outcome: 1,
+            }),
+            Command::SettleMarket(SettleMarket {
+                market: MarketId::new(1),
+            }),
+        ] {
+            let sequence = seq(canonical.last_seq.unwrap() + 1);
+            assert_eq!(
+                canonical.execute(sequence, command.clone()),
+                permuted.execute(sequence, command)
+            );
+            assert_eq!(
+                canonical.transition_root_v1().unwrap(),
+                permuted.transition_root_v1().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn engine_transition_root_v1_binds_book_fifo_beyond_legacy_root() {
+        let make_order = |id: u64, account: u32| NewOrder {
+            order_id: OrderId::new(id),
+            account: AccountId::new(account),
+            side: Side::Bid,
+            order_type: OrderType::Limit,
+            tif: TimeInForce::Gtc,
+            price: Price::from_raw(1_000_000),
+            quantity: Quantity::from_raw(1_000_000),
+            client_id: id,
+            reduce_only: false,
+        };
+        let mut first = OrderBook::new(BookConfig::default());
+        first.place(make_order(1, 1)).unwrap();
+        first.place(make_order(2, 2)).unwrap();
+        let mut second = OrderBook::new(BookConfig::default());
+        second.place(make_order(2, 2)).unwrap();
+        second.place(make_order(1, 1)).unwrap();
+        assert_eq!(first.state_root(), second.state_root());
+        assert_ne!(first.transition_root_v3(), second.transition_root_v3());
+
+        let mut a = Engine::new(EngineConfig::default());
+        let mut b = Engine::new(EngineConfig::default());
+        a.books.insert((7, 0), CowState::new(first));
+        b.books.insert((7, 0), CowState::new(second));
+        assert_eq!(a.state_root(), b.state_root());
+        assert_ne!(
+            a.transition_root_v1().unwrap(),
+            b.transition_root_v1().unwrap()
+        );
+    }
+
+    #[test]
+    fn rejected_command_preserves_engine_transition_root_v1() {
+        let mut engine = engine_transition_fixture();
+        let before = engine.transition_root_v1().unwrap();
+        let sequence = seq(engine.last_seq.unwrap() + 1);
+        assert_eq!(
+            engine.execute(
+                sequence,
+                Command::SetMarkPrice(SetMarkPrice {
+                    market: MarketId::new(99),
+                    price: Price::from_raw(1),
+                })
+            ),
+            Err(ExecutionError::UnknownMarket)
+        );
+        assert_eq!(engine.transition_root_v1().unwrap(), before);
     }
 
     // A single deterministic function of the ENTIRE engine state — every

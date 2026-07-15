@@ -497,9 +497,14 @@ impl OrderBook {
     /// Schema v3 is correctness-first and performs a full ordered scan. It is
     /// intentionally separate from the O(1) v2 diagnostic until an incremental
     /// authenticated ordered structure can reproduce these bytes without
-    /// weakening the transition commitment.
+    /// weakening the transition commitment. The scan also recomputes and
+    /// validates the stored v2 XOR cache because that cache feeds legacy market
+    /// leaves after future mutations.
     #[must_use]
     pub fn transition_root_v3(&self) -> Hash {
+        self.slab.validate_representation(self.config.capacity);
+        self.dedup
+            .validate_representation(self.config.dedup_capacity);
         let mut writer = TransitionWriter::default();
         writer.u16(BOOK_TRANSITION_ROOT_SCHEMA_VERSION);
         writer.len(self.config.capacity);
@@ -507,8 +512,19 @@ impl OrderBook {
         writer.len(self.config.dedup_capacity);
         writer.len(self.config.max_basket_legs);
 
-        let bid_orders = self.write_transition_side(&mut writer, &self.bids, Side::Bid);
-        let ask_orders = self.write_transition_side(&mut writer, &self.asks, Side::Ask);
+        let mut recomputed_order_leaf_xor = [0u8; 32];
+        let bid_orders = self.write_transition_side(
+            &mut writer,
+            &self.bids,
+            Side::Bid,
+            &mut recomputed_order_leaf_xor,
+        );
+        let ask_orders = self.write_transition_side(
+            &mut writer,
+            &self.asks,
+            Side::Ask,
+            &mut recomputed_order_leaf_xor,
+        );
         assert_eq!(
             bid_orders
                 .checked_add(ask_orders)
@@ -525,6 +541,10 @@ impl OrderBook {
             self.account_orders.values().map(Vec::len).sum::<usize>(),
             self.slab.len(),
             "account-order index must cover every live slab node"
+        );
+        assert_eq!(
+            recomputed_order_leaf_xor, self.order_leaf_xor,
+            "incremental order-leaf XOR must match the canonical live-order scan"
         );
 
         let mut positions: Vec<(u32, i64)> = self
@@ -769,7 +789,13 @@ impl OrderBook {
         writer: &mut TransitionWriter,
         side: &SideBook,
         expected_side: Side,
+        recomputed_order_leaf_xor: &mut [u8; 32],
     ) -> usize {
+        assert_eq!(
+            side.side(),
+            expected_side,
+            "stored side-book role must match its engine field"
+        );
         let mut visited = 0usize;
         writer.len(side.level_count());
         side.for_each_canonical_level(|price, head, tail, count, total_qty| {
@@ -815,6 +841,7 @@ impl OrderBook {
                 writer.i64(node.price.raw());
                 writer.i64(node.remaining.raw());
                 writer.u64(node.client_id);
+                Self::xor_in(recomputed_order_leaf_xor, Self::order_leaf(node));
                 computed_qty = computed_qty
                     .checked_add(node.remaining)
                     .expect("price-level total quantity must not overflow");

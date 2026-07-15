@@ -309,6 +309,39 @@ impl ReplayGuard {
         ))
     }
 
+    /// Validate replay relations that require authoritative engine context and
+    /// therefore cannot be checked by the guard in isolation.
+    pub(crate) fn validate_engine_context(
+        &self,
+        account_count: usize,
+        last_sequence: Option<u64>,
+    ) -> Result<(), ExecutionError> {
+        if self.watermark.keys().any(|&(principal, _)| {
+            usize::try_from(principal).map_or(true, |index| index >= account_count)
+        }) {
+            return Err(ExecutionError::StateInvariant(
+                "replay principal does not reference an existing ledger account",
+            ));
+        }
+        if !self.watermark.is_empty() && last_sequence.is_none() {
+            return Err(ExecutionError::StateInvariant(
+                "replay state exists without a consumed engine sequence",
+            ));
+        }
+        if let Some(last_sequence) = last_sequence {
+            if self
+                .records
+                .values()
+                .any(|(_, receipt)| receipt.sequence > last_sequence)
+            {
+                return Err(ExecutionError::StateInvariant(
+                    "replay receipt sequence exceeds the engine sequence",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn validate_transition_invariants(&self) -> Result<(), ExecutionError> {
         if self.records.len() > self.window {
             return Err(ExecutionError::StateInvariant(
@@ -1177,6 +1210,35 @@ mod tests {
         assert_invariant(
             &changed,
             "replay FIFO keys are not strictly increasing per principal and domain",
+        );
+    }
+
+    #[test]
+    fn replay_engine_context_rejects_cross_component_corruption() {
+        let base = rich_replay_guard();
+        assert_eq!(base.validate_engine_context(100, Some(1_000)), Ok(()));
+
+        assert_eq!(
+            base.validate_engine_context(1, Some(1_000)),
+            Err(ExecutionError::StateInvariant(
+                "replay principal does not reference an existing ledger account"
+            ))
+        );
+        assert_eq!(
+            base.validate_engine_context(100, None),
+            Err(ExecutionError::StateInvariant(
+                "replay state exists without a consumed engine sequence"
+            ))
+        );
+        assert_eq!(
+            base.validate_engine_context(100, Some(200)),
+            Err(ExecutionError::StateInvariant(
+                "replay receipt sequence exceeds the engine sequence"
+            ))
+        );
+        assert_eq!(
+            ReplayGuard::with_window(10).validate_engine_context(0, None),
+            Ok(())
         );
     }
 
