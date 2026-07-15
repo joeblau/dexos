@@ -21,6 +21,7 @@ crate-type = ["cdylib", "rlib"]
 name = "stub_gen"
 path = "src/bin/stub_gen.rs"
 doc = false
+required-features = ["stub-gen"]
 
 # FFI crate: it deliberately does NOT inherit the workspace `[lints]` (whose
 # `unsafe_code = "deny"` would trip pyo3's generated `unsafe`). The other
@@ -32,17 +33,21 @@ unreachable_pub = "warn"
 
 [features]
 default = []
+# NON-default: only the committed-stub regeneration job needs the generator.
+# Keeping it separate prevents its full-CPython type adapters from entering the
+# ABI3 wheel build.
+stub-gen = ["dep:pyo3-stub-gen"]
 # NON-default: maturin turns it on for the wheel. Building WITHOUT it lets the
 # crate link on the host without libpython (the engine gate skips this crate
 # entirely, so it is never compiled there anyway).
-extension-module = ["pyo3/extension-module"]
+extension-module = ["pyo3/abi3-py39", "pyo3/extension-module"]
 
 [dependencies]
 dexos-sdk-core = { path = "../../crates/sdk-core" }
 # `macros` is a pyo3 default feature the workspace pin turns off
 # (default-features = false); re-enable it here for the `#[pymodule]` /
 # `#[pyfunction]` attribute macros.
-pyo3 = { workspace = true, features = ["abi3-py39", "macros"] }
+pyo3 = { workspace = true, features = ["macros"] }
 # `#[gen_stub_pyfunction]` + `define_stub_info_gatherer!` drive the `stub_gen`
 # bin that writes the committed, diff-gated `_core.pyi`.
-pyo3-stub-gen.workspace = true
+pyo3-stub-gen = { workspace = true, optional = true }
