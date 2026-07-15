@@ -51,7 +51,7 @@ jobs:
           test -s dist-${{ matrix.target }}/build-metadata-${{ matrix.target }}.json
           python3 -c "import json; m=json.load(open('dist-${{ matrix.target }}/build-metadata-${{ matrix.target }}.json')); assert m['panic_strategy']=='abort', m"
       - name: install cosign
-        uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da # v3.7.0
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - name: sign artifacts (keyless OIDC)
         env:
           COSIGN_YES: "true"
@@ -148,7 +148,7 @@ jobs:
               dist-aarch64/SHA256SUMS-aarch64-unknown-linux-gnu > SHA256SUMS
           cat SHA256SUMS
       - name: install cosign
-        uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da # v3.7.0
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - name: sign combined checksums (keyless OIDC)
         env:
           COSIGN_YES: "true"
