@@ -125,6 +125,9 @@ pub enum ExecutionError {
     /// A downstream order-book error.
     #[error("order book: {0}")]
     Order(#[from] orderbook::OrderError),
+    /// Invalid stored order-book transition state discovered during recovery.
+    #[error("order book state: {0}")]
+    OrderState(#[from] orderbook::BookStateError),
     /// A downstream risk error.
     #[error("risk: {0}")]
     Risk(#[from] risk::RiskError),

@@ -128,28 +128,56 @@ impl SessionRegistry {
     /// [`Self::consume`].
     #[must_use]
     pub fn transition_root_v1(&self) -> Hash {
-        self.assert_transition_invariants();
+        self.validate_transition_invariants()
+            .unwrap_or_else(|error| panic!("invalid session transition state: {error}"));
         self.transition_root_v1_checked()
             .unwrap_or_else(|error| panic!("failed to encode canonical session state: {error}"))
     }
 
-    fn assert_transition_invariants(&self) {
+    /// Validate every stored relation required to interpret session state.
+    ///
+    /// Market scopes are deliberately not compared with the engine's current
+    /// market registry: a session may be authorized before a market exists, or
+    /// retain a scope after that market's lifecycle changes. Account ownership
+    /// is checked separately by the enclosing engine validator.
+    pub fn validate_transition_invariants(&self) -> Result<(), ExecutionError> {
         for session in self.sessions.values() {
-            assert!(
-                !session.max_notional.is_negative(),
-                "session maximum notional must be nonnegative"
-            );
-            assert!(
-                session.nonce_start <= session.nonce_end,
-                "session nonce range must be ordered"
-            );
+            if session.max_notional.is_negative() {
+                return Err(ExecutionError::StateInvariant(
+                    "session maximum notional must be nonnegative",
+                ));
+            }
+            if session.nonce_start > session.nonce_end {
+                return Err(ExecutionError::StateInvariant(
+                    "session nonce range must be ordered",
+                ));
+            }
             for nonce in &session.consumed {
-                assert!(
-                    (session.nonce_start..=session.nonce_end).contains(nonce),
-                    "consumed nonce must lie inside the authorized range"
-                );
+                if !(session.nonce_start..=session.nonce_end).contains(nonce) {
+                    return Err(ExecutionError::StateInvariant(
+                        "consumed nonce must lie inside the authorized range",
+                    ));
+                }
             }
         }
+        Ok(())
+    }
+
+    /// Validate session principals against the authoritative dense account
+    /// registry without imposing any relation on market scopes.
+    pub(crate) fn validate_engine_context(
+        &self,
+        account_count: usize,
+    ) -> Result<(), ExecutionError> {
+        self.validate_transition_invariants()?;
+        if self.sessions.keys().any(|(account, _)| {
+            usize::try_from(*account).map_or(true, |index| index >= account_count)
+        }) {
+            return Err(ExecutionError::StateInvariant(
+                "session principal does not reference an existing ledger account",
+            ));
+        }
+        Ok(())
     }
 
     fn write_state_v1_unchecked(
@@ -640,6 +668,61 @@ mod tests {
             Err(ExecutionError::BadNonce)
         );
         assert_eq!(registry.transition_root_v1(), root);
+    }
+
+    #[test]
+    fn transition_validator_is_typed_read_only_and_checks_engine_principals() {
+        let registry = registry_with_session(1, 1, &[3], 10, 100, 1, 5, &[1]);
+        let root = registry.transition_root_v1();
+        assert_eq!(registry.validate_transition_invariants(), Ok(()));
+        assert_eq!(registry.validate_engine_context(2), Ok(()));
+        assert_eq!(registry.transition_root_v1(), root);
+        assert_eq!(
+            registry.validate_engine_context(1),
+            Err(ExecutionError::StateInvariant(
+                "session principal does not reference an existing ledger account"
+            ))
+        );
+
+        let mut negative = registry.clone();
+        negative
+            .sessions
+            .get_mut(&(1, [1; 32]))
+            .unwrap()
+            .max_notional = Amount::from_raw(-1);
+        assert_eq!(
+            negative.validate_transition_invariants(),
+            Err(ExecutionError::StateInvariant(
+                "session maximum notional must be nonnegative"
+            ))
+        );
+
+        let mut reversed = registry.clone();
+        reversed
+            .sessions
+            .get_mut(&(1, [1; 32]))
+            .unwrap()
+            .nonce_start = 6;
+        assert_eq!(
+            reversed.validate_transition_invariants(),
+            Err(ExecutionError::StateInvariant(
+                "session nonce range must be ordered"
+            ))
+        );
+
+        let mut consumed = registry;
+        consumed
+            .sessions
+            .get_mut(&(1, [1; 32]))
+            .unwrap()
+            .consumed
+            .insert(6);
+        assert_eq!(
+            consumed.validate_transition_invariants(),
+            Err(ExecutionError::StateInvariant(
+                "consumed nonce must lie inside the authorized range"
+            ))
+        );
     }
 
     #[test]

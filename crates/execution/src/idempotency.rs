@@ -269,6 +269,12 @@ impl ReplayGuard {
         self.watermark.get(&(principal, domain.tag())).copied()
     }
 
+    /// Remove one durable watermark for outer recovery-corruption tests.
+    #[cfg(test)]
+    pub(crate) fn remove_watermark_for_test(&mut self, principal: u32, domain: KeyDomain) {
+        self.watermark.remove(&(principal, domain.tag()));
+    }
+
     /// Canonical commitment to the complete replay guard, including the exact
     /// result-affecting receipt window and FIFO eviction order.
     pub(crate) fn transition_root_v1(&self) -> Result<Hash, ExecutionError> {
@@ -312,7 +318,7 @@ impl ReplayGuard {
         Ok(())
     }
 
-    fn validate_transition_invariants(&self) -> Result<(), ExecutionError> {
+    pub(crate) fn validate_transition_invariants(&self) -> Result<(), ExecutionError> {
         self.validate_local_invariants()
             .map_err(|error| match error {
                 ReplayLocalValidationError::Invariant(message) => {
@@ -436,6 +442,27 @@ impl ReplayGuard {
             ));
         }
         Ok(())
+    }
+
+    /// Retained withdrawal requests whose provenance is still reconstructible
+    /// from the bounded receipt window. Evicted requests remain protected by a
+    /// watermark but intentionally cannot be reverse-mapped to a withdrawal id
+    /// without adding request provenance to a later state schema.
+    pub(crate) fn retained_withdrawal_requests(
+        &self,
+    ) -> impl Iterator<Item = (u32, u64, u64)> + '_ {
+        self.records
+            .iter()
+            .filter_map(
+                |(&(principal, domain, key), (_, receipt))| match &receipt.kind {
+                    ReceiptKind::WithdrawalRequested(withdrawal_id)
+                        if domain == KeyDomain::Withdrawal.tag() =>
+                    {
+                        Some((principal, key, *withdrawal_id))
+                    }
+                    _ => None,
+                },
+            )
     }
 
     fn write_receipt(writer: &mut ReplayTransitionWriter, receipt: &ExecutionReceipt) {
