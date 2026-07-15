@@ -10,9 +10,12 @@
 //!   binary search, and suffix-scaled truncation (useful for pure tests and
 //!   engines that stage commands before durability).
 //! * [`DurableLog`] — OS-backed segmented WAL with configurable
-//!   [`SyncPolicy`] (`fdatasync` after ack under [`SyncPolicy::Always`], RPO=0),
-//!   chain-hash segment integrity beyond CRC-32, crash recovery of torn tails,
-//!   and deterministic index rebuild.
+//!   [`SyncPolicy`] (`fdatasync` after ack under [`SyncPolicy::Always`]; on
+//!   Unix/POSIX, RPO=0 when the WAL directory hierarchy was durably provisioned
+//!   before open),
+//!   chain-hash segment integrity beyond CRC-32, strict recovery of a 1–3-byte
+//!   partial next-length field (longer ambiguous tails fail closed), and
+//!   deterministic index rebuild.
 //! * [`Snapshot`] — versioned, self-verifying state checkpoint with
 //!   [`Snapshot::install_atomic`] (temp → fsync → rename).
 //! * [`replay`] — reconstruct engine state from a snapshot plus the log tail.
@@ -29,6 +32,7 @@ mod fsutil;
 mod integrity;
 mod limits;
 mod log;
+mod prefix;
 mod record;
 mod replay;
 mod snapshot;
@@ -37,15 +41,17 @@ pub use crc::crc32;
 pub use durable::{DurableConfig, DurableError, DurableLog, DurableRecords, SyncPolicy};
 pub use integrity::{chain_genesis, chain_mix, chain_over_records, DOMAIN_WAL_CHAIN};
 pub use limits::{
-    DEFAULT_INDEX_STRIDE, DEFAULT_MAX_RECORD_BYTES, DEFAULT_MAX_SNAPSHOT_STATE_BYTES,
-    INTEGRITY_CHAIN_HASH, SEGMENT_TRAILER_LEN, SEGMENT_TRAILER_MAGIC, SEGMENT_TRAILER_VERSION,
+    DEFAULT_INDEX_STRIDE, DEFAULT_MAX_RECORD_BYTES, DEFAULT_MAX_SEGMENT_FILE_BYTES,
+    DEFAULT_MAX_SNAPSHOT_STATE_BYTES, INTEGRITY_CHAIN_HASH, SEGMENT_TRAILER_LEN,
+    SEGMENT_TRAILER_MAGIC, SEGMENT_TRAILER_VERSION,
 };
 pub use log::{LogError, Records, Segment, SegmentedLog, DEFAULT_SEGMENT_BYTES};
+pub use prefix::{WalPrefixCommitment, DOMAIN_WAL_PREFIX, WAL_PREFIX_COMMITMENT_VERSION};
 pub use record::{
     decode_ref_bounded, peek_declared_len, Record, RecordError, RecordRef, FRAME_OVERHEAD,
     PROTOCOL_VERSION,
 };
-pub use replay::replay;
+pub use replay::{replay, try_replay, ReplayError};
 pub use snapshot::{Snapshot, SnapshotError, SNAPSHOT_VERSION};
 
 /// Crate identity, used by the node composition root for a startup manifest.
@@ -54,10 +60,12 @@ pub const CRATE_NAME: &str = "storage";
 /// Documented recovery-point objective for [`SyncPolicy::Always`].
 ///
 /// After a successful [`DurableLog::append`] under `Always`, the record has been
-/// `fdatasync`'d. Process crash or `kill -9` after that return cannot lose the
-/// acknowledged record (RPO = 0 for acks).
+/// `fdatasync`'d. On Unix/POSIX, when the WAL directory hierarchy was durably
+/// provisioned before open, process crash or `kill -9` after that return cannot
+/// lose the acknowledged record (RPO = 0 for acks). Non-Unix targets currently
+/// lack a directory-entry barrier in this crate.
 pub const RPO_ALWAYS_SYNC: &str =
-    "RPO=0 for acknowledged appends under SyncPolicy::Always (fdatasync per append)";
+    "Unix/POSIX RPO=0 for acknowledged appends under SyncPolicy::Always when the WAL directory hierarchy was durably provisioned before open";
 
 #[cfg(test)]
 mod tests {

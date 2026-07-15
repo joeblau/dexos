@@ -53,6 +53,13 @@ pub const DOMAIN_VALIDATOR_SET: &[u8] = b"dexos:validator-set:v1";
 /// Decision-market action/outcome confirmation.
 pub const DOMAIN_DECISION: &[u8] = b"dexos:decision:v1";
 
+// ---- storage ----
+
+/// Per-segment chain over exact framed write-ahead-log records.
+pub const DOMAIN_STORAGE_WAL_CHAIN: &[u8] = b"dexos:storage:wal-chain:v1";
+/// Segmentation-independent commitment to an exact logical WAL prefix.
+pub const DOMAIN_STORAGE_WAL_PREFIX: &[u8] = b"dexos:storage:wal-prefix:v1";
+
 // ---- custody / chain-adapter withdrawal family ----
 
 /// Deterministic withdrawal request id (user + ledger).
@@ -96,6 +103,8 @@ pub const ALL_DOMAINS: &[&[u8]] = &[
     DOMAIN_ORACLE,
     DOMAIN_VALIDATOR_SET,
     DOMAIN_DECISION,
+    DOMAIN_STORAGE_WAL_CHAIN,
+    DOMAIN_STORAGE_WAL_PREFIX,
     DOMAIN_WITHDRAWAL_ID,
     DOMAIN_WITHDRAWAL_AUTH,
     DOMAIN_WITHDRAWAL_CERT,

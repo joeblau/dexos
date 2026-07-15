@@ -34,3 +34,12 @@ pub const INTEGRITY_CHAIN_HASH: u16 = 1;
 /// chain_tip:[u8;32] | trailer_crc:u32
 /// ```
 pub const SEGMENT_TRAILER_LEN: usize = 4 + 2 + 2 + 8 + 8 + 8 + 8 + 32 + 4;
+
+/// Default hard cap for one complete segment file, including its trailer.
+///
+/// This is deliberately separate from the soft rotation budget: changing that
+/// policy does not change this cap. The same (or a sufficiently large) hard cap
+/// must be supplied when reopening WALs created with a non-default larger cap.
+/// The default accepts a segment written at the 64 MiB default budget plus its
+/// trailer.
+pub const DEFAULT_MAX_SEGMENT_FILE_BYTES: usize = 64 * 1024 * 1024 + SEGMENT_TRAILER_LEN;

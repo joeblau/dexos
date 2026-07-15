@@ -10,7 +10,7 @@
 use types::Hash;
 
 /// Domain tag for WAL chain-hash mixing.
-pub const DOMAIN_WAL_CHAIN: &[u8] = b"dexos:storage:wal-chain:v1";
+pub const DOMAIN_WAL_CHAIN: &[u8] = crypto::DOMAIN_STORAGE_WAL_CHAIN;
 
 /// Genesis chain tip for an empty record region.
 #[must_use]

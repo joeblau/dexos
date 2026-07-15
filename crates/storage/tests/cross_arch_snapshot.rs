@@ -10,6 +10,7 @@
 //! - `CROSS_ARCH_SNAPSHOT_IN` — if set, load and verify that path (import/transfer).
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use storage::{DurableConfig, DurableLog, Snapshot, SyncPolicy};
 use types::Hash;
@@ -31,14 +32,16 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn tempfile_dir() -> PathBuf {
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
     let mut d = std::env::temp_dir();
     d.push(format!(
-        "dexos-cross-arch-{}-{}",
+        "dexos-cross-arch-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|x| x.as_nanos())
-            .unwrap_or(0)
+            .unwrap_or(0),
+        NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed),
     ));
     std::fs::create_dir_all(&d).unwrap();
     d
@@ -48,7 +51,9 @@ fn build_and_digest(dir: &Path) -> (PathBuf, String, String, String) {
     let log_dir = dir.join("log");
     std::fs::create_dir_all(&log_dir).unwrap();
 
-    // Exercise the durable WAL path with Always-sync (production RPO=0).
+    // Exercise the durable WAL path with Always-sync (Unix/POSIX RPO=0 once
+    // the WAL directory hierarchy has been durably provisioned; non-Unix has
+    // no directory-entry barrier in this crate).
     let cfg = DurableConfig::new(&log_dir).with_sync(SyncPolicy::Always);
     let mut log = DurableLog::open(cfg).expect("open durable log");
     for i in 0..32u64 {

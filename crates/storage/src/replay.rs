@@ -7,9 +7,27 @@
 //! injected by the caller, which keeps `storage` free of any engine dependency
 //! and makes replay bit-for-bit reproducible.
 
+use std::convert::Infallible;
+
 use crate::log::{LogError, SegmentedLog};
 use crate::record::Record;
 use crate::snapshot::Snapshot;
+
+/// Lossless replay failure that keeps source and application errors distinct.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ReplayError<S, A> {
+    /// Reading, decoding, or sequence validation failed.
+    #[error("replay source failed: {0}")]
+    Source(#[source] S),
+    /// The application rejected the record at `sequence`.
+    #[error("replay application failed at sequence {sequence}: {error}")]
+    Apply {
+        /// Exact record sequence passed to the application.
+        sequence: u64,
+        /// Original application error, preserved without string erasure.
+        error: A,
+    },
+}
 
 /// Replay `log` into `apply`, resuming after `from_snapshot` if provided.
 ///
@@ -34,13 +52,44 @@ pub fn replay<F>(
 where
     F: FnMut(Record),
 {
+    match try_replay(log, from_snapshot, |record| {
+        apply(record);
+        Ok::<(), Infallible>(())
+    }) {
+        Ok(sequence) => Ok(sequence),
+        Err(ReplayError::Source(error)) => Err(error),
+        Err(ReplayError::Apply { error, .. }) => match error {},
+    }
+}
+
+/// Fallibly replay `log` into `apply`, resuming after `from_snapshot`.
+///
+/// Source failures and application failures remain distinct in
+/// [`ReplayError`]. On an application failure, the offending sequence is
+/// reported, no later record is visited, and replay bookkeeping advances only
+/// after `apply` returns `Ok(())`.
+///
+/// The storage layer cannot roll back mutations performed inside `apply` before
+/// it returns an error. Callers restoring authoritative state must therefore
+/// make each injected transition atomic (or discard the in-memory state on any
+/// failure).
+///
+/// # Errors
+/// Returns the first [`LogError`] as [`ReplayError::Source`], or the exact
+/// application error as [`ReplayError::Apply`].
+pub fn try_replay<F, A>(
+    log: &SegmentedLog,
+    from_snapshot: Option<&Snapshot>,
+    mut apply: F,
+) -> Result<u64, ReplayError<LogError, A>>
+where
+    F: FnMut(Record) -> Result<(), A>,
+{
     let base = from_snapshot.map(Snapshot::last_sequence);
-    // `expected` is the sequence the next applied record must carry, once known.
-    let mut expected: Option<u64> = base.map(|b| b.saturating_add(1));
-    let mut last_applied = base.unwrap_or(0);
+    let mut last_applied = base;
 
     for item in log.iter() {
-        let rec = item?;
+        let rec = item.map_err(ReplayError::Source)?;
 
         // Skip anything already captured by the snapshot.
         if let Some(b) = base {
@@ -49,32 +98,34 @@ where
             }
         }
 
-        match expected {
-            Some(exp) if rec.sequence != exp => {
-                return Err(if rec.sequence > exp {
+        if let Some(previous) = last_applied {
+            let Some(expected) = previous.checked_add(1) else {
+                return Err(ReplayError::Source(LogError::OutOfOrder {
+                    last: previous,
+                    got: rec.sequence,
+                }));
+            };
+            if rec.sequence != expected {
+                return Err(ReplayError::Source(if rec.sequence > expected {
                     LogError::SequenceGap {
-                        expected: exp,
+                        expected,
                         got: rec.sequence,
                     }
                 } else {
                     LogError::OutOfOrder {
-                        last: exp.saturating_sub(1),
+                        last: previous,
                         got: rec.sequence,
                     }
-                });
-            }
-            Some(_) => {}
-            None => {
-                // No snapshot: the first record establishes the baseline.
+                }));
             }
         }
 
-        last_applied = rec.sequence;
-        expected = rec.sequence.checked_add(1);
-        apply(rec);
+        let sequence = rec.sequence;
+        apply(rec).map_err(|error| ReplayError::Apply { sequence, error })?;
+        last_applied = Some(sequence);
     }
 
-    Ok(last_applied)
+    Ok(last_applied.unwrap_or(0))
 }
 
 #[cfg(test)]
@@ -156,5 +207,42 @@ mod tests {
                 got: 5
             }
         ));
+    }
+
+    #[test]
+    fn fallible_replay_preserves_apply_error_and_stops() {
+        let log = build_log(&[1, 2, 3, 4]);
+        let mut applied = Vec::new();
+        let error = try_replay(&log, None, |record| {
+            if record.sequence == 3 {
+                return Err("transition rejected");
+            }
+            applied.push(record.sequence);
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            ReplayError::Apply {
+                sequence: 3,
+                error: "transition rejected",
+            }
+        );
+        assert_eq!(applied, vec![1, 2]);
+    }
+
+    #[test]
+    fn fallible_replay_keeps_source_errors_distinct() {
+        let log = build_log(&[1, 3]);
+        let error = try_replay(&log, None, |_| Ok::<(), &str>(())).unwrap_err();
+        assert_eq!(
+            error,
+            ReplayError::Source(LogError::SequenceGap {
+                expected: 2,
+                got: 3,
+            })
+        );
+        assert!(std::error::Error::source(&error).is_some());
     }
 }
