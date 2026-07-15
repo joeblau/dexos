@@ -16,18 +16,69 @@
 //!   high-water mark.
 //!
 //! Exactly-once survives both a bounded cache and a process restart. The
-//! per-principal high-water mark is committed into the versioned account leaf
-//! (and therefore the state root), while the receipt window is a deterministic,
-//! replay-rebuilt cache. Because keys are monotonic per principal per domain, an
-//! evicted key is still recognised as already-processed by the watermark and can
-//! never execute a second time.
+//! per-principal high-water mark is committed into the legacy account leaf,
+//! while canonical EngineState v1 additionally commits the window, retained
+//! receipts, and exact FIFO eviction order because they change retry results and
+//! whether a retry consumes the next sequence. Because keys are monotonic per
+//! principal per domain, an evicted key is still recognised as already-processed
+//! by the watermark and can never execute a second time.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use state_tree::LeafWriter;
 use types::{Hash, OrderType, Side, TimeInForce};
 
-use crate::command::{Command, ExecutionReceipt, PlaceOrder, RequestWithdrawal};
+use crate::command::{Command, ExecutionReceipt, PlaceOrder, ReceiptKind, RequestWithdrawal};
+use crate::error::ExecutionError;
+
+/// Canonical complete replay-guard transition-root schema.
+pub const REPLAY_TRANSITION_ROOT_SCHEMA_VERSION: u16 = 1;
+
+#[derive(Default)]
+struct ReplayTransitionWriter {
+    bytes: Vec<u8>,
+}
+
+impl ReplayTransitionWriter {
+    fn u8(&mut self, value: u8) {
+        self.bytes.push(value);
+    }
+
+    fn bool(&mut self, value: bool) {
+        self.u8(u8::from(value));
+    }
+
+    fn u16(&mut self, value: u16) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn u32(&mut self, value: u32) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn u64(&mut self, value: u64) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn i64(&mut self, value: i64) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn i128(&mut self, value: i128) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn usize(&mut self, value: usize) -> Result<(), ExecutionError> {
+        let value =
+            u64::try_from(value).map_err(|_| ExecutionError::StateEncodingOverflow { value })?;
+        self.u64(value);
+        Ok(())
+    }
+
+    fn hash(&mut self, value: Hash) {
+        self.bytes.extend_from_slice(value.as_bytes());
+    }
+}
 
 /// Idempotency key domain. Order `client_id`s and withdrawal `nonce`s occupy
 /// separate key spaces per principal and can never collide.
@@ -88,7 +139,8 @@ pub(crate) struct ReplayGuard {
     watermark: HashMap<(u32, u8), u64>,
     /// Bounded FIFO cache of recent `(digest, receipt)` for exact replay.
     records: HashMap<Slot, (Hash, ExecutionReceipt)>,
-    /// Insertion order backing deterministic FIFO eviction of `records`.
+    /// Insertion order backing deterministic FIFO eviction of `records`. Both
+    /// representations are part of canonical EngineState transition state.
     order: VecDeque<Slot>,
 }
 
@@ -164,9 +216,9 @@ impl ReplayGuard {
     }
 
     /// Record the receipt for a freshly applied key in the bounded window so an
-    /// exact retry can replay it. The window is a local, replay-rebuilt cache and
-    /// is *not* part of the committed root; only [`Self::reserve`] mutates
-    /// committed state.
+    /// exact retry can replay it. The legacy account tree commits only the
+    /// watermark, while canonical EngineState commits this cache because its
+    /// presence changes retry output and sequence consumption.
     ///
     /// Only ever called after a [`GuardDecision::Fresh`] classification, so the
     /// slot is novel; a [`debug_assert`] pins that invariant.
@@ -197,6 +249,253 @@ impl ReplayGuard {
     /// been processed. Used to fold the watermark into the account leaf.
     pub(crate) fn watermark(&self, principal: u32, domain: KeyDomain) -> Option<u64> {
         self.watermark.get(&(principal, domain.tag())).copied()
+    }
+
+    /// Copy the durable replay watermarks in canonical principal/domain order.
+    /// EngineState v1 commits this list together with the bounded receipt cache
+    /// and FIFO order below.
+    pub(crate) fn committed_watermarks_sorted(&self) -> Vec<(u32, u8, u64)> {
+        let mut watermarks: Vec<(u32, u8, u64)> = self
+            .watermark
+            .iter()
+            .map(|(&(principal, domain), &value)| (principal, domain, value))
+            .collect();
+        watermarks.sort_unstable();
+        watermarks
+    }
+
+    /// Canonical commitment to the complete replay guard, including the exact
+    /// result-affecting receipt window and FIFO eviction order.
+    pub(crate) fn transition_root_v1(&self) -> Result<Hash, ExecutionError> {
+        self.validate_transition_invariants()?;
+
+        let mut writer = ReplayTransitionWriter::default();
+        writer.u16(REPLAY_TRANSITION_ROOT_SCHEMA_VERSION);
+        writer.usize(self.window)?;
+
+        let watermarks = self.committed_watermarks_sorted();
+        writer.usize(watermarks.len())?;
+        for (principal, domain, value) in watermarks {
+            writer.u32(principal);
+            writer.u8(domain);
+            writer.u64(value);
+        }
+
+        let mut slots: Vec<Slot> = self.records.keys().copied().collect();
+        slots.sort_unstable();
+        writer.usize(slots.len())?;
+        for slot @ (principal, domain, key) in slots {
+            let (digest, receipt) = self
+                .records
+                .get(&slot)
+                .expect("record key collected from the same immutable map");
+            writer.u32(principal);
+            writer.u8(domain);
+            writer.u64(key);
+            writer.hash(*digest);
+            Self::write_receipt(&mut writer, receipt);
+        }
+
+        writer.usize(self.order.len())?;
+        for &(principal, domain, key) in &self.order {
+            writer.u32(principal);
+            writer.u8(domain);
+            writer.u64(key);
+        }
+
+        Ok(crypto::hash_domain(
+            crypto::DOMAIN_EXECUTION_REPLAY_STATE,
+            &writer.bytes,
+        ))
+    }
+
+    fn validate_transition_invariants(&self) -> Result<(), ExecutionError> {
+        if self.records.len() > self.window {
+            return Err(ExecutionError::StateInvariant(
+                "replay records exceed the configured window",
+            ));
+        }
+        if self.order.len() != self.records.len() {
+            return Err(ExecutionError::StateInvariant(
+                "replay FIFO and record map have different lengths",
+            ));
+        }
+
+        let known_domain =
+            |domain| domain == KeyDomain::Order.tag() || domain == KeyDomain::Withdrawal.tag();
+        for &(_, domain) in self.watermark.keys() {
+            if !known_domain(domain) {
+                return Err(ExecutionError::StateInvariant(
+                    "replay watermark has an unknown key domain",
+                ));
+            }
+        }
+
+        let mut ordered = HashSet::with_capacity(self.order.len());
+        let mut previous_sequence = None;
+        let mut previous_key = HashMap::new();
+        for &slot @ (principal, domain, key) in &self.order {
+            if !known_domain(domain) {
+                return Err(ExecutionError::StateInvariant(
+                    "replay FIFO has an unknown key domain",
+                ));
+            }
+            if !ordered.insert(slot) {
+                return Err(ExecutionError::StateInvariant(
+                    "replay FIFO contains a duplicate slot",
+                ));
+            }
+            let (_, receipt) = self
+                .records
+                .get(&slot)
+                .ok_or(ExecutionError::StateInvariant(
+                    "replay FIFO references a missing record",
+                ))?;
+            if self
+                .watermark
+                .get(&(principal, domain))
+                .is_none_or(|watermark| *watermark < key)
+            {
+                return Err(ExecutionError::StateInvariant(
+                    "replay record exceeds its durable watermark",
+                ));
+            }
+            if previous_sequence.is_some_and(|previous| receipt.sequence <= previous) {
+                return Err(ExecutionError::StateInvariant(
+                    "replay FIFO receipts are not strictly sequence ordered",
+                ));
+            }
+            previous_sequence = Some(receipt.sequence);
+            if previous_key
+                .insert((principal, domain), key)
+                .is_some_and(|previous| key <= previous)
+            {
+                return Err(ExecutionError::StateInvariant(
+                    "replay FIFO keys are not strictly increasing per principal and domain",
+                ));
+            }
+
+            match (domain, &receipt.kind) {
+                (domain, ReceiptKind::OrderApplied { filled, .. })
+                    if domain == KeyDomain::Order.tag() =>
+                {
+                    if filled.raw() < 0 {
+                        return Err(ExecutionError::StateInvariant(
+                            "replay order receipt has a negative filled quantity",
+                        ));
+                    }
+                }
+                (domain, ReceiptKind::WithdrawalRequested(withdrawal_id))
+                    if domain == KeyDomain::Withdrawal.tag() =>
+                {
+                    if *withdrawal_id != derive_withdrawal_id(principal, key) {
+                        return Err(ExecutionError::StateInvariant(
+                            "replay withdrawal receipt id does not match its command key",
+                        ));
+                    }
+                }
+                (domain, _) if domain == KeyDomain::Order.tag() => {
+                    return Err(ExecutionError::StateInvariant(
+                        "replay order key has a non-order receipt",
+                    ));
+                }
+                (domain, _) if domain == KeyDomain::Withdrawal.tag() => {
+                    return Err(ExecutionError::StateInvariant(
+                        "replay withdrawal key has a non-withdrawal receipt",
+                    ));
+                }
+                _ => unreachable!("known replay domain checked above"),
+            }
+        }
+        if self.records.keys().any(|slot| !ordered.contains(slot)) {
+            return Err(ExecutionError::StateInvariant(
+                "replay record map contains a slot missing from FIFO order",
+            ));
+        }
+        Ok(())
+    }
+
+    fn write_receipt(writer: &mut ReplayTransitionWriter, receipt: &ExecutionReceipt) {
+        writer.u64(receipt.sequence);
+        match &receipt.kind {
+            ReceiptKind::AccountCreated(account) => {
+                writer.u8(0);
+                writer.u32(account.get());
+            }
+            ReceiptKind::Credited(account, amount) => {
+                writer.u8(1);
+                writer.u32(account.get());
+                writer.i128(amount.raw());
+            }
+            ReceiptKind::WithdrawalRequested(withdrawal_id) => {
+                writer.u8(2);
+                writer.u64(*withdrawal_id);
+            }
+            ReceiptKind::WithdrawalFinalized(withdrawal_id) => {
+                writer.u8(3);
+                writer.u64(*withdrawal_id);
+            }
+            ReceiptKind::SessionUpdated => writer.u8(4),
+            ReceiptKind::MarketUpdated(market) => {
+                writer.u8(5);
+                writer.u32(market.get());
+            }
+            ReceiptKind::OrderApplied { filled, rested } => {
+                writer.u8(6);
+                writer.i64(filled.raw());
+                writer.bool(*rested);
+            }
+            ReceiptKind::Cancelled(count) => {
+                writer.u8(7);
+                writer.u32(*count);
+            }
+            ReceiptKind::CompleteSet(amount) => {
+                writer.u8(8);
+                writer.i128(amount.raw());
+            }
+            ReceiptKind::WalletBound => writer.u8(9),
+            ReceiptKind::ProtocolUpgraded(version) => {
+                writer.u8(10);
+                writer.u16(*version);
+            }
+            ReceiptKind::Liquidated {
+                account,
+                insurance_drawn,
+                socialized_loss,
+            } => {
+                writer.u8(11);
+                writer.u32(account.get());
+                writer.i128(insurance_drawn.raw());
+                writer.i128(socialized_loss.raw());
+            }
+            ReceiptKind::FundingApplied { market, epoch } => {
+                writer.u8(12);
+                writer.u32(market.get());
+                writer.u64(*epoch);
+            }
+            ReceiptKind::MarketResolved {
+                market,
+                winning_outcome,
+            } => {
+                writer.u8(13);
+                writer.u32(market.get());
+                writer.u16(*winning_outcome);
+            }
+            ReceiptKind::MarketSettled { market, paid } => {
+                writer.u8(14);
+                writer.u32(market.get());
+                writer.i128(paid.raw());
+            }
+        }
+        writer.hash(receipt.state_root);
+    }
+
+    /// Test-only cache-policy rewrite used to prove canonical EngineState binds
+    /// result-affecting replay receipt material.
+    #[cfg(test)]
+    pub(crate) fn discard_receipt_cache_for_test(&mut self) {
+        self.records.clear();
+        self.order.clear();
     }
 }
 
@@ -321,7 +620,7 @@ const fn tif_tag(t: TimeInForce) -> u32 {
 mod tests {
     use super::*;
     use crate::command::ReceiptKind;
-    use types::AccountId;
+    use types::{AccountId, Amount, MarketId, Quantity};
 
     fn receipt(seq: u64, id: u64) -> ExecutionReceipt {
         ExecutionReceipt {
@@ -338,6 +637,547 @@ mod tests {
             key,
             digest: Hash::from_bytes([digest_byte; 32]),
         }
+    }
+
+    fn all_receipt_kinds() -> Vec<ReceiptKind> {
+        vec![
+            ReceiptKind::AccountCreated(AccountId::new(1)),
+            ReceiptKind::Credited(AccountId::new(2), Amount::from_raw(3)),
+            ReceiptKind::WithdrawalRequested(4),
+            ReceiptKind::WithdrawalFinalized(5),
+            ReceiptKind::SessionUpdated,
+            ReceiptKind::MarketUpdated(MarketId::new(6)),
+            ReceiptKind::OrderApplied {
+                filled: Quantity::from_raw(7),
+                rested: true,
+            },
+            ReceiptKind::Cancelled(8),
+            ReceiptKind::CompleteSet(Amount::from_raw(9)),
+            ReceiptKind::WalletBound,
+            ReceiptKind::ProtocolUpgraded(10),
+            ReceiptKind::Liquidated {
+                account: AccountId::new(11),
+                insurance_drawn: Amount::from_raw(12),
+                socialized_loss: Amount::from_raw(13),
+            },
+            ReceiptKind::FundingApplied {
+                market: MarketId::new(14),
+                epoch: 15,
+            },
+            ReceiptKind::MarketResolved {
+                market: MarketId::new(16),
+                winning_outcome: 17,
+            },
+            ReceiptKind::MarketSettled {
+                market: MarketId::new(18),
+                paid: Amount::from_raw(19),
+            },
+        ]
+    }
+
+    fn rich_replay_guard() -> ReplayGuard {
+        let mut guard = ReplayGuard::with_window(32);
+        for index in 0..12_u64 {
+            let principal = u32::try_from(index + 20).unwrap();
+            let key = index + 100;
+            let domain = if index % 2 == 0 {
+                KeyDomain::Order
+            } else {
+                KeyDomain::Withdrawal
+            };
+            let binding = KeyBinding {
+                principal,
+                domain,
+                key,
+                digest: Hash::from_bytes([u8::try_from(index + 1).unwrap(); 32]),
+            };
+            let kind = match domain {
+                KeyDomain::Order => ReceiptKind::OrderApplied {
+                    filled: Quantity::from_raw(i64::try_from(index + 7).unwrap()),
+                    rested: index % 4 == 0,
+                },
+                KeyDomain::Withdrawal => {
+                    ReceiptKind::WithdrawalRequested(derive_withdrawal_id(principal, key))
+                }
+            };
+            guard.reserve(&binding);
+            guard.finalize(
+                &binding,
+                ExecutionReceipt {
+                    sequence: index + 200,
+                    kind,
+                    state_root: Hash::from_bytes([u8::try_from(index + 33).unwrap(); 32]),
+                },
+            );
+        }
+        guard
+    }
+
+    fn assert_invariant(guard: &ReplayGuard, message: &'static str) {
+        assert_eq!(
+            guard.transition_root_v1(),
+            Err(ExecutionError::StateInvariant(message))
+        );
+    }
+
+    fn encoded_receipt(kind: ReceiptKind) -> Vec<u8> {
+        let mut writer = ReplayTransitionWriter::default();
+        ReplayGuard::write_receipt(
+            &mut writer,
+            &ExecutionReceipt {
+                sequence: 0x0102_0304_0506_0708,
+                kind,
+                state_root: Hash::from_bytes([0xAB; 32]),
+            },
+        );
+        writer.bytes
+    }
+
+    fn assert_receipt_payload_bound(left: ReceiptKind, right: ReceiptKind) {
+        assert_ne!(encoded_receipt(left), encoded_receipt(right));
+    }
+
+    #[test]
+    fn replay_transition_root_v1_golden_vectors() {
+        assert_eq!(
+            ReplayGuard::with_window(0).transition_root_v1().unwrap(),
+            Hash::from_bytes([
+                28, 118, 249, 53, 111, 190, 171, 99, 240, 215, 58, 61, 189, 132, 99, 252, 216, 19,
+                134, 165, 140, 169, 164, 4, 29, 192, 139, 214, 168, 88, 128, 1,
+            ])
+        );
+        assert_eq!(
+            rich_replay_guard().transition_root_v1().unwrap(),
+            Hash::from_bytes([
+                239, 112, 47, 250, 31, 166, 221, 115, 215, 52, 40, 121, 153, 78, 133, 9, 101, 91,
+                9, 156, 97, 161, 184, 123, 130, 63, 168, 133, 132, 77, 176, 126,
+            ])
+        );
+    }
+
+    #[test]
+    fn replay_transition_root_v1_binds_complete_guard_state() {
+        let base = rich_replay_guard();
+        let root = base.transition_root_v1().unwrap();
+
+        let mut changed = base.clone();
+        changed.window += 1;
+        assert_ne!(changed.transition_root_v1().unwrap(), root);
+
+        let mut changed = base.clone();
+        *changed.watermark.values_mut().next().unwrap() += 1;
+        assert_ne!(changed.transition_root_v1().unwrap(), root);
+
+        let mut changed = base.clone();
+        changed.records.get_mut(&changed.order[0]).unwrap().0 = Hash::from_bytes([0xEE; 32]);
+        assert_ne!(changed.transition_root_v1().unwrap(), root);
+
+        let mut changed = base.clone();
+        let last = *changed.order.back().unwrap();
+        changed.records.get_mut(&last).unwrap().1.sequence += 1;
+        assert_ne!(changed.transition_root_v1().unwrap(), root);
+
+        let mut changed = base.clone();
+        let first = changed.order[0];
+        let ReceiptKind::OrderApplied { filled, rested } =
+            &mut changed.records.get_mut(&first).unwrap().1.kind
+        else {
+            panic!("first rich replay record must be an order");
+        };
+        *filled = Quantity::from_raw(filled.raw() + 1);
+        *rested = !*rested;
+        assert_ne!(changed.transition_root_v1().unwrap(), root);
+
+        let mut changed = base.clone();
+        changed
+            .records
+            .get_mut(&changed.order[0])
+            .unwrap()
+            .1
+            .state_root = Hash::from_bytes([0xDD; 32]);
+        assert_ne!(changed.transition_root_v1().unwrap(), root);
+
+        let mut changed = base.clone();
+        changed.records.clear();
+        changed.order.clear();
+        assert_ne!(changed.transition_root_v1().unwrap(), root);
+
+        let mut changed = base.clone();
+        let old_slot = changed.order[0];
+        let record = changed.records.remove(&old_slot).unwrap();
+        let watermark = changed.watermark.remove(&(old_slot.0, old_slot.1)).unwrap();
+        let new_slot = (old_slot.0 + 1_000, old_slot.1, old_slot.2);
+        changed.records.insert(new_slot, record);
+        changed.order[0] = new_slot;
+        changed
+            .watermark
+            .insert((new_slot.0, new_slot.1), watermark);
+        assert_ne!(changed.transition_root_v1().unwrap(), root);
+
+        let mut changed = base.clone();
+        let old_slot = changed.order[0];
+        let record = changed.records.remove(&old_slot).unwrap();
+        let new_slot = (old_slot.0, old_slot.1, old_slot.2 + 1);
+        changed.records.insert(new_slot, record);
+        changed.order[0] = new_slot;
+        changed
+            .watermark
+            .insert((new_slot.0, new_slot.1), new_slot.2);
+        assert_ne!(changed.transition_root_v1().unwrap(), root);
+
+        let mut changed = base.clone();
+        let old_slot = changed.order[0];
+        let mut record = changed.records.remove(&old_slot).unwrap();
+        let new_slot = (old_slot.0, KeyDomain::Withdrawal.tag(), old_slot.2);
+        record.1.kind =
+            ReceiptKind::WithdrawalRequested(derive_withdrawal_id(new_slot.0, new_slot.2));
+        changed.records.insert(new_slot, record);
+        changed.order[0] = new_slot;
+        changed
+            .watermark
+            .insert((new_slot.0, new_slot.1), new_slot.2);
+        assert_ne!(changed.transition_root_v1().unwrap(), root);
+
+        let mut corrupt = base;
+        corrupt.order.swap(0, 1);
+        assert_invariant(
+            &corrupt,
+            "replay FIFO receipts are not strictly sequence ordered",
+        );
+    }
+
+    #[test]
+    fn replay_transition_root_v1_distinguishes_every_receipt_variant() {
+        let mut encodings = Vec::new();
+        for kind in all_receipt_kinds() {
+            let mut writer = ReplayTransitionWriter::default();
+            ReplayGuard::write_receipt(
+                &mut writer,
+                &ExecutionReceipt {
+                    sequence: 1,
+                    kind,
+                    state_root: Hash::from_bytes([0xBB; 32]),
+                },
+            );
+            assert!(
+                !encodings.contains(&writer.bytes),
+                "receipt variants must have unique tags"
+            );
+            encodings.push(writer.bytes);
+        }
+    }
+
+    #[test]
+    fn replay_receipt_encoding_v1_golden_and_binds_every_payload_field() {
+        let mut writer = ReplayTransitionWriter::default();
+        for kind in all_receipt_kinds() {
+            writer.bytes.extend_from_slice(&encoded_receipt(kind));
+        }
+        assert_eq!(
+            crypto::hash_domain(crypto::DOMAIN_EXECUTION_REPLAY_STATE, &writer.bytes),
+            Hash::from_bytes([
+                212, 247, 138, 95, 87, 126, 135, 203, 244, 174, 60, 11, 254, 196, 255, 64, 147,
+                236, 30, 239, 121, 177, 40, 21, 245, 98, 101, 73, 6, 207, 105, 205,
+            ])
+        );
+
+        assert_receipt_payload_bound(
+            ReceiptKind::AccountCreated(AccountId::new(1)),
+            ReceiptKind::AccountCreated(AccountId::new(2)),
+        );
+        assert_receipt_payload_bound(
+            ReceiptKind::Credited(AccountId::new(1), Amount::from_raw(2)),
+            ReceiptKind::Credited(AccountId::new(2), Amount::from_raw(2)),
+        );
+        assert_receipt_payload_bound(
+            ReceiptKind::Credited(AccountId::new(1), Amount::from_raw(2)),
+            ReceiptKind::Credited(AccountId::new(1), Amount::from_raw(3)),
+        );
+        assert_receipt_payload_bound(
+            ReceiptKind::WithdrawalRequested(1),
+            ReceiptKind::WithdrawalRequested(2),
+        );
+        assert_receipt_payload_bound(
+            ReceiptKind::WithdrawalFinalized(1),
+            ReceiptKind::WithdrawalFinalized(2),
+        );
+        assert_receipt_payload_bound(
+            ReceiptKind::MarketUpdated(MarketId::new(1)),
+            ReceiptKind::MarketUpdated(MarketId::new(2)),
+        );
+        assert_receipt_payload_bound(
+            ReceiptKind::OrderApplied {
+                filled: Quantity::from_raw(1),
+                rested: false,
+            },
+            ReceiptKind::OrderApplied {
+                filled: Quantity::from_raw(2),
+                rested: false,
+            },
+        );
+        assert_receipt_payload_bound(
+            ReceiptKind::OrderApplied {
+                filled: Quantity::from_raw(1),
+                rested: false,
+            },
+            ReceiptKind::OrderApplied {
+                filled: Quantity::from_raw(1),
+                rested: true,
+            },
+        );
+        assert_receipt_payload_bound(ReceiptKind::Cancelled(1), ReceiptKind::Cancelled(2));
+        assert_receipt_payload_bound(
+            ReceiptKind::CompleteSet(Amount::from_raw(1)),
+            ReceiptKind::CompleteSet(Amount::from_raw(2)),
+        );
+        assert_receipt_payload_bound(
+            ReceiptKind::ProtocolUpgraded(1),
+            ReceiptKind::ProtocolUpgraded(2),
+        );
+        assert_receipt_payload_bound(
+            ReceiptKind::Liquidated {
+                account: AccountId::new(1),
+                insurance_drawn: Amount::from_raw(2),
+                socialized_loss: Amount::from_raw(3),
+            },
+            ReceiptKind::Liquidated {
+                account: AccountId::new(2),
+                insurance_drawn: Amount::from_raw(2),
+                socialized_loss: Amount::from_raw(3),
+            },
+        );
+        assert_receipt_payload_bound(
+            ReceiptKind::Liquidated {
+                account: AccountId::new(1),
+                insurance_drawn: Amount::from_raw(2),
+                socialized_loss: Amount::from_raw(3),
+            },
+            ReceiptKind::Liquidated {
+                account: AccountId::new(1),
+                insurance_drawn: Amount::from_raw(4),
+                socialized_loss: Amount::from_raw(3),
+            },
+        );
+        assert_receipt_payload_bound(
+            ReceiptKind::Liquidated {
+                account: AccountId::new(1),
+                insurance_drawn: Amount::from_raw(2),
+                socialized_loss: Amount::from_raw(3),
+            },
+            ReceiptKind::Liquidated {
+                account: AccountId::new(1),
+                insurance_drawn: Amount::from_raw(2),
+                socialized_loss: Amount::from_raw(4),
+            },
+        );
+        assert_receipt_payload_bound(
+            ReceiptKind::FundingApplied {
+                market: MarketId::new(1),
+                epoch: 2,
+            },
+            ReceiptKind::FundingApplied {
+                market: MarketId::new(2),
+                epoch: 2,
+            },
+        );
+        assert_receipt_payload_bound(
+            ReceiptKind::FundingApplied {
+                market: MarketId::new(1),
+                epoch: 2,
+            },
+            ReceiptKind::FundingApplied {
+                market: MarketId::new(1),
+                epoch: 3,
+            },
+        );
+        assert_receipt_payload_bound(
+            ReceiptKind::MarketResolved {
+                market: MarketId::new(1),
+                winning_outcome: 2,
+            },
+            ReceiptKind::MarketResolved {
+                market: MarketId::new(2),
+                winning_outcome: 2,
+            },
+        );
+        assert_receipt_payload_bound(
+            ReceiptKind::MarketResolved {
+                market: MarketId::new(1),
+                winning_outcome: 2,
+            },
+            ReceiptKind::MarketResolved {
+                market: MarketId::new(1),
+                winning_outcome: 3,
+            },
+        );
+        assert_receipt_payload_bound(
+            ReceiptKind::MarketSettled {
+                market: MarketId::new(1),
+                paid: Amount::from_raw(2),
+            },
+            ReceiptKind::MarketSettled {
+                market: MarketId::new(2),
+                paid: Amount::from_raw(2),
+            },
+        );
+        assert_receipt_payload_bound(
+            ReceiptKind::MarketSettled {
+                market: MarketId::new(1),
+                paid: Amount::from_raw(2),
+            },
+            ReceiptKind::MarketSettled {
+                market: MarketId::new(1),
+                paid: Amount::from_raw(3),
+            },
+        );
+    }
+
+    #[test]
+    fn replay_transition_root_v1_canonicalizes_hash_layout() {
+        let base = rich_replay_guard();
+        let mut rebuilt = base.clone();
+
+        let mut watermarks: Vec<_> = base.watermark.iter().map(|(k, v)| (*k, *v)).collect();
+        watermarks.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
+        rebuilt.watermark = watermarks.into_iter().collect();
+
+        let mut records: Vec<_> = base
+            .records
+            .iter()
+            .map(|(slot, record)| (*slot, record.clone()))
+            .collect();
+        records.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
+        rebuilt.records = records.into_iter().collect();
+
+        assert_eq!(
+            rebuilt.transition_root_v1().unwrap(),
+            base.transition_root_v1().unwrap()
+        );
+    }
+
+    #[test]
+    fn replay_transition_root_v1_rejects_corrupt_state() {
+        let base = rich_replay_guard();
+
+        let mut changed = base.clone();
+        changed.window = 1;
+        assert_invariant(&changed, "replay records exceed the configured window");
+
+        let mut changed = base.clone();
+        changed.order.pop_back();
+        assert_invariant(
+            &changed,
+            "replay FIFO and record map have different lengths",
+        );
+
+        let mut changed = base.clone();
+        changed.order[1] = changed.order[0];
+        assert_invariant(&changed, "replay FIFO contains a duplicate slot");
+
+        let mut changed = base.clone();
+        changed.watermark.insert((999, 9), 1);
+        assert_invariant(&changed, "replay watermark has an unknown key domain");
+
+        let mut changed = base.clone();
+        let old_slot = changed.order[0];
+        let record = changed.records.remove(&old_slot).unwrap();
+        let unknown_slot = (old_slot.0, 9, old_slot.2);
+        changed.records.insert(unknown_slot, record);
+        changed.order[0] = unknown_slot;
+        assert_invariant(&changed, "replay FIFO has an unknown key domain");
+
+        let mut changed = base.clone();
+        changed.order[0] = (999, KeyDomain::Order.tag(), 1);
+        assert_invariant(&changed, "replay FIFO references a missing record");
+
+        let mut changed = base;
+        let (principal, domain, key) = changed.order[0];
+        changed.watermark.insert((principal, domain), key - 1);
+        assert_invariant(&changed, "replay record exceeds its durable watermark");
+    }
+
+    #[test]
+    fn replay_transition_root_v1_rejects_unreachable_receipts() {
+        let base = rich_replay_guard();
+
+        let mut changed = base.clone();
+        let first = changed.order[0];
+        changed.records.get_mut(&first).unwrap().1.kind = ReceiptKind::SessionUpdated;
+        assert_invariant(&changed, "replay order key has a non-order receipt");
+
+        let mut changed = base.clone();
+        let second = changed.order[1];
+        changed.records.get_mut(&second).unwrap().1.kind = ReceiptKind::SessionUpdated;
+        assert_invariant(
+            &changed,
+            "replay withdrawal key has a non-withdrawal receipt",
+        );
+
+        let mut changed = base.clone();
+        let second = changed.order[1];
+        let ReceiptKind::WithdrawalRequested(withdrawal_id) =
+            &mut changed.records.get_mut(&second).unwrap().1.kind
+        else {
+            panic!("second rich replay record must be a withdrawal");
+        };
+        *withdrawal_id ^= 1;
+        assert_invariant(
+            &changed,
+            "replay withdrawal receipt id does not match its command key",
+        );
+
+        let mut changed = base.clone();
+        let first = changed.order[0];
+        let ReceiptKind::OrderApplied { filled, .. } =
+            &mut changed.records.get_mut(&first).unwrap().1.kind
+        else {
+            panic!("first rich replay record must be an order");
+        };
+        *filled = Quantity::from_raw(-1);
+        assert_invariant(
+            &changed,
+            "replay order receipt has a negative filled quantity",
+        );
+
+        let mut changed = base.clone();
+        let first_sequence = changed.records.get(&changed.order[0]).unwrap().1.sequence;
+        let second = changed.order[1];
+        changed.records.get_mut(&second).unwrap().1.sequence = first_sequence;
+        assert_invariant(
+            &changed,
+            "replay FIFO receipts are not strictly sequence ordered",
+        );
+
+        let mut changed = ReplayGuard::with_window(2);
+        for (key, sequence) in [(5, 1), (6, 2)] {
+            let binding = KeyBinding {
+                principal: 1,
+                domain: KeyDomain::Order,
+                key,
+                digest: Hash::from_bytes([u8::try_from(key).unwrap(); 32]),
+            };
+            changed.reserve(&binding);
+            changed.finalize(
+                &binding,
+                ExecutionReceipt {
+                    sequence,
+                    kind: ReceiptKind::OrderApplied {
+                        filled: Quantity::from_raw(1),
+                        rested: true,
+                    },
+                    state_root: Hash::ZERO,
+                },
+            );
+        }
+        let old_second = changed.order[1];
+        let record = changed.records.remove(&old_second).unwrap();
+        let reordered_second = (old_second.0, old_second.1, 4);
+        changed.records.insert(reordered_second, record);
+        changed.order[1] = reordered_second;
+        assert_invariant(
+            &changed,
+            "replay FIFO keys are not strictly increasing per principal and domain",
+        );
     }
 
     #[test]
