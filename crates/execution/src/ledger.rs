@@ -8,9 +8,41 @@
 //! every operation; it changes only on deposit (+) and finalized withdrawal (−).
 
 use state_tree::LeafWriter;
-use types::{AccountId, Amount};
+use types::{AccountId, Amount, Hash};
 
 use crate::error::ExecutionError;
+
+/// Canonical stored-ledger transition-root schema.
+pub const LEDGER_TRANSITION_ROOT_SCHEMA_VERSION: u16 = 1;
+
+/// Fixed-width canonical writer for the ledger's versioned stored-state
+/// commitment. Native-width integers and serde layouts are deliberately
+/// excluded from the preimage.
+#[derive(Default)]
+struct TransitionWriter {
+    bytes: Vec<u8>,
+}
+
+impl TransitionWriter {
+    fn u16(&mut self, value: u16) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn u64(&mut self, value: u64) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn i128(&mut self, value: i128) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn usize(&mut self, value: usize) -> Result<(), ExecutionError> {
+        let value =
+            u64::try_from(value).map_err(|_| ExecutionError::StateEncodingOverflow { value })?;
+        self.u64(value);
+        Ok(())
+    }
+}
 
 /// The SoA stablecoin ledger.
 #[derive(Debug, Clone, Default)]
@@ -97,6 +129,88 @@ impl Ledger {
     /// Total stablecoin supply held by the ledger.
     pub fn total_supply(&self) -> Amount {
         self.total_supply
+    }
+
+    /// Validate every dense column and accounting relation required to restore
+    /// the ledger as deterministic transition state.
+    ///
+    /// This check trusts neither cached `total_supply` nor vector alignment. It
+    /// rejects negative partitions, checked-sum overflow, and any mismatch
+    /// between the recomputed partition sum and the stored supply.
+    pub fn validate_transition_invariants(&self) -> Result<(), ExecutionError> {
+        let account_slots = self.available.len();
+        for (column, actual) in [
+            ("reserved", self.reserved.len()),
+            ("locked", self.locked.len()),
+            ("escrowed", self.escrowed.len()),
+            ("auth_epoch", self.auth_epoch.len()),
+        ] {
+            if actual != account_slots {
+                return Err(ExecutionError::StateShape {
+                    section: "ledger",
+                    column,
+                    expected: account_slots,
+                    actual,
+                });
+            }
+        }
+
+        if self.total_supply.is_negative() {
+            return Err(ExecutionError::StateInvariant(
+                "ledger total supply must be non-negative",
+            ));
+        }
+
+        let mut recomputed = Amount::ZERO;
+        for i in 0..account_slots {
+            for value in [
+                self.available[i],
+                self.reserved[i],
+                self.locked[i],
+                self.escrowed[i],
+            ] {
+                if value.is_negative() {
+                    return Err(ExecutionError::StateInvariant(
+                        "ledger balance partitions must be non-negative",
+                    ));
+                }
+                recomputed = recomputed.checked_add(value)?;
+            }
+        }
+        if recomputed != self.total_supply {
+            return Err(ExecutionError::StateInvariant(
+                "ledger partition sum does not equal total supply",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Cryptographic commitment to every stored ledger value that can affect a
+    /// future transition.
+    ///
+    /// Schema v1 records the exact dense account shape, every balance partition,
+    /// authorization epochs, and total supply using fixed-width little-endian
+    /// fields. Validation runs first so a malformed snapshot cannot obtain an
+    /// apparently authoritative root.
+    pub fn transition_root_v1(&self) -> Result<Hash, ExecutionError> {
+        self.validate_transition_invariants()?;
+
+        let mut writer = TransitionWriter::default();
+        writer.u16(LEDGER_TRANSITION_ROOT_SCHEMA_VERSION);
+        writer.usize(self.available.len())?;
+        for i in 0..self.available.len() {
+            writer.usize(i)?;
+            writer.i128(self.available[i].raw());
+            writer.i128(self.reserved[i].raw());
+            writer.i128(self.locked[i].raw());
+            writer.i128(self.escrowed[i].raw());
+            writer.u64(self.auth_epoch[i]);
+        }
+        writer.i128(self.total_supply.raw());
+        Ok(crypto::hash_domain(
+            crypto::DOMAIN_EXECUTION_LEDGER_STATE,
+            &writer.bytes,
+        ))
     }
 
     /// Credit a deposit into available. Increases total supply.
@@ -329,18 +443,189 @@ impl Ledger {
 
     /// Verify the conservation invariant (used by tests).
     pub fn conservation_holds(&self) -> bool {
-        let mut sum = Amount::ZERO;
-        for i in 0..self.available.len() {
-            sum = match sum
-                .checked_add(self.available[i])
-                .and_then(|s| s.checked_add(self.reserved[i]))
-                .and_then(|s| s.checked_add(self.locked[i]))
-                .and_then(|s| s.checked_add(self.escrowed[i]))
-            {
-                Ok(v) => v,
-                Err(_) => return false,
-            };
+        self.validate_transition_invariants().is_ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use types::ArithError;
+
+    fn amount(raw: i128) -> Amount {
+        Amount::from_raw(raw)
+    }
+
+    fn rich_ledger() -> Ledger {
+        let mut ledger = Ledger::new();
+        let first = ledger.create_account(amount(1_000)).unwrap();
+        let second = ledger.create_account(amount(500)).unwrap();
+        ledger.reserve(first, amount(100)).unwrap();
+        ledger.lock(first, amount(200)).unwrap();
+        ledger.escrow(first, amount(50)).unwrap();
+        ledger
+            .transfer_available(second, first, amount(25))
+            .unwrap();
+        ledger.bump_auth_epoch(first).unwrap();
+        ledger.bump_auth_epoch(first).unwrap();
+        ledger.bump_auth_epoch(second).unwrap();
+        ledger
+    }
+
+    #[test]
+    fn transition_root_v1_golden_vectors() {
+        assert_eq!(
+            Ledger::new().transition_root_v1().unwrap(),
+            Hash::from_bytes([
+                110, 5, 238, 79, 63, 135, 249, 64, 54, 220, 161, 247, 46, 34, 241, 173, 36, 19, 79,
+                147, 102, 233, 124, 37, 29, 63, 221, 74, 123, 45, 147, 210,
+            ])
+        );
+        assert_eq!(
+            rich_ledger().transition_root_v1().unwrap(),
+            Hash::from_bytes([
+                164, 225, 194, 34, 80, 9, 231, 94, 104, 14, 11, 127, 52, 149, 152, 142, 65, 140,
+                228, 157, 230, 202, 71, 137, 154, 170, 93, 84, 96, 121, 176, 91,
+            ])
+        );
+    }
+
+    #[test]
+    fn transition_root_v1_binds_shape_partitions_epochs_and_supply() {
+        let base = rich_ledger();
+        let root = base.transition_root_v1().unwrap();
+
+        let mut available = base.clone();
+        available
+            .transfer_available(AccountId::new(0), AccountId::new(1), amount(1))
+            .unwrap();
+        assert_ne!(available.transition_root_v1().unwrap(), root);
+
+        let mut reserved = base.clone();
+        reserved.reserve(AccountId::new(0), amount(1)).unwrap();
+        assert_ne!(reserved.transition_root_v1().unwrap(), root);
+
+        let mut locked = base.clone();
+        locked.lock(AccountId::new(0), amount(1)).unwrap();
+        assert_ne!(locked.transition_root_v1().unwrap(), root);
+
+        let mut escrowed = base.clone();
+        escrowed.escrow(AccountId::new(0), amount(1)).unwrap();
+        assert_ne!(escrowed.transition_root_v1().unwrap(), root);
+
+        let mut epoch = base.clone();
+        epoch.bump_auth_epoch(AccountId::new(0)).unwrap();
+        assert_ne!(epoch.transition_root_v1().unwrap(), root);
+
+        let mut supplied = base.clone();
+        supplied.credit(AccountId::new(0), amount(1)).unwrap();
+        assert_ne!(supplied.transition_root_v1().unwrap(), root);
+
+        let mut shaped = base.clone();
+        shaped.create_account(Amount::ZERO).unwrap();
+        assert_ne!(shaped.transition_root_v1().unwrap(), root);
+    }
+
+    #[test]
+    fn transition_root_v1_is_clone_and_replay_deterministic() {
+        let a = rich_ledger();
+        let b = rich_ledger();
+        assert_eq!(a.transition_root_v1(), b.transition_root_v1());
+        assert_eq!(a.transition_root_v1(), a.clone().transition_root_v1());
+    }
+
+    #[test]
+    fn validator_rejects_every_misaligned_column() {
+        let base = rich_ledger();
+        let expected = base.available.len();
+
+        macro_rules! reject {
+            ($field:ident, $column:literal) => {{
+                let mut ledger = base.clone();
+                ledger.$field.pop();
+                assert_eq!(
+                    ledger.transition_root_v1(),
+                    Err(ExecutionError::StateShape {
+                        section: "ledger",
+                        column: $column,
+                        expected,
+                        actual: expected - 1,
+                    })
+                );
+            }};
         }
-        sum == self.total_supply
+
+        reject!(reserved, "reserved");
+        reject!(locked, "locked");
+        reject!(escrowed, "escrowed");
+        reject!(auth_epoch, "auth_epoch");
+
+        let mut longer = base;
+        longer.reserved.push(Amount::ZERO);
+        assert_eq!(
+            longer.transition_root_v1(),
+            Err(ExecutionError::StateShape {
+                section: "ledger",
+                column: "reserved",
+                expected,
+                actual: expected + 1,
+            })
+        );
+    }
+
+    #[test]
+    fn validator_rejects_negative_partitions_and_supply() {
+        let base = rich_ledger();
+        for corrupt in [
+            |ledger: &mut Ledger| ledger.available[0] = amount(-1),
+            |ledger: &mut Ledger| ledger.reserved[0] = amount(-1),
+            |ledger: &mut Ledger| ledger.locked[0] = amount(-1),
+            |ledger: &mut Ledger| ledger.escrowed[0] = amount(-1),
+        ] {
+            let mut ledger = base.clone();
+            corrupt(&mut ledger);
+            assert_eq!(
+                ledger.transition_root_v1(),
+                Err(ExecutionError::StateInvariant(
+                    "ledger balance partitions must be non-negative"
+                ))
+            );
+        }
+
+        let mut negative_supply = base;
+        negative_supply.total_supply = amount(-1);
+        assert_eq!(
+            negative_supply.transition_root_v1(),
+            Err(ExecutionError::StateInvariant(
+                "ledger total supply must be non-negative"
+            ))
+        );
+    }
+
+    #[test]
+    fn validator_rejects_sum_overflow_and_supply_mismatch() {
+        let mut overflow = Ledger {
+            available: vec![amount(i128::MAX)],
+            reserved: vec![amount(1)],
+            locked: vec![Amount::ZERO],
+            escrowed: vec![Amount::ZERO],
+            auth_epoch: vec![0],
+            total_supply: amount(i128::MAX),
+        };
+        assert_eq!(
+            overflow.transition_root_v1(),
+            Err(ExecutionError::Arith(ArithError::Overflow))
+        );
+        assert!(!overflow.conservation_holds());
+
+        overflow.reserved[0] = Amount::ZERO;
+        overflow.total_supply = amount(i128::MAX - 1);
+        assert_eq!(
+            overflow.transition_root_v1(),
+            Err(ExecutionError::StateInvariant(
+                "ledger partition sum does not equal total supply"
+            ))
+        );
+        assert!(!overflow.conservation_holds());
     }
 }

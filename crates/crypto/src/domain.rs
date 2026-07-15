@@ -33,6 +33,8 @@ pub const DOMAIN_MARKET: &[u8] = b"dexos:market:v1";
 pub const DOMAIN_COMMAND: &[u8] = b"dexos:command:v1";
 /// Execution receipt.
 pub const DOMAIN_EXECUTION: &[u8] = b"dexos:execution:v1";
+/// Canonical execution-ledger transition state.
+pub const DOMAIN_EXECUTION_LEDGER_STATE: &[u8] = b"dexos:execution:ledger-state:v1";
 /// Canonical execution-layer session authorization and replay state.
 pub const DOMAIN_EXECUTION_SESSION_STATE: &[u8] = b"dexos:execution:session-state:v1";
 /// Canonical order-book transition state (price levels, FIFO priority, and
@@ -81,6 +83,7 @@ pub const ALL_DOMAINS: &[&[u8]] = &[
     DOMAIN_MARKET,
     DOMAIN_COMMAND,
     DOMAIN_EXECUTION,
+    DOMAIN_EXECUTION_LEDGER_STATE,
     DOMAIN_EXECUTION_SESSION_STATE,
     DOMAIN_ORDERBOOK_STATE,
     DOMAIN_RISK_STATE,
