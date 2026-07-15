@@ -1,0 +1,21 @@
+# Test-cluster-only RPC section for a 10,000-connection load campaign. Merge this
+# reviewed fragment into each dedicated sink/validator node configuration; never use
+# it to weaken an Internet-facing production node's admission controls.
+[rpc]
+listen = "0.0.0.0:9443"
+read_only = false
+tls_cert_path = "secrets/rpc-chain.pem"
+tls_key_path = "secrets/rpc-key.pem"
+tls_client_ca_path = "secrets/loadgen-client-roots.pem"
+max_connections = 20000
+max_connections_per_ip = 5000
+rate_per_ip_per_sec = 0
+rate_burst = 0
+idle_timeout_ms = 60000
+read_timeout_ms = 10000
+write_timeout_ms = 10000
+dispatch_timeout_ms = 5000
+max_in_flight_requests = 320000
+max_in_flight_bytes = 4294967296
+max_in_flight_requests_per_conn = 32
+max_in_flight_bytes_per_conn = 1048576

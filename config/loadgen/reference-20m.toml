@@ -1,0 +1,128 @@
+schema_version = 2
+mode = "Sink"
+role = "Controller"
+seed = 552
+clock_method = "NtpOffset"
+clock_uncertainty_ns = 1000000
+orders_per_second = 24000000
+warm_up_secs = 30
+duration_secs = 300
+drain_timeout_secs = 30
+cool_down_secs = 5
+worker_count = 48
+connection_queue_capacity = 4096
+in_flight_per_connection = 32
+reconnect_max_attempts = 8
+reconnect_base_delay_ms = 10
+reconnect_max_delay_ms = 2000
+client_id_base = 552000000
+nonce_base = 0
+market_ids = [1, 2, 3, 4, 5, 6, 7, 8]
+
+[operation_mix]
+new = 550000
+cancel = 300000
+replace = 150000
+
+[thresholds]
+minimum_written_per_second = 20000000
+minimum_acknowledged_per_second = 0
+maximum_p99_ns = 0
+maximum_failure_ratio = 100
+
+[output]
+directory = "artifacts/loadgen/reference-20m"
+interval_jsonl = true
+human = true
+
+[control]
+listen = "0.0.0.0:9910"
+token_file = "secrets/loadgen-control.token"
+heartbeat_ms = 1000
+agent_timeout_ms = 5000
+start_delay_ms = 10000
+agents = [
+  "gen-west-1",
+  "gen-west-2",
+  "gen-west-3",
+  "gen-west-4",
+  "gen-east-1",
+  "gen-east-2",
+  "gen-east-3",
+  "gen-east-4",
+]
+allowed_endpoints = ["198.51.100.20:9443", "198.51.100.21:9443", "[2001:db8:552:1::20]:9443", "[2001:db8:552:1::21]:9443"]
+
+[[regions]]
+name = "us-west"
+users = 6000
+cross_region = false
+base_latency_us = 200
+jitter_us = 50
+clock_offset_us = 0
+source_ips = ["192.0.2.10", "192.0.2.11"]
+
+[[regions.endpoints]]
+name = "sink-west-a"
+address = "198.51.100.20:9443"
+weight = 3
+connections_per_source_ip = 2000
+target_kind = "ReferenceSink"
+
+[regions.endpoints.tls]
+enabled = true
+server_name = "sink-west-a.loadtest.invalid"
+ca_file = "secrets/loadtest-ca.pem"
+client_cert_file = "secrets/loadgen-client.pem"
+client_key_file = "secrets/loadgen-client-key.pem"
+
+[[regions.endpoints]]
+name = "sink-west-b"
+address = "198.51.100.21:9443"
+weight = 1
+connections_per_source_ip = 1000
+target_kind = "ReferenceSink"
+
+[regions.endpoints.tls]
+enabled = true
+server_name = "sink-west-b.loadtest.invalid"
+ca_file = "secrets/loadtest-ca.pem"
+client_cert_file = "secrets/loadgen-client.pem"
+client_key_file = "secrets/loadgen-client-key.pem"
+
+[[regions]]
+name = "us-east"
+users = 6000
+cross_region = true
+base_latency_us = 35000
+jitter_us = 1000
+clock_offset_us = 0
+source_ips = ["2001:db8:552::10", "2001:db8:552::11"]
+
+[[regions.endpoints]]
+name = "sink-east-a"
+address = "[2001:db8:552:1::20]:9443"
+weight = 3
+connections_per_source_ip = 2000
+target_kind = "ReferenceSink"
+
+[regions.endpoints.tls]
+enabled = true
+server_name = "sink-east-a.loadtest.invalid"
+ca_file = "secrets/loadtest-ca.pem"
+client_cert_file = "secrets/loadgen-client.pem"
+client_key_file = "secrets/loadgen-client-key.pem"
+
+[[regions.endpoints]]
+name = "sink-east-b"
+address = "[2001:db8:552:1::21]:9443"
+weight = 1
+connections_per_source_ip = 1000
+target_kind = "ReferenceSink"
+
+[regions.endpoints.tls]
+enabled = true
+server_name = "sink-east-b.loadtest.invalid"
+ca_file = "secrets/loadtest-ca.pem"
+client_cert_file = "secrets/loadgen-client.pem"
+client_key_file = "secrets/loadgen-client-key.pem"

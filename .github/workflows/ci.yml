@@ -61,6 +61,11 @@ jobs:
           cargo test --workspace --locked
           --exclude dexos-ui --exclude dexos-web
           --exclude dexos-desktop --exclude dexos-mobile --exclude dexos-sdk-wasm --exclude dexos-sdk-py
+      - name: loadgen local + distributed smoke
+        run: |
+          ./scripts/loadgen-smoke.sh
+          ./scripts/loadgen-distributed-smoke.sh
+          ./scripts/loadgen-signal-smoke.sh
 
   consensus-simulation:
     name: consensus simulation proof

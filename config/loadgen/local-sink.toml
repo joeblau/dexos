@@ -1,0 +1,45 @@
+schema_version = 2
+mode = "Sink"
+role = "Local"
+seed = 565
+orders_per_second = 1000
+warm_up_secs = 0
+duration_secs = 1
+drain_timeout_secs = 3
+cool_down_secs = 0
+worker_count = 2
+connection_queue_capacity = 256
+in_flight_per_connection = 8
+client_id_base = 565000
+nonce_base = 0
+agent_id = "local-smoke"
+market_ids = [1, 2]
+
+[operation_mix]
+new = 700000
+cancel = 200000
+replace = 100000
+
+[thresholds]
+minimum_written_per_second = 900
+minimum_acknowledged_per_second = 900
+maximum_p99_ns = 500000000
+maximum_failure_ratio = 0
+
+[output]
+directory = "artifacts/loadgen/local-sink"
+interval_jsonl = true
+human = true
+
+[[regions]]
+name = "local"
+users = 100
+source_ips = ["127.0.0.1"]
+
+[[regions.endpoints]]
+name = "local-reference-sink"
+address = "127.0.0.1:9900"
+weight = 1
+connections_per_source_ip = 2
+target_kind = "ReferenceSink"
+

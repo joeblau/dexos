@@ -34,6 +34,31 @@ pub fn encode_request(request: &RpcRequest) -> Result<Vec<u8>, RpcError> {
     frame.encode().map_err(RpcError::from)
 }
 
+/// Encode a request using caller-owned payload and frame buffers. Neither buffer is
+/// resized: payload serialization writes into `payload_scratch`, and framing requires
+/// sufficient existing `frame_out` capacity.
+pub fn encode_request_into(
+    request: &RpcRequest,
+    payload_scratch: &mut [u8],
+    frame_out: &mut Vec<u8>,
+) -> Result<usize, RpcError> {
+    let payload_len = codec::encode_to_slice(request, payload_scratch)?;
+    let class = if request.is_control() {
+        TrafficClass::NewOrder
+    } else {
+        TrafficClass::MarketData
+    };
+    Frame::encode_parts_into(
+        class,
+        MSG_REQUEST,
+        request.request_id,
+        &payload_scratch[..payload_len],
+        frame_out,
+        codec::MAX_RPC_FRAME_PAYLOAD,
+    )
+    .map_err(RpcError::from)
+}
+
 /// Decode a framed request. Returns [`RpcError::InvalidRequest`] on a wrong
 /// message type, and never panics on arbitrary bytes. Decodes through a
 /// borrowed [`codec::FrameRef`]: the caller already holds the full contiguous
@@ -56,6 +81,24 @@ pub fn encode_response(response: &RpcResponse) -> Result<Vec<u8>, RpcError> {
         payload,
     };
     frame.encode().map_err(RpcError::from)
+}
+
+/// Encode a response into caller-owned fixed buffers without implicit resize.
+pub fn encode_response_into(
+    response: &RpcResponse,
+    payload_scratch: &mut [u8],
+    frame_out: &mut Vec<u8>,
+) -> Result<usize, RpcError> {
+    let payload_len = codec::encode_to_slice(response, payload_scratch)?;
+    Frame::encode_parts_into(
+        TrafficClass::MarketData,
+        MSG_RESPONSE,
+        response.request_id,
+        &payload_scratch[..payload_len],
+        frame_out,
+        codec::MAX_RPC_FRAME_PAYLOAD,
+    )
+    .map_err(RpcError::from)
 }
 
 /// Decode a framed response. Never panics on arbitrary bytes. Reads the

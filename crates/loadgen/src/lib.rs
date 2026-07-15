@@ -35,6 +35,8 @@
 //! [`types::Ratio`] at the configuration boundary and the engine is integer-only
 //! thereafter.
 
+pub mod campaign;
+mod campaign_distributed;
 pub mod command;
 pub mod config;
 pub mod distributed;
@@ -42,13 +44,20 @@ pub mod engine;
 pub mod impairment;
 pub mod live_packed;
 pub mod live_rpc;
+pub mod market;
+pub mod measured;
 pub mod metrics;
 pub mod packed_adapter;
+pub mod protocol;
 pub mod realtime;
 pub mod reference_sink;
 pub mod rng;
 pub mod rpc_adapter;
+pub mod runtime;
+pub mod scheduler;
+pub mod sink;
 pub mod timing;
+pub mod topology;
 pub mod util;
 pub mod workload;
 

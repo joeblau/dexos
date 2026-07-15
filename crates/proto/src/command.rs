@@ -62,6 +62,35 @@ pub struct ControlMeta {
 }
 
 impl ControlMeta {
+    /// Write canonical signing bytes into a caller-owned scratch buffer. This is the
+    /// allocation-free equivalent of [`ControlMeta::signing_bytes`].
+    pub fn signing_bytes_into<'a>(
+        &self,
+        command: &Command,
+        out: &'a mut [u8],
+    ) -> Result<&'a [u8], RpcError> {
+        #[derive(Serialize)]
+        struct Payload<'a> {
+            client_id: u64,
+            nonce: u64,
+            session_pubkey: Option<[u8; 32]>,
+            command: &'a Command,
+        }
+        if out.len() < CONTROL_SIGNING_DOMAIN.len() {
+            return Err(RpcError::InvalidSignature);
+        }
+        out[..CONTROL_SIGNING_DOMAIN.len()].copy_from_slice(CONTROL_SIGNING_DOMAIN);
+        let payload = Payload {
+            client_id: self.client_id,
+            nonce: self.nonce,
+            session_pubkey: self.session_pubkey,
+            command,
+        };
+        let encoded = codec::encode_to_slice(&payload, &mut out[CONTROL_SIGNING_DOMAIN.len()..])
+            .map_err(|_| RpcError::InvalidSignature)?;
+        Ok(&out[..CONTROL_SIGNING_DOMAIN.len() + encoded])
+    }
+
     /// The canonical bytes an envelope's signature commits to: a domain tag
     /// followed by the idempotency context (`client_id`, `nonce`,
     /// `session_pubkey`) and the lowered `command`. The `signer` and
@@ -125,6 +154,27 @@ impl ControlMeta {
             signature: [0u8; 64],
         };
         meta.signature = keypair.sign(&meta.signing_bytes(command)?);
+        Ok(meta)
+    }
+
+    /// Build a signed control envelope using caller-owned signing scratch. No heap
+    /// allocation occurs when the buffer is large enough.
+    pub fn signed_with_scratch(
+        client_id: u64,
+        nonce: u64,
+        session_pubkey: Option<[u8; 32]>,
+        keypair: &crypto::KeyPair,
+        command: &Command,
+        scratch: &mut [u8],
+    ) -> Result<Self, RpcError> {
+        let mut meta = ControlMeta {
+            client_id,
+            nonce,
+            session_pubkey,
+            signer: keypair.public(),
+            signature: [0u8; 64],
+        };
+        meta.signature = keypair.sign(meta.signing_bytes_into(command, scratch)?);
         Ok(meta)
     }
 }

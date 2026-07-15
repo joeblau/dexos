@@ -1,0 +1,52 @@
+schema_version = 2
+mode = "Validator"
+role = "Local"
+seed = 565
+orders_per_second = 1000
+warm_up_secs = 5
+duration_secs = 30
+drain_timeout_secs = 10
+cool_down_secs = 1
+worker_count = 2
+connection_queue_capacity = 256
+in_flight_per_connection = 1
+client_id_base = 565100
+nonce_base = 0
+agent_id = "local-validator-smoke"
+market_ids = [1, 2]
+
+[operation_mix]
+new = 700000
+cancel = 200000
+replace = 100000
+
+[thresholds]
+minimum_written_per_second = 1
+minimum_acknowledged_per_second = 1
+maximum_p99_ns = 1000000000
+maximum_failure_ratio = 10000
+
+[[accounts]]
+account_id = 1
+signing_key_file = "secrets/loadgen-account-1.ed25519"
+session_public_key_file = ""
+token_file = ""
+
+[[regions]]
+name = "local"
+users = 100
+source_ips = ["127.0.0.1"]
+
+[[regions.endpoints]]
+name = "local-validator"
+address = "127.0.0.1:9000"
+weight = 1
+connections_per_source_ip = 2
+target_kind = "Validator"
+
+[regions.endpoints.tls]
+enabled = true
+server_name = "localhost"
+ca_file = "secrets/dev-ca.pem"
+client_cert_file = "secrets/loadgen-client.pem"
+client_key_file = "secrets/loadgen-client-key.pem"

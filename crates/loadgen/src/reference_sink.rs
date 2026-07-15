@@ -296,6 +296,7 @@ mod tests {
             kind,
             side: Side::Bid,
             order_type: OrderType::Limit,
+            time_in_force: types::TimeInForce::Gtc,
             price: Price::from_raw(10_000_000),
             quantity: Quantity::from_raw(1_000_000),
             target_order: None,

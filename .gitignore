@@ -11,6 +11,7 @@ determinism-digest.txt
 *.profdata
 perf.data*
 flamegraph.svg
+/artifacts/loadgen/
 /data
 .DS_Store
 .claude/
