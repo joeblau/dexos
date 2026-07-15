@@ -6,6 +6,11 @@ use types::{AccountId, Amount, Hash, MarketId};
 
 use crate::error::ExecutionError;
 
+mod state;
+mod state_codec;
+
+pub use state::{SessionStateError, SessionStateLimits};
+
 /// Canonical execution-session transition-root schema.
 pub const SESSION_TRANSITION_ROOT_SCHEMA_VERSION: u16 = 1;
 
@@ -123,18 +128,13 @@ impl SessionRegistry {
     /// [`Self::consume`].
     #[must_use]
     pub fn transition_root_v1(&self) -> Hash {
-        let mut writer = TransitionWriter::default();
-        writer.u16(SESSION_TRANSITION_ROOT_SCHEMA_VERSION);
+        self.assert_transition_invariants();
+        self.transition_root_v1_checked()
+            .unwrap_or_else(|error| panic!("failed to encode canonical session state: {error}"))
+    }
 
-        let mut sessions: Vec<((u32, [u8; 32]), &Session)> = self
-            .sessions
-            .iter()
-            .map(|(key, session)| (*key, session))
-            .collect();
-        sessions.sort_unstable_by_key(|(key, _)| *key);
-        writer.len(sessions.len());
-
-        for ((account, session_key), session) in sessions {
+    fn assert_transition_invariants(&self) {
+        for session in self.sessions.values() {
             assert!(
                 !session.max_notional.is_negative(),
                 "session maximum notional must be nonnegative"
@@ -143,7 +143,32 @@ impl SessionRegistry {
                 session.nonce_start <= session.nonce_end,
                 "session nonce range must be ordered"
             );
+            for nonce in &session.consumed {
+                assert!(
+                    (session.nonce_start..=session.nonce_end).contains(nonce),
+                    "consumed nonce must lie inside the authorized range"
+                );
+            }
+        }
+    }
 
+    fn write_state_v1_unchecked(
+        &self,
+        writer: &mut TransitionWriter,
+    ) -> Result<(), SessionStateError> {
+        writer.u16(SESSION_TRANSITION_ROOT_SCHEMA_VERSION);
+
+        let mut sessions = Vec::new();
+        sessions
+            .try_reserve_exact(self.sessions.len())
+            .map_err(|_| SessionStateError::AllocationFailed {
+                resource: "session ordering",
+            })?;
+        sessions.extend(self.sessions.iter().map(|(key, session)| (*key, session)));
+        sessions.sort_unstable_by_key(|(key, _)| *key);
+        writer.len(sessions.len());
+
+        for ((account, session_key), session) in sessions {
             writer.u32(account);
             writer.bytes.extend_from_slice(&session_key);
 
@@ -152,11 +177,13 @@ impl SessionRegistry {
                 writer.len(0);
             } else {
                 writer.u8(1); // explicit semantic allow-list
-                let mut markets: Vec<u32> = session
-                    .allowed_markets
-                    .iter()
-                    .map(|market| market.get())
-                    .collect();
+                let mut markets = Vec::new();
+                markets
+                    .try_reserve_exact(session.allowed_markets.len())
+                    .map_err(|_| SessionStateError::AllocationFailed {
+                        resource: "session market ordering",
+                    })?;
+                markets.extend(session.allowed_markets.iter().map(|market| market.get()));
                 markets.sort_unstable();
                 markets.dedup();
                 writer.len(markets.len());
@@ -170,19 +197,20 @@ impl SessionRegistry {
             writer.u64(session.nonce_start);
             writer.u64(session.nonce_end);
 
-            let mut consumed: Vec<u64> = session.consumed.iter().copied().collect();
+            let mut consumed = Vec::new();
+            consumed
+                .try_reserve_exact(session.consumed.len())
+                .map_err(|_| SessionStateError::AllocationFailed {
+                    resource: "consumed nonce ordering",
+                })?;
+            consumed.extend(session.consumed.iter().copied());
             consumed.sort_unstable();
             writer.len(consumed.len());
             for nonce in consumed {
-                assert!(
-                    (session.nonce_start..=session.nonce_end).contains(&nonce),
-                    "consumed nonce must lie inside the authorized range"
-                );
                 writer.u64(nonce);
             }
         }
-
-        crypto::hash_domain(crypto::DOMAIN_EXECUTION_SESSION_STATE, &writer.bytes)
+        Ok(())
     }
 
     /// Validate a session action and consume its nonce exactly once. Rejects
@@ -350,16 +378,7 @@ mod tests {
         registry
     }
 
-    #[test]
-    fn transition_root_v1_golden_vectors() {
-        assert_eq!(
-            SessionRegistry::new().transition_root_v1(),
-            Hash::from_bytes([
-                150, 107, 144, 227, 55, 115, 114, 166, 75, 95, 115, 10, 11, 134, 122, 129, 72, 201,
-                2, 68, 84, 182, 133, 193, 21, 236, 138, 209, 142, 115, 250, 20,
-            ])
-        );
-
+    fn rich_registry() -> SessionRegistry {
         let mut rich = SessionRegistry::new();
         rich.authorize(
             acct(2),
@@ -387,6 +406,20 @@ mod tests {
             .unwrap();
         rich.consume(acct(1), [1; 32], 1, MarketId::new(3), Amount::ZERO, 1)
             .unwrap();
+        rich
+    }
+
+    #[test]
+    fn transition_root_v1_golden_vectors() {
+        assert_eq!(
+            SessionRegistry::new().transition_root_v1(),
+            Hash::from_bytes([
+                150, 107, 144, 227, 55, 115, 114, 166, 75, 95, 115, 10, 11, 134, 122, 129, 72, 201,
+                2, 68, 84, 182, 133, 193, 21, 236, 138, 209, 142, 115, 250, 20,
+            ])
+        );
+
+        let rich = rich_registry();
         assert_eq!(
             rich.transition_root_v1(),
             Hash::from_bytes([
@@ -644,5 +677,603 @@ mod tests {
             .consumed
             .insert(6);
         let _ = registry.transition_root_v1();
+    }
+
+    fn codec_bytes(registry: &SessionRegistry) -> Vec<u8> {
+        registry.encode_state_v1_bounded(usize::MAX).unwrap()
+    }
+
+    fn overwrite_u16(bytes: &mut [u8], offset: usize, value: u16) {
+        bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn overwrite_u32(bytes: &mut [u8], offset: usize, value: u32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn overwrite_u64(bytes: &mut [u8], offset: usize, value: u64) {
+        bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn overwrite_i128(bytes: &mut [u8], offset: usize, value: i128) {
+        bytes[offset..offset + 16].copy_from_slice(&value.to_le_bytes());
+    }
+
+    #[test]
+    fn state_codec_v1_exact_preimages_roots_and_semantic_recovery() {
+        let empty = SessionRegistry::new();
+        let empty_bytes = codec_bytes(&empty);
+        assert_eq!(empty_bytes.len(), 10);
+        assert_eq!(hex::encode(&empty_bytes), "01000000000000000000");
+        assert_eq!(
+            crypto::hash_domain(crypto::DOMAIN_EXECUTION_SESSION_STATE, &empty_bytes),
+            empty.transition_root_v1()
+        );
+        let restored =
+            SessionRegistry::decode_state_v1_bounded(&empty_bytes, &SessionStateLimits::default())
+                .unwrap();
+        assert_eq!(codec_bytes(&restored), empty_bytes);
+
+        let rich = rich_registry();
+        let rich_bytes = codec_bytes(&rich);
+        assert_eq!(rich_bytes.len(), 228);
+        assert_eq!(
+            hex::encode(&rich_bytes),
+            concat!(
+                "010002000000000000000100000001010101010101010101010101010101010101010101",
+                "010101010101010101010102000000000000000300000009000000e8030000000000000000",
+                "000000000000f4010000000000000100000000000000050000000000000002000000000000",
+                "0001000000000000000500000000000000020000000202020202020202020202020202020202",
+                "0202020202020202020202020202020000000000000000002900000000000080000000000000",
+                "0000e80300000000000007000000000000000900000000000000010000000000000009000000",
+                "00000000"
+            )
+        );
+        assert_eq!(
+            crypto::hash_domain(crypto::DOMAIN_EXECUTION_SESSION_STATE, &rich_bytes),
+            rich.transition_root_v1()
+        );
+
+        let restored =
+            SessionRegistry::decode_state_v1_bounded(&rich_bytes, &SessionStateLimits::default())
+                .unwrap();
+        assert_eq!(codec_bytes(&restored), rich_bytes);
+        assert_eq!(restored.transition_root_v1(), rich.transition_root_v1());
+        assert_eq!(
+            restored
+                .sessions
+                .get(&(1, [1; 32]))
+                .unwrap()
+                .allowed_markets,
+            vec![MarketId::new(3), MarketId::new(9)]
+        );
+
+        assert_eq!(
+            rich.encode_state_v1_bounded(rich_bytes.len() - 1),
+            Err(SessionStateError::EncodedBytesLimit {
+                actual: rich_bytes.len(),
+                max: rich_bytes.len() - 1,
+            })
+        );
+        assert_eq!(
+            rich.encode_state_v1_bounded(rich_bytes.len()).unwrap(),
+            rich_bytes
+        );
+    }
+
+    #[test]
+    fn state_codec_v1_enforces_each_independent_and_cumulative_limit() {
+        let bytes = codec_bytes(&rich_registry());
+        let exact = SessionStateLimits {
+            max_encoded_bytes: bytes.len(),
+            max_sessions: 2,
+            max_markets_per_session: 2,
+            max_total_markets: 2,
+            max_consumed_nonces_per_session: 2,
+            max_total_consumed_nonces: 3,
+        };
+        assert!(SessionRegistry::decode_state_v1_bounded(&bytes, &exact).is_ok());
+
+        assert_eq!(
+            SessionRegistry::decode_state_v1_bounded(
+                &bytes,
+                &SessionStateLimits {
+                    max_encoded_bytes: bytes.len() - 1,
+                    ..exact
+                },
+            )
+            .unwrap_err(),
+            SessionStateError::EncodedBytesLimit {
+                actual: bytes.len(),
+                max: bytes.len() - 1,
+            }
+        );
+
+        let cases = [
+            (
+                "sessions",
+                SessionStateLimits {
+                    max_sessions: 1,
+                    ..exact
+                },
+            ),
+            (
+                "markets per session",
+                SessionStateLimits {
+                    max_markets_per_session: 1,
+                    ..exact
+                },
+            ),
+            (
+                "total session markets",
+                SessionStateLimits {
+                    max_total_markets: 1,
+                    ..exact
+                },
+            ),
+            (
+                "consumed nonces per session",
+                SessionStateLimits {
+                    max_consumed_nonces_per_session: 1,
+                    ..exact
+                },
+            ),
+            (
+                "total consumed nonces",
+                SessionStateLimits {
+                    max_total_consumed_nonces: 2,
+                    ..exact
+                },
+            ),
+        ];
+        for (expected_resource, limits) in cases {
+            assert!(matches!(
+                SessionRegistry::decode_state_v1_bounded(&bytes, &limits),
+                Err(SessionStateError::ResourceLimit { resource, .. })
+                    if resource == expected_resource
+            ));
+        }
+    }
+
+    #[test]
+    fn state_codec_v1_rejects_every_truncation_suffix_and_noncanonical_field() {
+        let bytes = codec_bytes(&rich_registry());
+        let limits = SessionStateLimits::default();
+        for end in 0..bytes.len() {
+            assert!(
+                SessionRegistry::decode_state_v1_bounded(&bytes[..end], &limits).is_err(),
+                "truncation at byte {end} was accepted"
+            );
+        }
+
+        let mut suffixed = bytes.clone();
+        suffixed.push(0);
+        assert_eq!(
+            SessionRegistry::decode_state_v1_bounded(&suffixed, &limits).unwrap_err(),
+            SessionStateError::TrailingBytes { remaining: 1 }
+        );
+
+        let mut malformed = Vec::new();
+
+        let mut changed = bytes.clone();
+        overwrite_u16(&mut changed, 0, 2);
+        malformed.push(changed);
+
+        let mut changed = bytes.clone();
+        changed[46] = 2;
+        malformed.push(changed);
+
+        let mut changed = bytes.clone();
+        overwrite_u64(&mut changed, 47, 0);
+        malformed.push(changed);
+
+        let mut changed = bytes.clone();
+        overwrite_u64(&mut changed, 164, 1);
+        malformed.push(changed);
+
+        let mut changed = bytes.clone();
+        overwrite_u32(&mut changed, 127, 0);
+        malformed.push(changed);
+
+        let mut changed = bytes.clone();
+        overwrite_u32(&mut changed, 127, 1);
+        changed[131..163].copy_from_slice(&[1; 32]);
+        malformed.push(changed);
+
+        let mut changed = bytes.clone();
+        overwrite_u32(&mut changed, 127, 1);
+        changed[131..163].copy_from_slice(&[0; 32]);
+        malformed.push(changed);
+
+        let mut changed = bytes.clone();
+        overwrite_u32(&mut changed, 55, 10);
+        malformed.push(changed);
+
+        let mut changed = bytes.clone();
+        overwrite_u32(&mut changed, 59, 3);
+        malformed.push(changed);
+
+        let mut changed = bytes.clone();
+        overwrite_i128(&mut changed, 63, -1);
+        malformed.push(changed);
+
+        let mut changed = bytes.clone();
+        overwrite_u64(&mut changed, 87, 6);
+        malformed.push(changed);
+
+        let mut changed = bytes.clone();
+        overwrite_u64(&mut changed, 87, 1);
+        overwrite_u64(&mut changed, 95, 1);
+        overwrite_u64(&mut changed, 103, 2);
+        malformed.push(changed);
+
+        let mut changed = bytes.clone();
+        overwrite_u64(&mut changed, 111, 0);
+        malformed.push(changed);
+
+        let mut changed = bytes.clone();
+        overwrite_u64(&mut changed, 119, 6);
+        malformed.push(changed);
+
+        let mut changed = bytes.clone();
+        overwrite_u64(&mut changed, 119, 1);
+        malformed.push(changed);
+
+        let mut changed = bytes.clone();
+        overwrite_u64(&mut changed, 111, 4);
+        overwrite_u64(&mut changed, 119, 2);
+        malformed.push(changed);
+
+        for (index, changed) in malformed.iter().enumerate() {
+            assert!(
+                SessionRegistry::decode_state_v1_bounded(changed, &limits).is_err(),
+                "malformed case {index} was accepted"
+            );
+        }
+
+        let mut negative = rich_registry();
+        negative
+            .sessions
+            .get_mut(&(1, [1; 32]))
+            .unwrap()
+            .max_notional = Amount::from_raw(-1);
+        assert!(matches!(
+            negative.encode_state_v1_bounded(usize::MAX),
+            Err(SessionStateError::InvalidValue { .. })
+        ));
+
+        let mut reversed = rich_registry();
+        reversed
+            .sessions
+            .get_mut(&(1, [1; 32]))
+            .unwrap()
+            .nonce_start = 6;
+        assert!(matches!(
+            reversed.encode_state_v1_bounded(usize::MAX),
+            Err(SessionStateError::InvalidValue { .. })
+        ));
+
+        let mut out_of_range = rich_registry();
+        out_of_range
+            .sessions
+            .get_mut(&(1, [1; 32]))
+            .unwrap()
+            .consumed
+            .insert(6);
+        assert!(matches!(
+            out_of_range.encode_state_v1_bounded(usize::MAX),
+            Err(SessionStateError::InvalidValue { .. })
+        ));
+    }
+
+    #[test]
+    fn state_codec_v1_count_bombs_and_mutations_never_panic() {
+        let limits = SessionStateLimits::default();
+        let mut empty = codec_bytes(&SessionRegistry::new());
+        overwrite_u64(&mut empty, 2, u64::MAX);
+        assert!(matches!(
+            SessionRegistry::decode_state_v1_bounded(&empty, &limits),
+            Err(SessionStateError::ResourceLimit {
+                resource: "sessions",
+                ..
+            })
+        ));
+
+        let bytes = codec_bytes(&rich_registry());
+        for (offset, count_offset) in [
+            ("markets per session", 47),
+            ("consumed nonces per session", 103),
+        ] {
+            let mut bomb = bytes.clone();
+            overwrite_u64(&mut bomb, count_offset, u64::MAX);
+            assert!(matches!(
+                SessionRegistry::decode_state_v1_bounded(&bomb, &limits),
+                Err(SessionStateError::ResourceLimit { resource, .. }) if resource == offset
+            ));
+        }
+
+        let unbounded = SessionStateLimits {
+            max_encoded_bytes: usize::MAX,
+            max_sessions: usize::MAX,
+            max_markets_per_session: usize::MAX,
+            max_total_markets: usize::MAX,
+            max_consumed_nonces_per_session: usize::MAX,
+            max_total_consumed_nonces: usize::MAX,
+        };
+        overwrite_u64(&mut empty, 2, u64::try_from(usize::MAX).unwrap());
+        assert!(matches!(
+            SessionRegistry::decode_state_v1_bounded(&empty, &unbounded),
+            Err(SessionStateError::ArithmeticOverflow { .. })
+        ));
+
+        let mut market_bomb = bytes.clone();
+        overwrite_u64(&mut market_bomb, 47, u64::MAX);
+        assert!(SessionRegistry::decode_state_v1_bounded(&market_bomb, &unbounded).is_err());
+
+        let mut consumed_bomb = bytes.clone();
+        overwrite_u64(&mut consumed_bomb, 87, 0);
+        overwrite_u64(&mut consumed_bomb, 95, u64::MAX);
+        overwrite_u64(&mut consumed_bomb, 103, u64::MAX);
+        assert!(SessionRegistry::decode_state_v1_bounded(&consumed_bomb, &unbounded).is_err());
+
+        // Each nested count fits the bytes remaining at its own field, but not
+        // after reserving the second session's 93-byte minimum framing.
+        let mut market_tail_bomb = bytes.clone();
+        overwrite_u64(&mut market_tail_bomb, 47, 20);
+        assert!(matches!(
+            SessionRegistry::decode_state_v1_bounded(&market_tail_bomb, &unbounded),
+            Err(SessionStateError::Truncated { .. })
+        ));
+
+        let mut nonce_tail_bomb = bytes.clone();
+        overwrite_u64(&mut nonce_tail_bomb, 103, 4);
+        assert!(matches!(
+            SessionRegistry::decode_state_v1_bounded(&nonce_tail_bomb, &unbounded),
+            Err(SessionStateError::Truncated { .. })
+        ));
+
+        for offset in 0..bytes.len() {
+            let mut changed = bytes.clone();
+            changed[offset] ^= 0xa5;
+            assert!(std::panic::catch_unwind(|| {
+                let _ = SessionRegistry::decode_state_v1_bounded(&changed, &limits);
+            })
+            .is_ok());
+        }
+
+        let mut state = 0x43d2_91ab_77e5_102cu64;
+        for _ in 0..5_000 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            let len = usize::try_from(state % 256).unwrap();
+            let mut arbitrary = Vec::with_capacity(len);
+            for _ in 0..len {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                arbitrary.push(state.to_le_bytes()[3]);
+            }
+            assert!(std::panic::catch_unwind(|| {
+                let _ = SessionRegistry::decode_state_v1_bounded(&arbitrary, &limits);
+            })
+            .is_ok());
+        }
+    }
+
+    #[test]
+    fn state_codec_v1_accepts_boundary_state_and_numeric_account_order() {
+        let mut registry = SessionRegistry::new();
+        registry
+            .authorize(acct(256), [0; 32], vec![], Amount::ZERO, 0, 0, 0)
+            .unwrap();
+        registry
+            .authorize(
+                acct(255),
+                [u8::MAX; 32],
+                vec![
+                    MarketId::new(u32::MAX),
+                    MarketId::new(0),
+                    MarketId::new(u32::MAX),
+                ],
+                Amount::from_raw(i128::MAX),
+                u64::MAX,
+                0,
+                u64::MAX,
+            )
+            .unwrap();
+        registry
+            .consume(
+                acct(255),
+                [u8::MAX; 32],
+                0,
+                MarketId::new(0),
+                Amount::from_raw(i128::MAX),
+                u64::MAX,
+            )
+            .unwrap();
+        registry
+            .consume(
+                acct(255),
+                [u8::MAX; 32],
+                u64::MAX,
+                MarketId::new(u32::MAX),
+                Amount::from_raw(-1),
+                u64::MAX,
+            )
+            .unwrap();
+
+        let bytes = codec_bytes(&registry);
+        let restored =
+            SessionRegistry::decode_state_v1_bounded(&bytes, &SessionStateLimits::default())
+                .unwrap();
+        assert_eq!(codec_bytes(&restored), bytes);
+        assert_eq!(restored.transition_root_v1(), registry.transition_root_v1());
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn consume_pair(
+        left: &mut SessionRegistry,
+        right: &mut SessionRegistry,
+        account: AccountId,
+        key: [u8; 32],
+        nonce: u64,
+        market: MarketId,
+        notional: Amount,
+        now: u64,
+        expected: Result<(), ExecutionError>,
+    ) {
+        let left_before = codec_bytes(left);
+        let right_before = codec_bytes(right);
+        let left_result = left.consume(account, key, nonce, market, notional, now);
+        let right_result = right.consume(account, key, nonce, market, notional, now);
+        assert_eq!(left_result, expected);
+        assert_eq!(right_result, expected);
+        if expected.is_err() {
+            assert_eq!(codec_bytes(left), left_before);
+            assert_eq!(codec_bytes(right), right_before);
+        }
+        assert_eq!(codec_bytes(left), codec_bytes(right));
+        assert_eq!(left.transition_root_v1(), right.transition_root_v1());
+    }
+
+    #[test]
+    fn state_codec_v1_restored_registry_has_identical_continuation_behavior() {
+        let mut original = rich_registry();
+        let bytes = codec_bytes(&original);
+        let mut restored =
+            SessionRegistry::decode_state_v1_bounded(&bytes, &SessionStateLimits::default())
+                .unwrap();
+
+        consume_pair(
+            &mut original,
+            &mut restored,
+            acct(99),
+            [9; 32],
+            99,
+            MarketId::new(99),
+            Amount::from_raw(i128::MAX),
+            u64::MAX,
+            Err(ExecutionError::UnknownSession),
+        );
+        consume_pair(
+            &mut original,
+            &mut restored,
+            acct(1),
+            [1; 32],
+            6,
+            MarketId::new(4),
+            Amount::from_raw(1_001),
+            501,
+            Err(ExecutionError::SessionExpired),
+        );
+        consume_pair(
+            &mut original,
+            &mut restored,
+            acct(1),
+            [1; 32],
+            6,
+            MarketId::new(4),
+            Amount::from_raw(1_001),
+            0,
+            Err(ExecutionError::MarketNotAuthorized),
+        );
+        consume_pair(
+            &mut original,
+            &mut restored,
+            acct(1),
+            [1; 32],
+            6,
+            MarketId::new(3),
+            Amount::from_raw(1_001),
+            0,
+            Err(ExecutionError::NotionalExceeded),
+        );
+        consume_pair(
+            &mut original,
+            &mut restored,
+            acct(1),
+            [1; 32],
+            6,
+            MarketId::new(3),
+            Amount::from_raw(1_000),
+            0,
+            Err(ExecutionError::BadNonce),
+        );
+        consume_pair(
+            &mut original,
+            &mut restored,
+            acct(1),
+            [1; 32],
+            1,
+            MarketId::new(3),
+            Amount::ZERO,
+            0,
+            Err(ExecutionError::BadNonce),
+        );
+        consume_pair(
+            &mut original,
+            &mut restored,
+            acct(1),
+            [1; 32],
+            2,
+            MarketId::new(9),
+            Amount::from_raw(1_000),
+            500,
+            Ok(()),
+        );
+        consume_pair(
+            &mut original,
+            &mut restored,
+            acct(1),
+            [1; 32],
+            3,
+            MarketId::new(3),
+            Amount::from_raw(-1),
+            0,
+            Ok(()),
+        );
+        consume_pair(
+            &mut original,
+            &mut restored,
+            acct(2),
+            [2; 32],
+            7,
+            MarketId::new(u32::MAX),
+            Amount::ZERO,
+            1_000,
+            Ok(()),
+        );
+
+        for registry in [&mut original, &mut restored] {
+            registry
+                .authorize(
+                    acct(1),
+                    [1; 32],
+                    vec![MarketId::new(8), MarketId::new(8)],
+                    Amount::ZERO,
+                    0,
+                    u64::MAX,
+                    u64::MAX,
+                )
+                .unwrap();
+        }
+        assert_eq!(codec_bytes(&original), codec_bytes(&restored));
+        consume_pair(
+            &mut original,
+            &mut restored,
+            acct(1),
+            [1; 32],
+            u64::MAX,
+            MarketId::new(8),
+            Amount::ZERO,
+            0,
+            Ok(()),
+        );
+        assert!(original.revoke(acct(1), [1; 32]));
+        assert!(restored.revoke(acct(1), [1; 32]));
+        assert!(!original.revoke(acct(1), [9; 32]));
+        assert!(!restored.revoke(acct(1), [9; 32]));
+        assert_eq!(codec_bytes(&original), codec_bytes(&restored));
     }
 }
