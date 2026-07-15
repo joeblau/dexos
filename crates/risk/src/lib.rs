@@ -46,6 +46,7 @@ mod liquidation;
 mod math;
 mod position;
 mod scenario;
+mod state;
 
 pub use config::{
     MarginMode, OrderPriority, RiskConfig, DEFAULT_MAX_ACCOUNTS, DEFAULT_MAX_MARKETS,
@@ -59,6 +60,7 @@ pub use scenario::{
     best_case_scenario_pnl, required_collateral, scenario_values, worst_case_scenario_pnl,
     PayoutPosition,
 };
+pub use state::{RiskStateError, RiskStateLimits};
 
 /// Crate identity, used by the node composition root for a startup manifest.
 pub const CRATE_NAME: &str = "risk";

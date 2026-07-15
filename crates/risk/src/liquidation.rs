@@ -133,6 +133,21 @@ impl LiquidationQueue {
         }
     }
 
+    /// Rebuild a queue from a previously validated FIFO, deriving the membership
+    /// index instead of trusting a persisted hash-table representation.
+    pub(crate) fn from_fifo_checked(queue: Vec<AccountId>) -> Result<Self, RiskError> {
+        let present: HashSet<AccountId> = queue.iter().copied().collect();
+        if present.len() != queue.len() {
+            return Err(RiskError::StateInvariant(
+                "liquidation FIFO contains a duplicate account",
+            ));
+        }
+        Ok(Self {
+            queue: queue.into(),
+            present,
+        })
+    }
+
     /// Enqueue an account if it is not already queued (idempotent, O(1)).
     pub fn enqueue(&mut self, account: AccountId) {
         if self.present.insert(account) {
