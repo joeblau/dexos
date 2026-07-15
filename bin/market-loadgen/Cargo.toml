@@ -10,6 +10,10 @@ publish.workspace = true
 name = "market-loadgen"
 path = "src/main.rs"
 
+[[bin]]
+name = "market-loadgen-campaign"
+path = "src/bin/campaign.rs"
+
 [lints]
 workspace = true
 
@@ -21,3 +25,6 @@ getrandom.workspace = true
 serde.workspace = true
 tokio.workspace = true
 types = { path = "../../crates/types" }
+crypto = { path = "../../crates/crypto" }
+hex.workspace = true
+core_affinity = "0.8"

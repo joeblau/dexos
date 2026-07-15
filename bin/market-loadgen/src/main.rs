@@ -290,6 +290,7 @@ fn scenario_from_cli(cli: &Cli) -> LoadScenario {
             base_latency_us: if cross { 4_000 } else { 200 },
             jitter_us: if cross { 300 } else { 50 },
             clock_offset_us: 0,
+            ..RegionConfig::default()
         });
     }
 
@@ -656,6 +657,7 @@ async fn run_agent(args: &AgentArgs) -> ExitCode {
         base_latency_us: 0,
         jitter_us: 0,
         clock_offset_us: 0,
+        ..RegionConfig::default()
     }];
     eprintln!(
         "agent {}: authenticated run {}; waiting for synchronized warm-up; target traffic is direct",

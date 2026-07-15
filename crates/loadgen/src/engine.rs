@@ -460,7 +460,13 @@ fn run_region(
                 i + (u64::try_from(region_index).unwrap_or(0)) * MAX_EVENTS_PER_REGION,
             )
             .unwrap_or(u32::MAX);
-            SessionState::new(sid)
+            SessionState::with_partition(
+                sid,
+                scenario,
+                &region.name,
+                u16::try_from(region_index).unwrap_or(u16::MAX),
+                true,
+            )
         })
         .collect();
 
@@ -759,6 +765,7 @@ mod tests {
                 base_latency_us: 200,
                 jitter_us: 50,
                 clock_offset_us: 0,
+                ..RegionConfig::default()
             },
             RegionConfig {
                 name: "far".into(),
@@ -767,6 +774,7 @@ mod tests {
                 base_latency_us: 4000,
                 jitter_us: 300,
                 clock_offset_us: -2500,
+                ..RegionConfig::default()
             },
         ];
         let r = run_scenario(&s).unwrap();
@@ -826,6 +834,7 @@ mod tests {
                 base_latency_us: 200,
                 jitter_us: 50,
                 clock_offset_us: 0,
+                ..RegionConfig::default()
             },
             RegionConfig {
                 name: "b".into(),
@@ -834,6 +843,7 @@ mod tests {
                 base_latency_us: 3000,
                 jitter_us: 200,
                 clock_offset_us: 1500,
+                ..RegionConfig::default()
             },
             RegionConfig {
                 name: "c".into(),
@@ -842,6 +852,7 @@ mod tests {
                 base_latency_us: 5000,
                 jitter_us: 400,
                 clock_offset_us: -3000,
+                ..RegionConfig::default()
             },
         ];
         let r = run_scenario(&s).unwrap();

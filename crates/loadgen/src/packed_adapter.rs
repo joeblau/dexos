@@ -491,6 +491,7 @@ mod tests {
                 kind,
                 side: if index % 2 == 0 { Side::Bid } else { Side::Ask },
                 order_type: OrderType::Limit,
+                time_in_force: types::TimeInForce::Gtc,
                 price: Price::from_raw(10_000 + i64::try_from(index).unwrap_or(0)),
                 quantity: Quantity::from_raw(1_000),
                 target_order: None,

@@ -44,7 +44,7 @@ pub use order::{
 };
 /// Runtime backend used only for pure, bit-identical match-planning kernels.
 pub use simd::Backend as MatchingBackend;
-pub use state::{BookStateError, BookStateLimits};
+pub use state::{BookStateError, BookStateLimits, BookStateResources};
 
 /// Fast diagnostic book-root schema version (v2 = unordered XOR multiset of
 /// per-order leaves).

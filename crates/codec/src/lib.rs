@@ -65,6 +65,10 @@ pub enum CodecError {
     /// The traffic-class byte was not a known class.
     #[error("unknown traffic class {0}")]
     UnknownClass(u8),
+    /// A caller-provided hot-path buffer was too small; it is never resized
+    /// implicitly because that would hide an allocation.
+    #[error("buffer too small: required {required} bytes, available {available}")]
+    BufferTooSmall { required: usize, available: usize },
 }
 
 impl CodecError {
@@ -83,6 +87,7 @@ impl CodecError {
                 CodecError::UnsupportedVersion(_) => "unsupported frame protocol version",
                 CodecError::LengthOutOfRange => "payload length out of range",
                 CodecError::UnknownClass(_) => "unknown traffic class byte",
+                CodecError::BufferTooSmall { .. } => "caller-provided buffer too small",
             })
         }
         #[cfg(not(feature = "debug_codec"))]
@@ -102,6 +107,20 @@ pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, CodecError> {
         let _ = err;
         CodecError::Serialize
     })
+}
+
+/// Encode into a caller-provided initialized slice and return the number of bytes
+/// written. This never allocates or resizes.
+pub fn encode_to_slice<T: Serialize>(value: &T, out: &mut [u8]) -> Result<usize, CodecError> {
+    postcard::to_slice(value, out)
+        .map(|used| used.len())
+        .map_err(|err| {
+            #[cfg(feature = "debug_codec")]
+            eprintln!("codec in-place serialize error: {err}");
+            #[cfg(not(feature = "debug_codec"))]
+            let _ = err;
+            CodecError::Serialize
+        })
 }
 
 /// Decode a value from compact binary. Total on adversarial input.
@@ -229,6 +248,53 @@ impl Frame {
         Ok(out)
     }
 
+    /// Encode into a preallocated vector without growing it. The vector is cleared
+    /// first; insufficient capacity returns a typed error and performs no resize.
+    pub fn encode_into(&self, out: &mut Vec<u8>) -> Result<usize, CodecError> {
+        Self::encode_parts_into(
+            self.class,
+            self.msg_type,
+            self.sequence,
+            &self.payload,
+            out,
+            MAX_FRAME_PAYLOAD,
+        )
+    }
+
+    /// Frame a borrowed payload into a preallocated vector without constructing an
+    /// owned [`Frame`] or allocating a payload copy.
+    pub fn encode_parts_into(
+        class: TrafficClass,
+        msg_type: u16,
+        sequence: u64,
+        payload: &[u8],
+        out: &mut Vec<u8>,
+        max_payload: usize,
+    ) -> Result<usize, CodecError> {
+        if payload.len() > max_payload {
+            return Err(CodecError::LengthOutOfRange);
+        }
+        let required = FRAME_HEADER_LEN
+            .checked_add(payload.len())
+            .ok_or(CodecError::LengthOutOfRange)?;
+        if out.capacity() < required {
+            return Err(CodecError::BufferTooSmall {
+                required,
+                available: out.capacity(),
+            });
+        }
+        let plen = u32::try_from(payload.len()).map_err(|_| CodecError::LengthOutOfRange)?;
+        out.clear();
+        out.extend_from_slice(&FRAME_MAGIC.to_le_bytes());
+        out.extend_from_slice(&FRAME_VERSION.to_le_bytes());
+        out.push(class.priority());
+        out.extend_from_slice(&msg_type.to_le_bytes());
+        out.extend_from_slice(&sequence.to_le_bytes());
+        out.extend_from_slice(&plen.to_le_bytes());
+        out.extend_from_slice(payload);
+        Ok(required)
+    }
+
     /// Decode one frame, returning it and the number of bytes consumed. Total.
     /// Payload length is capped at [`MAX_FRAME_PAYLOAD`].
     pub fn decode(bytes: &[u8]) -> Result<(Frame, usize), CodecError> {
@@ -334,6 +400,53 @@ mod tests {
         let (back, consumed) = Frame::decode(&bytes).unwrap();
         assert_eq!(f, back);
         assert_eq!(consumed, bytes.len());
+    }
+
+    #[test]
+    fn in_place_value_and_frame_encoding_match_allocating_api() {
+        let message = Msg {
+            a: 7,
+            b: vec![1, 2, 3],
+            c: "in-place".to_string(),
+        };
+        let expected_payload = encode(&message).unwrap();
+        let mut payload = [0u8; 128];
+        let payload_len = encode_to_slice(&message, &mut payload).unwrap();
+        assert_eq!(&payload[..payload_len], expected_payload);
+
+        let frame = Frame {
+            class: TrafficClass::NewOrder,
+            msg_type: 9,
+            sequence: 11,
+            payload: expected_payload,
+        };
+        let expected = frame.encode().unwrap();
+        let mut out = Vec::with_capacity(expected.len());
+        let len = frame.encode_into(&mut out).unwrap();
+        assert_eq!(len, expected.len());
+        assert_eq!(out, expected);
+        let capacity = out.capacity();
+        for _ in 0..1000 {
+            frame.encode_into(&mut out).unwrap();
+            assert_eq!(out.capacity(), capacity);
+        }
+    }
+
+    #[test]
+    fn in_place_frame_rejects_resize() {
+        let frame = Frame {
+            class: TrafficClass::NewOrder,
+            msg_type: 1,
+            sequence: 1,
+            payload: vec![0; 100],
+        };
+        let mut out = Vec::with_capacity(10);
+        assert!(matches!(
+            frame.encode_into(&mut out),
+            Err(CodecError::BufferTooSmall { .. })
+        ));
+        assert_eq!(out.capacity(), 10);
+        assert!(out.is_empty());
     }
 
     #[test]

@@ -1,0 +1,47 @@
+schema_version = 2
+mode = "Sink"
+role = "Controller"
+seed = 563
+orders_per_second = 600
+duration_secs = 2
+drain_timeout_secs = 3
+worker_count = 3
+in_flight_per_connection = 32
+client_id_base = 563000
+market_ids = [1, 2]
+
+[operation_mix]
+new = 700000
+cancel = 200000
+replace = 100000
+
+[thresholds]
+minimum_written_per_second = 1
+minimum_acknowledged_per_second = 1
+maximum_p99_ns = 0
+maximum_failure_ratio = 1000000
+
+[output]
+directory = "artifacts/loadgen/distributed-smoke"
+interval_jsonl = true
+human = true
+
+[control]
+listen = "127.0.0.1:9910"
+token_file = "secrets/loadgen-smoke.token"
+heartbeat_ms = 100
+agent_timeout_ms = 5000
+start_delay_ms = 1000
+agents = ["agent-a", "agent-b", "agent-c"]
+allowed_endpoints = ["127.0.0.1:9900"]
+
+[[regions]]
+name = "local"
+users = 3
+source_ips = ["127.0.0.1"]
+
+[[regions.endpoints]]
+name = "reference-sink"
+address = "127.0.0.1:9900"
+connections_per_source_ip = 3
+target_kind = "ReferenceSink"

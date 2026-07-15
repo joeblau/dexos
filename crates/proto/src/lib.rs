@@ -40,8 +40,8 @@ pub use stream::{
     DEFAULT_TOPIC_BYTE_BUDGET,
 };
 pub use transport::{
-    decode_request, decode_response, decode_stream_event, encode_request, encode_response,
-    encode_stream_event,
+    decode_request, decode_response, decode_stream_event, encode_request, encode_request_into,
+    encode_response, encode_response_into, encode_stream_event,
 };
 pub use wire::{
     Account, AccountProof, Book, BookDelta, BridgeStatus, Checkpoint, DepositStatus,

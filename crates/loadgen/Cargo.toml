@@ -21,9 +21,16 @@ toml.workspace = true
 thiserror.workspace = true
 sha2.workspace = true
 tokio.workspace = true
+postcard.workspace = true
+futures-util = "0.3"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 rustls-pemfile = "2"
 
+[[bench]]
+name = "hot_path"
+harness = false
+
 [dev-dependencies]
+rcgen = "0.13"
 rpc = { path = "../rpc" }
