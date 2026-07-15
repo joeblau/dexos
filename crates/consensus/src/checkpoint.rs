@@ -339,7 +339,7 @@ pub fn verify_minimmit_checkpoint(
 pub fn links_to(child: &Checkpoint, parent: &Checkpoint) -> bool {
     child.shard_id == parent.shard_id
         && child.previous_state_root == parent.new_state_root
-        && child.first_sequence == parent.last_sequence.wrapping_add(1)
+        && parent.last_sequence.checked_add(1) == Some(child.first_sequence)
 }
 
 /// Verify an ancestry-linked chain of checkpoints against `set`.
