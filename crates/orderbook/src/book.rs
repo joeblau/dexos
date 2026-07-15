@@ -407,6 +407,38 @@ impl OrderBook {
         self.id_index.get(&id).map(|loc| loc.account)
     }
 
+    /// Immutable logical fields of resting order `id`, if it is present.
+    ///
+    /// The returned view excludes slab links and derived indexes, so callers
+    /// can reconcile external sidecars without depending on representation
+    /// details or changing canonical book state.
+    #[must_use]
+    pub fn resting_order(&self, id: OrderId) -> Option<crate::RestingOrder> {
+        let locator = self.id_index.get(&id)?;
+        let node = self.slab.get(locator.slot)?;
+        Some(crate::RestingOrder {
+            order_id: node.order_id,
+            account: node.account,
+            side: node.side,
+            price: node.price,
+            remaining: node.remaining,
+        })
+    }
+
+    /// Snapshot every resting order in ascending order-id order.
+    ///
+    /// This cold-path view is intended for recovery validation and coordinated
+    /// external-sidecar drains. Reading it does not mutate or re-encode book
+    /// state, and the returned order is independent of hash-table layout.
+    #[must_use]
+    pub fn resting_orders(&self) -> Vec<crate::RestingOrder> {
+        let mut ids: Vec<OrderId> = self.id_index.keys().copied().collect();
+        ids.sort_unstable();
+        ids.into_iter()
+            .filter_map(|id| self.resting_order(id))
+            .collect()
+    }
+
     /// The stubbed net position for `account` (positive long, negative short).
     /// Position tracking is external; the book consults this only for
     /// reduce-only handling.

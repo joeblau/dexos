@@ -134,6 +134,25 @@ pub struct MatchResult {
     pub outcome: OrderOutcome,
 }
 
+/// Immutable fields of one currently resting order.
+///
+/// This transient view lets integrations reconcile external reserve or escrow
+/// sidecars against the live book without exposing slab links or other
+/// representation details. It is not part of the canonical book-state schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestingOrder {
+    /// Exchange-assigned order id.
+    pub order_id: OrderId,
+    /// Account that owns the resting order.
+    pub account: AccountId,
+    /// Resting side.
+    pub side: Side,
+    /// Resting limit price.
+    pub price: Price,
+    /// Quantity still resting.
+    pub remaining: Quantity,
+}
+
 /// A resting self order removed by self-trade prevention while matching an
 /// incoming order.
 ///

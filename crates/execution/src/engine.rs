@@ -255,6 +255,13 @@ const STP_CANCELLATION_ACCOUNT_MISMATCH: &str =
     "STP cancellation account does not match incoming account";
 const STP_CANCELLATION_SIDECAR_MISMATCH: &str =
     "STP cancellation does not match its committed sidecar";
+const MARKET_BOOK_SHAPE_MISMATCH: &str = "market books do not match the configured instrument set";
+const MARKET_RESTING_SIDECAR_MISMATCH: &str =
+    "market resting orders do not match their committed sidecars";
+const MARKET_ESCROW_COLUMN_MISMATCH: &str =
+    "market escrow columns do not match their order sidecars";
+const MARKET_RESTING_BACKING_MISMATCH: &str =
+    "market resting sidecars do not match their aggregate backing";
 
 /// Notional reserved for one resting perp order, plus the resting quantity it
 /// was computed from.
@@ -1243,6 +1250,305 @@ impl Engine {
         }
         self.claim_escrows.remove(&key);
         Ok(Some(record.account))
+    }
+
+    /// Deterministically drain every resting order and its economic sidecar
+    /// from `market`.
+    ///
+    /// The full book/sidecar/column relation is validated before mutation. A
+    /// claim order must have exactly one matching claim escrow; a perp order
+    /// must have an exact reserve, except that a zero-notional order may have
+    /// no reserve or an exact zero reserve. Cross-kind, orphaned, duplicated,
+    /// or malformed sidecars fail closed. Releases and cancellations then run
+    /// in sorted order, with every downstream error propagated to the outer
+    /// COW transaction. The returned owners are exactly the accounts whose
+    /// risk, ledger, or claim state changed during release.
+    fn drain_market_resting_state(
+        &mut self,
+        market: MarketId,
+    ) -> Result<BTreeSet<AccountId>, ExecutionError> {
+        let meta = self
+            .markets
+            .get(&market.get())
+            .ok_or(ExecutionError::UnknownMarket)?
+            .clone();
+        let market_id = market.get();
+        let instrument_total = instrument_count(meta.market_type, meta.outcomes);
+
+        if self.books.keys().any(|&(book_market, instrument)| {
+            book_market == market_id && instrument >= instrument_total
+        }) {
+            return Err(ExecutionError::StateInvariant(MARKET_BOOK_SHAPE_MISMATCH));
+        }
+
+        let mut resting = BTreeMap::<OrderKey, orderbook::RestingOrder>::new();
+        for instrument in 0..instrument_total {
+            let book = self
+                .books
+                .get(&(market_id, instrument))
+                .ok_or(ExecutionError::StateInvariant(MARKET_BOOK_SHAPE_MISMATCH))?;
+            let orders = book.resting_orders();
+            if orders.len() != book.resting_len() {
+                return Err(ExecutionError::StateInvariant(
+                    MARKET_RESTING_SIDECAR_MISMATCH,
+                ));
+            }
+            for order in orders {
+                let key = (market_id, instrument, order.order_id.get());
+                if resting.insert(key, order).is_some() {
+                    return Err(ExecutionError::StateInvariant(
+                        MARKET_RESTING_SIDECAR_MISMATCH,
+                    ));
+                }
+            }
+        }
+
+        let mut reserve_keys: Vec<OrderKey> = self
+            .order_reserves
+            .keys()
+            .copied()
+            .filter(|key| key.0 == market_id)
+            .collect();
+        reserve_keys.sort_unstable();
+        let mut claim_keys: Vec<OrderKey> = self
+            .claim_escrows
+            .keys()
+            .copied()
+            .filter(|key| key.0 == market_id)
+            .collect();
+        claim_keys.sort_unstable();
+
+        for key in reserve_keys.iter().chain(&claim_keys) {
+            if !resting.contains_key(key)
+                || (self.order_reserves.contains_key(key) && self.claim_escrows.contains_key(key))
+            {
+                return Err(ExecutionError::StateInvariant(
+                    MARKET_RESTING_SIDECAR_MISMATCH,
+                ));
+            }
+        }
+
+        for (key, order) in &resting {
+            if is_claim_market(meta.market_type) {
+                if self.order_reserves.contains_key(key) {
+                    return Err(ExecutionError::StateInvariant(
+                        MARKET_RESTING_SIDECAR_MISMATCH,
+                    ));
+                }
+                let escrow =
+                    self.claim_escrows
+                        .get(key)
+                        .copied()
+                        .ok_or(ExecutionError::StateInvariant(
+                            MARKET_RESTING_SIDECAR_MISMATCH,
+                        ))?;
+                let floor_notional = order.price.notional(order.remaining)?;
+                let remaining = Amount::from_raw(i128::from(order.remaining.raw()));
+                let shape_matches = escrow.account == order.account
+                    && escrow.side == order.side
+                    && match order.side {
+                        Side::Bid => {
+                            escrow.claims == Amount::ZERO && escrow.premium >= floor_notional
+                        }
+                        Side::Ask => escrow.premium == Amount::ZERO && escrow.claims == remaining,
+                    };
+                if !shape_matches {
+                    return Err(ExecutionError::StateInvariant(
+                        MARKET_RESTING_SIDECAR_MISMATCH,
+                    ));
+                }
+            } else {
+                if self.claim_escrows.contains_key(key) {
+                    return Err(ExecutionError::StateInvariant(
+                        MARKET_RESTING_SIDECAR_MISMATCH,
+                    ));
+                }
+                let expected = order.price.notional(order.remaining)?;
+                let reserve_matches = match self.order_reserves.get(key) {
+                    Some(reserve) => {
+                        reserve.account == order.account
+                            && reserve.qty_remaining == order.remaining
+                            && reserve.reserved == expected
+                    }
+                    None => expected == Amount::ZERO,
+                };
+                if !reserve_matches {
+                    return Err(ExecutionError::StateInvariant(
+                        MARKET_RESTING_SIDECAR_MISMATCH,
+                    ));
+                }
+            }
+        }
+
+        let mut expected_premium = BTreeMap::new();
+        let mut expected_claims = BTreeMap::new();
+        for key in &claim_keys {
+            let escrow =
+                self.claim_escrows
+                    .get(key)
+                    .copied()
+                    .ok_or(ExecutionError::StateInvariant(
+                        MARKET_RESTING_SIDECAR_MISMATCH,
+                    ))?;
+            match escrow.side {
+                Side::Bid => column_add(
+                    &mut expected_premium,
+                    (escrow.account.get(), market_id),
+                    escrow.premium,
+                )?,
+                Side::Ask => column_add(
+                    &mut expected_claims,
+                    (escrow.account.get(), market_id, key.1),
+                    escrow.claims,
+                )?,
+            }
+        }
+        let actual_premium: BTreeMap<(u32, u32), Amount> = self
+            .bid_premium_escrow
+            .iter()
+            .filter(|((_, column_market), _)| *column_market == market_id)
+            .map(|(&key, &value)| (key, value))
+            .collect();
+        let actual_claims: BTreeMap<(u32, u32, u16), Amount> = self
+            .ask_claims_escrow
+            .iter()
+            .filter(|((_, column_market, _), _)| *column_market == market_id)
+            .map(|(&key, &value)| (key, value))
+            .collect();
+        if actual_premium != expected_premium || actual_claims != expected_claims {
+            return Err(ExecutionError::StateInvariant(
+                MARKET_ESCROW_COLUMN_MISMATCH,
+            ));
+        }
+
+        // The per-market columns above prove the target orders agree with
+        // their sidecars, but releases debit account-wide backing aggregates.
+        // Reconcile every target owner against all of that owner's sidecars
+        // across markets before mutating anything. Otherwise an excess risk
+        // reserve or ledger escrow could survive this drain with no remaining
+        // sidecar capable of releasing it.
+        let affected_owners: BTreeSet<AccountId> =
+            resting.values().map(|order| order.account).collect();
+        let mut expected_reserves = BTreeMap::<AccountId, Amount>::new();
+        for reserve in self
+            .order_reserves
+            .values()
+            .filter(|reserve| affected_owners.contains(&reserve.account))
+        {
+            column_add(&mut expected_reserves, reserve.account, reserve.reserved)
+                .map_err(|_| ExecutionError::StateInvariant(MARKET_RESTING_BACKING_MISMATCH))?;
+        }
+        let mut expected_ledger_escrow = BTreeMap::<AccountId, Amount>::new();
+        for (&(account, _), &premium) in self
+            .bid_premium_escrow
+            .iter()
+            .filter(|((account, _), _)| affected_owners.contains(&AccountId::new(*account)))
+        {
+            column_add(
+                &mut expected_ledger_escrow,
+                AccountId::new(account),
+                premium,
+            )
+            .map_err(|_| ExecutionError::StateInvariant(MARKET_RESTING_BACKING_MISMATCH))?;
+        }
+        for owner in affected_owners {
+            let expected_reserve = expected_reserves
+                .get(&owner)
+                .copied()
+                .unwrap_or(Amount::ZERO);
+            let actual_reserve = self
+                .risk
+                .reserved_resting(owner)
+                .map_err(|_| ExecutionError::StateInvariant(MARKET_RESTING_BACKING_MISMATCH))?;
+            let expected_escrow = expected_ledger_escrow
+                .get(&owner)
+                .copied()
+                .unwrap_or(Amount::ZERO);
+            let actual_escrow = self
+                .ledger
+                .escrowed(owner)
+                .map_err(|_| ExecutionError::StateInvariant(MARKET_RESTING_BACKING_MISMATCH))?;
+            if actual_reserve != expected_reserve || actual_escrow != expected_escrow {
+                return Err(ExecutionError::StateInvariant(
+                    MARKET_RESTING_BACKING_MISMATCH,
+                ));
+            }
+        }
+
+        let mut changed_owners = BTreeSet::new();
+        for key in reserve_keys {
+            let reserve =
+                self.order_reserves
+                    .get(&key)
+                    .copied()
+                    .ok_or(ExecutionError::StateInvariant(
+                        MARKET_RESTING_SIDECAR_MISMATCH,
+                    ))?;
+            self.release_order_reserve(market, key.1, types::OrderId::new(key.2), reserve.account)?;
+            if reserve.reserved != Amount::ZERO {
+                changed_owners.insert(reserve.account);
+            }
+        }
+        for key in claim_keys {
+            let escrow =
+                self.claim_escrows
+                    .get(&key)
+                    .copied()
+                    .ok_or(ExecutionError::StateInvariant(
+                        MARKET_RESTING_SIDECAR_MISMATCH,
+                    ))?;
+            let released = self.release_claim_escrow(key, Some(escrow.account))?;
+            if released != Some(escrow.account) {
+                return Err(ExecutionError::StateInvariant(
+                    MARKET_RESTING_SIDECAR_MISMATCH,
+                ));
+            }
+            if escrow.premium != Amount::ZERO || escrow.claims != Amount::ZERO {
+                changed_owners.insert(escrow.account);
+            }
+        }
+
+        for (key, order) in resting {
+            self.books
+                .get_mut(&(key.0, key.1))
+                .ok_or(ExecutionError::StateInvariant(MARKET_BOOK_SHAPE_MISMATCH))?
+                .cancel(order.order_id)?;
+        }
+
+        let has_sidecar = self.order_reserves.keys().any(|key| key.0 == market_id)
+            || self.claim_escrows.keys().any(|key| key.0 == market_id);
+        let has_column = self
+            .bid_premium_escrow
+            .keys()
+            .any(|(_, column_market)| *column_market == market_id)
+            || self
+                .ask_claims_escrow
+                .keys()
+                .any(|(_, column_market, _)| *column_market == market_id);
+        if has_sidecar || has_column {
+            return Err(ExecutionError::StateInvariant(
+                MARKET_ESCROW_COLUMN_MISMATCH,
+            ));
+        }
+
+        let book_config = BookConfig {
+            matching_backend: self.matching_backend,
+            ..BookConfig::default()
+        };
+        for instrument in 0..instrument_total {
+            let book = self
+                .books
+                .get_mut(&(market_id, instrument))
+                .ok_or(ExecutionError::StateInvariant(MARKET_BOOK_SHAPE_MISMATCH))?;
+            if book.resting_len() != 0 {
+                return Err(ExecutionError::StateInvariant(
+                    MARKET_RESTING_SIDECAR_MISMATCH,
+                ));
+            }
+            *book = CowState::new(OrderBook::new(book_config));
+        }
+
+        Ok(changed_owners)
     }
 
     /// Draw `premium` for a fill against a resting bid's escrow record and the
@@ -2560,6 +2866,32 @@ impl Engine {
                 ))
             }
             Command::SetMarketLifecycle(c) => {
+                let current = self
+                    .markets
+                    .get(&c.market.get())
+                    .ok_or(ExecutionError::UnknownMarket)?
+                    .lifecycle;
+                let allowed = if matches!(current, MarketLifecycle::Settled) {
+                    matches!(c.lifecycle, MarketLifecycle::Archived)
+                } else if matches!(
+                    current,
+                    MarketLifecycle::Resolved
+                        | MarketLifecycle::Invalid
+                        | MarketLifecycle::Archived
+                ) {
+                    false
+                } else {
+                    !matches!(
+                        c.lifecycle,
+                        MarketLifecycle::Resolved
+                            | MarketLifecycle::Invalid
+                            | MarketLifecycle::Settled
+                            | MarketLifecycle::Archived
+                    )
+                };
+                if !allowed {
+                    return Err(ExecutionError::LifecycleRejected);
+                }
                 let meta = self
                     .markets
                     .get_mut(&c.market.get())
@@ -2680,8 +3012,9 @@ impl Engine {
             Command::ResolveMarket(c) => {
                 let meta = self
                     .markets
-                    .get_mut(&c.market.get())
-                    .ok_or(ExecutionError::UnknownMarket)?;
+                    .get(&c.market.get())
+                    .ok_or(ExecutionError::UnknownMarket)?
+                    .clone();
                 if !is_claim_market(meta.market_type) {
                     return Err(ExecutionError::IncompatibleMarketType);
                 }
@@ -2698,73 +3031,18 @@ impl Engine {
                 if c.winning_outcome >= n {
                     return Err(ExecutionError::InvalidInstrument);
                 }
+                // Validate and drain all books/sidecars before committing the
+                // terminal metadata transition. Any malformed or unreleasable
+                // state fails the enclosing COW transaction byte-identically.
+                let released = self.drain_market_resting_state(c.market)?;
+                let meta = self
+                    .markets
+                    .get_mut(&c.market.get())
+                    .ok_or(ExecutionError::UnknownMarket)?;
                 meta.winning_outcome = Some(c.winning_outcome);
                 meta.lifecycle = MarketLifecycle::Resolved;
-                // Cancel all resting books so no post-resolve trading residue.
-                for inst in 0..n {
-                    if let Some(book) = self.books.get_mut(&(c.market.get(), inst)) {
-                        // Drain by canceling every account that has orders: collect
-                        // accounts from order_reserves for this market.
-                        let _ = book; // cancelled via reserves keys below
-                    }
-                }
-                let mut reserve_keys: Vec<OrderKey> = self
-                    .order_reserves
-                    .keys()
-                    .copied()
-                    .filter(|(m, _, _)| *m == c.market.get())
-                    .collect();
-                reserve_keys.sort_unstable();
-                for key in reserve_keys {
-                    if let Some(rec) = self.order_reserves.remove(&key) {
-                        let _ = self.risk.release_resting(rec.account, rec.reserved);
-                        if let Some(book) = self.books.get_mut(&(key.0, key.1)) {
-                            let _ = book.cancel(types::OrderId::new(key.2));
-                        }
-                    }
-                }
-                // Release every claim escrow in this market before settlement:
-                // escrowed claims return to live balances (so SettleMarket pays
-                // them) and escrowed premium returns to available. Sorted key
-                // order for determinism; owners re-commit below so the state
-                // root reflects the released balances.
-                let mut escrow_keys: Vec<OrderKey> = self
-                    .claim_escrows
-                    .keys()
-                    .copied()
-                    .filter(|(m, _, _)| *m == c.market.get())
-                    .collect();
-                escrow_keys.sort_unstable();
-                let mut released: Vec<AccountId> = Vec::new();
-                for key in escrow_keys {
-                    if let Some(owner) = self.release_claim_escrow(key, None)? {
-                        released.push(owner);
-                    }
-                }
-                released.sort_by_key(|a| a.get());
-                released.dedup();
                 for a in &released {
                     self.commit_account(*a)?;
-                }
-                // Cancel any remaining orders on every instrument book.
-                let book_config = BookConfig {
-                    matching_backend: self.matching_backend,
-                    ..BookConfig::default()
-                };
-                for inst in 0..n {
-                    if let Some(book) = self.books.get_mut(&(c.market.get(), inst)) {
-                        // cancel_all for every account that still has resting orders
-                        // by repeatedly canceling known ids via a snapshot clone.
-                        let snapshot = book.clone();
-                        // Use cancel_all on accounts present in the book's account index
-                        // via total — walk resting by cloning and canceling all via
-                        // a public API: cancel_all needs account. Use resting_len loop
-                        // is not available; cancel by scanning reserves already done.
-                        let _ = snapshot;
-                        // Full drain: create a throwaway list of owners by probing
-                        // order ids is hard; instead re-create empty books.
-                        *book = CowState::new(OrderBook::new(book_config));
-                    }
                 }
                 self.commit_market(c.market)?;
                 Ok(self.receipt(
@@ -2791,6 +3069,11 @@ impl Engine {
                     .winning_outcome
                     .ok_or(ExecutionError::MarketNotResolved)?;
                 let win_idx = usize::from(winner);
+                // Resolution normally leaves this empty. Revalidate and drain
+                // defensively so a state produced by legacy unrestricted
+                // lifecycle overrides cannot settle with live orders or
+                // stranded collateral/claims.
+                let mut touched = self.drain_market_resting_state(c.market)?;
                 // Drain mint locks into a settlement pool, then pay claim holders.
                 let mut minters: Vec<(u32, Amount)> = self
                     .mint_locked
@@ -2805,6 +3088,7 @@ impl Engine {
                     self.ledger.consume_locked(account, *amt)?;
                     pool = pool.checked_add(*amt)?;
                     self.mint_locked.remove(&(*acct, c.market.get()));
+                    touched.insert(account);
                 }
                 let mut holders: Vec<(u32, Vec<Amount>)> = self
                     .claims
@@ -2815,7 +3099,6 @@ impl Engine {
                     .collect();
                 holders.sort_unstable_by_key(|(account, _)| *account);
                 let mut paid = Amount::ZERO;
-                let mut touched: Vec<AccountId> = Vec::new();
                 for (acct, balances) in holders {
                     let account = AccountId::new(acct);
                     let payout = balances.get(win_idx).copied().unwrap_or(Amount::ZERO);
@@ -2834,7 +3117,7 @@ impl Engine {
                         self.risk.credit_collateral(account, payout)?;
                         paid = paid.checked_add(payout)?;
                     }
-                    touched.push(account);
+                    touched.insert(account);
                 }
                 // Any residual pool (should be zero under complete-set invariant)
                 // is burned from supply only if non-zero — treat as error.
@@ -2844,8 +3127,6 @@ impl Engine {
                 if let Some(meta) = self.markets.get_mut(&c.market.get()) {
                     meta.lifecycle = MarketLifecycle::Settled;
                 }
-                touched.sort_by_key(|a| a.get());
-                touched.dedup();
                 for a in touched {
                     self.commit_account(a)?;
                 }
@@ -5444,6 +5725,626 @@ mod tests {
         );
         assert_eq!(e.ledger.locked(seller).unwrap(), Amount::ZERO);
         check_invariants(&e);
+    }
+
+    #[test]
+    fn lifecycle_overrides_cannot_bypass_or_escape_effectful_states() {
+        let mut base = engine_with_caps(4, 4);
+        base.execute(seq(1), create_claim(0)).unwrap();
+        let market = MarketId::new(0);
+
+        for target in [
+            MarketLifecycle::Resolved,
+            MarketLifecycle::Invalid,
+            MarketLifecycle::Settled,
+            MarketLifecycle::Archived,
+        ] {
+            let mut engine = base.clone();
+            let before = engine.transition_root_v1().unwrap();
+            let before_fingerprint = fingerprint(&engine);
+            assert_eq!(
+                engine.execute(
+                    seq(2),
+                    Command::SetMarketLifecycle(SetMarketLifecycle {
+                        market,
+                        lifecycle: target,
+                    }),
+                ),
+                Err(ExecutionError::LifecycleRejected),
+                "Open must not override directly into {target:?}",
+            );
+            assert_eq!(engine.transition_root_v1().unwrap(), before);
+            assert_eq!(fingerprint(&engine), before_fingerprint);
+            assert_eq!(
+                engine.markets.get(&0).unwrap().lifecycle,
+                MarketLifecycle::Open
+            );
+        }
+
+        for current in [
+            MarketLifecycle::Resolved,
+            MarketLifecycle::Invalid,
+            MarketLifecycle::Archived,
+            MarketLifecycle::Settled,
+        ] {
+            let mut engine = base.clone();
+            engine.markets.get_mut(&0).unwrap().lifecycle = current;
+            let before = engine.transition_root_v1().unwrap();
+            let before_fingerprint = fingerprint(&engine);
+            assert_eq!(
+                engine.execute(
+                    seq(2),
+                    Command::SetMarketLifecycle(SetMarketLifecycle {
+                        market,
+                        lifecycle: MarketLifecycle::Open,
+                    }),
+                ),
+                Err(ExecutionError::LifecycleRejected),
+                "{current:?} must not be reopened by the override command",
+            );
+            assert_eq!(engine.transition_root_v1().unwrap(), before);
+            assert_eq!(fingerprint(&engine), before_fingerprint);
+            assert_eq!(engine.markets.get(&0).unwrap().lifecycle, current);
+        }
+
+        let mut settled = base;
+        settled.markets.get_mut(&0).unwrap().lifecycle = MarketLifecycle::Settled;
+        settled
+            .execute(
+                seq(2),
+                Command::SetMarketLifecycle(SetMarketLifecycle {
+                    market,
+                    lifecycle: MarketLifecycle::Archived,
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            settled.markets.get(&0).unwrap().lifecycle,
+            MarketLifecycle::Archived
+        );
+    }
+
+    #[test]
+    fn resolve_drains_multi_instrument_escrows_without_consuming_mint_locks() {
+        let mut engine = engine_with_caps(8, 4);
+        engine
+            .execute(seq(1), create_account(1_000_000_000))
+            .unwrap();
+        engine
+            .execute(seq(2), create_account(1_000_000_000))
+            .unwrap();
+        engine.execute(seq(3), create_claim(0)).unwrap();
+        engine.execute(seq(4), mint(0, 0, 100_000_000)).unwrap();
+        let market = MarketId::new(0);
+        let minter = AccountId::new(0);
+        let bidder = AccountId::new(1);
+
+        engine
+            .execute(
+                seq(5),
+                place_at(
+                    0,
+                    0,
+                    11,
+                    Side::Ask,
+                    800_000,
+                    20_000_000,
+                    0,
+                    TimeInForce::Gtc,
+                ),
+            )
+            .unwrap();
+        engine
+            .execute(
+                seq(6),
+                place_at(
+                    1,
+                    0,
+                    12,
+                    Side::Bid,
+                    200_000,
+                    20_000_000,
+                    0,
+                    TimeInForce::Gtc,
+                ),
+            )
+            .unwrap();
+        engine
+            .execute(
+                seq(7),
+                place_at(
+                    0,
+                    0,
+                    21,
+                    Side::Ask,
+                    700_000,
+                    30_000_000,
+                    1,
+                    TimeInForce::Gtc,
+                ),
+            )
+            .unwrap();
+        engine
+            .execute(
+                seq(8),
+                place_at(
+                    1,
+                    0,
+                    22,
+                    Side::Bid,
+                    300_000,
+                    30_000_000,
+                    1,
+                    TimeInForce::Gtc,
+                ),
+            )
+            .unwrap();
+        assert_eq!(engine.market_resting_len(market), Some(4));
+        let locks_before = engine.mint_locked.clone();
+        let bidder_available = engine.ledger.available(bidder).unwrap();
+
+        engine
+            .execute(
+                seq(9),
+                Command::ResolveMarket(ResolveMarket {
+                    market,
+                    winning_outcome: 1,
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(engine.market_resting_len(market), Some(0));
+        assert!(engine
+            .claim_escrows
+            .keys()
+            .all(|(stored_market, _, _)| *stored_market != market.get()));
+        assert!(engine
+            .bid_premium_escrow
+            .keys()
+            .all(|(_, stored_market)| *stored_market != market.get()));
+        assert!(engine
+            .ask_claims_escrow
+            .keys()
+            .all(|(_, stored_market, _)| *stored_market != market.get()));
+        assert_eq!(&*engine.mint_locked, &*locks_before);
+        assert_eq!(
+            engine.claim_balance(minter, market, 0),
+            Amount::from_raw(100_000_000)
+        );
+        assert_eq!(
+            engine.claim_balance(minter, market, 1),
+            Amount::from_raw(100_000_000)
+        );
+        assert_eq!(
+            engine.ledger.available(bidder).unwrap(),
+            bidder_available
+                .checked_add(Amount::from_raw(13_000_000))
+                .unwrap()
+        );
+        check_invariants(&engine);
+    }
+
+    #[test]
+    fn defensive_settlement_drains_legacy_reopen_and_commits_all_owner_roles() {
+        let mut engine = engine_with_caps(8, 4);
+        for sequence in 1..=3 {
+            engine
+                .execute(seq(sequence), create_account(1_000_000_000))
+                .unwrap();
+        }
+        engine.execute(seq(4), create_claim(0)).unwrap();
+        engine.execute(seq(5), mint(0, 0, 100_000_000)).unwrap();
+        let market = MarketId::new(0);
+        let minter = AccountId::new(0);
+        let holder = AccountId::new(1);
+        let released_owner = AccountId::new(2);
+
+        // Transfer both outcomes away from the minter so the settlement roles
+        // are three distinct accounts: lock owner, claim holder, and owner of
+        // an escrow released by the defensive drain.
+        engine
+            .execute(
+                seq(6),
+                place_at(
+                    1,
+                    0,
+                    11,
+                    Side::Bid,
+                    400_000,
+                    100_000_000,
+                    0,
+                    TimeInForce::Gtc,
+                ),
+            )
+            .unwrap();
+        engine
+            .execute(
+                seq(7),
+                place_at(
+                    0,
+                    0,
+                    21,
+                    Side::Ask,
+                    400_000,
+                    100_000_000,
+                    0,
+                    TimeInForce::Gtc,
+                ),
+            )
+            .unwrap();
+        engine
+            .execute(
+                seq(8),
+                place_at(
+                    1,
+                    0,
+                    12,
+                    Side::Bid,
+                    600_000,
+                    100_000_000,
+                    1,
+                    TimeInForce::Gtc,
+                ),
+            )
+            .unwrap();
+        engine
+            .execute(
+                seq(9),
+                place_at(
+                    0,
+                    0,
+                    22,
+                    Side::Ask,
+                    600_000,
+                    100_000_000,
+                    1,
+                    TimeInForce::Gtc,
+                ),
+            )
+            .unwrap();
+        {
+            let minter_claims = engine.claims.get_mut(&minter.get()).unwrap();
+            assert!(minter_claims
+                .get(&market.get())
+                .unwrap()
+                .iter()
+                .all(|amount| *amount == Amount::ZERO));
+            minter_claims.remove(&market.get());
+        }
+        if engine
+            .claims
+            .get(&minter.get())
+            .is_some_and(BTreeMap::is_empty)
+        {
+            engine.claims.remove(&minter.get());
+        }
+        engine.commit_account(minter).unwrap();
+
+        engine
+            .execute(
+                seq(10),
+                Command::ResolveMarket(ResolveMarket {
+                    market,
+                    winning_outcome: 0,
+                }),
+            )
+            .unwrap();
+
+        // Simulate state produced by the legacy unrestricted override: reopen
+        // a resolved market, rest new economic state, then force it back to
+        // Resolved without the dedicated drain.
+        engine.markets.get_mut(&market.get()).unwrap().lifecycle = MarketLifecycle::Open;
+        engine
+            .execute(
+                seq(11),
+                place_at(
+                    2,
+                    0,
+                    31,
+                    Side::Bid,
+                    200_000,
+                    50_000_000,
+                    0,
+                    TimeInForce::Gtc,
+                ),
+            )
+            .unwrap();
+        assert_eq!(engine.market_resting_len(market), Some(1));
+        engine.markets.get_mut(&market.get()).unwrap().lifecycle = MarketLifecycle::Resolved;
+
+        engine
+            .execute(seq(12), Command::SettleMarket(SettleMarket { market }))
+            .unwrap();
+
+        assert_eq!(
+            engine.markets.get(&market.get()).unwrap().lifecycle,
+            MarketLifecycle::Settled
+        );
+        assert_eq!(engine.market_resting_len(market), Some(0));
+        assert!(engine
+            .order_reserves
+            .keys()
+            .all(|(stored_market, _, _)| *stored_market != market.get()));
+        assert!(engine
+            .claim_escrows
+            .keys()
+            .all(|(stored_market, _, _)| *stored_market != market.get()));
+        assert!(engine
+            .bid_premium_escrow
+            .keys()
+            .all(|(_, stored_market)| *stored_market != market.get()));
+        assert!(engine
+            .ask_claims_escrow
+            .keys()
+            .all(|(_, stored_market, _)| *stored_market != market.get()));
+        assert!(!engine
+            .mint_locked
+            .contains_key(&(minter.get(), market.get())));
+        assert!(engine
+            .claims
+            .values()
+            .all(|markets| !markets.contains_key(&market.get())));
+        for account in [minter, holder, released_owner] {
+            let leaf = engine.account_leaf(account).unwrap();
+            let proof = engine.account_proof(account).unwrap();
+            assert!(verify_account(engine.state_root(), account, &leaf, &proof));
+        }
+        assert_eq!(
+            engine.ledger.available(minter).unwrap(),
+            Amount::from_raw(1_000_000_000)
+        );
+        assert_eq!(
+            engine.ledger.available(holder).unwrap(),
+            Amount::from_raw(1_000_000_000)
+        );
+        assert_eq!(
+            engine.ledger.available(released_owner).unwrap(),
+            Amount::from_raw(1_000_000_000)
+        );
+        check_invariants(&engine);
+    }
+
+    #[test]
+    fn resolve_release_overflow_restores_books_metadata_and_transition_root() {
+        let mut engine = engine_with_caps(4, 4);
+        engine
+            .execute(seq(1), create_account(1_000_000_000))
+            .unwrap();
+        engine.execute(seq(2), create_claim(0)).unwrap();
+        engine.execute(seq(3), mint(0, 0, 10_000_000)).unwrap();
+        engine
+            .execute(
+                seq(4),
+                place_at(0, 0, 1, Side::Ask, 500_000, 10_000_000, 0, TimeInForce::Gtc),
+            )
+            .unwrap();
+        let account = AccountId::new(0);
+        let market = MarketId::new(0);
+
+        // Preserve an otherwise exact book/sidecar/column/backing relation but
+        // corrupt the live claim balance so returning the resting ask's claims
+        // overflows after the release path has already removed its committed
+        // escrow column. The outer COW transaction must restore every partial
+        // mutation as well as the pre-existing private corruption.
+        engine.claims.get_mut(&0).unwrap().get_mut(&0).unwrap()[0] = Amount::from_raw(i128::MAX);
+        engine.commit_account(account).unwrap();
+        let before_root = engine.transition_root_v1().unwrap();
+        let before_state_root = engine.state_root();
+        let before_fingerprint = fingerprint(&engine);
+        let before_books: Vec<(u16, Vec<u8>)> = (0..2)
+            .map(|instrument| {
+                (
+                    instrument,
+                    engine
+                        .books
+                        .get(&(market.get(), instrument))
+                        .unwrap()
+                        .encode_state_v3_bounded(usize::MAX)
+                        .unwrap(),
+                )
+            })
+            .collect();
+        let before_meta = {
+            let meta = engine.markets.get(&market.get()).unwrap();
+            (meta.lifecycle, meta.winning_outcome)
+        };
+
+        assert_eq!(
+            engine.execute(
+                seq(5),
+                Command::ResolveMarket(ResolveMarket {
+                    market,
+                    winning_outcome: 0,
+                }),
+            ),
+            Err(ExecutionError::Arith(types::ArithError::Overflow))
+        );
+
+        assert_eq!(engine.transition_root_v1().unwrap(), before_root);
+        assert_eq!(engine.state_root(), before_state_root);
+        assert_eq!(fingerprint(&engine), before_fingerprint);
+        let after_books: Vec<(u16, Vec<u8>)> = (0..2)
+            .map(|instrument| {
+                (
+                    instrument,
+                    engine
+                        .books
+                        .get(&(market.get(), instrument))
+                        .unwrap()
+                        .encode_state_v3_bounded(usize::MAX)
+                        .unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(after_books, before_books);
+        let meta = engine.markets.get(&market.get()).unwrap();
+        assert_eq!((meta.lifecycle, meta.winning_outcome), before_meta);
+    }
+
+    #[test]
+    fn resolve_rejects_sidecar_and_column_inconsistencies_atomically() {
+        let mut base = engine_with_caps(4, 4);
+        base.execute(seq(1), create_account(1_000_000_000)).unwrap();
+        base.execute(seq(2), create_claim(0)).unwrap();
+        base.execute(
+            seq(3),
+            place_at(0, 0, 1, Side::Bid, 500_000, 10_000_000, 0, TimeInForce::Gtc),
+        )
+        .unwrap();
+        let market = MarketId::new(0);
+        let order_key = (0, 0, 1);
+
+        let mut cross_kind = base.clone();
+        cross_kind.order_reserves.insert(
+            order_key,
+            OrderReserve {
+                account: AccountId::new(0),
+                reserved: Amount::from_raw(5_000_000),
+                qty_remaining: Quantity::from_raw(10_000_000),
+            },
+        );
+
+        let mut missing_sidecar = base.clone();
+        missing_sidecar.claim_escrows.remove(&order_key);
+
+        let mut orphan_sidecar = base.clone();
+        orphan_sidecar.claim_escrows.insert(
+            (0, 0, 99),
+            ClaimOrderEscrow {
+                account: AccountId::new(0),
+                side: Side::Bid,
+                premium: Amount::ZERO,
+                claims: Amount::ZERO,
+            },
+        );
+
+        let mut wrong_shape = base.clone();
+        wrong_shape.claim_escrows.get_mut(&order_key).unwrap().side = Side::Ask;
+
+        let mut wrong_column = base.clone();
+        wrong_column
+            .bid_premium_escrow
+            .insert((0, 0), Amount::from_raw(5_000_001));
+
+        let mut excess_ledger_backing = base.clone();
+        excess_ledger_backing
+            .ledger
+            .escrow(AccountId::new(0), Amount::from_raw(1))
+            .unwrap();
+
+        let mut excess_risk_backing = base;
+        excess_risk_backing
+            .risk
+            .reserve_resting(AccountId::new(0), Amount::from_raw(1))
+            .unwrap();
+
+        for (label, mut engine, expected) in [
+            (
+                "cross-kind sidecar",
+                cross_kind,
+                MARKET_RESTING_SIDECAR_MISMATCH,
+            ),
+            (
+                "missing sidecar",
+                missing_sidecar,
+                MARKET_RESTING_SIDECAR_MISMATCH,
+            ),
+            (
+                "orphan sidecar",
+                orphan_sidecar,
+                MARKET_RESTING_SIDECAR_MISMATCH,
+            ),
+            (
+                "side mismatch",
+                wrong_shape,
+                MARKET_RESTING_SIDECAR_MISMATCH,
+            ),
+            (
+                "column mismatch",
+                wrong_column,
+                MARKET_ESCROW_COLUMN_MISMATCH,
+            ),
+            (
+                "excess ledger backing",
+                excess_ledger_backing,
+                MARKET_RESTING_BACKING_MISMATCH,
+            ),
+            (
+                "excess risk backing",
+                excess_risk_backing,
+                MARKET_RESTING_BACKING_MISMATCH,
+            ),
+        ] {
+            let before_root = engine.transition_root_v1().unwrap();
+            let before_fingerprint = fingerprint(&engine);
+            let before_book = engine
+                .books
+                .get(&(0, 0))
+                .unwrap()
+                .encode_state_v3_bounded(usize::MAX)
+                .unwrap();
+            let before_meta = {
+                let meta = engine.markets.get(&0).unwrap();
+                (meta.lifecycle, meta.winning_outcome)
+            };
+
+            assert_eq!(
+                engine.execute(
+                    seq(4),
+                    Command::ResolveMarket(ResolveMarket {
+                        market,
+                        winning_outcome: 0,
+                    }),
+                ),
+                Err(ExecutionError::StateInvariant(expected)),
+                "{label}",
+            );
+            assert_eq!(engine.transition_root_v1().unwrap(), before_root, "{label}");
+            assert_eq!(fingerprint(&engine), before_fingerprint, "{label}");
+            assert_eq!(
+                engine
+                    .books
+                    .get(&(0, 0))
+                    .unwrap()
+                    .encode_state_v3_bounded(usize::MAX)
+                    .unwrap(),
+                before_book,
+                "{label}",
+            );
+            let meta = engine.markets.get(&0).unwrap();
+            assert_eq!(
+                (meta.lifecycle, meta.winning_outcome),
+                before_meta,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn market_drain_accepts_absent_or_exact_zero_perp_reserve() {
+        let mut base = engine_with_caps(4, 4);
+        base.execute(seq(1), create_account(1_000_000_000)).unwrap();
+        base.execute(seq(2), create_perp(0, 1_000_000)).unwrap();
+        base.execute(seq(3), place(0, 0, 1, Side::Bid, 1, 1))
+            .unwrap();
+        let frozen_zero = base.order_reserves.get(&(0, 0, 1)).unwrap();
+        assert_eq!(frozen_zero.reserved, Amount::ZERO);
+        assert_eq!(frozen_zero.qty_remaining, Quantity::from_raw(1));
+
+        for present in [false, true] {
+            let mut engine = base.clone();
+            if !present {
+                engine.order_reserves.remove(&(0, 0, 1));
+            }
+            assert!(engine
+                .drain_market_resting_state(MarketId::new(0))
+                .unwrap()
+                .is_empty());
+            assert_eq!(engine.market_resting_len(MarketId::new(0)), Some(0));
+            assert!(engine.order_reserves.is_empty());
+            engine.commit_market(MarketId::new(0)).unwrap();
+            check_invariants(&engine);
+        }
     }
 
     // #408 repro: a perp maker rests 10 micro-lots at 0.333333, reserving

@@ -2137,8 +2137,6 @@ mod tests {
             types::MarketLifecycle::Draft,
             types::MarketLifecycle::Halted,
             types::MarketLifecycle::Closed,
-            types::MarketLifecycle::Resolved,
-            types::MarketLifecycle::Archived,
         ]
         .into_iter()
         .enumerate()
