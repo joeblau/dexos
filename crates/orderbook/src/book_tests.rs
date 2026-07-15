@@ -387,6 +387,197 @@ fn atomic_replace_failure_leaves_book_bit_identical() {
     assert_eq!(b.state_root(), root_before);
 }
 
+fn replace_overflow_fixture() -> OrderBook {
+    let mut book = OrderBook::new(cfg());
+    book.place(limit(1, 1, Side::Bid, 100, i64::MAX - 5))
+        .unwrap();
+    book.place(limit(2, 2, Side::Bid, 90, 1)).unwrap();
+    book.place(limit(3, 3, Side::Bid, 90, 2)).unwrap();
+    book
+}
+
+fn assert_overflowing_replace_is_atomic(
+    mut book: OrderBook,
+    replace: impl FnOnce(&mut OrderBook) -> Result<(), OrderError>,
+) {
+    let target = OrderId::new(2);
+    let bytes_before = canonical_bytes(&book);
+    let state_root_before = book.state_root();
+    let transition_root_before = book.transition_root_v3();
+    let locator_before = book.id_index.get(&target).copied().unwrap();
+    let node_before = *book.slab.get(locator_before.slot).unwrap();
+    let id_index_capacity_before = book.id_index.capacity();
+    let account_ids_before = book
+        .account_orders
+        .get(&AccountId::new(2))
+        .unwrap()
+        .clone();
+    let account_ids_capacity_before = book
+        .account_orders
+        .get(&AccountId::new(2))
+        .unwrap()
+        .capacity();
+
+    assert_eq!(replace(&mut book), Err(OrderError::Overflow));
+
+    assert_eq!(canonical_bytes(&book), bytes_before);
+    assert_eq!(book.state_root(), state_root_before);
+    assert_eq!(book.state_root_full_rebuild(), state_root_before);
+    assert_eq!(book.transition_root_v3(), transition_root_before);
+    assert_eq!(book.id_index.capacity(), id_index_capacity_before);
+    assert_eq!(book.slab.capacity(), cfg().capacity);
+    assert_eq!(
+        book.account_orders.get(&AccountId::new(2)).unwrap(),
+        &account_ids_before
+    );
+    assert_eq!(
+        book.account_orders
+            .get(&AccountId::new(2))
+            .unwrap()
+            .capacity(),
+        account_ids_capacity_before
+    );
+
+    let locator_after = book.id_index.get(&target).copied().unwrap();
+    assert_eq!(locator_after.slot, locator_before.slot);
+    assert_eq!(locator_after.side, locator_before.side);
+    assert_eq!(locator_after.account, locator_before.account);
+    let node_after = *book.slab.get(locator_after.slot).unwrap();
+    assert_eq!(node_after.order_id, node_before.order_id);
+    assert_eq!(node_after.account, node_before.account);
+    assert_eq!(node_after.side, node_before.side);
+    assert_eq!(node_after.price, node_before.price);
+    assert_eq!(node_after.remaining, node_before.remaining);
+    assert_eq!(node_after.client_id, node_before.client_id);
+    assert_eq!(node_after.prev, node_before.prev);
+    assert_eq!(node_after.next, node_before.next);
+
+    // The target must retain its original time priority ahead of id 3.
+    book.cancel(OrderId::new(1)).unwrap();
+    let result = book.place(limit(4, 4, Side::Ask, 90, 2)).unwrap();
+    assert_eq!(result.fills.len(), 2);
+    assert_eq!(result.fills[0].maker_order, target);
+    assert_eq!(result.fills[1].maker_order, OrderId::new(3));
+}
+
+#[test]
+fn legacy_replace_overflow_leaves_storage_and_fifo_bit_identical() {
+    assert_overflowing_replace_is_atomic(replace_overflow_fixture(), |book| {
+        book.replace(
+            OrderId::new(2),
+            Price::from_raw(100),
+            Quantity::from_raw(10),
+        )
+        .map(|_| ())
+    });
+}
+
+#[test]
+fn reported_replace_overflow_leaves_storage_and_fifo_bit_identical() {
+    assert_overflowing_replace_is_atomic(replace_overflow_fixture(), |book| {
+        book.replace_with_report(
+            OrderId::new(2),
+            Price::from_raw(100),
+            Quantity::from_raw(10),
+        )
+        .map(|_| ())
+    });
+}
+
+#[test]
+fn crossing_replace_is_not_rejected_by_full_quantity_overflow() {
+    let mut book = replace_overflow_fixture();
+    // Build the narrow crossed-state edge directly. The six-unit fill leaves a
+    // four-unit residual, which fits at price 100 even though the full ten-unit
+    // replacement would overflow that level.
+    let maker = limit(4, 4, Side::Ask, 100, 6);
+    book.rest_order(&maker, maker.quantity).unwrap();
+
+    let result = book
+        .replace(
+            OrderId::new(2),
+            Price::from_raw(100),
+            Quantity::from_raw(10),
+        )
+        .unwrap();
+
+    assert_eq!(result.filled_quantity(), Quantity::from_raw(6));
+    assert!(matches!(
+        result.outcome,
+        OrderOutcome::PartiallyFilledResting { remaining }
+            if remaining == Quantity::from_raw(4)
+    ));
+    assert_eq!(
+        book.level_quantity(Side::Bid, Price::from_raw(100)),
+        Quantity::from_raw(i64::MAX - 1)
+    );
+}
+
+#[test]
+fn property_overflowing_replace_err_preserves_canonical_state() {
+    let mut random = Lcg(0xA70A_1C5E);
+    for case in 0..2_000 {
+        let side = if random.below(2) == 0 {
+            Side::Bid
+        } else {
+            Side::Ask
+        };
+        let target_starts_at_replacement_price = random.below(2) == 0;
+        let replacement_price = 100;
+        let original_price = if target_starts_at_replacement_price {
+            replacement_price
+        } else {
+            match side {
+                Side::Bid => 90,
+                Side::Ask => 110,
+            }
+        };
+        let headroom = 1 + i64::try_from(random.below(2_048)).unwrap();
+        let original_quantity = 1 + i64::try_from(random.below(64)).unwrap();
+        let level_quantity = if target_starts_at_replacement_price {
+            i64::MAX - headroom - original_quantity
+        } else {
+            i64::MAX - headroom
+        };
+        let replacement_quantity = if target_starts_at_replacement_price {
+            headroom + original_quantity + 1
+        } else {
+            headroom + 1
+        };
+
+        let mut book = OrderBook::new(BookConfig {
+            capacity: 4,
+            ..cfg()
+        });
+        book.place(limit(1, 1, side, replacement_price, level_quantity))
+            .unwrap();
+        book.place(limit(2, 2, side, original_price, original_quantity))
+            .unwrap();
+        let bytes_before = canonical_bytes(&book);
+        let root_before = book.transition_root_v3();
+
+        let result = if random.below(2) == 0 {
+            book.replace(
+                OrderId::new(2),
+                Price::from_raw(replacement_price),
+                Quantity::from_raw(replacement_quantity),
+            )
+            .map(|_| ())
+        } else {
+            book.replace_with_report(
+                OrderId::new(2),
+                Price::from_raw(replacement_price),
+                Quantity::from_raw(replacement_quantity),
+            )
+            .map(|_| ())
+        };
+
+        assert_eq!(result, Err(OrderError::Overflow), "case {case}");
+        assert_eq!(canonical_bytes(&book), bytes_before, "case {case}");
+        assert_eq!(book.transition_root_v3(), root_before, "case {case}");
+    }
+}
+
 #[test]
 fn replace_repositions_order() {
     let mut b = OrderBook::new(cfg());
