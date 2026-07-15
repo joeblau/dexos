@@ -100,6 +100,13 @@ reserved flags, truncation, invalid enum values, zero order ids, and invalid
 positive price/quantity/leverage bounds before allocation. V1 negotiation succeeds
 only when the peer range includes version 1; there is no silent downgrade. Golden
 bytes and a SHA-256 digest pin cross-architecture compatibility.
+A checked-in libFuzzer target also exercises arbitrary decoder inputs and asserts
+that every accepted prefix re-encodes to the identical canonical bytes:
+
+```sh
+rustup run nightly cargo fuzz run packed_order_decode -- -max_total_time=60
+```
+
 A pinned Rust 1.92 x86_64 Mach-O run under Rosetta passed all 284 codec, network,
 and node unit/integration tests with the same golden digest. Its exact command and
 limitations are archived in

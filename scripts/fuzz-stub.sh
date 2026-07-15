@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Fuzz / property-test stub for CI.
+# Fuzz / property-test gate for CI.
 #
-# These are placeholder steps (existing workspace test invocations) until real
-# cargo-fuzz targets for codec/RPC/storage/config land with those epics. The
-# deterministic LCG property tests below exercise the same surfaces.
+# The packed-order decoder has a real libFuzzer target under `fuzz/`; CI builds
+# that target so it cannot drift, while the remaining RPC/storage/config
+# surfaces retain deterministic property corpora until their cargo-fuzz targets
+# land with those epics.
 #
 # The former per-step soft time budget (SECONDS-based deadline) was removed:
 # SECONDS includes cargo compile time, so on a cold cache the first step could
@@ -13,7 +14,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-echo "==> fuzz stub — property tests as interim coverage (all steps run unconditionally)"
+echo "==> fuzz/property gate (all steps run unconditionally)"
 
 run_step() {
   local label="$1"
@@ -31,9 +32,12 @@ run_step "simd backend differential corpus" \
 run_step "codec / crypto unit surfaces" \
   cargo test -p codec -p crypto --locked
 
+run_step "packed-order libFuzzer target builds" \
+  cargo check --manifest-path fuzz/Cargo.toml --locked
+
 run_step "storage + rpc unit surfaces" \
   cargo test -p storage -p rpc --locked
 
 echo
-echo "==> fuzz stub completed"
-echo "note: replace with cargo-fuzz targets when codec/RPC/storage fuzz harnesses land"
+echo "==> fuzz/property gate completed"
+echo "note: RPC/storage/config still need dedicated cargo-fuzz targets"
