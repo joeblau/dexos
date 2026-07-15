@@ -15,6 +15,7 @@ use types::{AccountId, Price, Quantity, Side};
 
 use crate::order::{Node, StpPolicy};
 use crate::slab::{Slab, NIL};
+use crate::BookStateError;
 
 /// True if a taker at `(taker_side, taker_price)` crosses an opposite level at
 /// `opp`. Boundary (equal price) crosses.
@@ -115,13 +116,45 @@ impl SideBook {
         }
     }
 
-    pub(crate) fn side(&self) -> Side {
-        self.side
-    }
-
     #[cfg(test)]
     pub(crate) fn set_side_for_test(&mut self, side: Side) {
         self.side = side;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_level_head_for_test(&mut self, price: Price, head: u32) {
+        self.levels.get_mut(&price).unwrap().head = head;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_level_tail_for_test(&mut self, price: Price, tail: u32) {
+        self.levels.get_mut(&price).unwrap().tail = tail;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_level_count_for_test(&mut self, price: Price, count: u32) {
+        self.levels.get_mut(&price).unwrap().count = count;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_level_total_for_test(&mut self, price: Price, total: Quantity) {
+        self.levels.get_mut(&price).unwrap().total_qty = total;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rekey_level_for_test(&mut self, from: Price, to: Price) {
+        let level = self.levels.remove(&from).unwrap();
+        assert!(self.levels.insert(to, level).is_none());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_empty_level_for_test(&mut self, price: Price) {
+        assert!(self.levels.insert(price, Level::empty()).is_none());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remove_level_for_test(&mut self, price: Price) {
+        self.levels.remove(&price).unwrap();
     }
 
     /// Best price on this side: highest for bids, lowest for asks.
@@ -299,15 +332,118 @@ impl SideBook {
         self.levels.len()
     }
 
-    /// Visit levels in canonical ascending-price order, exposing the FIFO head
-    /// and exact order count for bounded encoding.
-    pub(crate) fn for_each_canonical_level<F: FnMut(Price, u32, u32, u32, Quantity)>(
+    /// Validate every level and intrusive FIFO reachable from this side book.
+    ///
+    /// The link walk is capped by the slab's validated live count. A corrupt
+    /// cycle or a level chain that aliases another chain therefore returns a
+    /// typed error instead of hanging. `visit` is invoked once per traversed
+    /// node so the owning [`crate::OrderBook`] can validate global uniqueness
+    /// and its derived mirrors without relying on canonical iterators.
+    pub(crate) fn validate_reachable<L, F>(
         &self,
-        mut f: F,
-    ) {
-        for (price, level) in &self.levels {
-            f(*price, level.head, level.tail, level.count, level.total_qty);
+        slab: &Slab<Node>,
+        expected_side: Side,
+        mut visit_level: L,
+        mut visit: F,
+    ) -> Result<usize, BookStateError>
+    where
+        L: FnMut(Price, u32) -> Result<(), BookStateError>,
+        F: FnMut(u32, &Node) -> Result<(), BookStateError>,
+    {
+        if self.side != expected_side {
+            return Err(BookStateError::InvalidValue {
+                field: "stored side-book role must match its engine field",
+            });
         }
+
+        let mut side_nodes = 0usize;
+        for (price, level) in &self.levels {
+            if price.raw() <= 0 {
+                return Err(BookStateError::InvalidValue {
+                    field: "resting level price must be strictly positive",
+                });
+            }
+            if level.count == 0 || level.head == NIL {
+                return Err(BookStateError::InvalidValue {
+                    field: "price levels must contain at least one resting order",
+                });
+            }
+            visit_level(*price, level.count)?;
+
+            let mut current = level.head;
+            let mut previous = NIL;
+            let mut last = NIL;
+            let mut level_nodes = 0usize;
+            let mut computed_qty = Quantity::ZERO;
+            while current != NIL {
+                if level_nodes >= slab.len() {
+                    return Err(BookStateError::InvalidValue {
+                        field: "price-level FIFO must be acyclic and bounded by live slab nodes",
+                    });
+                }
+                let node = slab.get(current).ok_or(BookStateError::InvalidValue {
+                    field: "price-level FIFO must reference a live slab node",
+                })?;
+                if node.side != expected_side {
+                    return Err(BookStateError::InvalidValue {
+                        field: "resting node side does not match its side book",
+                    });
+                }
+                if node.price != *price {
+                    return Err(BookStateError::InvalidValue {
+                        field: "resting node price does not match its level",
+                    });
+                }
+                if node.remaining.raw() <= 0 {
+                    return Err(BookStateError::InvalidValue {
+                        field: "resting quantity must be strictly positive",
+                    });
+                }
+                if node.prev != previous {
+                    return Err(BookStateError::InvalidValue {
+                        field: "price-level FIFO backward link mismatch",
+                    });
+                }
+                visit(current, node)?;
+                computed_qty = computed_qty.checked_add(node.remaining).map_err(|_| {
+                    BookStateError::ArithmeticOverflow {
+                        field: "price-level aggregate quantity",
+                    }
+                })?;
+                side_nodes =
+                    side_nodes
+                        .checked_add(1)
+                        .ok_or(BookStateError::ArithmeticOverflow {
+                            field: "resting orders",
+                        })?;
+                level_nodes += 1;
+                previous = current;
+                last = current;
+                current = node.next;
+            }
+
+            let declared =
+                usize::try_from(level.count).map_err(|_| BookStateError::NativeWidth {
+                    field: "price-level order count",
+                    value: u64::from(level.count),
+                })?;
+            if level_nodes != declared {
+                return Err(BookStateError::InvalidValue {
+                    field: "price-level count must equal its live FIFO length",
+                });
+            }
+            if last != level.tail {
+                return Err(BookStateError::InvalidValue {
+                    field: "price-level tail must be the final FIFO node",
+                });
+            }
+            if computed_qty != level.total_qty {
+                return Err(BookStateError::InvalidValue {
+                    field: "price-level aggregate must equal its live order quantities",
+                });
+            }
+        }
+        Ok(side_nodes)
     }
 
     /// Iterate resting nodes in canonical order (price ascending, FIFO within a

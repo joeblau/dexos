@@ -11,6 +11,7 @@
 //! is relied on for reproducible order-book replay.
 
 use crate::error::SlabError;
+use crate::BookStateError;
 
 /// Sentinel meaning "no slot" in an intrusive index chain.
 pub(crate) const NIL: u32 = u32::MAX;
@@ -99,27 +100,36 @@ impl<T> Slab<T> {
         self.len == self.capacity
     }
 
-    /// Fail-stop validation for every allocator field read by a future insert
-    /// or remove. Free-list order is intentionally non-logical, but it must be
-    /// a duplicate-free permutation of every free entry.
-    pub(crate) fn validate_representation(&self, expected_capacity: usize) {
-        assert_eq!(
-            self.capacity, expected_capacity,
-            "slab capacity must match the logical book configuration"
-        );
-        assert!(
-            self.entries.len() <= self.capacity,
-            "slab entries must not exceed capacity"
-        );
+    /// Validate every allocator field read by a future insert or remove.
+    ///
+    /// Free-list order is intentionally non-logical, but it must be a
+    /// duplicate-free permutation of every free entry. The walk is bounded by
+    /// the number of stored free entries, so a corrupt cycle cannot hang
+    /// recovery validation.
+    pub(crate) fn validate_representation(
+        &self,
+        expected_capacity: usize,
+    ) -> Result<(), BookStateError> {
+        if self.capacity != expected_capacity {
+            return Err(BookStateError::InvalidValue {
+                field: "slab capacity must match the logical book configuration",
+            });
+        }
+        if self.entries.len() > self.capacity {
+            return Err(BookStateError::InvalidValue {
+                field: "slab entries must not exceed capacity",
+            });
+        }
         let occupied = self
             .entries
             .iter()
             .filter(|entry| matches!(entry, Entry::Occupied(_)))
             .count();
-        assert_eq!(
-            occupied, self.len,
-            "slab live count must equal its occupied entries"
-        );
+        if occupied != self.len {
+            return Err(BookStateError::InvalidValue {
+                field: "slab live count must equal its occupied entries",
+            });
+        }
 
         let stored_free = self
             .entries
@@ -129,29 +139,59 @@ impl<T> Slab<T> {
         let mut current = self.free_head;
         let mut free_count = 0usize;
         while current != NIL {
-            let index = usize::try_from(current).expect("free-list slot must fit usize");
-            assert!(
-                index < self.entries.len(),
-                "slab free list must reference an existing entry"
-            );
-            current = match &self.entries[index] {
+            let index = usize::try_from(current).map_err(|_| BookStateError::NativeWidth {
+                field: "slab free-list slot",
+                value: u64::from(current),
+            })?;
+            let entry = self
+                .entries
+                .get(index)
+                .ok_or(BookStateError::InvalidValue {
+                    field: "slab free list must reference an existing entry",
+                })?;
+            current = match entry {
                 Entry::Free(next) => {
-                    assert!(
-                        free_count < stored_free,
-                        "slab free list must not contain a cycle"
-                    );
+                    if free_count >= stored_free {
+                        return Err(BookStateError::InvalidValue {
+                            field: "slab free list must not contain a cycle",
+                        });
+                    }
                     free_count += 1;
                     *next
                 }
                 Entry::Occupied(_) => {
-                    panic!("slab free list must reference only free entries")
+                    return Err(BookStateError::InvalidValue {
+                        field: "slab free list must reference only free entries",
+                    })
                 }
             };
         }
-        assert_eq!(
-            free_count, stored_free,
-            "slab free list must cover every free entry exactly once"
-        );
+        if free_count != stored_free {
+            return Err(BookStateError::InvalidValue {
+                field: "slab free list must cover every free entry exactly once",
+            });
+        }
+        Ok(())
+    }
+
+    /// Visit every occupied slot exactly once in physical slot order.
+    ///
+    /// This is a bounded representation walk for recovery validation; logical
+    /// encoding deliberately remains independent of physical slab order.
+    pub(crate) fn try_for_each_occupied<F>(&self, mut f: F) -> Result<(), BookStateError>
+    where
+        F: FnMut(u32, &T) -> Result<(), BookStateError>,
+    {
+        for (index, entry) in self.entries.iter().enumerate() {
+            if let Entry::Occupied(value) = entry {
+                let slot = u32::try_from(index).map_err(|_| BookStateError::NativeWidth {
+                    field: "occupied slab slot",
+                    value: u64::try_from(index).unwrap_or(u64::MAX),
+                })?;
+                f(slot, value)?;
+            }
+        }
+        Ok(())
     }
 
     /// Insert `value`, returning its slot index.
@@ -236,6 +276,12 @@ impl<T> Slab<T> {
     #[cfg(test)]
     pub(crate) fn representation_for_test(&self) -> (usize, u32) {
         (self.entries.len(), self.free_head)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn make_free_list_cycle_for_test(&mut self) {
+        let slot = usize::try_from(self.free_head).unwrap();
+        self.entries[slot] = Entry::Free(self.free_head);
     }
 }
 
@@ -354,23 +400,28 @@ mod tests {
         let first = slab.insert(1).unwrap();
         slab.insert(2).unwrap();
         slab.remove(first).unwrap();
-        slab.validate_representation(4);
+        slab.validate_representation(4).unwrap();
 
-        let mismatch = std::panic::catch_unwind(|| slab.validate_representation(5));
-        assert!(mismatch.is_err());
+        assert!(matches!(
+            slab.validate_representation(5),
+            Err(BookStateError::InvalidValue { .. })
+        ));
     }
 
     #[test]
-    #[should_panic(expected = "slab free list must reference only free entries")]
     fn representation_validator_rejects_free_list_into_live_entry() {
         let mut slab = Slab::with_capacity(2);
         let live = slab.insert(1).unwrap();
         slab.free_head = live;
-        slab.validate_representation(2);
+        assert!(matches!(
+            slab.validate_representation(2),
+            Err(BookStateError::InvalidValue {
+                field: "slab free list must reference only free entries"
+            })
+        ));
     }
 
     #[test]
-    #[should_panic(expected = "slab free list must not contain a cycle")]
     fn representation_validator_rejects_free_list_cycle() {
         let mut slab = Slab::with_capacity(2);
         let first = slab.insert(1).unwrap();
@@ -379,17 +430,26 @@ mod tests {
         slab.remove(second).unwrap();
         slab.entries[usize::try_from(second).unwrap()] = Entry::Free(second);
         slab.free_head = second;
-        slab.validate_representation(2);
+        assert!(matches!(
+            slab.validate_representation(2),
+            Err(BookStateError::InvalidValue {
+                field: "slab free list must not contain a cycle"
+            })
+        ));
     }
 
     #[test]
-    #[should_panic(expected = "slab free list must cover every free entry exactly once")]
     fn representation_validator_rejects_unlinked_free_entry() {
         let mut slab = Slab::with_capacity(2);
         let first = slab.insert(1).unwrap();
         slab.remove(first).unwrap();
         slab.free_head = NIL;
-        slab.validate_representation(2);
+        assert!(matches!(
+            slab.validate_representation(2),
+            Err(BookStateError::InvalidValue {
+                field: "slab free list must cover every free entry exactly once"
+            })
+        ));
     }
 
     #[test]
