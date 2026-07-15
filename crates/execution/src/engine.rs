@@ -25,8 +25,21 @@ use crate::idempotency::{
 use crate::ledger::Ledger;
 use crate::session::SessionRegistry;
 
+mod state;
+mod state_codec;
+
+pub use state::EngineStateError;
+
 /// Canonical complete execution-engine transition-root schema.
 pub const ENGINE_TRANSITION_ROOT_SCHEMA_VERSION: u16 = 1;
+
+/// Canonical complete execution-engine state-image schema.
+///
+/// This version is deliberately independent from
+/// [`ENGINE_TRANSITION_ROOT_SCHEMA_VERSION`]: the transition root commits to
+/// logical state, while this image also carries the canonical child bytes
+/// needed by a future direct-restoration path.
+pub const ENGINE_STATE_SCHEMA_VERSION: u16 = 1;
 
 /// Fixed-width canonical writer for the complete EngineState commitment.
 /// Native-width integers, map layout, and serde enum ordinals are excluded.
@@ -1179,7 +1192,14 @@ impl Engine {
 
         writer.usize(self.tree.account_capacity())?;
         writer.usize(self.tree.market_capacity())?;
-        writer.hash(self.tree.root());
+        // Derive the same combined root without populating StateTree's
+        // worker-local interior cache. Transition-root computation and state
+        // encoding are observationally read-only, including non-logical cache
+        // state.
+        writer.hash(crypto::hash_node(
+            self.tree.account_root(),
+            self.tree.market_root(),
+        ));
         writer.hash(ledger_root);
         writer.hash(session_root);
         writer.hash(risk_root);
@@ -4100,6 +4120,35 @@ mod tests {
         engine
     }
 
+    fn take_state_bytes<'a>(bytes: &'a [u8], offset: &mut usize, len: usize) -> &'a [u8] {
+        let end = offset.checked_add(len).unwrap();
+        let value = &bytes[*offset..end];
+        *offset = end;
+        value
+    }
+
+    fn take_state_u16(bytes: &[u8], offset: &mut usize) -> u16 {
+        let mut raw = [0; 2];
+        raw.copy_from_slice(take_state_bytes(bytes, offset, 2));
+        u16::from_le_bytes(raw)
+    }
+
+    fn take_state_u32(bytes: &[u8], offset: &mut usize) -> u32 {
+        let mut raw = [0; 4];
+        raw.copy_from_slice(take_state_bytes(bytes, offset, 4));
+        u32::from_le_bytes(raw)
+    }
+
+    fn take_state_u64(bytes: &[u8], offset: &mut usize) -> u64 {
+        let mut raw = [0; 8];
+        raw.copy_from_slice(take_state_bytes(bytes, offset, 8));
+        u64::from_le_bytes(raw)
+    }
+
+    fn take_state_len(bytes: &[u8], offset: &mut usize) -> usize {
+        usize::try_from(take_state_u64(bytes, offset)).unwrap()
+    }
+
     fn assert_engine_transition_changes(base: &Engine, mutate: impl FnOnce(&mut Engine)) {
         let root = base.transition_root_v1().unwrap();
         let mut changed = base.clone();
@@ -4299,6 +4348,280 @@ mod tests {
             Hash::from_bytes([
                 224, 211, 240, 222, 168, 207, 17, 179, 33, 18, 171, 55, 14, 86, 220, 122, 82, 228,
                 188, 58, 77, 176, 72, 68, 138, 220, 18, 66, 240, 164, 193, 58,
+            ])
+        );
+    }
+
+    #[test]
+    fn engine_state_v1_embeds_source_root_and_exact_canonical_children() {
+        let engine = engine_transition_fixture();
+        let bytes = engine.encode_state_v1_bounded(usize::MAX).unwrap();
+        let mut offset = 0usize;
+
+        assert_eq!(
+            take_state_u16(&bytes, &mut offset),
+            ENGINE_STATE_SCHEMA_VERSION
+        );
+        assert_eq!(
+            take_state_bytes(&bytes, &mut offset, 32),
+            engine.transition_root_v1().unwrap().as_bytes()
+        );
+        assert_eq!(take_state_u16(&bytes, &mut offset), engine.protocol_version);
+        assert_eq!(take_state_bytes(&bytes, &mut offset, 1), &[1]);
+        assert_eq!(
+            take_state_u64(&bytes, &mut offset),
+            engine.last_seq.unwrap()
+        );
+        assert_eq!(
+            take_state_len(&bytes, &mut offset),
+            engine.tree.account_capacity()
+        );
+        assert_eq!(
+            take_state_len(&bytes, &mut offset),
+            engine.tree.market_capacity()
+        );
+
+        let expected_children = [
+            engine.ledger.encode_state_v1_bounded(usize::MAX).unwrap(),
+            engine.sessions.encode_state_v1_bounded(usize::MAX).unwrap(),
+            engine.risk.encode_state_v1_bounded(usize::MAX).unwrap(),
+            engine.replay.encode_state_v1_bounded(usize::MAX).unwrap(),
+        ];
+        for expected in expected_children {
+            let len = take_state_len(&bytes, &mut offset);
+            assert_eq!(take_state_bytes(&bytes, &mut offset, len), expected);
+        }
+
+        let market_count = take_state_len(&bytes, &mut offset);
+        assert_eq!(market_count, engine.markets.len());
+        let market_bytes = market_count.checked_mul(36).unwrap();
+        let _markets = take_state_bytes(&bytes, &mut offset, market_bytes);
+
+        let book_count = take_state_len(&bytes, &mut offset);
+        assert_eq!(book_count, engine.books.len());
+        let mut previous_key = None;
+        for _ in 0..book_count {
+            let market = take_state_u32(&bytes, &mut offset);
+            let instrument = take_state_u16(&bytes, &mut offset);
+            let key = (market, instrument);
+            assert!(previous_key.is_none_or(|previous| key > previous));
+            previous_key = Some(key);
+            let len = take_state_len(&bytes, &mut offset);
+            let child = take_state_bytes(&bytes, &mut offset, len);
+            assert_eq!(
+                child,
+                engine
+                    .books
+                    .get(&key)
+                    .unwrap()
+                    .encode_state_v3_bounded(usize::MAX)
+                    .unwrap()
+            );
+        }
+
+        // The remainder is the Engine-owned reserve, claim, escrow, mint,
+        // deposit, withdrawal, and wallet state. A non-empty suffix confirms
+        // that the child composition is not being mistaken for the full image;
+        // exact sizing is checked internally and by the golden vector below.
+        assert!(offset < bytes.len());
+    }
+
+    #[test]
+    fn engine_state_v1_is_canonical_bounded_and_excludes_worker_state() {
+        let base = engine_transition_fixture();
+        let canonical = base.encode_state_v1_bounded(usize::MAX).unwrap();
+        assert_eq!(
+            base.encode_state_v1_bounded(canonical.len()).unwrap(),
+            canonical
+        );
+        assert_eq!(
+            base.encode_state_v1_bounded(canonical.len() - 1),
+            Err(EngineStateError::EncodedBytesLimit {
+                required_at_least: canonical.len(),
+                max: canonical.len() - 1,
+            })
+        );
+
+        let mut permuted = base.clone();
+        permuted.markets = CowState::new(rebuild_map_descending(&base.markets));
+        permuted.books = CowState::new(rebuild_map_descending(&base.books));
+        permuted.order_reserves = CowState::new(rebuild_map_descending(&base.order_reserves));
+        permuted.claims = CowState::new(rebuild_map_descending(&base.claims));
+        permuted.claim_escrows = CowState::new(rebuild_map_descending(&base.claim_escrows));
+        permuted.mint_locked = CowState::new(rebuild_map_descending(&base.mint_locked));
+        permuted.withdrawals = CowState::new(rebuild_map_descending(&base.withdrawals));
+        permuted.wallets = CowState::new(rebuild_map_descending(&base.wallets));
+        let mut deposits: Vec<_> = base.deposits_seen.iter().cloned().collect();
+        deposits.sort_unstable_by(|a, b| b.cmp(a));
+        permuted.deposits_seen = CowState::new(deposits.into_iter().collect());
+        assert_eq!(
+            permuted.encode_state_v1_bounded(usize::MAX).unwrap(),
+            canonical
+        );
+
+        let mut worker_changed = base;
+        worker_changed.matching_backend = match worker_changed.matching_backend {
+            orderbook::MatchingBackend::Scalar => orderbook::MatchingBackend::Avx2,
+            _ => orderbook::MatchingBackend::Scalar,
+        };
+        worker_changed
+            .leaf_scratch
+            .extend_from_slice(b"non-logical encoder scratch");
+        assert_eq!(
+            worker_changed.encode_state_v1_bounded(usize::MAX).unwrap(),
+            canonical
+        );
+    }
+
+    #[test]
+    fn engine_state_v1_rejects_corrupt_source_and_contextualizes_book_bounds() {
+        let mut corrupt = engine_transition_fixture();
+        corrupt.protocol_version = 0;
+        assert_eq!(
+            corrupt.encode_state_v1_bounded(usize::MAX),
+            Err(EngineStateError::InvalidEngine(
+                ExecutionError::StateInvariant("engine protocol version must be non-zero")
+            ))
+        );
+
+        let mut book_heavy = engine_with_caps(8, 8);
+        for (index, command) in [create_account(1_000_000), create_perp(0, 1_000_000)]
+            .into_iter()
+            .enumerate()
+        {
+            book_heavy
+                .execute(seq(u64::try_from(index).unwrap() + 1), command)
+                .unwrap();
+        }
+        let book = book_heavy.books.get_mut(&(0, 0)).unwrap();
+        for account in 0..256u32 {
+            book.set_position(
+                AccountId::new(account),
+                Quantity::from_raw(i64::from(account) + 1),
+            );
+        }
+        book_heavy.commit_market(MarketId::new(0)).unwrap();
+        book_heavy.validate_recovery_invariants().unwrap();
+        let book_len = book_heavy
+            .books
+            .get(&(0, 0))
+            .unwrap()
+            .encode_state_v3_bounded(usize::MAX)
+            .unwrap()
+            .len();
+        assert!(
+            book_len
+                > book_heavy
+                    .risk
+                    .encode_state_v1_bounded(usize::MAX)
+                    .unwrap()
+                    .len()
+        );
+        assert!(matches!(
+            book_heavy.encode_state_v1_bounded(book_len - 1),
+            Err(EngineStateError::Book {
+                market: 0,
+                instrument: 0,
+                source: orderbook::BookStateError::EncodedBytesLimit { .. },
+            })
+        ));
+    }
+
+    #[test]
+    fn engine_state_v1_rejects_cumulative_multi_book_bytes_early() {
+        let mut engine = engine_with_caps(8, 8);
+        for market in 0..4u32 {
+            engine
+                .execute(
+                    seq(u64::from(market) + 1),
+                    create_perp(market, 1_000_000 + i64::from(market)),
+                )
+                .unwrap();
+        }
+        let exact = engine.encode_state_v1_bounded(usize::MAX).unwrap();
+        let one_book_len = engine
+            .books
+            .get(&(0, 0))
+            .unwrap()
+            .encode_state_v3_bounded(usize::MAX)
+            .unwrap()
+            .len();
+        let max = exact.len() - one_book_len / 2;
+        assert!(engine.books.values().all(|book| book
+            .encode_state_v3_bounded(usize::MAX)
+            .unwrap()
+            .len()
+            < max));
+        assert!(
+            engine
+                .ledger
+                .encode_state_v1_bounded(usize::MAX)
+                .unwrap()
+                .len()
+                < max
+        );
+        assert!(
+            engine
+                .sessions
+                .encode_state_v1_bounded(usize::MAX)
+                .unwrap()
+                .len()
+                < max
+        );
+        assert!(
+            engine
+                .risk
+                .encode_state_v1_bounded(usize::MAX)
+                .unwrap()
+                .len()
+                < max
+        );
+        assert!(
+            engine
+                .replay
+                .encode_state_v1_bounded(usize::MAX)
+                .unwrap()
+                .len()
+                < max
+        );
+
+        match engine.encode_state_v1_bounded(max) {
+            Err(EngineStateError::EncodedBytesLimit {
+                required_at_least,
+                max: reported_max,
+            }) => {
+                assert!(required_at_least > max);
+                assert_eq!(reported_max, max);
+                // The encoder stops after the first child that proves the
+                // aggregate cannot fit; it need not retain the remaining book
+                // images merely to report the final exact size.
+                assert!(required_at_least <= exact.len());
+            }
+            other => panic!("expected cumulative Engine byte bound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn engine_state_v1_root_and_encoding_leave_tree_cache_untouched() {
+        let engine = Engine::new(EngineConfig::default());
+        let before = format!("{:?}", &*engine.tree);
+        let _root = engine.transition_root_v1().unwrap();
+        assert_eq!(format!("{:?}", &*engine.tree), before);
+        let _bytes = engine.encode_state_v1_bounded(usize::MAX).unwrap();
+        assert_eq!(format!("{:?}", &*engine.tree), before);
+    }
+
+    #[test]
+    fn engine_state_v1_golden_image() {
+        let bytes = engine_transition_fixture()
+            .encode_state_v1_bounded(usize::MAX)
+            .unwrap();
+        assert_eq!(bytes.len(), 2_274);
+        assert_eq!(
+            crypto::hash_domain(b"dexos:test:execution-engine-state:v1", &bytes),
+            Hash::from_bytes([
+                193, 75, 117, 26, 146, 39, 64, 178, 247, 14, 4, 234, 222, 75, 16, 141, 179, 15, 33,
+                136, 155, 112, 44, 3, 216, 70, 148, 219, 115, 82, 56, 98,
             ])
         );
     }
