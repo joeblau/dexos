@@ -1117,6 +1117,34 @@ impl RiskEngine {
         self.used.iter().filter(|&&u| u).count()
     }
 
+    /// Exact dense account-slot shape, including normalized unused gaps.
+    #[inline]
+    pub fn account_slot_count(&self) -> usize {
+        self.used.len()
+    }
+
+    /// Stored mark for `market`, if that market has been initialized in risk.
+    ///
+    /// This read-only view lets an enclosing state machine reconcile its
+    /// authoritative market registry without exposing dense implementation
+    /// details or allocating a mirror collection.
+    #[inline]
+    pub fn mark_price(&self, market: MarketId) -> Option<Price> {
+        self.mark_for(market)
+    }
+
+    /// Number of initialized risk-market marks.
+    #[inline]
+    pub fn marked_market_count(&self) -> usize {
+        self.marks.iter().filter(|mark| mark.is_some()).count()
+    }
+
+    /// Exact dense market-slot shape, including normalized unmarked gaps.
+    #[inline]
+    pub fn market_slot_count(&self) -> usize {
+        self.marks.len()
+    }
+
     /// Validate every stored relation required to interpret the v1 transition
     /// state without trusting caches, reverse indexes, or queue membership.
     ///
@@ -1728,6 +1756,18 @@ mod tests {
     /// A payout vector from raw `Amount` units (already at the 6-dp scale).
     fn pv(raw: &[i128]) -> PayoutVector {
         PayoutVector::new(raw.iter().map(|&x| Amount::from_raw(x)).collect()).unwrap()
+    }
+
+    #[test]
+    fn public_shape_readouts_include_normalized_unused_slots() {
+        let mut engine = engine();
+        engine.grow_accounts(3).unwrap();
+        engine.grow_market(5).unwrap();
+        assert_eq!(engine.account_count(), 0);
+        assert_eq!(engine.account_slot_count(), 4);
+        assert_eq!(engine.marked_market_count(), 0);
+        assert_eq!(engine.market_slot_count(), 6);
+        assert_eq!(engine.validate_transition_invariants(), Ok(()));
     }
 
     #[test]

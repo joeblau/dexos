@@ -332,6 +332,53 @@ fn column_sub<K: Ord + Copy>(
     Ok(())
 }
 
+/// Checked aggregation for recovery validation. Zero values are omitted so
+/// exact comparisons also enforce the engine's sparse-column representation.
+fn recovery_column_add<K>(
+    column: &mut HashMap<K, Amount>,
+    key: K,
+    amount: Amount,
+    negative: &'static str,
+) -> Result<(), ExecutionError>
+where
+    K: Eq + std::hash::Hash,
+{
+    if amount.is_negative() {
+        return Err(ExecutionError::StateInvariant(negative));
+    }
+    if amount == Amount::ZERO {
+        return Ok(());
+    }
+    let current = column.get(&key).copied().unwrap_or(Amount::ZERO);
+    column.insert(key, current.checked_add(amount)?);
+    Ok(())
+}
+
+fn recovery_reserve<K, V>(map: &mut HashMap<K, V>, capacity: usize) -> Result<(), ExecutionError>
+where
+    K: Eq + std::hash::Hash,
+{
+    map.try_reserve(capacity).map_err(|_| {
+        ExecutionError::StateInvariant("unable to allocate recovery-validation workspace")
+    })
+}
+
+fn recovery_reserve_set<K>(set: &mut HashSet<K>, capacity: usize) -> Result<(), ExecutionError>
+where
+    K: Eq + std::hash::Hash,
+{
+    set.try_reserve(capacity).map_err(|_| {
+        ExecutionError::StateInvariant("unable to allocate recovery-validation workspace")
+    })
+}
+
+fn recovery_account_id(index: usize) -> Result<AccountId, ExecutionError> {
+    let index = u32::try_from(index).map_err(|_| {
+        ExecutionError::StateInvariant("account index cannot be represented by AccountId")
+    })?;
+    Ok(AccountId::new(index))
+}
+
 /// Escrow backing one resting claim-market order.
 ///
 /// A resting bid moves its promised premium out of the ledger's `available`
@@ -493,6 +540,597 @@ impl Engine {
     /// Read-only risk access.
     pub fn risk(&self) -> &RiskEngine {
         &self.risk
+    }
+
+    /// Validate the complete in-memory engine state before recovery makes the
+    /// executor ready or computes a fail-stop child commitment.
+    ///
+    /// The pass is read-only and does not repair derived columns. It first
+    /// validates each child representation, then reconciles
+    /// cross-component ownership, market, book/sidecar, escrow, reserve,
+    /// withdrawal, complete-set, replay, and sequence relations. Finally it
+    /// rebuilds the legacy proof tree from authoritative account and market
+    /// leaves and requires the account, market, and combined roots to match.
+    ///
+    /// Withdrawal ids whose request receipts have aged out of the bounded
+    /// replay window cannot be reverse-mapped to their original nonce under the
+    /// current schema. Retained requests are checked exactly; durable
+    /// watermarks continue to prevent evicted requests from executing twice.
+    ///
+    /// Metadata relations are those reachable under the current command
+    /// schema. A legacy/pre-activation checkpoint with older lifecycle policy
+    /// must be explicitly migrated before validation. Resource limits must be
+    /// enforced by the eventual outer checkpoint decoder before constructing
+    /// this in-memory state; this relational pass is not a byte-decoder budget.
+    pub fn validate_recovery_invariants(&self) -> Result<(), ExecutionError> {
+        self.ledger.validate_transition_invariants()?;
+        self.sessions
+            .validate_engine_context(self.ledger.account_count())?;
+        self.risk.validate_transition_invariants()?;
+        self.tree.validate_transition_invariants()?;
+        self.replay.validate_transition_invariants()?;
+        self.replay
+            .validate_engine_context(self.ledger.account_count(), self.last_seq)?;
+
+        if self.protocol_version == 0 {
+            return Err(ExecutionError::StateInvariant(
+                "engine protocol version must be non-zero",
+            ));
+        }
+
+        let account_count = self.ledger.account_count();
+        if account_count > self.tree.account_capacity() {
+            return Err(ExecutionError::StateInvariant(
+                "ledger account registry exceeds the account proof-tree capacity",
+            ));
+        }
+        if self.risk.account_count() != account_count
+            || self.risk.account_slot_count() != account_count
+        {
+            return Err(ExecutionError::StateInvariant(
+                "ledger and risk account registries have different dense shapes",
+            ));
+        }
+        for index in 0..account_count {
+            let account = recovery_account_id(index)?;
+            // This read accepts both open and legitimately closed risk accounts.
+            // Requiring active accounts here would reject reachable post-
+            // liquidation state.
+            let positions = self.risk.perp_positions(account)?;
+            for position in positions {
+                let meta = self.markets.get(&position.market.get()).ok_or(
+                    ExecutionError::StateInvariant(
+                        "risk position references an unknown engine market",
+                    ),
+                )?;
+                if !matches!(meta.market_type, MarketType::Perpetual) {
+                    return Err(ExecutionError::StateInvariant(
+                        "risk perp position references a claim market",
+                    ));
+                }
+            }
+        }
+
+        if self.markets.len() > self.tree.market_capacity() {
+            return Err(ExecutionError::StateInvariant(
+                "market registry exceeds the market proof-tree capacity",
+            ));
+        }
+        let expected_risk_market_slots =
+            self.markets
+                .keys()
+                .copied()
+                .max()
+                .map_or(Ok(0usize), |market| {
+                    usize::try_from(market)
+                        .ok()
+                        .and_then(|index| index.checked_add(1))
+                        .ok_or(ExecutionError::StateInvariant(
+                            "market id cannot define a risk slot",
+                        ))
+                })?;
+        if self.risk.marked_market_count() != self.markets.len()
+            || self.risk.market_slot_count() != expected_risk_market_slots
+        {
+            return Err(ExecutionError::StateInvariant(
+                "engine market registry and risk mark registry differ in shape",
+            ));
+        }
+
+        let mut expected_book_count = 0usize;
+        for (&market_id, meta) in self.markets.iter() {
+            let market_index = usize::try_from(market_id).map_err(|_| {
+                ExecutionError::StateInvariant("market id cannot index the proof tree")
+            })?;
+            if market_index >= self.tree.market_capacity() {
+                return Err(ExecutionError::StateInvariant(
+                    "market id exceeds the market proof-tree capacity",
+                ));
+            }
+            if meta.outcomes == 0 || (is_claim_market(meta.market_type) && meta.outcomes < 2) {
+                return Err(ExecutionError::StateInvariant(
+                    "market outcome count is not canonical for its market type",
+                ));
+            }
+            if is_claim_market(meta.market_type) && meta.last_funding_epoch != 0 {
+                return Err(ExecutionError::StateInvariant(
+                    "claim market carries a perpetual funding epoch",
+                ));
+            }
+            match meta.winning_outcome {
+                Some(winner) => {
+                    if !is_claim_market(meta.market_type)
+                        || winner >= instrument_count(meta.market_type, meta.outcomes)
+                    {
+                        return Err(ExecutionError::StateInvariant(
+                            "market winning outcome is incompatible with its instrument set",
+                        ));
+                    }
+                    if !matches!(
+                        meta.lifecycle,
+                        MarketLifecycle::Resolved
+                            | MarketLifecycle::Settled
+                            | MarketLifecycle::Archived
+                    ) {
+                        return Err(ExecutionError::StateInvariant(
+                            "market has a winner before reaching a resolved lifecycle",
+                        ));
+                    }
+                }
+                None if matches!(
+                    meta.lifecycle,
+                    MarketLifecycle::Resolved
+                        | MarketLifecycle::Settled
+                        | MarketLifecycle::Archived
+                ) =>
+                {
+                    return Err(ExecutionError::StateInvariant(
+                        "resolved market is missing its winning outcome",
+                    ));
+                }
+                None => {}
+            }
+            if self.risk.mark_price(MarketId::new(market_id)) != Some(meta.mark_price) {
+                return Err(ExecutionError::StateInvariant(
+                    "engine market mark disagrees with risk state",
+                ));
+            }
+            expected_book_count = expected_book_count
+                .checked_add(usize::from(instrument_count(
+                    meta.market_type,
+                    meta.outcomes,
+                )))
+                .ok_or(ExecutionError::StateInvariant(
+                    "market instrument count overflow",
+                ))?;
+        }
+        if self.books.len() != expected_book_count {
+            return Err(ExecutionError::StateInvariant(MARKET_BOOK_SHAPE_MISMATCH));
+        }
+
+        // Child book validation must precede every resting-order view: that
+        // view intentionally assumes the slab and side graphs are coherent.
+        let mut resting_count = 0usize;
+        for (&(market, instrument), book) in self.books.iter() {
+            let meta = self
+                .markets
+                .get(&market)
+                .ok_or(ExecutionError::StateInvariant(MARKET_BOOK_SHAPE_MISMATCH))?;
+            if instrument >= instrument_count(meta.market_type, meta.outcomes) {
+                return Err(ExecutionError::StateInvariant(MARKET_BOOK_SHAPE_MISMATCH));
+            }
+            book.validate_transition_invariants()?;
+            resting_count = resting_count.checked_add(book.resting_len()).ok_or(
+                ExecutionError::StateInvariant("resting order count overflow"),
+            )?;
+        }
+
+        let mut resting_keys = HashSet::new();
+        recovery_reserve_set(&mut resting_keys, resting_count)?;
+        let mut expected_reserves = HashMap::<u32, Amount>::new();
+        recovery_reserve(&mut expected_reserves, account_count)?;
+
+        for (&(market, instrument), book) in self.books.iter() {
+            let meta = self
+                .markets
+                .get(&market)
+                .ok_or(ExecutionError::StateInvariant(MARKET_BOOK_SHAPE_MISMATCH))?;
+            let orders = book.resting_orders();
+            if orders.len() != book.resting_len() {
+                return Err(ExecutionError::StateInvariant(
+                    MARKET_RESTING_SIDECAR_MISMATCH,
+                ));
+            }
+            for order in orders {
+                if !self.ledger.contains(order.account) {
+                    return Err(ExecutionError::StateInvariant(
+                        "resting order references an unknown account",
+                    ));
+                }
+                let key = (market, instrument, order.order_id.get());
+                if !resting_keys.insert(key) {
+                    return Err(ExecutionError::StateInvariant(
+                        MARKET_RESTING_SIDECAR_MISMATCH,
+                    ));
+                }
+                if is_claim_market(meta.market_type) {
+                    if self.order_reserves.contains_key(&key) {
+                        return Err(ExecutionError::StateInvariant(
+                            MARKET_RESTING_SIDECAR_MISMATCH,
+                        ));
+                    }
+                    let escrow = self.claim_escrows.get(&key).copied().ok_or(
+                        ExecutionError::StateInvariant(MARKET_RESTING_SIDECAR_MISMATCH),
+                    )?;
+                    let floor_notional = order.price.notional(order.remaining)?;
+                    let remaining = Amount::from_raw(i128::from(order.remaining.raw()));
+                    let matches = escrow.account == order.account
+                        && escrow.side == order.side
+                        && match order.side {
+                            Side::Bid => {
+                                escrow.claims == Amount::ZERO && escrow.premium >= floor_notional
+                            }
+                            Side::Ask => {
+                                escrow.premium == Amount::ZERO && escrow.claims == remaining
+                            }
+                        };
+                    if !matches {
+                        return Err(ExecutionError::StateInvariant(
+                            MARKET_RESTING_SIDECAR_MISMATCH,
+                        ));
+                    }
+                } else {
+                    if self.claim_escrows.contains_key(&key) {
+                        return Err(ExecutionError::StateInvariant(
+                            MARKET_RESTING_SIDECAR_MISMATCH,
+                        ));
+                    }
+                    let expected = order.price.notional(order.remaining)?;
+                    match self.order_reserves.get(&key).copied() {
+                        Some(reserve)
+                            if reserve.account == order.account
+                                && reserve.qty_remaining == order.remaining
+                                && reserve.reserved == expected =>
+                        {
+                            recovery_column_add(
+                                &mut expected_reserves,
+                                reserve.account.get(),
+                                reserve.reserved,
+                                "resting order reserve must be non-negative",
+                            )?;
+                        }
+                        None if expected == Amount::ZERO => {}
+                        _ => {
+                            return Err(ExecutionError::StateInvariant(
+                                MARKET_RESTING_SIDECAR_MISMATCH,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        if resting_keys.len() != resting_count
+            || self
+                .order_reserves
+                .keys()
+                .any(|key| !resting_keys.contains(key))
+            || self
+                .claim_escrows
+                .keys()
+                .any(|key| !resting_keys.contains(key))
+            || self
+                .order_reserves
+                .keys()
+                .any(|key| self.claim_escrows.contains_key(key))
+        {
+            return Err(ExecutionError::StateInvariant(
+                MARKET_RESTING_SIDECAR_MISMATCH,
+            ));
+        }
+
+        for index in 0..account_count {
+            let account = recovery_account_id(index)?;
+            let expected = expected_reserves
+                .get(&account.get())
+                .copied()
+                .unwrap_or(Amount::ZERO);
+            if self.risk.reserved_resting(account)? != expected {
+                return Err(ExecutionError::StateInvariant(
+                    "risk resting reserve disagrees with per-order reserves",
+                ));
+            }
+        }
+
+        let mut expected_premium = HashMap::<(u32, u32), Amount>::new();
+        recovery_reserve(&mut expected_premium, self.claim_escrows.len())?;
+        let mut expected_ask_claims = HashMap::<(u32, u32, u16), Amount>::new();
+        recovery_reserve(&mut expected_ask_claims, self.claim_escrows.len())?;
+        for (&(market, instrument, _), escrow) in self.claim_escrows.iter() {
+            if !self.ledger.contains(escrow.account) {
+                return Err(ExecutionError::StateInvariant(
+                    "claim-order escrow references an unknown account",
+                ));
+            }
+            match escrow.side {
+                Side::Bid => recovery_column_add(
+                    &mut expected_premium,
+                    (escrow.account.get(), market),
+                    escrow.premium,
+                    "claim bid premium escrow must be non-negative",
+                )?,
+                Side::Ask => recovery_column_add(
+                    &mut expected_ask_claims,
+                    (escrow.account.get(), market, instrument),
+                    escrow.claims,
+                    "claim ask escrow must be non-negative",
+                )?,
+            }
+        }
+
+        if self.bid_premium_escrow.len() != expected_premium.len()
+            || self.bid_premium_escrow.iter().any(|(key, value)| {
+                value.raw() <= 0 || expected_premium.get(key).copied() != Some(*value)
+            })
+            || self.ask_claims_escrow.len() != expected_ask_claims.len()
+            || self.ask_claims_escrow.iter().any(|(key, value)| {
+                value.raw() <= 0 || expected_ask_claims.get(key).copied() != Some(*value)
+            })
+        {
+            return Err(ExecutionError::StateInvariant(
+                MARKET_ESCROW_COLUMN_MISMATCH,
+            ));
+        }
+
+        let mut premium_by_account = HashMap::<u32, Amount>::new();
+        recovery_reserve(&mut premium_by_account, account_count)?;
+        for (&(account, _), &premium) in self.bid_premium_escrow.iter() {
+            recovery_column_add(
+                &mut premium_by_account,
+                account,
+                premium,
+                "premium escrow column must be non-negative",
+            )?;
+        }
+        for index in 0..account_count {
+            let account = recovery_account_id(index)?;
+            let expected = premium_by_account
+                .get(&account.get())
+                .copied()
+                .unwrap_or(Amount::ZERO);
+            if self.ledger.escrowed(account)? != expected {
+                return Err(ExecutionError::StateInvariant(
+                    "ledger escrow disagrees with claim-bid premium columns",
+                ));
+            }
+        }
+
+        let mut pending_withdrawals = HashMap::<u32, Amount>::new();
+        recovery_reserve(&mut pending_withdrawals, account_count)?;
+        for withdrawal in self.withdrawals.values() {
+            if !self.ledger.contains(withdrawal.account) {
+                return Err(ExecutionError::StateInvariant(
+                    "withdrawal references an unknown account",
+                ));
+            }
+            if self
+                .replay
+                .watermark(withdrawal.account.get(), KeyDomain::Withdrawal)
+                .is_none()
+            {
+                return Err(ExecutionError::StateInvariant(
+                    "persisted withdrawal has no durable withdrawal replay watermark",
+                ));
+            }
+            if withdrawal.amount.is_negative() {
+                return Err(ExecutionError::StateInvariant(
+                    "withdrawal amount must be non-negative",
+                ));
+            }
+            if !withdrawal.finalized {
+                recovery_column_add(
+                    &mut pending_withdrawals,
+                    withdrawal.account.get(),
+                    withdrawal.amount,
+                    "withdrawal amount must be non-negative",
+                )?;
+            }
+        }
+        let retained_withdrawal_count = self.replay.retained_withdrawal_requests().count();
+        let mut retained_withdrawal_ids = HashSet::new();
+        recovery_reserve_set(&mut retained_withdrawal_ids, retained_withdrawal_count)?;
+        for (principal, _nonce, withdrawal_id) in self.replay.retained_withdrawal_requests() {
+            if !retained_withdrawal_ids.insert(withdrawal_id) {
+                return Err(ExecutionError::StateInvariant(
+                    "retained withdrawal requests do not map one-to-one to withdrawal ids",
+                ));
+            }
+            let withdrawal =
+                self.withdrawals
+                    .get(&withdrawal_id)
+                    .ok_or(ExecutionError::StateInvariant(
+                        "retained withdrawal receipt has no persisted withdrawal",
+                    ))?;
+            if withdrawal.account.get() != principal {
+                return Err(ExecutionError::StateInvariant(
+                    "retained withdrawal receipt principal disagrees with persisted withdrawal",
+                ));
+            }
+        }
+        for index in 0..account_count {
+            let account = recovery_account_id(index)?;
+            let expected = pending_withdrawals
+                .get(&account.get())
+                .copied()
+                .unwrap_or(Amount::ZERO);
+            if self.ledger.reserved(account)? != expected {
+                return Err(ExecutionError::StateInvariant(
+                    "ledger reserved balance disagrees with pending withdrawals",
+                ));
+            }
+        }
+
+        let mut locked_by_account = HashMap::<u32, Amount>::new();
+        recovery_reserve(&mut locked_by_account, account_count)?;
+        let mut minted_by_market = HashMap::<u32, Amount>::new();
+        recovery_reserve(&mut minted_by_market, self.markets.len())?;
+        for (&(account, market), &amount) in self.mint_locked.iter() {
+            if usize::try_from(account).map_or(true, |index| index >= account_count) {
+                return Err(ExecutionError::StateInvariant(
+                    "complete-set lock references an unknown account",
+                ));
+            }
+            let meta = self
+                .markets
+                .get(&market)
+                .ok_or(ExecutionError::StateInvariant(
+                    "complete-set lock references an unknown market",
+                ))?;
+            if !is_claim_market(meta.market_type) || amount.is_negative() {
+                return Err(ExecutionError::StateInvariant(
+                    "complete-set lock is invalid for its market",
+                ));
+            }
+            recovery_column_add(
+                &mut locked_by_account,
+                account,
+                amount,
+                "complete-set lock must be non-negative",
+            )?;
+            recovery_column_add(
+                &mut minted_by_market,
+                market,
+                amount,
+                "complete-set lock must be non-negative",
+            )?;
+        }
+        for index in 0..account_count {
+            let account = recovery_account_id(index)?;
+            let expected = locked_by_account
+                .get(&account.get())
+                .copied()
+                .unwrap_or(Amount::ZERO);
+            if self.ledger.locked(account)? != expected {
+                return Err(ExecutionError::StateInvariant(
+                    "ledger locked balance disagrees with complete-set locks",
+                ));
+            }
+        }
+
+        let mut claim_supply = HashMap::<(u32, u16), Amount>::new();
+        recovery_reserve(&mut claim_supply, expected_book_count)?;
+        for (&account, markets) in self.claims.iter() {
+            if usize::try_from(account).map_or(true, |index| index >= account_count) {
+                return Err(ExecutionError::StateInvariant(
+                    "claim balance references an unknown account",
+                ));
+            }
+            for (&market, balances) in markets {
+                let meta = self
+                    .markets
+                    .get(&market)
+                    .ok_or(ExecutionError::StateInvariant(
+                        "claim balance references an unknown market",
+                    ))?;
+                if !is_claim_market(meta.market_type)
+                    || balances.len()
+                        != usize::from(instrument_count(meta.market_type, meta.outcomes))
+                {
+                    return Err(ExecutionError::StateInvariant(
+                        "claim balance vector does not match its market instruments",
+                    ));
+                }
+                for (instrument, &balance) in balances.iter().enumerate() {
+                    let instrument = u16::try_from(instrument).map_err(|_| {
+                        ExecutionError::StateInvariant(
+                            "claim instrument index cannot be represented",
+                        )
+                    })?;
+                    recovery_column_add(
+                        &mut claim_supply,
+                        (market, instrument),
+                        balance,
+                        "live claim balance must be non-negative",
+                    )?;
+                }
+            }
+        }
+        for (&(_, market, instrument), &amount) in self.ask_claims_escrow.iter() {
+            recovery_column_add(
+                &mut claim_supply,
+                (market, instrument),
+                amount,
+                "claim ask escrow must be non-negative",
+            )?;
+        }
+        for (&market, meta) in self.markets.iter() {
+            if !is_claim_market(meta.market_type) {
+                continue;
+            }
+            let minted = minted_by_market
+                .get(&market)
+                .copied()
+                .unwrap_or(Amount::ZERO);
+            for instrument in 0..instrument_count(meta.market_type, meta.outcomes) {
+                let outstanding = claim_supply
+                    .get(&(market, instrument))
+                    .copied()
+                    .unwrap_or(Amount::ZERO);
+                if outstanding != minted {
+                    return Err(ExecutionError::StateInvariant(
+                        "outcome claims are not conserved against complete-set locks",
+                    ));
+                }
+            }
+        }
+
+        for &account in self.wallets.keys() {
+            if usize::try_from(account).map_or(true, |index| index >= account_count) {
+                return Err(ExecutionError::StateInvariant(
+                    "wallet binding references an unknown account",
+                ));
+            }
+        }
+
+        if self.last_seq.is_none()
+            && (account_count != 0
+                || !self.markets.is_empty()
+                || !self.deposits_seen.is_empty()
+                || self.protocol_version != 1
+                || self.risk.insurance_fund() != Amount::ZERO
+                || self.risk.socialized_loss() != Amount::ZERO)
+        {
+            return Err(ExecutionError::StateInvariant(
+                "engine state exists without a consumed sequence",
+            ));
+        }
+
+        let mut rebuilt = StateTree::new(self.tree.account_capacity(), self.tree.market_capacity());
+        for index in 0..account_count {
+            let account = recovery_account_id(index)?;
+            rebuilt.set_account(account, &self.account_leaf(account)?)?;
+        }
+        for &market in self.markets.keys() {
+            let market = MarketId::new(market);
+            rebuilt.set_market(market, &self.market_leaf(market)?)?;
+        }
+        if rebuilt.account_root() != self.tree.account_root() {
+            return Err(ExecutionError::StateInvariant(
+                "account proof-tree root disagrees with authoritative account leaves",
+            ));
+        }
+        if rebuilt.market_root() != self.tree.market_root() {
+            return Err(ExecutionError::StateInvariant(
+                "market proof-tree root disagrees with authoritative market leaves",
+            ));
+        }
+        let rebuilt_combined = crypto::hash_node(rebuilt.account_root(), rebuilt.market_root());
+        let stored_combined = crypto::hash_node(self.tree.account_root(), self.tree.market_root());
+        if rebuilt_combined != stored_combined {
+            return Err(ExecutionError::StateInvariant(
+                "combined proof-tree root disagrees with authoritative leaves",
+            ));
+        }
+        Ok(())
     }
 
     /// Cryptographic commitment to every stored value that can affect a future
@@ -3469,6 +4107,182 @@ mod tests {
         assert_ne!(changed.transition_root_v1().unwrap(), root);
     }
 
+    fn assert_recovery_rejects_without_panic(base: &Engine, mutate: impl FnOnce(&mut Engine)) {
+        let mut corrupt = base.clone();
+        mutate(&mut corrupt);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            corrupt.validate_recovery_invariants()
+        }));
+        assert!(
+            result.is_ok(),
+            "recovery validation panicked on corrupt state"
+        );
+        assert!(
+            result.unwrap().is_err(),
+            "recovery validation accepted corrupt state"
+        );
+    }
+
+    #[test]
+    fn recovery_validator_accepts_rich_and_empty_state_without_observable_mutation() {
+        let empty = Engine::new(EngineConfig::default());
+        let empty_account_root = empty.tree.account_root();
+        let empty_market_root = empty.tree.market_root();
+        assert_eq!(empty.validate_recovery_invariants(), Ok(()));
+        assert_eq!(empty.tree.account_root(), empty_account_root);
+        assert_eq!(empty.tree.market_root(), empty_market_root);
+
+        let rich = engine_transition_fixture();
+        let legacy_root = rich.state_root();
+        let account_root = rich.tree.account_root();
+        let market_root = rich.tree.market_root();
+        let transition_root = rich.transition_root_v1().unwrap();
+        let before = fingerprint(&rich);
+        assert_eq!(rich.validate_recovery_invariants(), Ok(()));
+        assert_eq!(rich.validate_recovery_invariants(), Ok(()));
+        assert_eq!(rich.state_root(), legacy_root);
+        assert_eq!(rich.tree.account_root(), account_root);
+        assert_eq!(rich.tree.market_root(), market_root);
+        assert_eq!(rich.transition_root_v1().unwrap(), transition_root);
+        assert_eq!(fingerprint(&rich), before);
+    }
+
+    #[test]
+    fn recovery_validator_requires_withdrawal_watermark_after_receipt_eviction() {
+        for finalize in [false, true] {
+            let mut engine = engine_transition_fixture();
+            let (&withdrawal_id, withdrawal) = engine.withdrawals.iter().next().unwrap();
+            let account = withdrawal.account;
+            if finalize {
+                engine
+                    .execute(
+                        seq(engine.last_seq.unwrap() + 1),
+                        Command::FinalizeWithdrawal(FinalizeWithdrawal { withdrawal_id }),
+                    )
+                    .unwrap();
+            }
+            engine.replay.discard_receipt_cache_for_test();
+            assert!(engine
+                .replay
+                .watermark(account.get(), KeyDomain::Withdrawal)
+                .is_some());
+            engine
+                .replay
+                .remove_watermark_for_test(account.get(), KeyDomain::Withdrawal);
+            // Rebuild the authoritative account leaf too, proving the outer
+            // invariant rejects an internally consistent proof tree rather
+            // than merely observing a stale cached leaf.
+            engine.commit_account(account).unwrap();
+            assert_eq!(
+                engine.validate_recovery_invariants(),
+                Err(ExecutionError::StateInvariant(
+                    "persisted withdrawal has no durable withdrawal replay watermark"
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_validator_corruption_matrix_is_typed_and_never_panics() {
+        let base = engine_transition_fixture();
+
+        assert_recovery_rejects_without_panic(&base, |engine| {
+            engine.ledger.corrupt_total_supply_for_test();
+        });
+        assert_recovery_rejects_without_panic(&base, |engine| {
+            engine
+                .sessions
+                .authorize(
+                    AccountId::new(99),
+                    [0x99; 32],
+                    Vec::new(),
+                    Amount::ZERO,
+                    1,
+                    0,
+                    0,
+                )
+                .unwrap();
+        });
+        assert_recovery_rejects_without_panic(&base, |engine| {
+            engine
+                .risk
+                .open_account(AccountId::new(2), Amount::ZERO)
+                .unwrap();
+        });
+        assert_recovery_rejects_without_panic(&base, |engine| {
+            engine
+                .risk
+                .set_mark_price(MarketId::new(0), Price::from_raw(1_000_001))
+                .unwrap();
+        });
+        assert_recovery_rejects_without_panic(&base, |engine| {
+            engine
+                .risk
+                .set_mark_price(MarketId::new(2), Price::from_raw(1))
+                .unwrap();
+        });
+        assert_recovery_rejects_without_panic(&base, |engine| {
+            engine.books.remove(&(0, 0));
+        });
+        assert_recovery_rejects_without_panic(&base, |engine| {
+            engine.order_reserves.clear();
+        });
+        assert_recovery_rejects_without_panic(&base, |engine| {
+            engine
+                .risk
+                .reserve_resting(AccountId::new(0), Amount::from_raw(1))
+                .unwrap();
+        });
+        assert_recovery_rejects_without_panic(&base, |engine| {
+            engine.claim_escrows.values_mut().next().unwrap().premium = Amount::from_raw(999_999);
+        });
+        assert_recovery_rejects_without_panic(&base, |engine| {
+            *engine.bid_premium_escrow.values_mut().next().unwrap() = Amount::from_raw(1);
+        });
+        assert_recovery_rejects_without_panic(&base, |engine| {
+            engine
+                .ledger
+                .escrow(AccountId::new(0), Amount::from_raw(1))
+                .unwrap();
+        });
+        assert_recovery_rejects_without_panic(&base, |engine| {
+            engine.withdrawals.values_mut().next().unwrap().amount = Amount::from_raw(2);
+        });
+        assert_recovery_rejects_without_panic(&base, |engine| {
+            let (&id, _) = engine.withdrawals.iter().next().unwrap();
+            let withdrawal = engine.withdrawals.remove(&id).unwrap();
+            engine.withdrawals.insert(id ^ 1, withdrawal);
+        });
+        assert_recovery_rejects_without_panic(&base, |engine| {
+            *engine.mint_locked.values_mut().next().unwrap() = Amount::from_raw(1);
+        });
+        assert_recovery_rejects_without_panic(&base, |engine| {
+            engine.claims.get_mut(&0).unwrap().get_mut(&1).unwrap()[0] = Amount::from_raw(1);
+        });
+        assert_recovery_rejects_without_panic(&base, |engine| {
+            let wallet = engine.wallets.remove(&0).unwrap();
+            engine.wallets.insert(99, wallet);
+        });
+        assert_recovery_rejects_without_panic(&base, |engine| {
+            engine.protocol_version = 0;
+        });
+        assert_recovery_rejects_without_panic(&base, |engine| {
+            engine.last_seq = None;
+        });
+        assert_recovery_rejects_without_panic(&base, |engine| {
+            engine
+                .tree
+                .set_account(AccountId::new(7), b"stale recovery leaf")
+                .unwrap();
+        });
+        assert_recovery_rejects_without_panic(&base, |engine| {
+            engine
+                .tree
+                .set_market(MarketId::new(7), b"stale recovery market leaf")
+                .unwrap();
+        });
+    }
+
     #[test]
     fn engine_transition_root_v1_golden_vectors() {
         assert_eq!(
@@ -4138,6 +4952,8 @@ mod tests {
     // successful command it reconciles the ledger, risk engine, positions, claims,
     // withdrawals, and the committed state tree with one another.
     fn check_invariants(e: &Engine) {
+        e.validate_recovery_invariants()
+            .expect("public recovery validator rejected reachable engine state");
         // Ledger self-conservation: available + reserved + locked == total supply.
         assert!(e.ledger.conservation_holds(), "ledger conservation broken");
 
@@ -6600,6 +7416,7 @@ mod tests {
         assert_eq!(reserve.qty_remaining, Quantity::from_raw(500_000));
         assert_eq!(engine.risk.reserved_resting(account).unwrap(), Amount::ZERO);
         assert_eq!(engine.market_resting_len(MarketId::new(0)), Some(1));
+        engine.validate_recovery_invariants().unwrap();
 
         engine
             .execute(
@@ -6636,6 +7453,7 @@ mod tests {
             .unwrap();
         assert!(engine.order_reserves.is_empty());
         assert_eq!(engine.market_resting_len(MarketId::new(0)), Some(1));
+        engine.validate_recovery_invariants().unwrap();
         engine
             .execute(
                 seq(6),
@@ -6766,6 +7584,7 @@ mod tests {
         assert_eq!(maker.premium, Amount::from_raw(3));
         assert_eq!(maker.claims, Amount::ZERO);
         assert_eq!(engine.premium_escrowed(buyer, market), Amount::from_raw(3));
+        engine.validate_recovery_invariants().unwrap();
 
         // The buyer owns the one acquired claim and may submit it back. STP
         // removes the remaining self bid; validation must accept premium >=
