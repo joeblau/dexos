@@ -84,6 +84,10 @@ pub enum RiskError {
         /// Native-width value that could not be encoded.
         value: usize,
     },
+    /// Stored risk state violates a relation required for deterministic future
+    /// transitions, such as cache equality or reverse-index consistency.
+    #[error("risk state invariant violated: {0}")]
+    StateInvariant(&'static str),
     /// A fixed-point arithmetic step overflowed or divided by zero.
     #[error("fixed-point arithmetic error: {0}")]
     Arith(#[from] ArithError),

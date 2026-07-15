@@ -18,7 +18,7 @@
 //! across the whole pipeline: the bankrupt account's negative equity is exactly
 //! matched by the insurance draw plus the solvent-collateral haircut.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeSet, HashSet, VecDeque};
 
 use types::{AccountId, Amount, MarketId, Price, Quantity};
 
@@ -178,12 +178,10 @@ impl LiquidationQueue {
         self.queue.is_empty()
     }
 
-    /// Visit the stored liquidation order from the next account to pop through
-    /// the newest queued account.
-    pub(crate) fn for_each_fifo<F: FnMut(AccountId)>(&self, mut f: F) {
-        for account in &self.queue {
-            f(*account);
-        }
+    /// Iterate over the stored liquidation order from the next account to pop
+    /// through the newest queued account.
+    pub(crate) fn iter_fifo(&self) -> impl Iterator<Item = AccountId> + '_ {
+        self.queue.iter().copied()
     }
 
     /// Copy the actual membership index in canonical account order. The v1
@@ -193,6 +191,27 @@ impl LiquidationQueue {
         let mut accounts: Vec<AccountId> = self.present.iter().copied().collect();
         accounts.sort_unstable();
         accounts
+    }
+
+    /// Verify that FIFO and membership representations describe the same
+    /// duplicate-free account set.
+    pub(crate) fn validate_representation(&self) -> Result<(), RiskError> {
+        let mut queued = BTreeSet::new();
+        for account in &self.queue {
+            if !queued.insert(*account) {
+                return Err(RiskError::StateInvariant(
+                    "liquidation FIFO contains a duplicate account",
+                ));
+            }
+        }
+        if queued.len() != self.present.len()
+            || queued.iter().any(|account| !self.present.contains(account))
+        {
+            return Err(RiskError::StateInvariant(
+                "liquidation FIFO and membership index disagree",
+            ));
+        }
+        Ok(())
     }
 
     /// Test-only corruption hook used to prove that the transition root binds
@@ -267,5 +286,30 @@ mod tests {
         assert_eq!(q.pop(), Some(AccountId::new(3)));
         assert_eq!(q.pop(), Some(AccountId::new(2)));
         assert_eq!(q.pop(), None);
+    }
+
+    #[test]
+    fn queue_representation_validator_rejects_duplicate_and_membership_drift() {
+        let account = AccountId::new(7);
+        let mut queue = LiquidationQueue::new();
+        queue.enqueue(account);
+        assert_eq!(queue.validate_representation(), Ok(()));
+
+        queue.queue.push_back(account);
+        assert_eq!(
+            queue.validate_representation(),
+            Err(RiskError::StateInvariant(
+                "liquidation FIFO contains a duplicate account"
+            ))
+        );
+
+        queue.queue.pop_back();
+        assert!(queue.present.remove(&account));
+        assert_eq!(
+            queue.validate_representation(),
+            Err(RiskError::StateInvariant(
+                "liquidation FIFO and membership index disagree"
+            ))
+        );
     }
 }
