@@ -250,6 +250,12 @@ struct Withdrawal {
 /// Book-order coordinates: `(market, instrument, order_id)`.
 type OrderKey = (u32, u16, u64);
 
+const FRESH_ORDER_SIDECAR_COLLISION: &str = "fresh order key already has a committed sidecar";
+const STP_CANCELLATION_ACCOUNT_MISMATCH: &str =
+    "STP cancellation account does not match incoming account";
+const STP_CANCELLATION_SIDECAR_MISMATCH: &str =
+    "STP cancellation does not match its committed sidecar";
+
 /// Notional reserved for one resting perp order, plus the resting quantity it
 /// was computed from.
 ///
@@ -847,7 +853,9 @@ impl Engine {
             return None;
         }
         let reserve_key = (c.market.get(), c.instrument, c.order_id.get());
-        if self.order_reserves.contains_key(&reserve_key) {
+        if self.order_reserves.contains_key(&reserve_key)
+            || self.claim_escrows.contains_key(&reserve_key)
+        {
             return None;
         }
 
@@ -1012,6 +1020,95 @@ impl Engine {
                 qty_remaining,
             },
         );
+        Ok(())
+    }
+
+    /// Release collateral or claim escrow for maker orders removed by the
+    /// order book's self-trade-prevention policy. The report is transient, so
+    /// every field is reconciled against committed sidecar state before any
+    /// release. A mismatch fails closed and the enclosing COW transaction
+    /// restores both book and sidecars.
+    fn release_stp_cancellations(
+        &mut self,
+        market: MarketId,
+        instrument: u16,
+        incoming_account: AccountId,
+        market_type: MarketType,
+        cancellations: &[orderbook::StpCancellation],
+    ) -> Result<(), ExecutionError> {
+        for cancellation in cancellations {
+            if cancellation.account != incoming_account {
+                return Err(ExecutionError::StateInvariant(
+                    STP_CANCELLATION_ACCOUNT_MISMATCH,
+                ));
+            }
+            let key = (market.get(), instrument, cancellation.order_id.get());
+            let floor_notional = cancellation.price.notional(cancellation.remaining)?;
+
+            if is_claim_market(market_type) {
+                if self.order_reserves.contains_key(&key) {
+                    return Err(ExecutionError::StateInvariant(
+                        STP_CANCELLATION_SIDECAR_MISMATCH,
+                    ));
+                }
+                let record =
+                    self.claim_escrows
+                        .get(&key)
+                        .copied()
+                        .ok_or(ExecutionError::StateInvariant(
+                            STP_CANCELLATION_SIDECAR_MISMATCH,
+                        ))?;
+                if record.account != cancellation.account || record.side != cancellation.side {
+                    return Err(ExecutionError::StateInvariant(
+                        STP_CANCELLATION_SIDECAR_MISMATCH,
+                    ));
+                }
+                let remaining = Amount::from_raw(i128::from(cancellation.remaining.raw()));
+                let matches = match cancellation.side {
+                    Side::Ask => record.claims == remaining && record.premium == Amount::ZERO,
+                    Side::Bid => record.claims == Amount::ZERO && record.premium >= floor_notional,
+                };
+                if !matches {
+                    return Err(ExecutionError::StateInvariant(
+                        STP_CANCELLATION_SIDECAR_MISMATCH,
+                    ));
+                }
+                if self
+                    .release_claim_escrow(key, Some(incoming_account))?
+                    .is_none()
+                {
+                    return Err(ExecutionError::StateInvariant(
+                        STP_CANCELLATION_SIDECAR_MISMATCH,
+                    ));
+                }
+            } else {
+                if self.claim_escrows.contains_key(&key) {
+                    return Err(ExecutionError::StateInvariant(
+                        STP_CANCELLATION_SIDECAR_MISMATCH,
+                    ));
+                }
+                match self.order_reserves.get(&key).copied() {
+                    Some(record) => {
+                        if record.account != cancellation.account
+                            || record.qty_remaining != cancellation.remaining
+                            || record.reserved != floor_notional
+                        {
+                            return Err(ExecutionError::StateInvariant(
+                                STP_CANCELLATION_SIDECAR_MISMATCH,
+                            ));
+                        }
+                        self.risk.release_resting(record.account, record.reserved)?;
+                        self.order_reserves.remove(&key);
+                    }
+                    None if floor_notional == Amount::ZERO => {}
+                    None => {
+                        return Err(ExecutionError::StateInvariant(
+                            STP_CANCELLATION_SIDECAR_MISMATCH,
+                        ));
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1960,6 +2057,19 @@ impl Engine {
                     client_id: c.client_id,
                     reduce_only: c.reduce_only,
                 };
+                let order_key = (c.market.get(), c.instrument, c.order_id.get());
+                let already_rests = self
+                    .books
+                    .get(&(c.market.get(), c.instrument))
+                    .is_some_and(|book| book.contains(c.order_id));
+                if !already_rests
+                    && (self.order_reserves.contains_key(&order_key)
+                        || self.claim_escrows.contains_key(&order_key))
+                {
+                    return Err(ExecutionError::StateInvariant(
+                        FRESH_ORDER_SIDECAR_COLLISION,
+                    ));
+                }
                 // Market orders margin from executable depth; limit orders use
                 // their limit price. See `pretrade_notional`.
                 let notional =
@@ -2015,12 +2125,20 @@ impl Engine {
                 // `execute`), so the book submits through its non-deduplicating
                 // path: a book-local dedup here could replay stale fills that this
                 // handler would then re-apply to both counterparties.
-                let result = book.place(new_order)?;
+                let report = book.place_with_report(new_order)?;
+                let result = report.result;
                 let filled = result.filled_quantity();
                 let rested = matches!(
                     result.outcome,
                     OrderOutcome::Resting { .. } | OrderOutcome::PartiallyFilledResting { .. }
                 );
+                self.release_stp_cancellations(
+                    c.market,
+                    c.instrument,
+                    c.account,
+                    meta_type,
+                    &report.stp_cancelled,
+                )?;
                 let touched = self.apply_fills(c.market, c.instrument, &result)?;
                 // Escrow (claims) or reserve IM (perps) for any residual that
                 // rests on the book.
@@ -2037,20 +2155,16 @@ impl Engine {
                         // ask over the same claims — or a bid promising cash
                         // `available` does not hold — fails closed right here.
                         self.escrow_claim_resting(
-                            (c.market.get(), c.instrument, c.order_id.get()),
-                            c.account,
-                            c.side,
-                            c.price,
-                            remaining,
+                            order_key, c.account, c.side, c.price, remaining,
                         )?;
                     } else {
-                        let (rest_notional, rest_qty) =
-                            Self::residual_notional(&result, c.price, c.quantity)?;
-                        // Limit orders use their limit price; market residuals
-                        // do not rest.
+                        // Use the book's actual resting outcome, not requested
+                        // minus filled: reduce-only orders may clamp before
+                        // matching, and the sidecar must describe that clamped
+                        // quantity exactly for later fill/STP reconciliation.
                         let (rest_notional, rest_qty) =
                             if !matches!(c.order_type, OrderType::Market) && c.price.raw() > 0 {
-                                (rest_notional, rest_qty)
+                                (c.price.notional(remaining)?, remaining)
                             } else {
                                 (Amount::ZERO, Quantity::ZERO)
                             };
@@ -2218,7 +2332,15 @@ impl Engine {
                     .books
                     .get_mut(&(c.market.get(), instrument))
                     .ok_or(ExecutionError::UnknownMarket)?;
-                let result = book.replace(c.order_id, c.price, c.quantity)?;
+                let report = book.replace_with_report(c.order_id, c.price, c.quantity)?;
+                let result = report.result;
+                self.release_stp_cancellations(
+                    c.market,
+                    instrument,
+                    c.account,
+                    meta_type,
+                    &report.stp_cancelled,
+                )?;
                 let touched = self.apply_fills(c.market, instrument, &result)?;
                 let filled = result.filled_quantity();
                 let rested = matches!(
@@ -3750,6 +3872,18 @@ mod tests {
             }
         }
 
+        // Every per-order perp reserve must reconcile exactly with the risk
+        // engine's per-account aggregate. This catches both stranded STP maker
+        // records and double releases that an account-level root alone cannot
+        // localize.
+        let mut resting_by_account: HashMap<u32, i128> = HashMap::new();
+        for reserve in e.order_reserves.values() {
+            let total = resting_by_account.entry(reserve.account.get()).or_default();
+            *total = total
+                .checked_add(reserve.reserved.raw())
+                .expect("test reserve aggregate must not overflow");
+        }
+
         for i in 0..n {
             let a = AccountId::from_index(i).unwrap();
             // The committed account leaf folds ledger balances, risk collateral and
@@ -3766,6 +3900,11 @@ mod tests {
             assert_eq!(
                 reserved, expected,
                 "account {i} reserved {reserved} != pending withdrawals {expected}",
+            );
+            assert_eq!(
+                e.risk.reserved_resting(a).unwrap().raw(),
+                resting_by_account.get(&a.get()).copied().unwrap_or(0),
+                "account {i} risk resting reserve diverged from per-order records",
             );
         }
 
@@ -5501,6 +5640,629 @@ mod tests {
         assert_eq!(
             hex::encode(e.state_root().as_bytes()),
             "16873ec5c49c71a33f4efb6f8e73d1d714ed5a8dc34644d76efdb8b14bd60693",
+        );
+    }
+
+    #[test]
+    fn stp_place_releases_perp_maker_reserve() {
+        let mut engine = engine_with_caps(4, 4);
+        engine.execute(seq(1), create_account(100_000_000)).unwrap();
+        engine.execute(seq(2), create_perp(0, 1_000_000)).unwrap();
+        let account = AccountId::new(0);
+
+        engine
+            .execute(seq(3), place(0, 0, 1, Side::Ask, 1_000_000, 10_000_000))
+            .unwrap();
+        assert_eq!(
+            engine.risk.reserved_resting(account).unwrap(),
+            Amount::from_raw(10_000_000)
+        );
+
+        engine
+            .execute(
+                seq(4),
+                place_at(
+                    0,
+                    0,
+                    2,
+                    Side::Bid,
+                    1_000_000,
+                    4_000_000,
+                    0,
+                    TimeInForce::Ioc,
+                ),
+            )
+            .unwrap();
+
+        assert!(engine.order_reserves.is_empty());
+        assert_eq!(engine.risk.reserved_resting(account).unwrap(), Amount::ZERO);
+        assert_eq!(engine.market_resting_len(MarketId::new(0)), Some(0));
+        check_invariants(&engine);
+    }
+
+    #[test]
+    fn stp_zero_notional_perp_accepts_present_and_absent_reserve_forms() {
+        let mut engine = engine_with_caps(4, 4);
+        engine.execute(seq(1), create_account(100_000_000)).unwrap();
+        engine.execute(seq(2), create_perp(0, 1_000_000)).unwrap();
+        let account = AccountId::new(0);
+
+        // floor(1 * 500_000 / 1_000_000) = 0. The frozen optimized GTC path
+        // materializes an exact-zero sidecar, which STP must validate and
+        // release through risk like every other present reserve record.
+        engine
+            .execute(seq(3), place(0, 0, 1, Side::Ask, 1, 500_000))
+            .unwrap();
+        let reserve = engine.order_reserves.get(&(0, 0, 1)).unwrap();
+        assert_eq!(reserve.account, account);
+        assert_eq!(reserve.reserved, Amount::ZERO);
+        assert_eq!(reserve.qty_remaining, Quantity::from_raw(500_000));
+        assert_eq!(engine.risk.reserved_resting(account).unwrap(), Amount::ZERO);
+        assert_eq!(engine.market_resting_len(MarketId::new(0)), Some(1));
+
+        engine
+            .execute(
+                seq(4),
+                place_at(0, 0, 2, Side::Bid, 1, 1, 0, TimeInForce::Ioc),
+            )
+            .unwrap();
+
+        assert!(engine.order_reserves.is_empty());
+        assert_eq!(engine.risk.reserved_resting(account).unwrap(), Amount::ZERO);
+        assert_eq!(engine.market_resting_len(MarketId::new(0)), Some(0));
+
+        // The general PostOnly producer routes through reserve_order, which
+        // canonically omits a zero-valued record. The same STP reconciliation
+        // therefore also accepts the absent representation.
+        engine
+            .execute(
+                seq(5),
+                Command::PlaceOrder(PlaceOrder {
+                    account,
+                    market: MarketId::new(0),
+                    order_id: OrderId::new(3),
+                    side: Side::Ask,
+                    order_type: OrderType::PostOnly,
+                    tif: TimeInForce::Gtc,
+                    price: Price::from_raw(1),
+                    quantity: Quantity::from_raw(500_000),
+                    client_id: 3,
+                    reduce_only: false,
+                    instrument: 0,
+                    auth: Authorization::Master,
+                }),
+            )
+            .unwrap();
+        assert!(engine.order_reserves.is_empty());
+        assert_eq!(engine.market_resting_len(MarketId::new(0)), Some(1));
+        engine
+            .execute(
+                seq(6),
+                place_at(0, 0, 4, Side::Bid, 1, 1, 0, TimeInForce::Ioc),
+            )
+            .unwrap();
+        assert!(engine.order_reserves.is_empty());
+        assert_eq!(engine.risk.reserved_resting(account).unwrap(), Amount::ZERO);
+        assert_eq!(engine.market_resting_len(MarketId::new(0)), Some(0));
+        check_invariants(&engine);
+    }
+
+    #[test]
+    fn stp_replace_releases_crossed_perp_maker_reserve() {
+        let mut engine = engine_with_caps(4, 4);
+        engine.execute(seq(1), create_account(100_000_000)).unwrap();
+        engine.execute(seq(2), create_perp(0, 1_000_000)).unwrap();
+        let account = AccountId::new(0);
+        let market = MarketId::new(0);
+
+        engine
+            .execute(seq(3), place(0, 0, 1, Side::Ask, 1_000_000, 5_000_000))
+            .unwrap();
+        engine
+            .execute(seq(4), place(0, 0, 2, Side::Bid, 900_000, 3_000_000))
+            .unwrap();
+        engine
+            .execute(
+                seq(5),
+                Command::ReplaceOrder(ReplaceOrder {
+                    market,
+                    account,
+                    order_id: OrderId::new(2),
+                    price: Price::from_raw(1_000_000),
+                    quantity: Quantity::from_raw(3_000_000),
+                    auth: Authorization::Master,
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(engine.order_reserves.len(), 1);
+        assert!(!engine.order_reserves.contains_key(&(0, 0, 1)));
+        let reserve = engine.order_reserves.get(&(0, 0, 2)).unwrap();
+        assert_eq!(reserve.account, account);
+        assert_eq!(reserve.reserved, Amount::from_raw(3_000_000));
+        assert_eq!(reserve.qty_remaining, Quantity::from_raw(3_000_000));
+        assert_eq!(
+            engine.risk.reserved_resting(account).unwrap(),
+            Amount::from_raw(3_000_000)
+        );
+        check_invariants(&engine);
+    }
+
+    #[test]
+    fn stp_place_releases_claim_bid_and_ask_escrows() {
+        let mut engine = engine_with_caps(4, 4);
+        engine.execute(seq(1), create_account(100_000_000)).unwrap();
+        engine.execute(seq(2), create_claim(0)).unwrap();
+        engine.execute(seq(3), mint(0, 0, 10_000_000)).unwrap();
+        let account = AccountId::new(0);
+        let market = MarketId::new(0);
+
+        engine
+            .execute(seq(4), place(0, 0, 1, Side::Bid, 400_000, 10_000_000))
+            .unwrap();
+        assert_eq!(
+            engine.premium_escrowed(account, market),
+            Amount::from_raw(4_000_000)
+        );
+        engine
+            .execute(
+                seq(5),
+                place_at(0, 0, 2, Side::Ask, 400_000, 10_000_000, 0, TimeInForce::Ioc),
+            )
+            .unwrap();
+        assert_eq!(engine.premium_escrowed(account, market), Amount::ZERO);
+        assert_eq!(engine.ledger.escrowed(account).unwrap(), Amount::ZERO);
+        assert_eq!(
+            engine.claim_balance(account, market, 0),
+            Amount::from_raw(10_000_000)
+        );
+
+        engine
+            .execute(seq(6), place(0, 0, 3, Side::Ask, 400_000, 10_000_000))
+            .unwrap();
+        assert_eq!(
+            engine.claims_escrowed(account, market, 0),
+            Amount::from_raw(10_000_000)
+        );
+        engine
+            .execute(
+                seq(7),
+                place_at(0, 0, 4, Side::Bid, 400_000, 10_000_000, 0, TimeInForce::Ioc),
+            )
+            .unwrap();
+        assert_eq!(engine.claims_escrowed(account, market, 0), Amount::ZERO);
+        assert_eq!(
+            engine.claim_balance(account, market, 0),
+            Amount::from_raw(10_000_000)
+        );
+        assert!(engine.claim_escrows.is_empty());
+        check_invariants(&engine);
+    }
+
+    #[test]
+    fn stp_claim_bid_release_accepts_legitimate_floor_rounding_dust() {
+        let mut engine = engine_with_caps(4, 4);
+        engine.execute(seq(1), create_account(100_000_000)).unwrap();
+        engine.execute(seq(2), create_account(100_000_000)).unwrap();
+        engine.execute(seq(3), create_claim(0)).unwrap();
+        engine.execute(seq(4), mint(1, 0, 10)).unwrap();
+        let buyer = AccountId::new(0);
+        let market = MarketId::new(0);
+
+        // floor(0.333333 * 10 raw units) = 3 micro-units are escrowed.
+        engine
+            .execute(seq(5), place(0, 0, 1, Side::Bid, 333_333, 10))
+            .unwrap();
+        // A one-unit fill costs floor(0.333333) = 0, so the maker now has nine
+        // units remaining with 3 escrowed even though floor(0.333333 * 9) = 2.
+        engine
+            .execute(
+                seq(6),
+                place_at(1, 0, 2, Side::Ask, 333_333, 1, 0, TimeInForce::Ioc),
+            )
+            .unwrap();
+        let maker = engine.claim_escrows.get(&(0, 0, 1)).unwrap();
+        assert_eq!(maker.premium, Amount::from_raw(3));
+        assert_eq!(maker.claims, Amount::ZERO);
+        assert_eq!(engine.premium_escrowed(buyer, market), Amount::from_raw(3));
+
+        // The buyer owns the one acquired claim and may submit it back. STP
+        // removes the remaining self bid; validation must accept premium >=
+        // the current floor and release the legitimate one-unit rounding dust.
+        engine
+            .execute(
+                seq(7),
+                place_at(0, 0, 3, Side::Ask, 333_333, 1, 0, TimeInForce::Ioc),
+            )
+            .unwrap();
+
+        assert!(engine.claim_escrows.is_empty());
+        assert_eq!(engine.premium_escrowed(buyer, market), Amount::ZERO);
+        assert_eq!(engine.ledger.escrowed(buyer).unwrap(), Amount::ZERO);
+        assert_eq!(
+            engine.ledger.available(buyer).unwrap(),
+            Amount::from_raw(100_000_000)
+        );
+        assert_eq!(engine.claim_balance(buyer, market, 0), Amount::from_raw(1));
+        check_invariants(&engine);
+    }
+
+    #[test]
+    fn stp_claim_replace_releases_crossed_ask_and_reescrows_replacement() {
+        let mut engine = engine_with_caps(4, 4);
+        engine.execute(seq(1), create_account(100_000_000)).unwrap();
+        engine.execute(seq(2), create_claim(0)).unwrap();
+        engine.execute(seq(3), mint(0, 0, 10_000_000)).unwrap();
+        let account = AccountId::new(0);
+        let market = MarketId::new(0);
+
+        engine
+            .execute(seq(4), place(0, 0, 1, Side::Ask, 400_000, 5_000_000))
+            .unwrap();
+        engine
+            .execute(seq(5), place(0, 0, 2, Side::Bid, 300_000, 2_000_000))
+            .unwrap();
+        engine
+            .execute(
+                seq(6),
+                Command::ReplaceOrder(ReplaceOrder {
+                    market,
+                    account,
+                    order_id: OrderId::new(2),
+                    price: Price::from_raw(400_000),
+                    quantity: Quantity::from_raw(2_000_000),
+                    auth: Authorization::Master,
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(engine.claims_escrowed(account, market, 0), Amount::ZERO);
+        assert_eq!(
+            engine.claim_balance(account, market, 0),
+            Amount::from_raw(10_000_000)
+        );
+        assert_eq!(
+            engine.premium_escrowed(account, market),
+            Amount::from_raw(800_000)
+        );
+        assert!(!engine.claim_escrows.contains_key(&(0, 0, 1)));
+        let replacement = engine.claim_escrows.get(&(0, 0, 2)).unwrap();
+        assert_eq!(replacement.account, account);
+        assert_eq!(replacement.side, Side::Bid);
+        assert_eq!(replacement.premium, Amount::from_raw(800_000));
+        assert_eq!(replacement.claims, Amount::ZERO);
+        assert!(engine.order_reserves.is_empty());
+        check_invariants(&engine);
+    }
+
+    #[test]
+    fn stp_self_cancel_then_third_party_fill_reconciles_both_sidecars() {
+        let mut engine = engine_with_caps(4, 4);
+        engine.execute(seq(1), create_account(100_000_000)).unwrap();
+        engine.execute(seq(2), create_account(100_000_000)).unwrap();
+        engine.execute(seq(3), create_perp(0, 1_000_000)).unwrap();
+        engine
+            .execute(seq(4), place(0, 0, 1, Side::Ask, 1_000_000, 2_000_000))
+            .unwrap();
+        engine
+            .execute(seq(5), place(1, 0, 2, Side::Ask, 1_000_000, 3_000_000))
+            .unwrap();
+
+        let receipt = engine
+            .execute(
+                seq(6),
+                place_at(
+                    0,
+                    0,
+                    3,
+                    Side::Bid,
+                    1_000_000,
+                    3_000_000,
+                    0,
+                    TimeInForce::Ioc,
+                ),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            receipt.kind,
+            ReceiptKind::OrderApplied { filled, rested: false }
+                if filled == Quantity::from_raw(3_000_000)
+        ));
+        assert!(engine.order_reserves.is_empty());
+        assert_eq!(
+            engine
+                .risk
+                .position(AccountId::new(0), MarketId::new(0))
+                .unwrap(),
+            Quantity::from_raw(3_000_000)
+        );
+        assert_eq!(
+            engine
+                .risk
+                .position(AccountId::new(1), MarketId::new(0))
+                .unwrap(),
+            Quantity::from_raw(-3_000_000)
+        );
+        check_invariants(&engine);
+    }
+
+    #[test]
+    fn stp_released_order_key_can_be_reused_without_aggregate_drift() {
+        let mut engine = engine_with_caps(4, 4);
+        engine.execute(seq(1), create_account(100_000_000)).unwrap();
+        engine.execute(seq(2), create_perp(0, 1_000_000)).unwrap();
+        let account = AccountId::new(0);
+        engine
+            .execute(seq(3), place(0, 0, 1, Side::Ask, 1_000_000, 4_000_000))
+            .unwrap();
+        engine
+            .execute(
+                seq(4),
+                place_at(
+                    0,
+                    0,
+                    2,
+                    Side::Bid,
+                    1_000_000,
+                    1_000_000,
+                    0,
+                    TimeInForce::Ioc,
+                ),
+            )
+            .unwrap();
+
+        engine
+            .execute(
+                seq(5),
+                Command::PlaceOrder(PlaceOrder {
+                    account,
+                    market: MarketId::new(0),
+                    order_id: OrderId::new(1),
+                    side: Side::Bid,
+                    order_type: OrderType::Limit,
+                    tif: TimeInForce::Gtc,
+                    price: Price::from_raw(900_000),
+                    quantity: Quantity::from_raw(2_000_000),
+                    client_id: 99,
+                    reduce_only: false,
+                    instrument: 0,
+                    auth: Authorization::Master,
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(engine.order_reserves.len(), 1);
+        let reserve = engine.order_reserves.get(&(0, 0, 1)).unwrap();
+        assert_eq!(reserve.account, account);
+        assert_eq!(reserve.reserved, Amount::from_raw(1_800_000));
+        assert_eq!(reserve.qty_remaining, Quantity::from_raw(2_000_000));
+        assert_eq!(
+            engine.risk.reserved_resting(account).unwrap(),
+            Amount::from_raw(1_800_000)
+        );
+        check_invariants(&engine);
+    }
+
+    #[test]
+    fn clamped_reduce_only_place_reserves_actual_qty_and_stp_releases_it() {
+        let mut engine = engine_with_caps(4, 4);
+        engine.execute(seq(1), create_account(100_000_000)).unwrap();
+        engine.execute(seq(2), create_account(100_000_000)).unwrap();
+        engine.execute(seq(3), create_perp(0, 1_000_000)).unwrap();
+        // Account 0 becomes long three units.
+        engine
+            .execute(seq(4), place(1, 0, 10, Side::Ask, 1_000_000, 3_000_000))
+            .unwrap();
+        engine
+            .execute(seq(5), place(0, 0, 11, Side::Bid, 1_000_000, 3_000_000))
+            .unwrap();
+        let account = AccountId::new(0);
+        assert_eq!(
+            engine.risk.position(account, MarketId::new(0)).unwrap(),
+            Quantity::from_raw(3_000_000)
+        );
+
+        let reduce_flag = Command::PlaceOrder(PlaceOrder {
+            account,
+            market: MarketId::new(0),
+            order_id: OrderId::new(20),
+            side: Side::Ask,
+            order_type: OrderType::Limit,
+            tif: TimeInForce::Gtc,
+            price: Price::from_raw(1_100_000),
+            quantity: Quantity::from_raw(10_000_000),
+            client_id: 20,
+            reduce_only: true,
+            instrument: 0,
+            auth: Authorization::Master,
+        });
+        engine.execute(seq(6), reduce_flag).unwrap();
+        let reserve = engine.order_reserves.get(&(0, 0, 20)).unwrap();
+        assert_eq!(reserve.qty_remaining, Quantity::from_raw(3_000_000));
+        assert_eq!(reserve.reserved, Amount::from_raw(3_300_000));
+        engine
+            .execute(
+                seq(7),
+                place_at(
+                    0,
+                    0,
+                    21,
+                    Side::Bid,
+                    1_100_000,
+                    1_000_000,
+                    0,
+                    TimeInForce::Ioc,
+                ),
+            )
+            .unwrap();
+        assert!(engine.order_reserves.is_empty());
+        assert_eq!(engine.risk.reserved_resting(account).unwrap(), Amount::ZERO);
+
+        let reduce_type = Command::PlaceOrder(PlaceOrder {
+            account,
+            market: MarketId::new(0),
+            order_id: OrderId::new(30),
+            side: Side::Ask,
+            order_type: OrderType::ReduceOnly,
+            tif: TimeInForce::Gtc,
+            price: Price::from_raw(1_200_000),
+            quantity: Quantity::from_raw(10_000_000),
+            client_id: 30,
+            reduce_only: false,
+            instrument: 0,
+            auth: Authorization::Master,
+        });
+        engine.execute(seq(8), reduce_type).unwrap();
+        let reserve = engine.order_reserves.get(&(0, 0, 30)).unwrap();
+        assert_eq!(reserve.qty_remaining, Quantity::from_raw(3_000_000));
+        assert_eq!(reserve.reserved, Amount::from_raw(3_600_000));
+        engine
+            .execute(
+                seq(9),
+                place_at(
+                    0,
+                    0,
+                    31,
+                    Side::Bid,
+                    1_200_000,
+                    1_000_000,
+                    0,
+                    TimeInForce::Ioc,
+                ),
+            )
+            .unwrap();
+        assert!(engine.order_reserves.is_empty());
+        assert_eq!(engine.risk.reserved_resting(account).unwrap(), Amount::ZERO);
+        check_invariants(&engine);
+    }
+
+    #[test]
+    fn fresh_place_sidecar_collisions_reject_before_book_mutation() {
+        let mut base = engine_with_caps(4, 4);
+        base.execute(seq(1), create_account(100_000_000)).unwrap();
+        base.execute(seq(2), create_perp(0, 1_000_000)).unwrap();
+        let key = (0, 0, 77);
+
+        let mut reserve_collision = base.clone();
+        reserve_collision.order_reserves.insert(
+            key,
+            OrderReserve {
+                account: AccountId::new(0),
+                reserved: Amount::ZERO,
+                qty_remaining: Quantity::ZERO,
+            },
+        );
+        let before_root = reserve_collision.transition_root_v1().unwrap();
+        let before_bytes = reserve_collision
+            .books
+            .get(&(0, 0))
+            .unwrap()
+            .encode_state_v3_bounded(usize::MAX)
+            .unwrap();
+        assert_eq!(
+            reserve_collision.execute(seq(3), place(0, 0, 77, Side::Bid, 900_000, 1_000_000)),
+            Err(ExecutionError::StateInvariant(
+                FRESH_ORDER_SIDECAR_COLLISION
+            ))
+        );
+        assert_eq!(reserve_collision.transition_root_v1().unwrap(), before_root);
+        assert_eq!(
+            reserve_collision
+                .books
+                .get(&(0, 0))
+                .unwrap()
+                .encode_state_v3_bounded(usize::MAX)
+                .unwrap(),
+            before_bytes
+        );
+
+        let mut claim_collision = base;
+        claim_collision.claim_escrows.insert(
+            key,
+            ClaimOrderEscrow {
+                account: AccountId::new(0),
+                side: Side::Bid,
+                premium: Amount::ZERO,
+                claims: Amount::ZERO,
+            },
+        );
+        let before_root = claim_collision.transition_root_v1().unwrap();
+        let before_bytes = claim_collision
+            .books
+            .get(&(0, 0))
+            .unwrap()
+            .encode_state_v3_bounded(usize::MAX)
+            .unwrap();
+        assert_eq!(
+            claim_collision.execute(seq(3), place(0, 0, 77, Side::Bid, 900_000, 1_000_000)),
+            Err(ExecutionError::StateInvariant(
+                FRESH_ORDER_SIDECAR_COLLISION
+            ))
+        );
+        assert_eq!(claim_collision.transition_root_v1().unwrap(), before_root);
+        assert_eq!(
+            claim_collision
+                .books
+                .get(&(0, 0))
+                .unwrap()
+                .encode_state_v3_bounded(usize::MAX)
+                .unwrap(),
+            before_bytes
+        );
+    }
+
+    #[test]
+    fn malformed_stp_maker_sidecar_rolls_back_book_and_engine_bytes() {
+        let mut engine = engine_with_caps(4, 4);
+        engine.execute(seq(1), create_account(100_000_000)).unwrap();
+        engine.execute(seq(2), create_perp(0, 1_000_000)).unwrap();
+        engine
+            .execute(seq(3), place(0, 0, 1, Side::Ask, 1_000_000, 4_000_000))
+            .unwrap();
+        engine.order_reserves.get_mut(&(0, 0, 1)).unwrap().reserved = Amount::from_raw(4_000_001);
+
+        let before_root = engine.transition_root_v1().unwrap();
+        let before_fingerprint = fingerprint(&engine);
+        let before_book = engine
+            .books
+            .get(&(0, 0))
+            .unwrap()
+            .encode_state_v3_bounded(usize::MAX)
+            .unwrap();
+        assert_eq!(
+            engine.execute(
+                seq(4),
+                place_at(
+                    0,
+                    0,
+                    2,
+                    Side::Bid,
+                    1_000_000,
+                    1_000_000,
+                    0,
+                    TimeInForce::Ioc,
+                ),
+            ),
+            Err(ExecutionError::StateInvariant(
+                STP_CANCELLATION_SIDECAR_MISMATCH
+            ))
+        );
+        assert_eq!(engine.transition_root_v1().unwrap(), before_root);
+        assert_eq!(fingerprint(&engine), before_fingerprint);
+        assert_eq!(
+            engine
+                .books
+                .get(&(0, 0))
+                .unwrap()
+                .encode_state_v3_bounded(usize::MAX)
+                .unwrap(),
+            before_book
+        );
+        assert_eq!(engine.market_resting_len(MarketId::new(0)), Some(1));
+        assert_eq!(
+            engine.order_reserves.get(&(0, 0, 1)).unwrap().reserved,
+            Amount::from_raw(4_000_001)
         );
     }
 

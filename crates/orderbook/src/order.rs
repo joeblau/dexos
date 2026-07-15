@@ -134,6 +134,38 @@ pub struct MatchResult {
     pub outcome: OrderOutcome,
 }
 
+/// A resting self order removed by self-trade prevention while matching an
+/// incoming order.
+///
+/// This is a transient execution report. It is deliberately excluded from the
+/// book's client-id deduplication records and canonical v3 state encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StpCancellation {
+    /// Resting order removed by the STP policy.
+    pub order_id: OrderId,
+    /// Account that owned the resting order.
+    pub account: AccountId,
+    /// Side of the removed resting order.
+    pub side: Side,
+    /// Resting limit price at removal.
+    pub price: Price,
+    /// Quantity still resting immediately before removal.
+    pub remaining: Quantity,
+}
+
+/// Match result plus transient maker cancellations caused by STP.
+///
+/// Cancellations are emitted in exact matching encounter order. They are an
+/// integration side channel for callers that keep collateral or escrow state
+/// alongside the book; they are never persisted in book state or dedup caches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchReport {
+    /// The legacy match result.
+    pub result: MatchResult,
+    /// Resting self orders removed during this match, in encounter order.
+    pub stp_cancelled: Vec<StpCancellation>,
+}
+
 impl MatchResult {
     /// A rejection with no fills.
     #[must_use]
