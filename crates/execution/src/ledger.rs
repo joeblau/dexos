@@ -445,6 +445,13 @@ impl Ledger {
     pub fn conservation_holds(&self) -> bool {
         self.validate_transition_invariants().is_ok()
     }
+
+    /// Deliberately break supply conservation for outer-root error propagation
+    /// tests. Production code has no unchecked mutation path to this field.
+    #[cfg(test)]
+    pub(crate) fn corrupt_total_supply_for_test(&mut self) {
+        self.total_supply = Amount::from_raw(self.total_supply.raw() + 1);
+    }
 }
 
 #[cfg(test)]

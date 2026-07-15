@@ -99,6 +99,61 @@ impl<T> Slab<T> {
         self.len == self.capacity
     }
 
+    /// Fail-stop validation for every allocator field read by a future insert
+    /// or remove. Free-list order is intentionally non-logical, but it must be
+    /// a duplicate-free permutation of every free entry.
+    pub(crate) fn validate_representation(&self, expected_capacity: usize) {
+        assert_eq!(
+            self.capacity, expected_capacity,
+            "slab capacity must match the logical book configuration"
+        );
+        assert!(
+            self.entries.len() <= self.capacity,
+            "slab entries must not exceed capacity"
+        );
+        let occupied = self
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry, Entry::Occupied(_)))
+            .count();
+        assert_eq!(
+            occupied, self.len,
+            "slab live count must equal its occupied entries"
+        );
+
+        let stored_free = self
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry, Entry::Free(_)))
+            .count();
+        let mut current = self.free_head;
+        let mut free_count = 0usize;
+        while current != NIL {
+            let index = usize::try_from(current).expect("free-list slot must fit usize");
+            assert!(
+                index < self.entries.len(),
+                "slab free list must reference an existing entry"
+            );
+            current = match &self.entries[index] {
+                Entry::Free(next) => {
+                    assert!(
+                        free_count < stored_free,
+                        "slab free list must not contain a cycle"
+                    );
+                    free_count += 1;
+                    *next
+                }
+                Entry::Occupied(_) => {
+                    panic!("slab free list must reference only free entries")
+                }
+            };
+        }
+        assert_eq!(
+            free_count, stored_free,
+            "slab free list must cover every free entry exactly once"
+        );
+    }
+
     /// Insert `value`, returning its slot index.
     ///
     /// Prefers a recycled slot from the free list (LIFO); otherwise grows the
@@ -284,6 +339,50 @@ mod tests {
         // A clone of a completely empty slab keeps its reservation too.
         let empty: Slab<u64> = Slab::with_capacity(16);
         assert!(empty.clone().entries.capacity() >= 16);
+    }
+
+    #[test]
+    fn representation_validator_accepts_reuse_and_rejects_bad_capacity() {
+        let mut slab = Slab::with_capacity(4);
+        let first = slab.insert(1).unwrap();
+        slab.insert(2).unwrap();
+        slab.remove(first).unwrap();
+        slab.validate_representation(4);
+
+        let mismatch = std::panic::catch_unwind(|| slab.validate_representation(5));
+        assert!(mismatch.is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "slab free list must reference only free entries")]
+    fn representation_validator_rejects_free_list_into_live_entry() {
+        let mut slab = Slab::with_capacity(2);
+        let live = slab.insert(1).unwrap();
+        slab.free_head = live;
+        slab.validate_representation(2);
+    }
+
+    #[test]
+    #[should_panic(expected = "slab free list must not contain a cycle")]
+    fn representation_validator_rejects_free_list_cycle() {
+        let mut slab = Slab::with_capacity(2);
+        let first = slab.insert(1).unwrap();
+        let second = slab.insert(2).unwrap();
+        slab.remove(first).unwrap();
+        slab.remove(second).unwrap();
+        slab.entries[usize::try_from(second).unwrap()] = Entry::Free(second);
+        slab.free_head = second;
+        slab.validate_representation(2);
+    }
+
+    #[test]
+    #[should_panic(expected = "slab free list must cover every free entry exactly once")]
+    fn representation_validator_rejects_unlinked_free_entry() {
+        let mut slab = Slab::with_capacity(2);
+        let first = slab.insert(1).unwrap();
+        slab.remove(first).unwrap();
+        slab.free_head = NIL;
+        slab.validate_representation(2);
     }
 
     #[test]

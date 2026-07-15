@@ -14,6 +14,12 @@ pub enum MerkleError {
     /// Leaf index is beyond the tree capacity.
     #[error("merkle leaf index out of range")]
     IndexOutOfRange,
+    /// Capacity/node storage is not a complete fixed-capacity tree.
+    #[error("merkle tree representation has an invalid shape")]
+    InvalidRepresentation,
+    /// A stored internal node disagrees with the hash of its children.
+    #[error("merkle tree contains an inconsistent internal node")]
+    InconsistentInternalNode,
 }
 
 /// A fixed-capacity incremental Merkle tree.
@@ -80,6 +86,31 @@ impl MerkleTree {
     /// The current root (O(1)).
     pub fn root(&self) -> Hash {
         self.nodes[1]
+    }
+
+    /// Validate the complete incremental representation against its leaves.
+    ///
+    /// The root alone commits the leaves cryptographically, but future
+    /// incremental updates also read off-path stored internal nodes. Recovery
+    /// must reject a tree whose cached nodes are not the exact bottom-up hashes
+    /// of those leaves before treating its root as authoritative.
+    pub fn validate_invariants(&self) -> Result<(), MerkleError> {
+        let expected_nodes = self
+            .capacity
+            .checked_mul(2)
+            .ok_or(MerkleError::InvalidRepresentation)?;
+        if self.capacity == 0
+            || !self.capacity.is_power_of_two()
+            || self.nodes.len() != expected_nodes
+        {
+            return Err(MerkleError::InvalidRepresentation);
+        }
+        for index in (1..self.capacity).rev() {
+            if self.nodes[index] != hash_node(self.nodes[2 * index], self.nodes[2 * index + 1]) {
+                return Err(MerkleError::InconsistentInternalNode);
+            }
+        }
+        Ok(())
     }
 
     /// An inclusion proof (sibling hashes from leaf to root) for `index`.
@@ -222,5 +253,35 @@ mod tests {
             let proof: Vec<Hash> = (0..plen).map(|_| r.leaf()).collect();
             let _ = verify_proof(r.leaf(), index, r.leaf(), &proof);
         }
+    }
+
+    #[test]
+    fn validator_rejects_equal_root_off_path_corruption_before_future_divergence() {
+        let mut valid = MerkleTree::new(8);
+        valid.set(0, Hash::from_bytes([1; 32])).unwrap();
+        valid.set(7, Hash::from_bytes([2; 32])).unwrap();
+        assert_eq!(valid.validate_invariants(), Ok(()));
+
+        let mut corrupt = valid.clone();
+        corrupt.nodes[3] = Hash::from_bytes([0xCC; 32]);
+        assert_eq!(corrupt.root(), valid.root());
+        assert_eq!(
+            corrupt.validate_invariants(),
+            Err(MerkleError::InconsistentInternalNode)
+        );
+
+        valid.set(1, Hash::from_bytes([3; 32])).unwrap();
+        corrupt.set(1, Hash::from_bytes([3; 32])).unwrap();
+        assert_ne!(corrupt.root(), valid.root());
+    }
+
+    #[test]
+    fn validator_rejects_invalid_representation_shape() {
+        let mut tree = MerkleTree::new(4);
+        tree.nodes.pop();
+        assert_eq!(
+            tree.validate_invariants(),
+            Err(MerkleError::InvalidRepresentation)
+        );
     }
 }

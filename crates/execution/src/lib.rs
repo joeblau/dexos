@@ -19,8 +19,9 @@ pub use command::{
     ReplaceOrder, RequestWithdrawal, ResolveMarket, RevokeSession, SetMarkPrice,
     SetMarketLifecycle, SetOracleHealth, SettleMarket, Timestamp,
 };
-pub use engine::{Engine, EngineConfig, WalletBinding};
+pub use engine::{Engine, EngineConfig, WalletBinding, ENGINE_TRANSITION_ROOT_SCHEMA_VERSION};
 pub use error::ExecutionError;
+pub use idempotency::REPLAY_TRANSITION_ROOT_SCHEMA_VERSION;
 pub use ledger::{Ledger, LEDGER_TRANSITION_ROOT_SCHEMA_VERSION};
 pub use session::{SessionRegistry, SESSION_TRANSITION_ROOT_SCHEMA_VERSION};
 

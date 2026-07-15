@@ -836,6 +836,26 @@ fn transition_root_v3_rejects_corrupt_fifo_backward_link() {
 }
 
 #[test]
+#[should_panic(expected = "incremental order-leaf XOR must match the canonical live-order scan")]
+fn transition_root_v3_rejects_corrupt_incremental_root_cache() {
+    let mut book = OrderBook::new(cfg());
+    book.place(limit(1, 1, Side::Ask, 100, 5)).unwrap();
+    book.order_leaf_xor[0] ^= 1;
+
+    let _ = book.transition_root_v3();
+}
+
+#[test]
+#[should_panic(expected = "stored side-book role must match its engine field")]
+fn transition_root_v3_rejects_corrupt_side_book_role() {
+    let mut book = OrderBook::new(cfg());
+    book.place(limit(1, 1, Side::Bid, 100, 5)).unwrap();
+    book.bids.set_side_for_test(Side::Ask);
+
+    let _ = book.transition_root_v3();
+}
+
+#[test]
 fn transition_root_v3_binds_logical_config_and_positions() {
     let base = OrderBook::new(cfg());
     let root = base.transition_root_v3();
