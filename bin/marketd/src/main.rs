@@ -597,20 +597,14 @@ mod tests {
 
     #[test]
     fn repeated_role_flags_accumulate() {
-        let cli = Cli::try_parse_from([
-            "marketd",
-            "run",
-            "--role",
-            "validator",
-            "--role",
-            "sequencer",
-        ])
-        .unwrap();
+        let cli =
+            Cli::try_parse_from(["marketd", "run", "--role", "gateway", "--role", "observer"])
+                .unwrap();
         let Command::Run(args) = cli.command else {
             panic!("expected run");
         };
         let cfg = resolve_config(&args).unwrap();
-        assert_eq!(cfg.node.roles, vec![Role::Validator, Role::Sequencer]);
+        assert_eq!(cfg.node.roles, vec![Role::Gateway, Role::Observer]);
     }
 
     #[test]

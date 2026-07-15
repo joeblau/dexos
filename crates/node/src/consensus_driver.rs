@@ -49,6 +49,9 @@ pub enum DriverError {
     /// Execution completed for a block with no retained notarization proof.
     #[error("consensus-final block has no retained notarization proof")]
     MissingNotarization,
+    /// The P0 transport sequence cannot advance without wrapping.
+    #[error("consensus transport sequence exhausted")]
+    SequenceExhausted,
 }
 
 /// Node-owned driver for a single Minimmit replica.
@@ -110,7 +113,10 @@ impl ConsensusDriver {
                 MinimmitEffect::Broadcast(message) => {
                     let (msg_type, payload) = message.encode()?;
                     let sequence = self.next_sequence;
-                    self.next_sequence = self.next_sequence.wrapping_add(1);
+                    self.next_sequence = self
+                        .next_sequence
+                        .checked_add(1)
+                        .ok_or(DriverError::SequenceExhausted)?;
                     events.push(DriverEvent::Broadcast(Frame {
                         class: TrafficClass::Consensus,
                         msg_type,
@@ -331,5 +337,26 @@ mod tests {
                 DriverEvent::Commit { block, height: 1 },
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn broadcast_sequence_exhaustion_fails_closed() {
+        let (mut driver, _, keys) = driver();
+        driver.next_sequence = u64::MAX;
+        let block = Hash::from_bytes([9; 32]);
+        let digest = notarize_digest(0, 0, block);
+        let message = ConsensusMessage::Notarize(Notarize {
+            epoch: 0,
+            view: 0,
+            block_hash: block,
+            validator_index: 0,
+            signature: keys[0].sign(digest.as_bytes()),
+        });
+
+        assert!(matches!(
+            driver.drive(vec![MinimmitEffect::Broadcast(message)]),
+            Err(DriverError::SequenceExhausted)
+        ));
+        assert_eq!(driver.next_sequence, u64::MAX);
     }
 }

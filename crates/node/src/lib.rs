@@ -163,6 +163,21 @@ impl Node {
     /// ingress queue exists per role.
     pub fn new(config: NodeConfig) -> Result<Self, NodeError> {
         config.validate()?;
+        if config
+            .node
+            .roles
+            .iter()
+            .any(|role| role.requires_validator_set())
+        {
+            return Err(ConfigError::Unsupported {
+                field: "node.roles",
+                detail: "validator, sequencer, witness, and custody roles are release-blocked until the production RPC, WAL, consensus-safety, execution, checkpoint, and recovery composition is complete",
+            }
+            .into());
+        }
+        // `Node` is also a public construction boundary. Do not rely solely on
+        // the CLI loader to have checked TLS and storage paths.
+        config.validate_paths()?;
         let roles = config.effective_roles();
         let (shutdown_tx, _initial_rx) = watch::channel(false);
         let mut ingress = Vec::with_capacity(roles.len());
@@ -815,6 +830,28 @@ mod tests {
         bad.node.light = true;
         bad.node.roles = vec![Role::Validator];
         assert!(matches!(Node::new(bad), Err(NodeError::Config(_))));
+    }
+
+    #[test]
+    fn authoritative_placeholder_roles_fail_closed() {
+        for role in [
+            Role::Validator,
+            Role::Sequencer,
+            Role::Witness,
+            Role::Custody,
+        ] {
+            let err = Node::new(cfg_with_roles(false, vec![role])).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    NodeError::Config(ConfigError::Unsupported {
+                        field: "node.roles",
+                        ..
+                    })
+                ),
+                "{role:?}: {err}"
+            );
+        }
     }
 
     #[test]
