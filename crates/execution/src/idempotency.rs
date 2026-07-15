@@ -31,6 +31,16 @@ use types::{Hash, OrderType, Side, TimeInForce};
 use crate::command::{Command, ExecutionReceipt, PlaceOrder, ReceiptKind, RequestWithdrawal};
 use crate::error::ExecutionError;
 
+// The standalone decoder is staged for the outer Engine checkpoint codec. Until
+// that caller lands, its crate-private API is exercised only by this module's
+// tests; keep ordinary non-test library builds warning-clean without widening it.
+#[allow(dead_code)]
+mod state;
+#[allow(dead_code)]
+mod state_codec;
+
+pub(crate) use state::{ReplayStateError, ReplayStateLimits};
+
 /// Canonical complete replay-guard transition-root schema.
 pub const REPLAY_TRANSITION_ROOT_SCHEMA_VERSION: u16 = 1;
 
@@ -40,6 +50,16 @@ struct ReplayTransitionWriter {
 }
 
 impl ReplayTransitionWriter {
+    fn try_with_capacity(capacity: usize) -> Result<Self, ReplayStateError> {
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(capacity)
+            .map_err(|_| ReplayStateError::Allocation {
+                resource: "encoded bytes",
+            })?;
+        Ok(Self { bytes })
+    }
+
     fn u8(&mut self, value: u8) {
         self.bytes.push(value);
     }
@@ -68,16 +88,14 @@ impl ReplayTransitionWriter {
         self.bytes.extend_from_slice(&value.to_le_bytes());
     }
 
-    fn usize(&mut self, value: usize) -> Result<(), ExecutionError> {
-        let value =
-            u64::try_from(value).map_err(|_| ExecutionError::StateEncodingOverflow { value })?;
-        self.u64(value);
-        Ok(())
-    }
-
     fn hash(&mut self, value: Hash) {
         self.bytes.extend_from_slice(value.as_bytes());
     }
+}
+
+enum ReplayLocalValidationError {
+    Invariant(&'static str),
+    Allocation(&'static str),
 }
 
 /// Idempotency key domain. Order `client_id`s and withdrawal `nonce`s occupy
@@ -251,61 +269,13 @@ impl ReplayGuard {
         self.watermark.get(&(principal, domain.tag())).copied()
     }
 
-    /// Copy the durable replay watermarks in canonical principal/domain order.
-    /// EngineState v1 commits this list together with the bounded receipt cache
-    /// and FIFO order below.
-    pub(crate) fn committed_watermarks_sorted(&self) -> Vec<(u32, u8, u64)> {
-        let mut watermarks: Vec<(u32, u8, u64)> = self
-            .watermark
-            .iter()
-            .map(|(&(principal, domain), &value)| (principal, domain, value))
-            .collect();
-        watermarks.sort_unstable();
-        watermarks
-    }
-
     /// Canonical commitment to the complete replay guard, including the exact
     /// result-affecting receipt window and FIFO eviction order.
     pub(crate) fn transition_root_v1(&self) -> Result<Hash, ExecutionError> {
-        self.validate_transition_invariants()?;
-
-        let mut writer = ReplayTransitionWriter::default();
-        writer.u16(REPLAY_TRANSITION_ROOT_SCHEMA_VERSION);
-        writer.usize(self.window)?;
-
-        let watermarks = self.committed_watermarks_sorted();
-        writer.usize(watermarks.len())?;
-        for (principal, domain, value) in watermarks {
-            writer.u32(principal);
-            writer.u8(domain);
-            writer.u64(value);
-        }
-
-        let mut slots: Vec<Slot> = self.records.keys().copied().collect();
-        slots.sort_unstable();
-        writer.usize(slots.len())?;
-        for slot @ (principal, domain, key) in slots {
-            let (digest, receipt) = self
-                .records
-                .get(&slot)
-                .expect("record key collected from the same immutable map");
-            writer.u32(principal);
-            writer.u8(domain);
-            writer.u64(key);
-            writer.hash(*digest);
-            Self::write_receipt(&mut writer, receipt);
-        }
-
-        writer.usize(self.order.len())?;
-        for &(principal, domain, key) in &self.order {
-            writer.u32(principal);
-            writer.u8(domain);
-            writer.u64(key);
-        }
-
+        let bytes = self.encode_state_v1_for_transition_root()?;
         Ok(crypto::hash_domain(
             crypto::DOMAIN_EXECUTION_REPLAY_STATE,
-            &writer.bytes,
+            &bytes,
         ))
     }
 
@@ -343,13 +313,27 @@ impl ReplayGuard {
     }
 
     fn validate_transition_invariants(&self) -> Result<(), ExecutionError> {
+        self.validate_local_invariants()
+            .map_err(|error| match error {
+                ReplayLocalValidationError::Invariant(message) => {
+                    ExecutionError::StateInvariant(message)
+                }
+                ReplayLocalValidationError::Allocation(_resource) => {
+                    ExecutionError::StateInvariant(
+                        "replay transition-state validation allocation failed",
+                    )
+                }
+            })
+    }
+
+    fn validate_local_invariants(&self) -> Result<(), ReplayLocalValidationError> {
         if self.records.len() > self.window {
-            return Err(ExecutionError::StateInvariant(
+            return Err(ReplayLocalValidationError::Invariant(
                 "replay records exceed the configured window",
             ));
         }
         if self.order.len() != self.records.len() {
-            return Err(ExecutionError::StateInvariant(
+            return Err(ReplayLocalValidationError::Invariant(
                 "replay FIFO and record map have different lengths",
             ));
         }
@@ -358,43 +342,49 @@ impl ReplayGuard {
             |domain| domain == KeyDomain::Order.tag() || domain == KeyDomain::Withdrawal.tag();
         for &(_, domain) in self.watermark.keys() {
             if !known_domain(domain) {
-                return Err(ExecutionError::StateInvariant(
+                return Err(ReplayLocalValidationError::Invariant(
                     "replay watermark has an unknown key domain",
                 ));
             }
         }
 
-        let mut ordered = HashSet::with_capacity(self.order.len());
+        let mut ordered = HashSet::new();
+        ordered
+            .try_reserve(self.order.len())
+            .map_err(|_| ReplayLocalValidationError::Allocation("replay FIFO validation set"))?;
         let mut previous_sequence = None;
         let mut previous_key = HashMap::new();
+        previous_key
+            .try_reserve(self.order.len())
+            .map_err(|_| ReplayLocalValidationError::Allocation("replay key validation map"))?;
         for &slot @ (principal, domain, key) in &self.order {
             if !known_domain(domain) {
-                return Err(ExecutionError::StateInvariant(
+                return Err(ReplayLocalValidationError::Invariant(
                     "replay FIFO has an unknown key domain",
                 ));
             }
             if !ordered.insert(slot) {
-                return Err(ExecutionError::StateInvariant(
+                return Err(ReplayLocalValidationError::Invariant(
                     "replay FIFO contains a duplicate slot",
                 ));
             }
-            let (_, receipt) = self
-                .records
-                .get(&slot)
-                .ok_or(ExecutionError::StateInvariant(
-                    "replay FIFO references a missing record",
-                ))?;
+            let (_, receipt) =
+                self.records
+                    .get(&slot)
+                    .ok_or(ReplayLocalValidationError::Invariant(
+                        "replay FIFO references a missing record",
+                    ))?;
             if self
                 .watermark
                 .get(&(principal, domain))
                 .is_none_or(|watermark| *watermark < key)
             {
-                return Err(ExecutionError::StateInvariant(
+                return Err(ReplayLocalValidationError::Invariant(
                     "replay record exceeds its durable watermark",
                 ));
             }
             if previous_sequence.is_some_and(|previous| receipt.sequence <= previous) {
-                return Err(ExecutionError::StateInvariant(
+                return Err(ReplayLocalValidationError::Invariant(
                     "replay FIFO receipts are not strictly sequence ordered",
                 ));
             }
@@ -403,7 +393,7 @@ impl ReplayGuard {
                 .insert((principal, domain), key)
                 .is_some_and(|previous| key <= previous)
             {
-                return Err(ExecutionError::StateInvariant(
+                return Err(ReplayLocalValidationError::Invariant(
                     "replay FIFO keys are not strictly increasing per principal and domain",
                 ));
             }
@@ -413,7 +403,7 @@ impl ReplayGuard {
                     if domain == KeyDomain::Order.tag() =>
                 {
                     if filled.raw() < 0 {
-                        return Err(ExecutionError::StateInvariant(
+                        return Err(ReplayLocalValidationError::Invariant(
                             "replay order receipt has a negative filled quantity",
                         ));
                     }
@@ -422,18 +412,18 @@ impl ReplayGuard {
                     if domain == KeyDomain::Withdrawal.tag() =>
                 {
                     if *withdrawal_id != derive_withdrawal_id(principal, key) {
-                        return Err(ExecutionError::StateInvariant(
+                        return Err(ReplayLocalValidationError::Invariant(
                             "replay withdrawal receipt id does not match its command key",
                         ));
                     }
                 }
                 (domain, _) if domain == KeyDomain::Order.tag() => {
-                    return Err(ExecutionError::StateInvariant(
+                    return Err(ReplayLocalValidationError::Invariant(
                         "replay order key has a non-order receipt",
                     ));
                 }
                 (domain, _) if domain == KeyDomain::Withdrawal.tag() => {
-                    return Err(ExecutionError::StateInvariant(
+                    return Err(ReplayLocalValidationError::Invariant(
                         "replay withdrawal key has a non-withdrawal receipt",
                     ));
                 }
@@ -441,7 +431,7 @@ impl ReplayGuard {
             }
         }
         if self.records.keys().any(|slot| !ordered.contains(slot)) {
-            return Err(ExecutionError::StateInvariant(
+            return Err(ReplayLocalValidationError::Invariant(
                 "replay record map contains a slot missing from FIFO order",
             ));
         }
@@ -558,10 +548,21 @@ pub(crate) fn command_binding(command: &Command) -> Option<KeyBinding> {
 /// counter that a partial recovery could desynchronise. Non-wrapping by
 /// construction (a truncated domain-separated digest).
 pub(crate) fn derive_withdrawal_id(account: u32, nonce: u64) -> u64 {
-    let mut w = LeafWriter::new();
-    w.field_u32(account)
-        .field_i64(i64::from_le_bytes(nonce.to_le_bytes()));
-    let h = crypto::hash_domain(crypto::DOMAIN_COMMAND, &w.finish());
+    // Exact LeafWriter v1 bytes on the stack. This helper also runs while a
+    // bounded ReplayGuard image is being validated, where an infallible heap
+    // allocation would turn memory pressure into an abort instead of a typed
+    // decoder error.
+    let mut bytes = [0u8; 14];
+    let mut at = 0usize;
+    put(
+        &mut bytes,
+        &mut at,
+        &state_tree::LEAF_ENCODING_VERSION.to_le_bytes(),
+    );
+    put(&mut bytes, &mut at, &account.to_le_bytes());
+    put(&mut bytes, &mut at, &nonce.to_le_bytes());
+    debug_assert_eq!(at, bytes.len());
+    let h = crypto::hash_domain(crypto::DOMAIN_COMMAND, &bytes);
     let b = h.as_bytes();
     u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
 }
@@ -1327,6 +1328,28 @@ mod tests {
     #[test]
     fn derived_withdrawal_id_is_deterministic_and_key_dependent() {
         let a = derive_withdrawal_id(3, 1);
+        assert_eq!(a, 16_797_745_059_889_606_235);
+
+        let mut reference = LeafWriter::new();
+        reference
+            .field_u32(3)
+            .field_i64(i64::from_le_bytes(1_u64.to_le_bytes()));
+        let reference_hash = crypto::hash_domain(crypto::DOMAIN_COMMAND, reference.as_bytes());
+        let reference_bytes = reference_hash.as_bytes();
+        assert_eq!(
+            a,
+            u64::from_le_bytes([
+                reference_bytes[0],
+                reference_bytes[1],
+                reference_bytes[2],
+                reference_bytes[3],
+                reference_bytes[4],
+                reference_bytes[5],
+                reference_bytes[6],
+                reference_bytes[7],
+            ]),
+            "stack encoding must remain byte-identical to canonical LeafWriter v1",
+        );
         assert_eq!(a, derive_withdrawal_id(3, 1));
         assert_ne!(a, derive_withdrawal_id(3, 2));
         assert_ne!(a, derive_withdrawal_id(4, 1));
@@ -1350,6 +1373,13 @@ mod tests {
             auth: crate::command::Authorization::Master,
         };
         let d = place_order_digest(&base);
+        assert_eq!(
+            d,
+            Hash::from_bytes([
+                97, 93, 68, 19, 189, 107, 188, 126, 216, 151, 245, 137, 96, 29, 216, 81, 60, 35,
+                98, 60, 178, 144, 233, 161, 100, 114, 155, 67, 191, 40, 0, 32,
+            ])
+        );
         let mut reference = LeafWriter::new();
         reference
             .field_u32(u32::from(KeyDomain::Order.tag()))
@@ -1369,16 +1399,106 @@ mod tests {
             crypto::hash_domain(crypto::DOMAIN_COMMAND, reference.as_bytes()),
             "stack encoding must remain byte-identical to canonical LeafWriter v1",
         );
-        let mut changed = base.clone();
-        changed.quantity = Quantity::from_raw(2_000_001);
-        assert_ne!(d, place_order_digest(&changed));
-        // The volatile authorization envelope is excluded from the digest.
-        let mut reauthed = base;
+        macro_rules! changed {
+            ($field:ident = $value:expr) => {{
+                let mut command = base.clone();
+                command.$field = $value;
+                assert_ne!(
+                    d,
+                    place_order_digest(&command),
+                    concat!(stringify!($field), " must be digest-bound")
+                );
+            }};
+        }
+        changed!(account = AccountId::new(2));
+        changed!(market = MarketId::new(1));
+        changed!(order_id = OrderId::new(10));
+        changed!(side = Side::Ask);
+        changed!(order_type = OrderType::Market);
+        changed!(tif = TimeInForce::Ioc);
+        changed!(price = Price::from_raw(1_000_001));
+        changed!(quantity = Quantity::from_raw(2_000_001));
+        changed!(client_id = 6);
+        changed!(reduce_only = true);
+        changed!(instrument = 1);
+
+        // Every authorization field is deliberately excluded from the digest.
+        let mut reauthed = base.clone();
         reauthed.auth = crate::command::Authorization::Session {
             session_key: [9u8; 32],
-            nonce: 0,
-            now: 1,
+            nonce: u64::MAX,
+            now: u64::MAX,
         };
         assert_eq!(d, place_order_digest(&reauthed));
+
+        let binding = command_binding(&Command::PlaceOrder(base)).unwrap();
+        assert_eq!(binding.principal, 1);
+        assert_eq!(binding.domain, KeyDomain::Order);
+        assert_eq!(binding.key, 5);
+        assert_eq!(binding.digest, d);
+    }
+
+    #[test]
+    fn withdrawal_digest_golden_binds_every_payload_field_and_excludes_auth() {
+        let base = RequestWithdrawal {
+            account: AccountId::new(7),
+            amount: Amount::from_raw(0x0102_0304_0506_0708_1112_1314_1516_1718),
+            nonce: 0x2122_2324_2526_2728,
+            destination_chain: 0x3132_3334,
+            destination_address: vec![0x41, 0x42, 0x43, 0x44, 0x45],
+            auth: crate::command::Authorization::Master,
+        };
+        let digest = withdrawal_digest(&base);
+        assert_eq!(
+            digest,
+            Hash::from_bytes([
+                95, 175, 54, 23, 164, 202, 104, 5, 1, 143, 66, 66, 124, 43, 209, 66, 131, 70, 107,
+                153, 34, 16, 15, 0, 130, 22, 131, 46, 228, 45, 239, 223,
+            ])
+        );
+
+        let mut reference = LeafWriter::new();
+        reference
+            .field_u32(u32::from(KeyDomain::Withdrawal.tag()))
+            .field_u32(base.account.get())
+            .field_i128(base.amount.raw())
+            .field_i64(i64::from_le_bytes(base.nonce.to_le_bytes()))
+            .field_u32(base.destination_chain)
+            .field_bytes(&base.destination_address);
+        assert_eq!(
+            digest,
+            crypto::hash_domain(crypto::DOMAIN_COMMAND, reference.as_bytes())
+        );
+
+        macro_rules! changed {
+            ($field:ident = $value:expr) => {{
+                let mut command = base.clone();
+                command.$field = $value;
+                assert_ne!(
+                    digest,
+                    withdrawal_digest(&command),
+                    concat!(stringify!($field), " must be digest-bound")
+                );
+            }};
+        }
+        changed!(account = AccountId::new(8));
+        changed!(amount = Amount::from_raw(base.amount.raw() + 1));
+        changed!(nonce = base.nonce + 1);
+        changed!(destination_chain = base.destination_chain + 1);
+        changed!(destination_address = vec![0x41, 0x42, 0x43, 0x44, 0x46]);
+
+        let mut reauthed = base.clone();
+        reauthed.auth = crate::command::Authorization::Session {
+            session_key: [0xAA; 32],
+            nonce: u64::MAX,
+            now: u64::MAX,
+        };
+        assert_eq!(digest, withdrawal_digest(&reauthed));
+
+        let binding = command_binding(&Command::RequestWithdrawal(base)).unwrap();
+        assert_eq!(binding.principal, 7);
+        assert_eq!(binding.domain, KeyDomain::Withdrawal);
+        assert_eq!(binding.key, 0x2122_2324_2526_2728);
+        assert_eq!(binding.digest, digest);
     }
 }
