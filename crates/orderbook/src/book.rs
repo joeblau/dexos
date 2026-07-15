@@ -559,6 +559,29 @@ impl OrderBook {
             .copied()
             .ok_or(OrderError::UnknownOrder)?;
         let node = *self.slab.get(loc.slot).ok_or(OrderError::UnknownOrder)?;
+        // A non-crossing replacement rests in full, so aggregate overflow is
+        // the only reachable error after removing the original. Check the
+        // exact post-removal level total while every index and FIFO link is
+        // still untouched. Crossing replacements deliberately skip this
+        // full-quantity check: fills or STP may reduce/cancel their residual,
+        // and `execute_with_report` already returns those applied mutations as
+        // a successful result rather than surfacing a later resting error.
+        if !self.would_cross(node.side, price) {
+            let book = match node.side {
+                Side::Bid => &self.bids,
+                Side::Ask => &self.asks,
+            };
+            let level_total = if node.price == price {
+                book.level_total(price)
+                    .checked_sub(node.remaining)
+                    .map_err(|_| OrderError::Overflow)?
+            } else {
+                book.level_total(price)
+            };
+            level_total
+                .checked_add(quantity)
+                .map_err(|_| OrderError::Overflow)?;
+        }
         // Removing the original first frees a slot, so the resubmission can never
         // exhaust capacity (net slot delta is <= 0).
         self.remove_resting(loc.side, loc.slot);
