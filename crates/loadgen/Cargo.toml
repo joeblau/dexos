@@ -32,5 +32,5 @@ name = "hot_path"
 harness = false
 
 [dev-dependencies]
-rcgen = "0.13"
+rcgen = "0.14"
 rpc = { path = "../rpc" }

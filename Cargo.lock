@@ -3754,7 +3754,7 @@ dependencies = [
  "network",
  "postcard",
  "proto",
- "rcgen 0.13.2",
+ "rcgen",
  "rpc",
  "rustls",
  "rustls-pemfile",
@@ -4196,7 +4196,7 @@ dependencies = [
  "hkdf",
  "lz4_flex",
  "quinn",
- "rcgen 0.14.8",
+ "rcgen",
  "rustls",
  "rustls-pki-types",
  "serde",
@@ -5559,19 +5559,6 @@ dependencies = [
 
 [[package]]
 name = "rcgen"
-version = "0.13.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75e669e5202259b5314d1ea5397316ad400819437857b90861765f24c4cf80a2"
-dependencies = [
- "pem",
- "ring",
- "rustls-pki-types",
- "time",
- "yasna 0.5.2",
-]
-
-[[package]]
-name = "rcgen"
 version = "0.14.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57f6d249aad744e274e682777a50283a225a32705394ee6d5fcc01efa25e4055"
@@ -5581,7 +5568,7 @@ dependencies = [
  "rustls-pki-types",
  "time",
  "x509-parser",
- "yasna 0.6.0",
+ "yasna",
 ]
 
 [[package]]
@@ -5744,7 +5731,7 @@ dependencies = [
  "libc",
  "observability",
  "proto",
- "rcgen 0.14.8",
+ "rcgen",
  "rustls",
  "rustls-pemfile",
  "serde",
@@ -6562,7 +6549,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -8013,15 +8000,6 @@ name = "y4m"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a5a4b21e1a62b67a2970e6831bc091d7b87e119e7f9791aef9702e3bef04448"
-
-[[package]]
-name = "yasna"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e17bb3549cc1321ae1296b9cdc2698e2b6cb1992adfa19a8c72e5b7a738f44cd"
-dependencies = [
- "time",
-]
 
 [[package]]
 name = "yasna"
